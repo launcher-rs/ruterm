@@ -236,6 +236,7 @@ impl RuLinkApp {
             user: form.user.read(cx).value().trim().to_string(),
             auth: form.auth,
             key_path: form.key_path.read(cx).value().trim().to_string(),
+            favorite: false,
         };
         if let Some(error) = host.validate() {
             log::warn!("保存主机失败: {error}");
@@ -262,6 +263,15 @@ impl RuLinkApp {
             self.hosts.remove(index);
             self.store.save(&self.hosts);
             self.status = SharedString::from(format!("已删除主机 {label}"));
+            cx.notify();
+        }
+    }
+
+    /// 切换指定主机的收藏状态并持久化。
+    fn toggle_favorite(&mut self, index: usize, cx: &mut Context<Self>) {
+        if let Some(host) = self.hosts.get_mut(index) {
+            host.favorite = !host.favorite;
+            self.store.save(&self.hosts);
             cx.notify();
         }
     }
@@ -548,7 +558,7 @@ impl RuLinkApp {
         }
         let query = self.search.read(cx).value().trim().to_lowercase();
         // 按展示名 / user@host:port 子串过滤；保留真实下标供点击/删除定位。
-        let matched: Vec<usize> = self
+        let mut matched: Vec<usize> = self
             .hosts
             .iter()
             .enumerate()
@@ -559,6 +569,8 @@ impl RuLinkApp {
             })
             .map(|(index, _)| index)
             .collect();
+        // 收藏主机置顶（稳定排序，同组内保持原插入顺序）。
+        matched.sort_by_key(|&index| !self.hosts[index].favorite);
         if matched.is_empty() {
             return div()
                 .text_sm()
@@ -572,6 +584,8 @@ impl RuLinkApp {
                 let host = &self.hosts[index];
                 let host_id = SharedString::from(format!("host-row-{index}"));
                 let del_id = SharedString::from(format!("host-del-{index}"));
+                let fav_id = SharedString::from(format!("host-fav-{index}"));
+                let fav_glyph: &'static str = if host.favorite { "★" } else { "☆" };
                 h_flex()
                     .id(host_id)
                     .w_full()
@@ -611,6 +625,22 @@ impl RuLinkApp {
                             .flex_shrink_0()
                             .gap_2()
                             .items_center()
+                            .child(
+                                div()
+                                    .id(fav_id)
+                                    .text_sm()
+                                    .px_1()
+                                    .text_color(if host.favorite { pal.accent } else { pal.muted })
+                                    .child(fav_glyph)
+                                    .cursor_pointer()
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                                    )
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.toggle_favorite(index, cx)
+                                    })),
+                            )
                             .child(
                                 div()
                                     .text_xs()

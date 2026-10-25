@@ -33,6 +33,9 @@ pub struct HostConfig {
     /// 私钥路径（仅 IdentityFile 使用）
     #[serde(default)]
     pub key_path: String,
+    /// 是否收藏（收藏主机在列表置顶，★ 标记）
+    #[serde(default)]
+    pub favorite: bool,
 }
 
 impl HostConfig {
