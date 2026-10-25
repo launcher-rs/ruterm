@@ -13,7 +13,7 @@ use std::collections::HashMap;
 
 use rgpui::components::split_pane::{CollapsiblePane, SplitPane, SplitPaneState};
 use rgpui::components::status_bar::{StatusBar, StatusBarItem};
-use rgpui::input_ui::{Input, InputContentType, InputState};
+use rgpui::input_ui::{Input, InputContentType, InputEvent, InputState};
 use rgpui::prelude::*;
 use rgpui::{
     AnyElement, App, Bounds, Button, ButtonVariants, Context, Entity, FocusHandle, Focusable, Hsla,
@@ -73,6 +73,8 @@ struct RuLinkApp {
     store: SessionStore,
     /// 已保存的主机账号列表。
     hosts: Vec<HostConfig>,
+    /// 主机列表搜索框（按展示名 / user@host:port 子串过滤）。
+    search: Entity<InputState>,
     /// 活动会话标签。
     tabs: Vec<SessionTab>,
     /// 当前选中标签 id。
@@ -160,9 +162,13 @@ impl RuLinkApp {
             state.set_ratio(0.25, cx);
             state.set_min_first(200.0, cx);
         });
+        let search = cx.new(|cx| InputState::new(window, cx).placeholder("搜索主机…"));
+        cx.subscribe(&search, |_, _, _: &InputEvent, cx| cx.notify())
+            .detach();
         let mut app = Self {
             store,
             hosts,
+            search,
             tabs: Vec::new(),
             active_tab: None,
             new_host: None,
@@ -469,6 +475,8 @@ impl RuLinkApp {
         } else {
             "切换到暗色主题 (Ctrl+T)"
         };
+        // 搜索框只在主机列表模式下出现（表单 / 待输入密码时隐藏）。
+        let list_mode = self.new_host.is_none() && self.pending.is_none();
 
         v_flex()
             .size_full()
@@ -503,6 +511,9 @@ impl RuLinkApp {
                     .w_full()
                     .on_click(cx.listener(|this, _, window, cx| this.open_form(window, cx))),
             )
+            .when(list_mode, |this| {
+                this.child(styled_input(Input::new(&self.search), &pal))
+            })
             .child(div().flex_1().overflow_y_scrollbar().child(panel))
             .into_any_element()
     }
@@ -517,9 +528,30 @@ impl RuLinkApp {
                 .child("暂无主机，点击上方“新建主机”添加。")
                 .into_any_element();
         }
+        let query = self.search.read(cx).value().trim().to_lowercase();
+        // 按展示名 / user@host:port 子串过滤；保留真实下标供点击/删除定位。
+        let matched: Vec<usize> = self
+            .hosts
+            .iter()
+            .enumerate()
+            .filter(|(_, host)| {
+                query.is_empty()
+                    || host.name.to_lowercase().contains(&query)
+                    || host.addr().to_lowercase().contains(&query)
+            })
+            .map(|(index, _)| index)
+            .collect();
+        if matched.is_empty() {
+            return div()
+                .text_sm()
+                .text_color(pal.muted)
+                .child("无匹配主机")
+                .into_any_element();
+        }
         v_flex()
             .gap_1()
-            .children(self.hosts.iter().enumerate().map(|(index, host)| {
+            .children(matched.into_iter().map(|index| {
+                let host = &self.hosts[index];
                 let host_id = SharedString::from(format!("host-row-{index}"));
                 let del_id = SharedString::from(format!("host-del-{index}"));
                 h_flex()
