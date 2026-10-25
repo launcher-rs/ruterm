@@ -116,6 +116,11 @@ impl RuLinkApp {
             key_path: cx.new(|cx| InputState::new(window, cx).placeholder("~/.ssh/id_ed25519")),
             auth: AuthMethod::Agent,
         });
+        // 表单打开即把焦点交给"主机地址"输入框：退格/删除等键位动作只在输入框
+        // 持有焦点（"Input" 键位上下文激活）时才会派发，主动聚焦让删除键即时可用。
+        if let Some(form) = self.new_host.as_ref() {
+            form.host.update(cx, |state, cx| state.focus(window, cx));
+        }
         cx.notify();
     }
 
@@ -178,6 +183,7 @@ impl RuLinkApp {
             }
             let password =
                 cx.new(|cx| InputState::new(window, cx).placeholder("输入密码后点击连接"));
+            password.update(cx, |state, cx| state.focus(window, cx));
             self.pending = Some(PendingConnect { host, password });
             cx.notify();
         } else {
@@ -475,7 +481,9 @@ impl RuLinkApp {
                     .text_sm()
                     .child(format!("连接 {host} 需要密码（仅本次使用，不保存）")),
             )
-            .child(Input::new(&pending.password).content_type(InputContentType::Password))
+            .child(styled_input(
+                Input::new(&pending.password).content_type(InputContentType::Password),
+            ))
             .child(
                 h_flex()
                     .gap_2()
@@ -577,7 +585,16 @@ fn labeled_field(label: &'static str, input: &Entity<InputState>) -> impl IntoEl
     v_flex()
         .gap_1()
         .child(div().text_sm().child(label))
-        .child(Input::new(input))
+        .child(styled_input(Input::new(input)))
+}
+
+/// 统一输入框外观：暗底 + 明显边框 + 亮色文字，保证未聚焦时文字与边框都清晰可辨。
+fn styled_input(input: Input) -> Input {
+    input
+        .bg(rgb(0x1b1b1c))
+        .text_color(rgb(0xf2f2f2))
+        .border_1()
+        .border_color(rgb(0x4a4a4a))
 }
 
 impl Focusable for RuLinkApp {
@@ -605,9 +622,12 @@ fn main() {
     let app = rgpui_platform::application();
     app.run(move |cx| {
         rgpui::tokio::init(cx);
-        // 主题 + 输入子系统必须初始化：否则输入框无配色（文字看不清）且
+        // 主题 + 输入子系统必须初始化：否则输入框无配色且
         // 退格/删除等键位动作未注册（无法编辑已输入内容）。
         rgpui::theme::init(cx);
+        // theme::init 默认切到亮色，输入框背景近白；本程序整体是暗色配色，
+        // 文字继承浅灰会洗白看不清，这里显式切到暗色主题统一底色。
+        rgpui::theme::Theme::change(rgpui::theme::ThemeMode::Dark, None, cx);
         rgpui::input_ui::init(cx);
         let opened = cx.open_window(
             WindowOptions {
