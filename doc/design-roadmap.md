@@ -71,7 +71,7 @@
 
 ### 8. 系统托盘
 - `[x]` 品牌托盘图标 + 悬停提示 + 右键菜单（显示主界面 / 退出），经 `App::set_tray_icon/tooltip/menu` + `on_tray_menu_action`。
-- `[ ]` 关闭 / 最小化到托盘（关窗口不退出，后台保活会话；托盘"退出"才真正结束）。
+- `[x]` 关闭到托盘（点窗口 X 经 `Window::on_window_should_close` 返回 false 改调 `hide_window()`，会话后台保活；托盘"显示主界面"经 `WindowHandle::update(..).activate_window()` 恢复，"退出"经 `cx.quit()` 直接投 `WM_QUIT` 真正结束）。
 - `[ ]` 托盘菜单动态列出当前活动会话，点击可跳转到对应标签。
 - `[ ]` 托盘图标角标 / tooltip 反映会话数或连接状态。
 

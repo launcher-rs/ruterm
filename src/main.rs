@@ -990,13 +990,23 @@ fn main() {
             },
             |window, cx| {
                 let quick = quick.clone();
-                cx.new(|cx| RuLinkApp::new(quick, window, cx))
+                let app = cx.new(|cx| RuLinkApp::new(quick, window, cx));
+                // 关闭按钮改为隐藏到托盘：窗口不销毁，会话后台保活；
+                // 返回 false 中断关闭，真正退出走托盘"退出"（cx.quit 直接投 WM_QUIT，不经此回调）。
+                window.on_window_should_close(cx, |window, _cx| {
+                    window.hide_window();
+                    false
+                });
+                app
             },
         );
-        if opened.is_err() {
-            cx.quit();
-            return;
-        }
+        let window_handle = match opened {
+            Ok(handle) => handle,
+            Err(_) => {
+                cx.quit();
+                return;
+            }
+        };
         cx.activate(true);
 
         // 系统托盘：品牌图标 + 悬停提示 + 右键菜单（显示主界面 / 退出）。
@@ -1015,9 +1025,14 @@ fn main() {
                 id: "quit".into(),
             },
         ]);
-        cx.on_tray_menu_action(|id: SharedString, cx: &mut App| match id.as_ref() {
+        cx.on_tray_menu_action(move |id: SharedString, cx: &mut App| match id.as_ref() {
             "quit" => cx.quit(),
-            "show" => cx.activate(true),
+            "show" => {
+                // 从托盘恢复：把隐藏的主窗口重新带到前台。
+                window_handle
+                    .update(cx, |_, window, _| window.activate_window())
+                    .ok();
+            }
             _ => {}
         });
     });
