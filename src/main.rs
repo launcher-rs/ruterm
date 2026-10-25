@@ -11,6 +11,7 @@ mod ssh;
 
 use std::collections::HashMap;
 
+use rgpui::components::split_pane::{CollapsiblePane, SplitPane, SplitPaneState};
 use rgpui::components::status_bar::{StatusBar, StatusBarItem};
 use rgpui::input_ui::{Input, InputContentType, InputState};
 use rgpui::prelude::*;
@@ -86,8 +87,8 @@ struct RuLinkApp {
     next_id: usize,
     /// 状态栏左侧的瞬态消息（连接/保存/删除/断开等节点更新）。
     status: SharedString,
-    /// 侧边栏是否展开（折叠后收成窄轨道，仅留一个展开按钮）。
-    sidebar_open: bool,
+    /// 侧边栏 ↔ 主区 的分隔面板状态（拖拽调整宽度 + 折叠/展开）。
+    split_state: Entity<SplitPaneState>,
     focus_handle: FocusHandle,
 }
 
@@ -153,6 +154,12 @@ impl RuLinkApp {
     fn new(quick: Option<SshTarget>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let store = SessionStore::new();
         let hosts = store.load();
+        // 侧边栏 ↔ 主区 分隔面板：初始侧边栏占比约 0.25，最小宽 200px。
+        let split_state = cx.new(SplitPaneState::new);
+        split_state.update(cx, |state, cx| {
+            state.set_ratio(0.25, cx);
+            state.set_min_first(200.0, cx);
+        });
         let mut app = Self {
             store,
             hosts,
@@ -163,7 +170,7 @@ impl RuLinkApp {
             password_cache: HashMap::new(),
             next_id: 0,
             status: "就绪".into(),
-            sidebar_open: true,
+            split_state,
             focus_handle: cx.focus_handle(),
         };
         if let Some(target) = quick {
@@ -416,9 +423,11 @@ impl Render for RuLinkApp {
             .text_color(pal.text)
             .on_key_down(
                 cx.listener(|this, event: &rgpui::KeyDownEvent, window, cx| {
-                    // Ctrl+B 折叠 / 展开侧边栏。
+                    // Ctrl+B 折叠 / 展开侧边栏（走分隔面板状态）。
                     if event.keystroke.key == "b" && event.keystroke.modifiers.control {
-                        this.sidebar_open = !this.sidebar_open;
+                        this.split_state.update(cx, |state, cx| {
+                            state.toggle_collapse(CollapsiblePane::First, cx);
+                        });
                         cx.notify();
                     }
                     // Ctrl+T 切换明暗主题。
@@ -428,44 +437,23 @@ impl Render for RuLinkApp {
                 }),
             )
             .child(
-                h_flex()
-                    .w_full()
+                SplitPane::horizontal(self.split_state.clone())
+                    .show_collapse_buttons(true)
+                    .first(self.render_sidebar(cx))
+                    .second(self.render_main(cx))
                     .flex_1()
                     .min_h_0()
-                    .overflow_hidden()
-                    .child(self.render_sidebar(cx))
-                    .child(self.render_main(cx)),
+                    .overflow_hidden(),
             )
             .child(self.render_status_bar().flex_shrink_0().w_full())
     }
 }
 
 impl RuLinkApp {
-    /// 左侧栏：展开时显示标题 / 新建按钮 / 主机列表面板；折叠时收成窄轨道，仅留展开按钮。
+    /// 左侧栏：标题 + 主题切换 / 新建按钮 / 主机列表面板。
+    /// 宽度与折叠由外层 SplitPane 负责，这里只填充第一面板区域。
     fn render_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
         let pal = self.palette(cx);
-        if !self.sidebar_open {
-            return v_flex()
-                .w(px(44.0))
-                .h_full()
-                .flex_shrink_0()
-                .items_center()
-                .pt_2()
-                .bg(pal.sidebar_bg)
-                .border_r_1()
-                .border_color(pal.border)
-                .child(
-                    Button::new("sidebar-expand")
-                        .label("»")
-                        .tooltip("展开侧边栏 (Ctrl+B)")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.sidebar_open = true;
-                            cx.notify();
-                        })),
-                )
-                .into_any_element();
-        }
-
         let panel = if self.new_host.is_some() {
             self.render_form_panel(cx)
         } else if self.pending.is_some() {
@@ -483,12 +471,8 @@ impl RuLinkApp {
         };
 
         v_flex()
-            .w(px(280.0))
-            .h_full()
-            .flex_shrink_0()
+            .size_full()
             .bg(pal.sidebar_bg)
-            .border_r_1()
-            .border_color(pal.border)
             .p_3()
             .gap_2()
             .child(
@@ -503,26 +487,13 @@ impl RuLinkApp {
                             .child("RuLink"),
                     )
                     .child(
-                        h_flex()
-                            .gap_1()
-                            .child(
-                                Button::new("toggle-theme")
-                                    .label(theme_label)
-                                    .ghost()
-                                    .tooltip(theme_tooltip)
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.toggle_theme(window, cx);
-                                    })),
-                            )
-                            .child(
-                                Button::new("sidebar-collapse")
-                                    .label("«")
-                                    .tooltip("折叠侧边栏 (Ctrl+B)")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.sidebar_open = false;
-                                        cx.notify();
-                                    })),
-                            ),
+                        Button::new("toggle-theme")
+                            .label(theme_label)
+                            .ghost()
+                            .tooltip(theme_tooltip)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.toggle_theme(window, cx);
+                            })),
                     ),
             )
             .child(

@@ -33,9 +33,9 @@
 - `[ ]` **可配置显示项**：设置面板勾选状态栏要显示哪些条目（主机名/OS/内存/磁盘/uptime…）。
 
 ### 2. 侧边栏
-- `[x]` 折叠 / 展开切换（按钮 + 快捷键 `Ctrl+B`；折叠为窄轨道，仅留展开按钮）。
-- `[ ]` 折叠后保留窄图标轨道，悬停可临时展开（参考 rgpui `TaskPane` 自动隐藏轨道）。
-- `[ ]` 可拖拽调整宽度（参考 `SplitPane` / `TaskPaneStack` 权重拖拽）。
+- `[x]` 可拖拽调整宽度（改用 rgpui `SplitPane::horizontal`，初始比例 0.25、最小宽度 200px，分隔线可拖动）。
+- `[x]` 折叠 / 展开切换（分隔线上的 `SplitPane` 折叠按钮 + 快捷键 `Ctrl+B`；折叠后浮出展开按钮）。
+- `[ ]` 折叠后保留窄图标轨道，悬停可临时展开（现折叠为完全收起 + 浮出展开按钮；窄轨道悬停展开可后续按需增强）。
 
 ### 3. 主题
 - `[x]` 明 / 暗主题切换（rgpui `Theme::change(ThemeMode)` + 配色统一走 `cx.theme()` 语义色），侧边栏 ☀/☾ 按钮 + `Ctrl+T`。
@@ -80,7 +80,7 @@ RuLink 不自造 UI 轮子，优先复用 rgpui 现成子系统：
 | 需求 | 复用组件 |
 |------|----------|
 | 状态栏 | `components::status_bar::{StatusBar, StatusBarItem}`（已用） |
-| 侧边栏折叠 / 自动隐藏 | `TaskPane` / `TaskPaneStack` |
+| 侧边栏可拖拽宽度 / 折叠 | `SplitPane`（已用）/ `TaskPane` 自动隐藏轨道（备用） |
 | 分屏 / 停靠 | `SplitPane`、`DockArea` |
 | 自定义标题栏 | `title_bar::TitleBar` |
 | 主题切换 | `theme::Theme::change` |
