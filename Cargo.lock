@@ -5420,6 +5420,8 @@ dependencies = [
  "rgpui-platform",
  "rgpui-term",
  "russh",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 

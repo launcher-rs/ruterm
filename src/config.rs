@@ -1,6 +1,8 @@
-//! 连接目标解析：命令行与凭据来源（密码只走环境变量，不落命令行）。
+//! 连接目标解析：命令行快速连接与 GUI 主机账号的统一形态。
 
 use std::path::PathBuf;
+
+use crate::sessions::{AuthMethod, HostConfig};
 
 /// 一次 SSH 会话的连接参数。
 #[derive(Clone, Debug)]
@@ -91,5 +93,22 @@ impl SshTarget {
     /// known_hosts 记录用的展示地址（host:port）。
     pub fn addr(&self) -> String {
         format!("{}:{}", self.host, self.port)
+    }
+
+    /// 由主机账号 + 连接时临时输入的密码构造连接目标。
+    ///
+    /// 密码仅在内存中传递、绝不落盘；`key_path` 仅私钥认证时使用。
+    pub fn from_host(host: &HostConfig, password: Option<String>) -> Self {
+        Self {
+            user: host.user.clone(),
+            host: host.host.clone(),
+            port: host.port,
+            key_path: if host.auth == AuthMethod::IdentityFile {
+                Some(PathBuf::from(host.key_path.as_str()))
+            } else {
+                None
+            },
+            password,
+        }
     }
 }
