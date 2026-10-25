@@ -160,7 +160,8 @@ impl RuLinkApp {
         let split_state = cx.new(SplitPaneState::new);
         split_state.update(cx, |state, cx| {
             state.set_ratio(0.25, cx);
-            state.set_min_first(200.0, cx);
+            // 允许拖到很窄；一旦低于折叠阈值即自动收起（见 render 的 on_resize）。
+            state.set_min_first(80.0, cx);
         });
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("搜索主机…"));
         cx.subscribe(&search, |_, _, _: &InputEvent, cx| cx.notify())
@@ -419,6 +420,9 @@ impl RuLinkApp {
 impl Render for RuLinkApp {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let pal = self.palette(cx);
+        // 侧边栏拖到低于此宽度（px）即自动折叠隐藏。
+        const SIDEBAR_COLLAPSE_PX: f32 = 150.0;
+        let split_for_resize = self.split_state.clone();
         v_flex()
             .id("rulink-root")
             .track_focus(&self.focus_handle)
@@ -444,7 +448,22 @@ impl Render for RuLinkApp {
             )
             .child(
                 SplitPane::horizontal(self.split_state.clone())
-                    .show_collapse_buttons(true)
+                    .show_collapse_buttons(false)
+                    .on_resize(move |ratio, window, cx| {
+                        let total = window.bounds().size.width.as_f32();
+                        if ratio * total < SIDEBAR_COLLAPSE_PX {
+                            // on_resize 在 SplitPaneState 自身的 mouse-move update 内被调用，
+                            // 直接 update 同一实体会重入租约 panic —— 推迟到本帧结束再折叠。
+                            let split = split_for_resize.clone();
+                            window.defer(cx, move |_, cx| {
+                                split.update(cx, |state, cx| {
+                                    if !state.is_collapsed() {
+                                        state.collapse(CollapsiblePane::First, cx);
+                                    }
+                                });
+                            });
+                        }
+                    })
                     .first(self.render_sidebar(cx))
                     .second(self.render_main(cx))
                     .flex_1()
@@ -495,13 +514,29 @@ impl RuLinkApp {
                             .child("RuLink"),
                     )
                     .child(
-                        Button::new("toggle-theme")
-                            .label(theme_label)
-                            .ghost()
-                            .tooltip(theme_tooltip)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.toggle_theme(window, cx);
-                            })),
+                        h_flex()
+                            .gap_1()
+                            .child(
+                                Button::new("toggle-theme")
+                                    .label(theme_label)
+                                    .ghost()
+                                    .tooltip(theme_tooltip)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.toggle_theme(window, cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("sidebar-collapse")
+                                    .label("«")
+                                    .ghost()
+                                    .tooltip("折叠侧边栏 (Ctrl+B)")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.split_state.update(cx, |state, cx| {
+                                            state.collapse(CollapsiblePane::First, cx);
+                                        });
+                                        cx.notify();
+                                    })),
+                            ),
                     ),
             )
             .child(
@@ -572,15 +607,25 @@ impl RuLinkApp {
                     .child(
                         v_flex()
                             .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
                             .child(
                                 div()
+                                    .text_ellipsis()
                                     .font_weight(rgpui::FontWeight(600.0))
                                     .child(host.name.clone()),
                             )
-                            .child(div().text_xs().text_color(pal.muted).child(host.addr())),
+                            .child(
+                                div()
+                                    .text_ellipsis()
+                                    .text_xs()
+                                    .text_color(pal.muted)
+                                    .child(host.addr()),
+                            ),
                     )
                     .child(
                         h_flex()
+                            .flex_shrink_0()
                             .gap_2()
                             .items_center()
                             .child(
@@ -793,7 +838,38 @@ impl RuLinkApp {
                     .into_any_element()
             });
 
-        v_flex().flex_1().h_full().child(tab_bar).child(body)
+        // 侧边栏折叠后，主区顶部补一条展开栏（分隔面板自带折叠按钮已关闭）。
+        let collapsed = self.split_state.read(cx).is_collapsed();
+        let expand_bar = if collapsed {
+            h_flex()
+                .h(px(36.0))
+                .flex_shrink_0()
+                .items_center()
+                .px_2()
+                .bg(pal.sidebar_bg)
+                .border_b_1()
+                .border_color(pal.border)
+                .child(
+                    Button::new("sidebar-expand")
+                        .label("»")
+                        .ghost()
+                        .tooltip("展开侧边栏 (Ctrl+B)")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.split_state.update(cx, |state, cx| state.expand(cx));
+                            cx.notify();
+                        })),
+                )
+                .into_any_element()
+        } else {
+            div().into_any_element()
+        };
+
+        v_flex()
+            .flex_1()
+            .h_full()
+            .child(expand_bar)
+            .child(tab_bar)
+            .child(body)
     }
 
     /// 底部状态栏：左侧瞬态状态 + 活动会话信息（地址/认证/远程指标占位），右侧会话计数。
