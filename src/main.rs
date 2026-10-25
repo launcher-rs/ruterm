@@ -9,14 +9,15 @@ mod session;
 mod sessions;
 mod ssh;
 
-use anyhow::Result;
+use std::collections::HashMap;
+
 use rgpui::input_ui::{Input, InputContentType, InputState};
 use rgpui::prelude::*;
 use rgpui::{
     AnyElement, App, Button, ButtonVariants, Context, Entity, FocusHandle, Focusable,
     InteractiveElement, IntoElement, MouseButton, ParentElement, Render, ScrollableElement,
-    SharedString, StatefulInteractiveElement, Styled, Task, Window, WindowOptions, div, h_flex, px,
-    rgb, v_flex,
+    SharedString, StatefulInteractiveElement, Styled, Window, WindowOptions, div, h_flex, px, rgb,
+    v_flex,
 };
 use rgpui_term::{TerminalBuilder, TerminalView};
 
@@ -32,14 +33,14 @@ fn auth_label(method: AuthMethod) -> &'static str {
     }
 }
 
-/// 一个已连接的会话标签（持有终端视图与后台 SSH 任务）。
+/// 一个已连接的会话标签（持有终端视图）。
 struct SessionTab {
+    /// 稳定标签 id（会话结束或用户关闭时据此定位）。
+    id: usize,
     /// 标签标题（主机名）。
     title: SharedString,
     /// 渲染用终端视图。
     terminal_view: Entity<TerminalView>,
-    /// SSH 会话任务；drop 会取消会话，因此标签存活期间必须持有。
-    _session: Task<Result<()>>,
 }
 
 /// 新建主机表单（各字段为受控输入状态）。
@@ -66,12 +67,16 @@ struct RuLinkApp {
     hosts: Vec<HostConfig>,
     /// 活动会话标签。
     tabs: Vec<SessionTab>,
-    /// 当前选中标签索引。
-    active_tab: usize,
+    /// 当前选中标签 id。
+    active_tab: Option<usize>,
     /// 打开的新建主机表单（None 显示列表）。
     new_host: Option<NewHostForm>,
     /// 等待密码输入的连接。
     pending: Option<PendingConnect>,
+    /// 本次运行内缓存的密码（按 user@host:port），避免重复弹窗；绝不落盘。
+    password_cache: HashMap<String, String>,
+    /// 标签自增 id。
+    next_id: usize,
     focus_handle: FocusHandle,
 }
 
@@ -84,14 +89,16 @@ impl RuLinkApp {
             store,
             hosts,
             tabs: Vec::new(),
-            active_tab: 0,
+            active_tab: None,
             new_host: None,
             pending: None,
+            password_cache: HashMap::new(),
+            next_id: 0,
             focus_handle: cx.focus_handle(),
         };
         if let Some(target) = quick {
             let title = target.addr();
-            app.connect(title, target, window, cx);
+            app.connect(title, target, None, window, cx);
         }
         app
     }
@@ -157,19 +164,25 @@ impl RuLinkApp {
         }
     }
 
-    /// 点击主机账号：密码认证先索取密码，其余直接连接。
+    /// 点击主机账号：密码认证优先用缓存，无缓存才弹窗；其余直接连接。
     fn click_host(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(host) = self.hosts.get(index).cloned() else {
             return;
         };
         if host.auth == AuthMethod::Password {
+            let key = host.addr();
+            if let Some(password) = self.password_cache.get(&key).cloned() {
+                let target = SshTarget::from_host(&host, Some(password));
+                self.connect(host.name.clone(), target, Some(key), window, cx);
+                return;
+            }
             let password =
                 cx.new(|cx| InputState::new(window, cx).placeholder("输入密码后点击连接"));
             self.pending = Some(PendingConnect { host, password });
             cx.notify();
         } else {
             let target = SshTarget::from_host(&host, None);
-            self.connect(host.name.clone(), target, window, cx);
+            self.connect(host.name.clone(), target, None, window, cx);
         }
     }
 
@@ -179,7 +192,7 @@ impl RuLinkApp {
         cx.notify();
     }
 
-    /// 用输入的密码完成待连接。
+    /// 用输入的密码完成待连接，并缓存到本次运行内存中。
     fn confirm_pending(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(pending) = self.pending.as_ref() else {
             return;
@@ -187,15 +200,22 @@ impl RuLinkApp {
         let password = pending.password.read(cx).value().to_string();
         let host = pending.host.clone();
         self.pending = None;
+        let key = host.addr();
+        self.password_cache.insert(key.clone(), password.clone());
         let target = SshTarget::from_host(&host, Some(password));
-        self.connect(host.name.clone(), target, window, cx);
+        self.connect(host.name.clone(), target, Some(key), window, cx);
     }
 
     /// 建立外接终端并启动 SSH 会话，追加为新标签。
+    ///
+    /// 会话任务由后台 future 持有并等待：SSH 断开、远端 `exit`、认证失败都会
+    /// 让任务结束，据此自动移除标签（对应"退出即关窗口"）；认证失败时顺带清掉
+    /// 缓存密码，下次点击会重新询问。
     fn connect(
         &mut self,
         title: String,
         target: SshTarget,
+        cache_key: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -209,25 +229,46 @@ impl RuLinkApp {
         };
         let terminal = cx.new(|cx| builder.subscribe(cx));
         let terminal_view = cx.new(|cx| TerminalView::new(terminal, window, cx));
+        let id = self.next_id;
+        self.next_id += 1;
         let session = session::start(target, handles, cx);
         self.tabs.push(SessionTab {
+            id,
             title: title.into(),
             terminal_view,
-            _session: session,
         });
-        self.active_tab = self.tabs.len() - 1;
+        self.active_tab = Some(id);
+        cx.spawn(async move |this, cx| {
+            let result = session.await;
+            let _ = this.update(cx, |this, cx| {
+                if result.is_err()
+                    && let Some(key) = &cache_key
+                {
+                    this.password_cache.remove(key);
+                }
+                this.remove_tab(id, cx);
+            });
+        })
+        .detach();
         cx.notify();
     }
 
-    /// 关闭指定标签：drop 会话任务即断开 SSH 并结束终端。
-    fn close_tab(&mut self, index: usize, cx: &mut Context<Self>) {
-        if index < self.tabs.len() {
-            self.tabs.remove(index);
-            if self.active_tab >= self.tabs.len() {
-                self.active_tab = self.tabs.len().saturating_sub(1);
-            }
-            cx.notify();
+    /// 用户点击标签关闭按钮。
+    fn close_tab(&mut self, id: usize, cx: &mut Context<Self>) {
+        self.remove_tab(id, cx);
+    }
+
+    /// 移除标签并修正选中态。
+    fn remove_tab(&mut self, id: usize, cx: &mut Context<Self>) {
+        let before = self.tabs.len();
+        self.tabs.retain(|tab| tab.id != id);
+        if self.tabs.len() == before {
+            return;
         }
+        if self.active_tab == Some(id) {
+            self.active_tab = self.tabs.last().map(|tab| tab.id);
+        }
+        cx.notify();
     }
 }
 
@@ -466,10 +507,11 @@ impl RuLinkApp {
                 .px_2()
                 .gap_1()
                 .overflow_hidden()
-                .children(self.tabs.iter().enumerate().map(|(index, tab)| {
-                    let active = index == self.active_tab;
-                    let tab_id = SharedString::from(format!("tab-{index}"));
-                    let close_id = SharedString::from(format!("tab-close-{index}"));
+                .children(self.tabs.iter().map(|tab| {
+                    let id = tab.id;
+                    let active = self.active_tab == Some(id);
+                    let tab_id = SharedString::from(format!("tab-{id}"));
+                    let close_id = SharedString::from(format!("tab-close-{id}"));
                     h_flex()
                         .id(tab_id)
                         .px_3()
@@ -480,7 +522,7 @@ impl RuLinkApp {
                         .bg(if active { rgb(0x1e1e1e) } else { rgb(0x2d2d30) })
                         .cursor_pointer()
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.active_tab = index;
+                            this.active_tab = Some(id);
                             cx.notify();
                         }))
                         .child(div().child(tab.title.clone()))
@@ -496,25 +538,35 @@ impl RuLinkApp {
                                     cx.listener(|_, _, _, cx| cx.stop_propagation()),
                                 )
                                 .on_click(
-                                    cx.listener(move |this, _, _, cx| this.close_tab(index, cx)),
+                                    cx.listener(move |this, _, _, cx| this.close_tab(id, cx)),
                                 ),
                         )
                 }))
         };
 
-        let body = if let Some(tab) = self.tabs.get(self.active_tab) {
-            div()
-                .flex_1()
-                .overflow_hidden()
-                .child(tab.terminal_view.clone())
-        } else {
-            v_flex().flex_1().items_center().justify_center().child(
+        let body = self
+            .active_tab
+            .and_then(|id| self.tabs.iter().find(|tab| tab.id == id))
+            .map(|tab| {
                 div()
-                    .text_base()
-                    .text_color(rgb(0x7a7a7a))
-                    .child("从左侧点击主机账号开始连接"),
-            )
-        };
+                    .flex_1()
+                    .overflow_hidden()
+                    .child(tab.terminal_view.clone())
+                    .into_any_element()
+            })
+            .unwrap_or_else(|| {
+                v_flex()
+                    .flex_1()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        div()
+                            .text_base()
+                            .text_color(rgb(0x7a7a7a))
+                            .child("从左侧点击主机账号开始连接"),
+                    )
+                    .into_any_element()
+            });
 
         v_flex().flex_1().h_full().child(tab_bar).child(body)
     }
@@ -553,6 +605,10 @@ fn main() {
     let app = rgpui_platform::application();
     app.run(move |cx| {
         rgpui::tokio::init(cx);
+        // 主题 + 输入子系统必须初始化：否则输入框无配色（文字看不清）且
+        // 退格/删除等键位动作未注册（无法编辑已输入内容）。
+        rgpui::theme::init(cx);
+        rgpui::input_ui::init(cx);
         let opened = cx.open_window(
             WindowOptions {
                 titlebar: Some(rgpui::TitlebarOptions {
@@ -568,6 +624,8 @@ fn main() {
         );
         if opened.is_err() {
             cx.quit();
+            return;
         }
+        cx.activate(true);
     });
 }
