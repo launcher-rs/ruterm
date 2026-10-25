@@ -17,8 +17,8 @@ use rgpui::prelude::*;
 use rgpui::{
     AnyElement, App, Bounds, Button, ButtonVariants, Context, Entity, FocusHandle, Focusable,
     InteractiveElement, IntoElement, MouseButton, ParentElement, Render, ScrollableElement,
-    SharedString, StatefulInteractiveElement, Styled, Window, WindowBounds, WindowOptions, div,
-    h_flex, px, rgb, size, v_flex,
+    SharedString, StatefulInteractiveElement, Styled, TrayMenuItem, Window, WindowBounds,
+    WindowOptions, div, h_flex, px, rgb, size, v_flex,
 };
 use rgpui_term::{TerminalBuilder, TerminalView};
 
@@ -736,5 +736,27 @@ fn main() {
             return;
         }
         cx.activate(true);
+
+        // 系统托盘：品牌图标 + 悬停提示 + 右键菜单（显示主界面 / 退出）。
+        // 图标以 32px PNG 内嵌，Windows 走 image 解码路径最稳；不依赖运行时文件路径。
+        const TRAY_ICON: &[u8] = include_bytes!("../assets/icons/tray-32.png");
+        cx.set_tray_icon(Some(TRAY_ICON));
+        cx.set_tray_tooltip("RuLink 拾连");
+        cx.set_tray_menu(vec![
+            TrayMenuItem::Action {
+                label: "显示主界面".into(),
+                id: "show".into(),
+            },
+            TrayMenuItem::Separator,
+            TrayMenuItem::Action {
+                label: "退出".into(),
+                id: "quit".into(),
+            },
+        ]);
+        cx.on_tray_menu_action(|id: SharedString, cx: &mut App| match id.as_ref() {
+            "quit" => cx.quit(),
+            "show" => cx.activate(true),
+            _ => {}
+        });
     });
 }
