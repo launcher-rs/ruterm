@@ -13,10 +13,11 @@
 | 主机指纹校验 | `[x]` | TOFU known_hosts，不匹配 / 写入失败一律拒绝（fail-closed，防 MITM） |
 | 会话标签页 | `[x]` | 多标签、关闭、激活切换 |
 | CLI 快速连接 | `[x]` | 带参数一次性连接；密码仅走环境变量 / GUI 临时输入 |
-| 暗色主题基线 | `[x]` | 启动强制 Dark，输入框可读性修复 |
+| 主题 | `[x]` | 明 / 暗主题切换（`Theme::change` + 本地调色板），侧边栏 ☀/☾ 按钮 + `Ctrl+T`；启动默认暗色 |
 | 底部状态栏 | `[x]` | 已实现并验证渲染（左"就绪"/地址/认证，右"会话 N"）；远程信息条目为占位扩展位 |
 | 凭据持久化 | `[ ]` | 密码从不落盘；主机配置存 JSON（`~/.rulink/sessions.json`），见 §四 |
-| 品牌图标 | `[x]` | 从展示板切分 6 图标变体 + logo + 多尺寸 `.ico`；`build.rs`+winresource 嵌入 exe（任务栏/标题栏），托盘图标 + 菜单（显示/退出） |
+| 品牌图标 | `[x]` | 从展示板切分 6 图标变体 + logo + 多尺寸 `.ico`；`build.rs`+winresource 嵌入 exe（任务栏/标题栏） |
+| 系统托盘 | `[x]` | 品牌托盘图标 + 悬停提示 + 右键菜单（显示主界面 / 退出），`App::set_tray_*` + `on_tray_menu_action` |
 
 ---
 
@@ -37,7 +38,8 @@
 - `[ ]` 可拖拽调整宽度（参考 `SplitPane` / `TaskPaneStack` 权重拖拽）。
 
 ### 3. 主题
-- `[ ]` 明 / 暗主题切换（rgpui `Theme::change(ThemeMode)`），启动项记忆上次选择。
+- `[x]` 明 / 暗主题切换（rgpui `Theme::change(ThemeMode)` + 本地 `Palette` 调色板统一换色），侧边栏 ☀/☾ 按钮 + `Ctrl+T`。
+- `[ ]` 启动项记忆上次主题选择（持久化到配置，下次启动自动应用）。
 - `[ ]` 终端配色方案（多套预设，可自定义前景/背景/16 色）。
 - `[ ]` 自定义字体与字号、行高（终端 + UI）。
 
@@ -63,6 +65,12 @@
 - `[ ]` 终端日志记录与导出、会话保存 / 恢复。
 - `[ ]` `~/.ssh/config` 导入与解析。
 
+### 8. 系统托盘
+- `[x]` 品牌托盘图标 + 悬停提示 + 右键菜单（显示主界面 / 退出），经 `App::set_tray_icon/tooltip/menu` + `on_tray_menu_action`。
+- `[ ]` 关闭 / 最小化到托盘（关窗口不退出，后台保活会话；托盘"退出"才真正结束）。
+- `[ ]` 托盘菜单动态列出当前活动会话，点击可跳转到对应标签。
+- `[ ]` 托盘图标角标 / tooltip 反映会话数或连接状态。
+
 ---
 
 ## 三、架构基座复用（来自 rgpui）
@@ -76,6 +84,7 @@ RuLink 不自造 UI 轮子，优先复用 rgpui 现成子系统：
 | 分屏 / 停靠 | `SplitPane`、`DockArea` |
 | 自定义标题栏 | `title_bar::TitleBar` |
 | 主题切换 | `theme::Theme::change` |
+| 系统托盘 | `tray::{TrayMenuItem, TrayIconEvent}` + `App::set_tray_*`（已用） |
 | 国际化 | `i18n::I18nManager` |
 | 命令注册 / 快捷键 | `commands::CommandRegistry`、`key_context` |
 | 布局约束范式 | `examples/showcase/src/bin/app_suite.rs`（flex_grow + min_h(0) 有界布局范式，状态栏布局修复即据此） |
@@ -108,7 +117,7 @@ RuLink 不自造 UI 轮子，优先复用 rgpui 现成子系统：
 ## 五、实施优先级建议
 
 1. **先收尾状态栏**（验证渲染 + 接入远程信息 exec 通道）——当前正在做。
-2. 侧边栏折叠 + 主题切换（改动小、体感强）。
+2. ~~侧边栏折叠 + 主题切换~~（已完成：`Ctrl+B` 折叠、`Ctrl+T` / ☀☾ 明暗切换）。
 3. 凭据 SQLite + keyring（安全核心，尽早定型，越晚迁移成本越高）。
 4. 自定义标题栏 + 分屏（结构性改动，成批做）。
 5. i18n（文案抽取宜在功能稳定后统一做，避免反复）。
