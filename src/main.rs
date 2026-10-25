@@ -156,12 +156,13 @@ impl RuLinkApp {
     fn new(quick: Option<SshTarget>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let store = SessionStore::new();
         let hosts = store.load();
-        // 侧边栏 ↔ 主区 分隔面板：初始侧边栏占比约 0.25，最小宽 200px。
+        // 侧边栏 ↔ 主区 分隔面板：初始侧边栏占比约 0.25。
         let split_state = cx.new(SplitPaneState::new);
         split_state.update(cx, |state, cx| {
             state.set_ratio(0.25, cx);
-            // 允许拖到很窄；一旦低于折叠阈值即自动收起（见 render 的 on_resize）。
-            state.set_min_first(80.0, cx);
+            // WindTerm 式拖动：拖到最小宽度即停住，分隔线仍可抓住往大拖；
+            // 完全收起交给标题栏 « 折叠按钮 / Ctrl+B，不靠拖拽阈值自动折叠。
+            state.set_min_first(160.0, cx);
         });
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("搜索主机…"));
         cx.subscribe(&search, |_, _, _: &InputEvent, cx| cx.notify())
@@ -420,9 +421,6 @@ impl RuLinkApp {
 impl Render for RuLinkApp {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let pal = self.palette(cx);
-        // 侧边栏拖到低于此宽度（px）即自动折叠隐藏。
-        const SIDEBAR_COLLAPSE_PX: f32 = 150.0;
-        let split_for_resize = self.split_state.clone();
         v_flex()
             .id("rulink-root")
             .track_focus(&self.focus_handle)
@@ -449,21 +447,6 @@ impl Render for RuLinkApp {
             .child(
                 SplitPane::horizontal(self.split_state.clone())
                     .show_collapse_buttons(false)
-                    .on_resize(move |ratio, window, cx| {
-                        let total = window.bounds().size.width.as_f32();
-                        if ratio * total < SIDEBAR_COLLAPSE_PX {
-                            // on_resize 在 SplitPaneState 自身的 mouse-move update 内被调用，
-                            // 直接 update 同一实体会重入租约 panic —— 推迟到本帧结束再折叠。
-                            let split = split_for_resize.clone();
-                            window.defer(cx, move |_, cx| {
-                                split.update(cx, |state, cx| {
-                                    if !state.is_collapsed() {
-                                        state.collapse(CollapsiblePane::First, cx);
-                                    }
-                                });
-                            });
-                        }
-                    })
                     .first(self.render_sidebar(cx))
                     .second(self.render_main(cx))
                     .flex_1()
