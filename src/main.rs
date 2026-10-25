@@ -15,10 +15,10 @@ use rgpui::components::status_bar::{StatusBar, StatusBarItem};
 use rgpui::input_ui::{Input, InputContentType, InputState};
 use rgpui::prelude::*;
 use rgpui::{
-    AnyElement, App, Bounds, Button, ButtonVariants, Context, Entity, FocusHandle, Focusable,
+    AnyElement, App, Bounds, Button, ButtonVariants, Context, Entity, FocusHandle, Focusable, Hsla,
     InteractiveElement, IntoElement, MouseButton, ParentElement, Render, ScrollableElement,
     SharedString, StatefulInteractiveElement, Styled, TrayMenuItem, Window, WindowBounds,
-    WindowOptions, div, h_flex, px, rgb, size, v_flex,
+    WindowOptions, div, h_flex, px, size, v_flex,
 };
 use rgpui_term::{TerminalBuilder, TerminalView};
 
@@ -88,82 +88,62 @@ struct RuLinkApp {
     status: SharedString,
     /// 侧边栏是否展开（折叠后收成窄轨道，仅留一个展开按钮）。
     sidebar_open: bool,
-    /// 是否为暗色主题（true 暗色，false 亮色）。
-    dark: bool,
     focus_handle: FocusHandle,
 }
 
-/// 主题调色板：一次渲染内的所有界面颜色都从这里取（存原始十六进制，用 `rgb` 现取）。
-/// 切换明暗只改 `RuLinkApp::dark`，界面整体随之换色。
+/// 主题调色板：从 rgpui 全局 `Theme` 的语义色映射而来（不硬编码颜色）。
+/// 切换明暗只调 `Theme::change`，本结构随之重取，界面整体换色，且与按钮 / 状态栏等
+/// 组件共用同一份主题（避免手工配色与框架主题脱节）。
 struct Palette {
     /// 窗口/编辑区底色。
-    window_bg: u32,
+    window_bg: Hsla,
     /// 侧边栏与标签栏底色。
-    sidebar_bg: u32,
+    sidebar_bg: Hsla,
     /// 卡片/表单/非活动标签底色。
-    card_bg: u32,
+    card_bg: Hsla,
     /// 卡片悬停底色。
-    card_hover: u32,
+    card_hover: Hsla,
     /// 分隔边框色。
-    border: u32,
+    border: Hsla,
     /// 主文字色。
-    text: u32,
+    text: Hsla,
     /// 次要/弱化文字色。
-    muted: u32,
+    muted: Hsla,
     /// 认证方式链接色。
-    link: u32,
+    link: Hsla,
     /// 删除/关闭等危险操作色。
-    danger: u32,
+    danger: Hsla,
     /// 选中/主按钮强调色。
-    accent: u32,
+    accent: Hsla,
     /// 未选中分段（认证方式切换）底色。
-    segment_bg: u32,
+    segment_bg: Hsla,
     /// 输入框底色。
-    input_bg: u32,
+    input_bg: Hsla,
     /// 输入框文字色。
-    input_text: u32,
+    input_text: Hsla,
     /// 输入框边框色。
-    input_border: u32,
+    input_border: Hsla,
 }
 
 impl Palette {
-    /// 暗色配色（沿用初始手工调好的 VSCode 深色值）。
-    fn dark() -> Self {
+    /// 从当前全局主题取语义色，组装一次性调色板。
+    fn from_theme(cx: &App) -> Self {
+        let theme = cx.theme();
         Palette {
-            window_bg: 0x1e1e1e,
-            sidebar_bg: 0x252526,
-            card_bg: 0x2d2d30,
-            card_hover: 0x37373d,
-            border: 0x3a3a3a,
-            text: 0xd6d6d6,
-            muted: 0x8a8a8a,
-            link: 0x6fa8dc,
-            danger: 0xbf5b5b,
-            accent: 0x0e639c,
-            segment_bg: 0x3a3a3a,
-            input_bg: 0x1b1b1c,
-            input_text: 0xf2f2f2,
-            input_border: 0x4a4a4a,
-        }
-    }
-
-    /// 亮色配色。
-    fn light() -> Self {
-        Palette {
-            window_bg: 0xf5f5f5,
-            sidebar_bg: 0xececec,
-            card_bg: 0xffffff,
-            card_hover: 0xe0e0e0,
-            border: 0xcfcfcf,
-            text: 0x2a2a2a,
-            muted: 0x767676,
-            link: 0x0e639c,
-            danger: 0xc0392b,
-            accent: 0x0e639c,
-            segment_bg: 0xdcdcdc,
-            input_bg: 0xffffff,
-            input_text: 0x1e1e1e,
-            input_border: 0xb8b8b8,
+            window_bg: theme.background,
+            sidebar_bg: theme.sidebar,
+            card_bg: theme.popover,
+            card_hover: theme.list_hover,
+            border: theme.border,
+            text: theme.foreground,
+            muted: theme.muted_foreground,
+            link: theme.link,
+            danger: theme.danger,
+            accent: theme.primary,
+            segment_bg: theme.muted,
+            input_bg: theme.input_background(),
+            input_text: theme.foreground,
+            input_border: theme.border,
         }
     }
 }
@@ -184,7 +164,6 @@ impl RuLinkApp {
             next_id: 0,
             status: "就绪".into(),
             sidebar_open: true,
-            dark: true,
             focus_handle: cx.focus_handle(),
         };
         if let Some(target) = quick {
@@ -405,22 +384,17 @@ impl RuLinkApp {
         cx.notify();
     }
 
-    /// 当前主题对应的调色板。
-    fn palette(&self) -> Palette {
-        if self.dark {
-            Palette::dark()
-        } else {
-            Palette::light()
-        }
+    /// 当前主题对应的调色板（从全局 Theme 语义色组装）。
+    fn palette(&self, cx: &App) -> Palette {
+        Palette::from_theme(cx)
     }
 
-    /// 切换明暗主题：翻转本地配色并同步 rgpui 全局主题（状态栏/按钮随之换色）。
-    fn toggle_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.dark = !self.dark;
-        let mode = if self.dark {
-            rgpui::theme::ThemeMode::Dark
-        } else {
+    /// 切换明暗主题：翻转全局 Theme 模式，界面（含状态栏/按钮）随之重取配色。
+    fn toggle_theme(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let mode = if cx.theme().is_dark() {
             rgpui::theme::ThemeMode::Light
+        } else {
+            rgpui::theme::ThemeMode::Dark
         };
         rgpui::theme::Theme::change(mode, Some(window), cx);
         cx.notify();
@@ -429,15 +403,15 @@ impl RuLinkApp {
 
 impl Render for RuLinkApp {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let pal = self.palette();
+        let pal = self.palette(cx);
         v_flex()
             .id("rulink-root")
             .track_focus(&self.focus_handle)
             .relative()
             .size_full()
             .overflow_hidden()
-            .bg(rgb(pal.window_bg))
-            .text_color(rgb(pal.text))
+            .bg(pal.window_bg)
+            .text_color(pal.text)
             .on_key_down(
                 cx.listener(|this, event: &rgpui::KeyDownEvent, window, cx| {
                     // Ctrl+B 折叠 / 展开侧边栏。
@@ -467,7 +441,7 @@ impl Render for RuLinkApp {
 impl RuLinkApp {
     /// 左侧栏：展开时显示标题 / 新建按钮 / 主机列表面板；折叠时收成窄轨道，仅留展开按钮。
     fn render_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
-        let pal = self.palette();
+        let pal = self.palette(cx);
         if !self.sidebar_open {
             return v_flex()
                 .w(px(44.0))
@@ -475,9 +449,9 @@ impl RuLinkApp {
                 .flex_shrink_0()
                 .items_center()
                 .pt_2()
-                .bg(rgb(pal.sidebar_bg))
+                .bg(pal.sidebar_bg)
                 .border_r_1()
-                .border_color(rgb(pal.border))
+                .border_color(pal.border)
                 .child(
                     Button::new("sidebar-expand")
                         .label("»")
@@ -498,8 +472,9 @@ impl RuLinkApp {
             self.render_host_list(cx)
         };
 
-        let theme_label: &'static str = if self.dark { "☀" } else { "☾" };
-        let theme_tooltip: &'static str = if self.dark {
+        let dark = cx.theme().is_dark();
+        let theme_label: &'static str = if dark { "☀" } else { "☾" };
+        let theme_tooltip: &'static str = if dark {
             "切换到亮色主题 (Ctrl+T)"
         } else {
             "切换到暗色主题 (Ctrl+T)"
@@ -509,9 +484,9 @@ impl RuLinkApp {
             .w(px(280.0))
             .h_full()
             .flex_shrink_0()
-            .bg(rgb(pal.sidebar_bg))
+            .bg(pal.sidebar_bg)
             .border_r_1()
-            .border_color(rgb(pal.border))
+            .border_color(pal.border)
             .p_3()
             .gap_2()
             .child(
@@ -561,11 +536,11 @@ impl RuLinkApp {
 
     /// 主机账号列表；每行可点击连接、附删除按钮。
     fn render_host_list(&self, cx: &mut Context<Self>) -> AnyElement {
-        let pal = self.palette();
+        let pal = self.palette(cx);
         if self.hosts.is_empty() {
             return div()
                 .text_sm()
-                .text_color(rgb(pal.muted))
+                .text_color(pal.muted)
                 .child("暂无主机，点击上方“新建主机”添加。")
                 .into_any_element();
         }
@@ -583,8 +558,8 @@ impl RuLinkApp {
                     .items_center()
                     .justify_between()
                     .rounded(px(6.0))
-                    .bg(rgb(pal.card_bg))
-                    .hover(|style| style.bg(rgb(pal.card_hover)))
+                    .bg(pal.card_bg)
+                    .hover(|style| style.bg(pal.card_hover))
                     .cursor_pointer()
                     .on_click(
                         cx.listener(move |this, _, window, cx| this.click_host(index, window, cx)),
@@ -597,12 +572,7 @@ impl RuLinkApp {
                                     .font_weight(rgpui::FontWeight(600.0))
                                     .child(host.name.clone()),
                             )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(pal.muted))
-                                    .child(host.addr()),
-                            ),
+                            .child(div().text_xs().text_color(pal.muted).child(host.addr())),
                     )
                     .child(
                         h_flex()
@@ -611,14 +581,14 @@ impl RuLinkApp {
                             .child(
                                 div()
                                     .text_xs()
-                                    .text_color(rgb(pal.link))
+                                    .text_color(pal.link)
                                     .child(auth_label(host.auth)),
                             )
                             .child(
                                 div()
                                     .id(del_id)
                                     .text_sm()
-                                    .text_color(rgb(pal.danger))
+                                    .text_color(pal.danger)
                                     .child("删除")
                                     .cursor_pointer()
                                     .on_mouse_down(
@@ -636,7 +606,7 @@ impl RuLinkApp {
 
     /// 新建主机表单面板。
     fn render_form_panel(&self, cx: &mut Context<Self>) -> AnyElement {
-        let pal = self.palette();
+        let pal = self.palette(cx);
         let Some(form) = self.new_host.as_ref() else {
             return div().into_any_element();
         };
@@ -650,7 +620,7 @@ impl RuLinkApp {
             .gap_2()
             .p_3()
             .rounded(px(6.0))
-            .bg(rgb(pal.card_bg))
+            .bg(pal.card_bg)
             .child(labeled_field("展示名", &form.name, &pal))
             .child(labeled_field("主机地址", &form.host, &pal))
             .child(labeled_field("端口", &form.port, &pal))
@@ -669,9 +639,9 @@ impl RuLinkApp {
                             .text_sm()
                             .cursor_pointer()
                             .bg(if method == selected {
-                                rgb(pal.accent)
+                                pal.accent
                             } else {
-                                rgb(pal.segment_bg)
+                                pal.segment_bg
                             })
                             .child(auth_label(method))
                             .on_click(cx.listener(move |this, _, _, cx| {
@@ -706,7 +676,7 @@ impl RuLinkApp {
 
     /// 密码输入面板。
     fn render_pending_panel(&self, cx: &mut Context<Self>) -> AnyElement {
-        let pal = self.palette();
+        let pal = self.palette(cx);
         let Some(pending) = self.pending.as_ref() else {
             return div().into_any_element();
         };
@@ -715,7 +685,7 @@ impl RuLinkApp {
             .gap_2()
             .p_3()
             .rounded(px(6.0))
-            .bg(rgb(pal.card_bg))
+            .bg(pal.card_bg)
             .child(
                 div()
                     .text_sm()
@@ -743,7 +713,7 @@ impl RuLinkApp {
 
     /// 右侧主区：标签栏 + 当前终端。
     fn render_main(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let pal = self.palette();
+        let pal = self.palette(cx);
         let tab_bar = if self.tabs.is_empty() {
             div()
         } else {
@@ -751,9 +721,9 @@ impl RuLinkApp {
                 .h(px(36.0))
                 .flex_shrink_0()
                 .items_center()
-                .bg(rgb(pal.sidebar_bg))
+                .bg(pal.sidebar_bg)
                 .border_b_1()
-                .border_color(rgb(pal.border))
+                .border_color(pal.border)
                 .px_2()
                 .gap_1()
                 .overflow_hidden()
@@ -769,11 +739,7 @@ impl RuLinkApp {
                         .gap_2()
                         .items_center()
                         .rounded(px(5.0))
-                        .bg(if active {
-                            rgb(pal.window_bg)
-                        } else {
-                            rgb(pal.card_bg)
-                        })
+                        .bg(if active { pal.window_bg } else { pal.card_bg })
                         .cursor_pointer()
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.active_tab = Some(id);
@@ -784,7 +750,7 @@ impl RuLinkApp {
                             div()
                                 .id(close_id)
                                 .text_sm()
-                                .text_color(rgb(pal.danger))
+                                .text_color(pal.danger)
                                 .child("×")
                                 .cursor_pointer()
                                 .on_mouse_down(
@@ -816,7 +782,7 @@ impl RuLinkApp {
                     .child(
                         div()
                             .text_base()
-                            .text_color(rgb(pal.muted))
+                            .text_color(pal.muted)
                             .child("从左侧点击主机账号开始连接"),
                     )
                     .into_any_element()
@@ -868,10 +834,10 @@ fn labeled_field(
 /// 统一输入框外观：随主题取底色/文字/边框，保证未聚焦时文字与边框都清晰可辨。
 fn styled_input(input: Input, pal: &Palette) -> Input {
     input
-        .bg(rgb(pal.input_bg))
-        .text_color(rgb(pal.input_text))
+        .bg(pal.input_bg)
+        .text_color(pal.input_text)
         .border_1()
-        .border_color(rgb(pal.input_border))
+        .border_color(pal.input_border)
 }
 
 impl Focusable for RuLinkApp {
