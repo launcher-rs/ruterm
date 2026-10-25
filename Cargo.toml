@@ -5,9 +5,9 @@ edition = "2024"
 description = "面向开发者的开源远程连接工具（SSH 客户端），基于 rgpui + rgpui-term 外接 IO 后端"
 
 [dependencies]
-rgpui = { path = "../rgpui/crates/rgpui", features = ["tokio"] }
-rgpui-platform = { path = "../rgpui/crates/rgpui-platform" }
-rgpui-term = { path = "../rgpui/crates/rgpui-term" }
+rgpui = { version = "1.6.0", features = ["tokio"] }
+rgpui-platform = "1.6.0"
+rgpui-term = "1.6.0"
 russh = { version = "0.64.1", default-features = false, features = ["flate2", "ring", "rsa"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros", "net", "io-util", "time"] }
 bytes = "1"

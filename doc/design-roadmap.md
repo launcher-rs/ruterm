@@ -9,6 +9,7 @@
 | 能力 | 状态 | 说明 |
 |------|------|------|
 | SSH 连接与终端 | `[x]` | russh + rgpui-term（外部 IO 后端），交互式 PTY |
+| 本地终端（系统 Shell） | `[ ]` | 待接入 rgpui-term 本地 PTY 后端：cmd / PowerShell / pwsh7 / Git Bash / WSL，见 §五 |
 | 认证方式 | `[x]` | 密码 / 私钥(IdentityFile) / Agent，连接时自动推断 |
 | 主机指纹校验 | `[x]` | TOFU known_hosts，不匹配 / 写入失败一律拒绝（fail-closed，防 MITM） |
 | 会话标签页 | `[x]` | 多标签、关闭、激活切换 |
@@ -118,13 +119,57 @@ RuLink 不自造 UI 轮子，优先复用 rgpui 现成子系统：
 
 ---
 
-## 五、实施优先级建议
+## 五、本地终端（系统 Shell 会话）
+
+> RuLink 目前是纯 SSH 客户端。目标是同时成为**本地 + 远程统一终端**：
+> 一个应用里既能开 SSH 会话，也能开本机 shell 标签。
+> 基座已具备：`rgpui-term` 除外接 IO 后端（`TerminalBuilder::new_external`）外，
+> 还有本地 PTY 后端 `TerminalBuilder::new(working_directory, shell, env, max_scroll_history_lines, window_id, cx)`，
+> `shell: Option<...>` 为 `None` 时用系统默认 shell。SSH 侧只需继续用外接后端，两条路径共用 `TerminalView`。
+
+### 1. Windows 本地 shell（首批）
+- `[ ]` **cmd.exe**：`cmd.exe`（默认回退 shell）。
+- `[ ]` **Windows PowerShell 5.x**：`powershell.exe`（系统自带，无需安装）。
+- `[ ]` **PowerShell 7**：`pwsh.exe`（用户自行安装；探测 PATH 与常见安装位置）。
+- `[ ]` **Git Bash**：`bash.exe`（探测 `git\bin\bash.exe` / `git\usr\bin\bash.exe` 注册表与 PATH）。
+- `[ ]` **WSL**：`wsl.exe`（可带 `-d <发行版>` 列出已安装发行版供选择）。
+- `[ ]` Windows 控制台 PTY ConPTY 适配（`ConPTY` 作为 `portable-pty` 后端落地路径），确认 Ctrl+C / 尺寸变化 / ANSI 序列正常。
+
+### 2. 其他平台本地 shell（顺带，非 Windows 用户同样受益）
+- `[ ]` Linux/macOS：探测 `$SHELL`，回退 `bash` / `zsh` / `sh`。
+
+### 3. 会话形态与 UI
+- `[ ]` 侧边栏新增"本地终端"分区（与主机列表并列），或顶部"+ 新建会话"下拉选择目标类型（SSH / 本地 shell）。
+- `[ ]` 标签标题区分来源：本地会话显示 `shell 名 + 当前目录`，远程会话保持 `user@host`（现有 `SessionTab.addr` 语义扩展为"连接描述"）。
+- `[ ]` 默认 shell 可设置（`settings.json` 增 `default_local_shell`），启动时可记忆上次使用的 profile。
+- `[ ]` 每个本地会话可选起始工作目录（含"打开当前目录的终端"入口）。
+
+### 4. Shell Profile（类 Windows Terminal 的 profile 概念）
+- `[ ]` `sessions.json` 增本地条目类型（或独立 `profiles.json`）：名称、可执行路径、参数数组、起始目录、环境变量、图标/配色。
+- `[ ]` 保留与收藏、搜索、置顶复用现有主机列表机制（★ 收藏 + 搜索过滤天然适用）。
+- `[ ]` 从系统自动发现 profile（注册表 / PATH / `wsl -l`），一键添加。
+
+### 5. 架构约束（避免做成 SSH 专用）
+- `[ ]` 抽出 `SessionBackend` 抽象（`External`（russh）/ `LocalPty`），UI 层只认 `TerminalView` + 会话生命周期，不再假设"有 target/host"。
+- `[ ]` 状态栏本地会话条目显示 shell 与运行时长，不显示地址/认证方式。
+- `[ ]` 基座已具备，一期只需调用：`TerminalBuilder::new(working_directory, shell, env, max_scroll_history_lines, window_id, cx) -> Task<Result<TerminalBuilder>>`（`shell` 为 `None` 时走 `default_shell_command()`），拿到 builder 后与 SSH 路径完全同构（`cx.new(|cx| builder.subscribe(cx))` + `TerminalView::new`）。
+- `[ ]` 保持 UI 线程零阻塞：本地 PTY 读写走 rgpui-term 内部线程，应用侧只持有句柄。
+
+### 6. 分期落地（慢慢实现）
+- 一期：`TerminalBuilder::new` 直连默认 shell，单标签跑通 cmd + PowerShell 5。
+- 二期：profile 自动发现（pwsh7 / Git Bash / WSL）+ 侧边栏"本地终端"入口 + 新建会话选择器。
+- 三期：profile 持久化、起始目录、环境变量、默认 shell 设置，与 SSH 共用分屏/标签/搜索能力。
+
+---
+
+## 六、实施优先级建议
 
 1. **先收尾状态栏**（验证渲染 + 接入远程信息 exec 通道）——当前正在做。
 2. ~~侧边栏折叠 + 主题切换~~（已完成：`Ctrl+B` 折叠、`Ctrl+T` / ☀☾ 明暗切换）。
 3. 凭据 SQLite + keyring（安全核心，尽早定型，越晚迁移成本越高）。
 4. 自定义标题栏 + 分屏（结构性改动，成批做）。
 5. i18n（文案抽取宜在功能稳定后统一做，避免反复）。
-6. SFTP / 端口转发 / 跳板机（`rulink.txt` 第二阶段）。
+6. **本地终端**（§五：cmd / PowerShell / pwsh7 / Git Bash / WSL）——基座已在 rgpui-term，一期只是接本地 PTY，投入小、日常价值高，可与凭据存储并行推进。
+7. SFTP / 端口转发 / 跳板机（`rulink.txt` 第二阶段）。
 
 > 每完成一项，回到本文件把对应方框勾成 `[x]`，并在 §一快照表更新状态。
