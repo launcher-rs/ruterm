@@ -11,13 +11,14 @@ mod ssh;
 
 use std::collections::HashMap;
 
+use rgpui::components::status_bar::{StatusBar, StatusBarItem};
 use rgpui::input_ui::{Input, InputContentType, InputState};
 use rgpui::prelude::*;
 use rgpui::{
-    AnyElement, App, Button, ButtonVariants, Context, Entity, FocusHandle, Focusable,
+    AnyElement, App, Bounds, Button, ButtonVariants, Context, Entity, FocusHandle, Focusable,
     InteractiveElement, IntoElement, MouseButton, ParentElement, Render, ScrollableElement,
-    SharedString, StatefulInteractiveElement, Styled, Window, WindowOptions, div, h_flex, px, rgb,
-    v_flex,
+    SharedString, StatefulInteractiveElement, Styled, Window, WindowBounds, WindowOptions, div,
+    h_flex, px, rgb, size, v_flex,
 };
 use rgpui_term::{TerminalBuilder, TerminalView};
 
@@ -39,6 +40,12 @@ struct SessionTab {
     id: usize,
     /// 标签标题（主机名）。
     title: SharedString,
+    /// 连接位置（user@host:port），状态栏展示；将来远程指标也挂在这里。
+    addr: SharedString,
+    /// 认证方式，状态栏展示。
+    auth: AuthMethod,
+    /// 远程服务器信息（预留扩展位，本次恒为 None；将来由 SSH 查询任务填充后在状态栏展示）。
+    remote_info: Option<SharedString>,
     /// 渲染用终端视图。
     terminal_view: Entity<TerminalView>,
 }
@@ -77,6 +84,8 @@ struct RuLinkApp {
     password_cache: HashMap<String, String>,
     /// 标签自增 id。
     next_id: usize,
+    /// 状态栏左侧的瞬态消息（连接/保存/删除/断开等节点更新）。
+    status: SharedString,
     focus_handle: FocusHandle,
 }
 
@@ -94,6 +103,7 @@ impl RuLinkApp {
             pending: None,
             password_cache: HashMap::new(),
             next_id: 0,
+            status: "就绪".into(),
             focus_handle: cx.focus_handle(),
         };
         if let Some(target) = quick {
@@ -121,12 +131,14 @@ impl RuLinkApp {
         if let Some(form) = self.new_host.as_ref() {
             form.host.update(cx, |state, cx| state.focus(window, cx));
         }
+        self.status = "填写主机信息".into();
         cx.notify();
     }
 
     /// 关闭新建表单（不保存）。
     fn cancel_form(&mut self, cx: &mut Context<Self>) {
         self.new_host = None;
+        self.status = "就绪".into();
         cx.notify();
     }
 
@@ -152,19 +164,29 @@ impl RuLinkApp {
         };
         if let Some(error) = host.validate() {
             log::warn!("保存主机失败: {error}");
+            self.status = SharedString::from(format!("保存失败：{error}"));
+            cx.notify();
             return;
         }
+        let label = if host.name.is_empty() {
+            host.host.clone()
+        } else {
+            host.name.clone()
+        };
         self.hosts.push(host);
         self.store.save(&self.hosts);
         self.new_host = None;
+        self.status = SharedString::from(format!("已保存主机 {label}"));
         cx.notify();
     }
 
     /// 删除指定主机并持久化。
     fn delete_host(&mut self, index: usize, cx: &mut Context<Self>) {
         if index < self.hosts.len() {
+            let label = self.hosts[index].name.clone();
             self.hosts.remove(index);
             self.store.save(&self.hosts);
+            self.status = SharedString::from(format!("已删除主机 {label}"));
             cx.notify();
         }
     }
@@ -235,12 +257,25 @@ impl RuLinkApp {
         };
         let terminal = cx.new(|cx| builder.subscribe(cx));
         let terminal_view = cx.new(|cx| TerminalView::new(terminal, window, cx));
+        // 状态栏展示用的连接位置与认证方式，须在 target 被 session::start 消费前取出。
+        let addr = format!("{}@{}:{}", target.user, target.host, target.port);
+        let auth = if target.password.is_some() {
+            AuthMethod::Password
+        } else if target.key_path.is_some() {
+            AuthMethod::IdentityFile
+        } else {
+            AuthMethod::Agent
+        };
         let id = self.next_id;
         self.next_id += 1;
         let session = session::start(target, handles, cx);
+        self.status = SharedString::from(format!("正在连接 {addr}…"));
         self.tabs.push(SessionTab {
             id,
             title: title.into(),
+            addr: addr.clone().into(),
+            auth,
+            remote_info: None,
             terminal_view,
         });
         self.active_tab = Some(id);
@@ -253,6 +288,10 @@ impl RuLinkApp {
                     this.password_cache.remove(key);
                 }
                 this.remove_tab(id, cx);
+                if result.is_err() {
+                    this.status = SharedString::from(format!("连接失败：{addr}"));
+                    cx.notify();
+                }
             });
         })
         .detach();
@@ -264,12 +303,20 @@ impl RuLinkApp {
         self.remove_tab(id, cx);
     }
 
-    /// 移除标签并修正选中态。
+    /// 移除标签并修正选中态；顺带把状态栏切到"已断开"。
     fn remove_tab(&mut self, id: usize, cx: &mut Context<Self>) {
+        let title = self
+            .tabs
+            .iter()
+            .find(|tab| tab.id == id)
+            .map(|tab| tab.title.clone());
         let before = self.tabs.len();
         self.tabs.retain(|tab| tab.id != id);
         if self.tabs.len() == before {
             return;
+        }
+        if let Some(title) = title {
+            self.status = SharedString::from(format!("已断开 {title}"));
         }
         if self.active_tab == Some(id) {
             self.active_tab = self.tabs.last().map(|tab| tab.id);
@@ -280,14 +327,24 @@ impl RuLinkApp {
 
 impl Render for RuLinkApp {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
+        v_flex()
+            .id("rulink-root")
             .track_focus(&self.focus_handle)
+            .relative()
             .size_full()
-            .flex()
+            .overflow_hidden()
             .bg(rgb(0x1e1e1e))
             .text_color(rgb(0xd6d6d6))
-            .child(self.render_sidebar(cx))
-            .child(self.render_main(cx))
+            .child(
+                h_flex()
+                    .w_full()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_hidden()
+                    .child(self.render_sidebar(cx))
+                    .child(self.render_main(cx)),
+            )
+            .child(self.render_status_bar().flex_shrink_0().w_full())
     }
 }
 
@@ -578,6 +635,33 @@ impl RuLinkApp {
 
         v_flex().flex_1().h_full().child(tab_bar).child(body)
     }
+
+    /// 底部状态栏：左侧瞬态状态 + 活动会话信息（地址/认证/远程指标占位），右侧会话计数。
+    fn render_status_bar(&self) -> StatusBar {
+        let active = self
+            .active_tab
+            .and_then(|id| self.tabs.iter().find(|tab| tab.id == id));
+
+        let mut left = vec![StatusBarItem::new(self.status.clone()).id("status")];
+        if let Some(tab) = active {
+            left.push(StatusBarItem::new(tab.addr.clone()).id("addr"));
+            left.push(
+                StatusBarItem::new(auth_label(tab.auth))
+                    .id("auth")
+                    .muted(true),
+            );
+            // 远程服务器信息扩展位：将来由 SSH 查询任务写入 tab.remote_info 后自动出现。
+            if let Some(info) = tab.remote_info.clone() {
+                left.push(StatusBarItem::new(info).id("remote").muted(true));
+            }
+        }
+        let right = vec![
+            StatusBarItem::new(format!("会话 {}", self.tabs.len()))
+                .id("sessions")
+                .muted(true),
+        ];
+        StatusBar::new().left(left).right(right)
+    }
 }
 
 /// 带标题的输入框行。
@@ -631,6 +715,11 @@ fn main() {
         rgpui::input_ui::init(cx);
         let opened = cx.open_window(
             WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
+                    None,
+                    size(px(1100.0), px(720.0)),
+                    cx,
+                ))),
                 titlebar: Some(rgpui::TitlebarOptions {
                     title: Some("RuLink".into()),
                     ..Default::default()
