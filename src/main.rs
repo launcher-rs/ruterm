@@ -86,6 +86,8 @@ struct RuLinkApp {
     next_id: usize,
     /// 状态栏左侧的瞬态消息（连接/保存/删除/断开等节点更新）。
     status: SharedString,
+    /// 侧边栏是否展开（折叠后收成窄轨道，仅留一个展开按钮）。
+    sidebar_open: bool,
     focus_handle: FocusHandle,
 }
 
@@ -104,6 +106,7 @@ impl RuLinkApp {
             password_cache: HashMap::new(),
             next_id: 0,
             status: "就绪".into(),
+            sidebar_open: true,
             focus_handle: cx.focus_handle(),
         };
         if let Some(target) = quick {
@@ -335,6 +338,13 @@ impl Render for RuLinkApp {
             .overflow_hidden()
             .bg(rgb(0x1e1e1e))
             .text_color(rgb(0xd6d6d6))
+            .on_key_down(cx.listener(|this, event: &rgpui::KeyDownEvent, _, cx| {
+                // Ctrl+B 折叠 / 展开侧边栏。
+                if event.keystroke.key == "b" && event.keystroke.modifiers.control {
+                    this.sidebar_open = !this.sidebar_open;
+                    cx.notify();
+                }
+            }))
             .child(
                 h_flex()
                     .w_full()
@@ -349,8 +359,30 @@ impl Render for RuLinkApp {
 }
 
 impl RuLinkApp {
-    /// 左侧栏：标题、新建按钮，以及主机列表 / 新建表单 / 密码面板三选一。
-    fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// 左侧栏：展开时显示标题 / 新建按钮 / 主机列表面板；折叠时收成窄轨道，仅留展开按钮。
+    fn render_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
+        if !self.sidebar_open {
+            return v_flex()
+                .w(px(44.0))
+                .h_full()
+                .flex_shrink_0()
+                .items_center()
+                .pt_2()
+                .bg(rgb(0x252526))
+                .border_r_1()
+                .border_color(rgb(0x3a3a3a))
+                .child(
+                    Button::new("sidebar-expand")
+                        .label("»")
+                        .tooltip("展开侧边栏 (Ctrl+B)")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.sidebar_open = true;
+                            cx.notify();
+                        })),
+                )
+                .into_any_element();
+        }
+
         let panel = if self.new_host.is_some() {
             self.render_form_panel(cx)
         } else if self.pending.is_some() {
@@ -369,10 +401,25 @@ impl RuLinkApp {
             .p_3()
             .gap_2()
             .child(
-                div()
-                    .text_lg()
-                    .font_weight(rgpui::FontWeight(700.0))
-                    .child("RuLink"),
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_lg()
+                            .font_weight(rgpui::FontWeight(700.0))
+                            .child("RuLink"),
+                    )
+                    .child(
+                        Button::new("sidebar-collapse")
+                            .label("«")
+                            .tooltip("折叠侧边栏 (Ctrl+B)")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.sidebar_open = false;
+                                cx.notify();
+                            })),
+                    ),
             )
             .child(
                 Button::new("new-host")
@@ -382,6 +429,7 @@ impl RuLinkApp {
                     .on_click(cx.listener(|this, _, window, cx| this.open_form(window, cx))),
             )
             .child(div().flex_1().overflow_y_scrollbar().child(panel))
+            .into_any_element()
     }
 
     /// 主机账号列表；每行可点击连接、附删除按钮。
