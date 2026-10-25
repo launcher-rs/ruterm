@@ -389,14 +389,16 @@ impl RuLinkApp {
         Palette::from_theme(cx)
     }
 
-    /// 切换明暗主题：翻转全局 Theme 模式，界面（含状态栏/按钮）随之重取配色。
+    /// 切换明暗主题：翻转全局 Theme 模式并持久化，界面（含状态栏/按钮）随之重取配色。
     fn toggle_theme(&self, window: &mut Window, cx: &mut Context<Self>) {
-        let mode = if cx.theme().is_dark() {
+        let dark = cx.theme().is_dark();
+        let mode = if dark {
             rgpui::theme::ThemeMode::Light
         } else {
             rgpui::theme::ThemeMode::Dark
         };
         rgpui::theme::Theme::change(mode, Some(window), cx);
+        self.store.save_theme(!dark);
         cx.notify();
     }
 }
@@ -868,9 +870,18 @@ fn main() {
         // 主题 + 输入子系统必须初始化：否则输入框无配色且
         // 退格/删除等键位动作未注册（无法编辑已输入内容）。
         rgpui::theme::init(cx);
-        // theme::init 默认切到亮色，输入框背景近白；本程序整体是暗色配色，
-        // 文字继承浅灰会洗白看不清，这里显式切到暗色主题统一底色。
-        rgpui::theme::Theme::change(rgpui::theme::ThemeMode::Dark, None, cx);
+        // theme::init 默认切到亮色；这里按上次持久化的主题选择应用（缺省暗色），
+        // 使输入框/界面底色与用户上次退出时的选择一致。
+        let dark = SessionStore::new().load_settings().dark();
+        rgpui::theme::Theme::change(
+            if dark {
+                rgpui::theme::ThemeMode::Dark
+            } else {
+                rgpui::theme::ThemeMode::Light
+            },
+            None,
+            cx,
+        );
         rgpui::input_ui::init(cx);
         let opened = cx.open_window(
             WindowOptions {

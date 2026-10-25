@@ -59,9 +59,26 @@ impl HostConfig {
     }
 }
 
+/// 应用级设置（与主机列表分开存，避免动到 sessions.json 的数组格式）。
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Settings {
+    /// 主题模式："dark" / "light"；缺省按暗色。
+    #[serde(default)]
+    pub theme: String,
+}
+
+impl Settings {
+    /// 是否暗色（非 "light" 一律视为暗色）。
+    pub fn dark(&self) -> bool {
+        self.theme != "light"
+    }
+}
+
 /// 会话仓库：整表读写 JSON 文件。
 pub struct SessionStore {
     path: PathBuf,
+    /// 应用级设置文件路径（settings.json）。
+    settings_path: PathBuf,
 }
 
 impl SessionStore {
@@ -71,8 +88,39 @@ impl SessionStore {
             .or_else(|| std::env::var_os("HOME"))
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("."));
+        let dir = home.join(".rulink");
         Self {
-            path: home.join(".rulink").join("sessions.json"),
+            path: dir.join("sessions.json"),
+            settings_path: dir.join("settings.json"),
+        }
+    }
+
+    /// 读取应用级设置；文件缺失或损坏时返回默认值（暗色）。
+    pub fn load_settings(&self) -> Settings {
+        match std::fs::read_to_string(&self.settings_path) {
+            Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
+            Err(_) => Settings::default(),
+        }
+    }
+
+    /// 保存主题选择（"dark" / "light"）；失败仅记日志。
+    pub fn save_theme(&self, dark: bool) {
+        let settings = Settings {
+            theme: if dark { "dark" } else { "light" }.to_string(),
+        };
+        if let Some(parent) = self.settings_path.parent()
+            && let Err(error) = std::fs::create_dir_all(parent)
+        {
+            log::warn!("无法创建 {}（{error}），设置不持久化", parent.display());
+            return;
+        }
+        match serde_json::to_string_pretty(&settings) {
+            Ok(text) => {
+                if let Err(error) = std::fs::write(&self.settings_path, text) {
+                    log::warn!("写入 settings.json 失败: {error}");
+                }
+            }
+            Err(error) => log::warn!("序列化设置失败: {error}"),
         }
     }
 
