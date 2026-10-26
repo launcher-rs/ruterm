@@ -959,9 +959,7 @@ impl RuLinkApp {
     /// 宽度与折叠由外层 SplitPane 负责，这里只填充第一面板区域。
     fn render_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
         let pal = self.palette(cx);
-        let panel = if self.new_host.is_some() {
-            self.render_form_panel(cx)
-        } else if self.pending.is_some() {
+        let panel = if self.pending.is_some() {
             self.render_pending_panel(cx)
         } else {
             self.render_host_list(cx)
@@ -974,8 +972,8 @@ impl RuLinkApp {
         } else {
             "切换到暗色主题 (Ctrl+T)"
         };
-        // 搜索框只在主机列表模式下出现（表单 / 待输入密码时隐藏）。
-        let list_mode = self.new_host.is_none() && self.pending.is_none();
+        // 搜索框只在主机列表模式下出现（待输入密码时隐藏；表单已是居中弹窗，不占列表）。
+        let list_mode = self.pending.is_none();
 
         v_flex()
             .size_full()
@@ -1113,6 +1111,10 @@ impl RuLinkApp {
                         ),
                 )
                 .into_any_element();
+        }
+        // 新建/编辑主机：居中模态弹窗（不再挤占侧边栏窄面板）。
+        if self.new_host.is_some() {
+            return self.render_form_dialog(cx);
         }
         // 主机行右键菜单：编辑 / 删除（删除走二次确认）。
         if let Some(menu) = self.context_menu.as_ref() {
@@ -1301,8 +1303,9 @@ impl RuLinkApp {
             .into_any_element()
     }
 
-    /// 新建主机表单面板。
-    fn render_form_panel(&self, cx: &mut Context<Self>) -> AnyElement {
+    /// 新建/编辑主机：居中模态弹窗。遮罩只挡交互、点击不关闭（防误丢已填内容），
+    /// 关闭仅走"取消"按钮或标题栏 ×。
+    fn render_form_dialog(&self, cx: &Context<Self>) -> AnyElement {
         let pal = self.palette(cx);
         let Some(form) = self.new_host.as_ref() else {
             return div().into_any_element();
@@ -1315,132 +1318,184 @@ impl RuLinkApp {
         let selected = form.auth;
         let editing = form.editing.is_some();
         v_flex()
-            .gap_2()
-            .p_3()
-            .rounded(px(6.0))
-            .bg(pal.card_bg)
-            .child(
-                div()
-                    .text_sm()
-                    .font_weight(rgpui::FontWeight(600.0))
-                    .child(if editing {
-                        "编辑主机"
-                    } else {
-                        "新建主机"
-                    }),
+            .id("form-backdrop")
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .size_full()
+            .items_center()
+            .justify_center()
+            .bg(rgpui::hsla(0.0, 0.0, 0.0, 0.45))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_, _, _, cx| cx.stop_propagation()),
             )
-            .child(labeled_field("展示名", &form.name, &pal))
-            .child(labeled_field("主机地址", &form.host, &pal))
-            .child(labeled_field("端口", &form.port, &pal))
-            .child(labeled_field("用户名", &form.user, &pal))
             .child(
                 v_flex()
-                    .gap_1()
-                    .child(div().text_sm().child("认证方式"))
-                    .child(h_flex().gap_2().children(methods.into_iter().map(|method| {
-                        let auth_id = SharedString::from(format!("auth-{}", auth_label(method)));
-                        let is_selected = method == selected;
-                        div()
-                            .id(auth_id)
-                            .px_3()
-                            .py_1()
-                            .rounded(px(5.0))
-                            .text_sm()
-                            .cursor_pointer()
-                            .bg(if is_selected {
-                                pal.accent
-                            } else {
-                                pal.segment_bg
-                            })
-                            // 选中段文字用主题的 primary_foreground（与主按钮同规则），
-                            // 否则强调色底上会沿用默认文字色导致看不清。
-                            .text_color(if is_selected {
-                                cx.theme().primary_foreground
-                            } else {
-                                pal.text
-                            })
-                            .when(is_selected, |this| this.font_weight(FontWeight::BOLD))
-                            .child(auth_label(method))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                if let Some(form) = this.new_host.as_mut() {
-                                    form.auth = method;
-                                }
-                                cx.notify();
-                            }))
-                    }))),
-            )
-            .when(selected == AuthMethod::IdentityFile, |this| {
-                let save_checked = form.save_secret;
-                this.child(
-                    h_flex()
-                        .gap_2()
-                        .items_end()
-                        .child(div().flex_1().child(labeled_field(
-                            "私钥路径",
-                            &form.key_path,
-                            &pal,
-                        )))
-                        .child(
-                            Button::new("browse-key")
-                                .label("浏览…")
-                                .ghost()
-                                .flex_shrink_0()
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.browse_key_path(cx);
-                                })),
-                        ),
-                )
-                .child(
-                    v_flex()
-                        .gap_1()
-                        .child(div().text_sm().child("私钥口令"))
-                        .child(styled_input(
-                            Input::new(&form.passphrase).content_type(InputContentType::Password),
-                            &pal,
-                        )),
-                )
-                .when(self.vault.is_some(), |this| {
-                    this.child(
+                    .id("host-form")
+                    .w(px(440.0))
+                    .gap_3()
+                    .p_5()
+                    .rounded(px(8.0))
+                    .bg(pal.card_bg)
+                    .border_1()
+                    .border_color(pal.border)
+                    .shadow_md()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                    )
+                    .child(
                         h_flex()
-                            .id("save-passphrase")
-                            .gap_2()
+                            .w_full()
                             .items_center()
-                            .cursor_pointer()
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                if let Some(form) = this.new_host.as_mut() {
-                                    form.save_secret = !form.save_secret;
-                                    cx.notify();
-                                }
-                            }))
+                            .justify_between()
                             .child(
                                 div()
-                                    .text_sm()
-                                    .text_color(if save_checked { pal.text } else { pal.muted })
-                                    .child(if save_checked { "☑" } else { "☐" }),
+                                    .text_base()
+                                    .font_weight(rgpui::FontWeight(600.0))
+                                    .child(if editing {
+                                        "编辑主机"
+                                    } else {
+                                        "新建主机"
+                                    }),
+                            )
+                            .child(
+                                Button::new("close-form")
+                                    .label("×")
+                                    .ghost()
+                                    .on_click(cx.listener(|this, _, _, cx| this.cancel_form(cx))),
+                            ),
+                    )
+                    .child(labeled_field("展示名", &form.name, &pal))
+                    .child(labeled_field("主机地址", &form.host, &pal))
+                    .child(
+                        h_flex()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .child(labeled_field("端口", &form.port, &pal)),
                             )
                             .child(
                                 div()
-                                    .text_sm()
-                                    .text_color(pal.muted)
-                                    .child("保存口令（加密存入本地凭据库，默认仅本次内存持有）"),
+                                    .flex_1()
+                                    .child(labeled_field("用户名", &form.user, &pal)),
                             ),
                     )
-                })
-            })
-            .child(
-                h_flex()
-                    .gap_2()
                     .child(
-                        Button::new("save-host")
-                            .label(if editing { "保存修改" } else { "保存" })
-                            .primary()
-                            .on_click(cx.listener(|this, _, _, cx| this.save_form(cx))),
+                        v_flex()
+                            .gap_1()
+                            .child(div().text_sm().child("认证方式"))
+                            .child(h_flex().gap_2().children(methods.into_iter().map(|method| {
+                                let auth_id =
+                                    SharedString::from(format!("auth-{}", auth_label(method)));
+                                let is_selected = method == selected;
+                                div()
+                                    .id(auth_id)
+                                    .px_3()
+                                    .py_1()
+                                    .rounded(px(5.0))
+                                    .text_sm()
+                                    .cursor_pointer()
+                                    .bg(if is_selected {
+                                        pal.accent
+                                    } else {
+                                        pal.segment_bg
+                                    })
+                                    // 选中段文字用主题的 primary_foreground（与主按钮同规则），
+                                    // 否则强调色底上会沿用默认文字色导致看不清。
+                                    .text_color(if is_selected {
+                                        cx.theme().primary_foreground
+                                    } else {
+                                        pal.text
+                                    })
+                                    .when(is_selected, |this| this.font_weight(FontWeight::BOLD))
+                                    .child(auth_label(method))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        if let Some(form) = this.new_host.as_mut() {
+                                            form.auth = method;
+                                        }
+                                        cx.notify();
+                                    }))
+                            }))),
                     )
+                    .when(selected == AuthMethod::IdentityFile, |this| {
+                        let save_checked = form.save_secret;
+                        this.child(
+                            h_flex()
+                                .gap_2()
+                                .items_end()
+                                .child(div().flex_1().child(labeled_field(
+                                    "私钥路径",
+                                    &form.key_path,
+                                    &pal,
+                                )))
+                                .child(
+                                    Button::new("browse-key")
+                                        .label("浏览…")
+                                        .ghost()
+                                        .flex_shrink_0()
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.browse_key_path(cx);
+                                        })),
+                                ),
+                        )
+                        .child(
+                            v_flex()
+                                .gap_1()
+                                .child(div().text_sm().child("私钥口令"))
+                                .child(styled_input(
+                                    Input::new(&form.passphrase)
+                                        .content_type(InputContentType::Password),
+                                    &pal,
+                                )),
+                        )
+                        .when(self.vault.is_some(), |this| {
+                            this.child(
+                                h_flex()
+                                    .id("save-passphrase")
+                                    .gap_2()
+                                    .items_center()
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        if let Some(form) = this.new_host.as_mut() {
+                                            form.save_secret = !form.save_secret;
+                                            cx.notify();
+                                        }
+                                    }))
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(if save_checked {
+                                                pal.text
+                                            } else {
+                                                pal.muted
+                                            })
+                                            .child(if save_checked { "☑" } else { "☐" }),
+                                    )
+                                    .child(div().text_sm().text_color(pal.muted).child(
+                                        "保存口令（加密存入本地凭据库，默认仅本次内存持有）",
+                                    )),
+                            )
+                        })
+                    })
                     .child(
-                        Button::new("cancel-host")
-                            .label("取消")
-                            .ghost()
-                            .on_click(cx.listener(|this, _, _, cx| this.cancel_form(cx))),
+                        h_flex()
+                            .gap_2()
+                            .justify_end()
+                            .child(
+                                Button::new("save-host")
+                                    .label(if editing { "保存修改" } else { "保存" })
+                                    .primary()
+                                    .on_click(cx.listener(|this, _, _, cx| this.save_form(cx))),
+                            )
+                            .child(
+                                Button::new("cancel-host")
+                                    .label("取消")
+                                    .ghost()
+                                    .on_click(cx.listener(|this, _, _, cx| this.cancel_form(cx))),
+                            ),
                     ),
             )
             .into_any_element()
