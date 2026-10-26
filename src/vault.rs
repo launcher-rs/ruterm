@@ -783,7 +783,10 @@ fn archive_legacy(vault: &Vault, path: &Path) {
         // 最长约 30 秒：足够覆盖连接回收，又不必让用户等待。
         match rename_db_bundle(&background, from, target, 300).await {
             Ok(()) => log::info!("旧库已归档为 .migrated: {display}"),
-            Err(error) => log::warn!("迁移后改名 {display} 失败: {error}"),
+            Err(error) => log::warn!(
+                "迁移后改名 {display} 失败: {error}；数据已入库，若有程序（如数据库管理器）\
+                 打开该文件，关闭后下次启动会自动继续归档"
+            ),
         }
     });
 }
