@@ -7,6 +7,7 @@
 //! 网络 IO 全部在 rgpui 的 tokio 运行时上异步进行，UI 线程零阻塞。
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
@@ -26,6 +27,35 @@ use crate::config::SshTarget;
 use crate::remote::{PROBE_CMD, RemoteInfo};
 use crate::ssh::{SideChannels, SshTerminalHandler};
 
+/// 信号：私钥有口令但连接未携带口令。
+///
+/// UI 层据此弹出口令输入窗，而不是把加载失败当普通错误一笔带过。
+#[derive(Debug)]
+pub struct PassphraseRequired;
+
+impl std::fmt::Display for PassphraseRequired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("私钥已加密，需要口令")
+    }
+}
+
+impl std::error::Error for PassphraseRequired {}
+
+/// 信号：本次连接使用的秘密（密码/私钥口令/Agent 密钥）被拒绝或已失效。
+///
+/// UI 层据此清除内存缓存；若秘密来自加密库，同时清除库内条目，
+/// 下次点击会重新弹窗输入，而不是拿坏密码反复直连。
+#[derive(Debug)]
+pub struct SecretRejected;
+
+impl std::fmt::Display for SecretRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("认证被拒绝")
+    }
+}
+
+impl std::error::Error for SecretRejected {}
+
 /// 远端 PTY 的初始尺寸（终端首个 Resize 到达前生效）。
 const INIT_COLS: u16 = 80;
 const INIT_ROWS: u16 = 24;
@@ -36,12 +66,23 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(8);
 /// 客户端会话通道别名。
 type SessionChannel = Channel<Msg>;
 
-/// 一次 SSH 会话：连接主体 + 远程基本信息回传。
+/// 一次 SSH 会话：连接主体 + 远程基本信息回传 + 启动标记。
 pub struct SshSession {
     /// 会话任务，必须被持有（提前 drop 会取消 SSH）。
     pub join: Task<Result<()>>,
     /// 远程主机基本信息摘要（探测失败/无信息时发送端被丢弃，收到 `Err`）。
     pub remote_info: oneshot::Receiver<String>,
+    /// shell 是否成功开启。失败发生在开启之前＝没建立过终端，标签页应保留展示错误。
+    pub started: Arc<AtomicBool>,
+}
+
+/// anyhow 错误链拍平成一行（状态栏与终端展示用，避免只看到顶层语境）。
+pub fn error_summary(error: &anyhow::Error) -> String {
+    error
+        .chain()
+        .map(std::string::ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("：")
 }
 
 /// 在 rgpui 的 tokio 运行时上启动 SSH 会话。
@@ -51,6 +92,7 @@ pub fn start<C: AppContext>(target: SshTarget, handles: ExternalHandles, cx: &C)
     let ExternalHandles { feed, rx } = handles;
     let (ui_tx, ui_rx) = mpsc::unbounded_channel::<PtyBoundMessage>();
     let (info_tx, info_rx) = oneshot::channel::<String>();
+    let started = Arc::new(AtomicBool::new(false));
 
     // 上行泵：把终端的阻塞通道接到 tokio 通道；send 是非阻塞的，
     // 泵线程只在 recv 上休眠，不碰 UI 也不占运行时。
@@ -68,10 +110,12 @@ pub fn start<C: AppContext>(target: SshTarget, handles: ExternalHandles, cx: &C)
     feed.feed(format!("\r\n[rulink] 正在连接 {}…\r\n", target.addr()).into_bytes());
 
     let closing_feed = feed.clone();
+    let started_flag = started.clone();
     let join = rgpui::tokio::Tokio::spawn_result(cx, async move {
-        let result = run(target, feed, ui_rx, info_tx).await;
+        let result = run(target, feed, ui_rx, info_tx, started_flag).await;
         if let Err(error) = &result {
-            closing_feed.feed(format!("\r\n[rulink] 会话结束: {error}\r\n").into_bytes());
+            closing_feed
+                .feed(format!("\r\n[rulink] 会话结束: {}\r\n", error_summary(error)).into_bytes());
         }
         // 无论成功失败都以"远端退出"收场，UI 表现与本地 shell 退出一致。
         closing_feed.end_session();
@@ -80,6 +124,7 @@ pub fn start<C: AppContext>(target: SshTarget, handles: ExternalHandles, cx: &C)
     SshSession {
         join,
         remote_info: info_rx,
+        started,
     }
 }
 
@@ -89,6 +134,7 @@ async fn run(
     feed: FeedHandle,
     ui_rx: mpsc::UnboundedReceiver<PtyBoundMessage>,
     info_tx: oneshot::Sender<String>,
+    started: Arc<AtomicBool>,
 ) -> Result<()> {
     let config = Arc::new(SshConfig::default());
     let side = SideChannels::default();
@@ -113,6 +159,7 @@ async fn run(
         )
         .await?;
     channel.request_shell(true).await?;
+    started.store(true, Ordering::SeqCst);
 
     // 上行转发先落地：探测通道握手即使被慢服务器拖住，也不能延迟按键转发。
     tokio::spawn(forward_uplink(channel, ui_rx));
@@ -209,20 +256,46 @@ async fn authenticate(handle: &mut Handle<SshTerminalHandler>, target: &SshTarge
             .authenticate_password(target.user.clone(), password.clone())
             .await?
             .success();
-        anyhow::ensure!(ok, "密码认证失败");
+        if !ok {
+            return Err(anyhow::anyhow!("密码认证失败").context(SecretRejected));
+        }
         return Ok(());
     }
 
     if let Some(path) = &target.key_path {
-        let secret = russh::keys::load_secret_key(path, None)
-            .with_context(|| format!("无法加载私钥 {}", path.display()))?;
+        let secret = match russh::keys::load_secret_key(path, target.passphrase.as_deref()) {
+            Ok(secret) => secret,
+            // 密钥有口令但本次没带：以专用错误上抛，UI 弹口令窗而不是连接失败一闪而过。
+            Err(russh::keys::Error::KeyIsEncrypted) if target.passphrase.is_none() => {
+                return Err(PassphraseRequired.into());
+            }
+            Err(error) => {
+                let context = if target.passphrase.is_some() {
+                    format!("私钥口令解密失败 {}（口令可能不正确）", path.display())
+                } else {
+                    format!("无法加载私钥 {}", path.display())
+                };
+                let mut error = anyhow::Error::new(error).context(context);
+                // 带了口令还解不开＝口令失效，按"秘密被拒"处理（清缓存/库内条目）。
+                if target.passphrase.is_some() {
+                    error = error.context(SecretRejected);
+                }
+                return Err(error);
+            }
+        };
         let hash_alg = handle.best_supported_rsa_hash().await?.flatten();
         let key = PrivateKeyWithHashAlg::new(Arc::new(secret), hash_alg);
         let ok = handle
             .authenticate_publickey(target.user.clone(), key)
             .await?
             .success();
-        anyhow::ensure!(ok, "公钥认证失败（{}）", path.display());
+        if !ok {
+            return Err(anyhow::anyhow!(
+                "公钥认证被服务器拒绝：{}（请确认此私钥与服务器上授权的公钥匹配；若服务器只允许密码，请把该主机的认证方式改为密码）",
+                path.display()
+            )
+            .context(SecretRejected));
+        }
         return Ok(());
     }
 
@@ -252,5 +325,5 @@ async fn authenticate(handle: &mut Handle<SshTerminalHandler>, target: &SshTarge
             return Ok(());
         }
     }
-    anyhow::bail!("SSH Agent 中的密钥均被服务器拒绝");
+    return Err(anyhow::anyhow!("SSH Agent 中的密钥均被服务器拒绝").context(SecretRejected));
 }

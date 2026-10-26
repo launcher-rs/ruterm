@@ -15,8 +15,10 @@ pub struct SshTarget {
     pub port: u16,
     /// 私钥文件（可选；与密码二选一，都没有则尝试 SSH Agent）
     pub key_path: Option<PathBuf>,
-    /// 密码（来自环境变量 RULINK_PASSWORD）
+    /// 密码（来自环境变量 RULINK_PASSWORD 或 GUI 临时输入/加密库）
     pub password: Option<String>,
+    /// 加密私钥的口令（仅私钥认证且密钥有口令时使用；绝不入命令行）
+    pub passphrase: Option<String>,
 }
 
 impl SshTarget {
@@ -84,6 +86,7 @@ impl SshTarget {
             host,
             port,
             key_path,
+            passphrase: None,
             password: std::env::var("RULINK_PASSWORD")
                 .ok()
                 .filter(|s| !s.is_empty()),
@@ -97,7 +100,8 @@ impl SshTarget {
 
     /// 由主机账号 + 连接时临时输入的密码构造连接目标。
     ///
-    /// 密码仅在内存中传递、绝不落盘；`key_path` 仅私钥认证时使用。
+    /// 密码仅在内存中传递；加密库只存勾选"保存"后的密文；`key_path` 仅私钥认证时使用。
+    /// 私钥口令经 `with_passphrase` 补充。
     pub fn from_host(host: &HostConfig, password: Option<String>) -> Self {
         Self {
             user: host.user.clone(),
@@ -109,6 +113,13 @@ impl SshTarget {
                 None
             },
             password,
+            passphrase: None,
         }
+    }
+
+    /// 补充加密私钥的口令（仅内存传递）。
+    pub fn with_passphrase(mut self, passphrase: Option<String>) -> Self {
+        self.passphrase = passphrase;
+        self
     }
 }

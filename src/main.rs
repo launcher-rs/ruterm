@@ -19,10 +19,10 @@ use rgpui::components::status_bar::{StatusBar, StatusBarItem};
 use rgpui::input_ui::{Input, InputContentType, InputEvent, InputState};
 use rgpui::prelude::*;
 use rgpui::{
-    AnyElement, App, Bounds, Button, ButtonVariants, Context, Entity, FocusHandle, Focusable, Hsla,
-    InteractiveElement, IntoElement, MouseButton, ParentElement, Render, ScrollableElement,
-    SharedString, StatefulInteractiveElement, Styled, TrayMenuItem, Window, WindowBounds,
-    WindowOptions, div, h_flex, px, size, v_flex,
+    AnyElement, App, Bounds, Button, ButtonVariants, Context, Entity, FocusHandle, Focusable,
+    FontWeight, Hsla, InteractiveElement, IntoElement, MouseButton, ParentElement, Render,
+    ScrollableElement, SharedString, StatefulInteractiveElement, Styled, TrayMenuItem, Window,
+    WindowBounds, WindowOptions, div, h_flex, px, size, v_flex,
 };
 use rgpui_term::{TerminalBuilder, TerminalView};
 
@@ -65,12 +65,21 @@ struct NewHostForm {
     auth: AuthMethod,
 }
 
-/// 待输入密码后连接的会话（点击密码认证主机时进入）。
+/// 弹窗索取的秘密类型：登录密码或加密私钥的口令。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PromptKind {
+    Password,
+    Passphrase,
+}
+
+/// 待输入密码/口令后连接的会话（点击需要秘密的主机时进入）。
 struct PendingConnect {
     host: HostConfig,
     password: Entity<InputState>,
-    /// 是否勾选"保存密码"（仅加密库可用时生效，默认否＝本次内存持有）。
+    /// 是否勾选"保存"（仅加密库可用时生效，默认否＝本次内存持有）。
     save_password: bool,
+    /// 弹窗类型（决定文案与连接参数落点）。
+    kind: PromptKind,
 }
 
 /// RuLink 主视图：左侧主机账号管理，右侧会话标签终端。
@@ -193,7 +202,7 @@ impl RuLinkApp {
         app.boot_vault(cx);
         if let Some(target) = quick {
             let title = target.addr();
-            app.connect(title, target, None, window, cx);
+            app.connect(title, target, None, None, false, window, cx);
         }
         app
     }
@@ -278,14 +287,11 @@ impl RuLinkApp {
 
     /// 打开新建主机表单，填充默认端口。
     fn open_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let default_user = std::env::var("USER")
-            .or_else(|_| std::env::var("USERNAME"))
-            .unwrap_or_else(|_| "root".to_string());
         self.new_host = Some(NewHostForm {
             name: cx.new(|cx| InputState::new(window, cx).placeholder("展示名（留空用主机地址）")),
             host: cx.new(|cx| InputState::new(window, cx).placeholder("host 或 IP")),
             port: cx.new(|cx| InputState::new(window, cx).default_value("22")),
-            user: cx.new(|cx| InputState::new(window, cx).default_value(default_user)),
+            user: cx.new(|cx| InputState::new(window, cx).placeholder("登录用户名")),
             key_path: cx.new(|cx| InputState::new(window, cx).placeholder("~/.ssh/id_ed25519")),
             auth: AuthMethod::Agent,
         });
@@ -383,60 +389,116 @@ impl RuLinkApp {
         }
     }
 
-    /// 点击主机账号：密码认证按 内存缓存 → 加密库已存密码 → 弹窗 的顺序取密码；其余直接连接。
+    /// 点击主机账号：密码/私钥口令按 内存缓存 → 加密库 → 弹窗 的顺序取得；Agent 直接连接。
     fn click_host(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(host) = self.hosts.get(index).cloned() else {
             return;
         };
-        if host.auth == AuthMethod::Password {
-            let key = host.addr();
-            if let Some(password) = self.password_cache.get(&key).cloned() {
-                let target = SshTarget::from_host(&host, Some(password));
-                self.connect(host.name.clone(), target, Some(key), window, cx);
-                return;
+        match host.auth {
+            AuthMethod::Agent => {
+                let target = SshTarget::from_host(&host, None);
+                let title = host.name.clone();
+                self.connect(title, target, None, None, false, window, cx);
             }
-            if self.pending.is_some() {
-                return;
+            AuthMethod::Password | AuthMethod::IdentityFile => {
+                self.click_secret_host(host, window, cx);
             }
-            // 加密库可用：异步查已存密码，命中直连，未命中回到弹窗（默认不保存）。
-            if let (Some(vault), true) = (self.vault.clone(), host.id != 0) {
-                let entity = cx.entity();
-                let entity_id = entity.entity_id();
-                cx.spawn(async move |_, cx| {
-                    let saved = vault.password_of(host.id).await.ok().flatten();
-                    let _ = cx.with_window(entity_id, move |window, cx| {
-                        let _ = entity.update(cx, move |this, cx| {
-                            if this.pending.is_some() {
-                                return;
-                            }
-                            match saved {
-                                Some(password) => {
-                                    let target = SshTarget::from_host(&host, Some(password));
-                                    this.connect(host.name.clone(), target, Some(key), window, cx);
-                                }
-                                None => this.prompt_password(host, window, cx),
-                            }
-                        });
-                    });
-                })
-                .detach();
-                return;
-            }
-            self.prompt_password(host, window, cx);
-        } else {
-            let target = SshTarget::from_host(&host, None);
-            self.connect(host.name.clone(), target, None, window, cx);
         }
     }
 
-    /// 弹出密码输入面板（默认不保存；加密库可用时提供"保存密码"勾选）。
-    fn prompt_password(&mut self, host: HostConfig, window: &mut Window, cx: &mut Context<Self>) {
-        let password = cx.new(|cx| InputState::new(window, cx).placeholder("输入密码后点击连接"));
+    /// 密码/私钥主机的取密顺序：缓存 → 加密库 →（密码）弹窗 /（私钥）免口令直连探测。
+    fn click_secret_host(&mut self, host: HostConfig, window: &mut Window, cx: &mut Context<Self>) {
+        let key = host.addr();
+        if let Some(secret) = self.password_cache.get(&key).cloned() {
+            self.connect_with_secret(host, secret, key, false, window, cx);
+            return;
+        }
+        if self.pending.is_some() {
+            return;
+        }
+        // 加密库可用：异步查已存秘密，命中直连，未命中回弹窗 / 免口令试连（口令信号由会话回抛）。
+        if let (Some(vault), true) = (self.vault.clone(), host.id != 0) {
+            let entity = cx.entity();
+            let entity_id = entity.entity_id();
+            cx.spawn(async move |_, cx| {
+                let saved = vault.password_of(host.id).await.ok().flatten();
+                let _ = cx.with_window(entity_id, move |window, cx| {
+                    let _ = entity.update(cx, move |this, cx| {
+                        if this.pending.is_some() {
+                            return;
+                        }
+                        match (saved, host.auth) {
+                            (Some(secret), _) => {
+                                let key = host.addr();
+                                this.connect_with_secret(host, secret, key, true, window, cx);
+                            }
+                            (None, AuthMethod::Password) => {
+                                this.prompt_secret(host, PromptKind::Password, window, cx);
+                            }
+                            // 私钥：先不带口令直连；密钥确有口令时回传 PassphraseRequired 再弹窗。
+                            (None, _) => this.connect_without_secret(host, window, cx),
+                        }
+                    });
+                });
+            })
+            .detach();
+            return;
+        }
+        match host.auth {
+            AuthMethod::Password => self.prompt_secret(host, PromptKind::Password, window, cx),
+            _ => self.connect_without_secret(host, window, cx),
+        }
+    }
+
+    /// 用取到的秘密（缓存或加密库）建立连接目标并连接。
+    fn connect_with_secret(
+        &mut self,
+        host: HostConfig,
+        secret: String,
+        key: String,
+        from_vault: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target = match host.auth {
+            AuthMethod::Password => SshTarget::from_host(&host, Some(secret)),
+            _ => SshTarget::from_host(&host, None).with_passphrase(Some(secret)),
+        };
+        let title = host.name.clone();
+        self.connect(title, target, Some(key), Some(host), from_vault, window, cx);
+    }
+
+    /// 不带秘密直连（私钥主机的口令探测路径）。
+    fn connect_without_secret(
+        &mut self,
+        host: HostConfig,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target = SshTarget::from_host(&host, None);
+        let title = host.name.clone();
+        self.connect(title, target, None, Some(host), false, window, cx);
+    }
+
+    /// 弹出密码/私钥口令输入面板（默认不保存；加密库可用时提供"保存"勾选）。
+    fn prompt_secret(
+        &mut self,
+        host: HostConfig,
+        kind: PromptKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let placeholder = match kind {
+            PromptKind::Password => "输入密码后点击连接",
+            PromptKind::Passphrase => "输入私钥口令后点击连接",
+        };
+        let password = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder));
         password.update(cx, |state, cx| state.focus(window, cx));
         self.pending = Some(PendingConnect {
             host,
             password,
             save_password: false,
+            kind,
         });
         cx.notify();
     }
@@ -447,40 +509,57 @@ impl RuLinkApp {
         cx.notify();
     }
 
-    /// 用输入的密码完成待连接：内存缓存必写；勾选保存且加密库可用时再持久化入库。
+    /// 用输入的秘密完成待连接：内存缓存必写；勾选保存且加密库可用时再持久化入库。
     fn confirm_pending(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(pending) = self.pending.take() else {
             return;
         };
-        let password = pending.password.read(cx).value().to_string();
+        let secret = pending.password.read(cx).value().to_string();
         let host = pending.host;
         let save = pending.save_password;
+        let kind = pending.kind;
         let key = host.addr();
-        self.password_cache.insert(key.clone(), password.clone());
+        self.password_cache.insert(key.clone(), secret.clone());
         if save && let (Some(vault), true) = (self.vault.clone(), host.id != 0) {
-            let stored = password.clone();
+            let stored = secret.clone();
             let id = host.id;
             cx.spawn(async move |_, _| {
                 if let Err(error) = vault.set_password(id, Some(&stored)).await {
-                    log::warn!("保存密码失败: {error}");
+                    log::warn!("保存凭据失败: {error}");
                 }
             })
             .detach();
         }
-        let target = SshTarget::from_host(&host, Some(password));
-        self.connect(host.name.clone(), target, Some(key), window, cx);
+        let target = match kind {
+            PromptKind::Password => SshTarget::from_host(&host, Some(secret)),
+            PromptKind::Passphrase => {
+                SshTarget::from_host(&host, None).with_passphrase(Some(secret))
+            }
+        };
+        self.connect(
+            host.name.clone(),
+            target,
+            Some(key),
+            Some(host),
+            false,
+            window,
+            cx,
+        );
     }
 
     /// 建立外接终端并启动 SSH 会话，追加为新标签。
     ///
-    /// 会话任务由后台 future 持有并等待：SSH 断开、远端 `exit`、认证失败都会
-    /// 让任务结束，据此自动移除标签（对应"退出即关窗口"）；认证失败时顺带清掉
-    /// 缓存密码，下次点击会重新询问。
+    /// shell 开启前的失败（连不上 / 认证被拒 / 私钥需口令）**保留标签页**，
+    /// 错误文本留在终端里可读，不再一闪而过；需要口令时自动弹口令窗。
+    /// 被拒绝的秘密会清掉内存缓存；若来自加密库，库内条目也一并清除，
+    /// 下次点击重新询问，而不是拿坏凭据反复直连。
     fn connect(
         &mut self,
         title: String,
         target: SshTarget,
         cache_key: Option<String>,
+        host: Option<HostConfig>,
+        secret_from_vault: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -505,7 +584,11 @@ impl RuLinkApp {
         };
         let id = self.next_id;
         self.next_id += 1;
-        let session::SshSession { join, remote_info } = session::start(target, handles, cx);
+        let session::SshSession {
+            join,
+            remote_info,
+            started,
+        } = session::start(target, handles, cx);
         self.status = SharedString::from(format!("正在连接 {addr}…"));
         self.tabs.push(SessionTab {
             id,
@@ -516,19 +599,69 @@ impl RuLinkApp {
             terminal_view,
         });
         self.active_tab = Some(id);
+        let vault = self.vault.clone();
         cx.spawn(async move |this, cx| {
             let result = join.await;
-            let _ = this.update(cx, |this, cx| {
-                if result.is_err()
-                    && let Some(key) = &cache_key
-                {
-                    this.password_cache.remove(key);
-                }
-                this.remove_tab(id, cx);
-                if result.is_err() {
-                    this.status = SharedString::from(format!("连接失败：{addr}"));
+            let shell_started = started.load(std::sync::atomic::Ordering::SeqCst);
+            let Some(entity) = this.upgrade() else {
+                return;
+            };
+            let entity_id = entity.entity_id();
+            let _ = cx.with_window(entity_id, move |window, cx| {
+                let _ = entity.update(cx, move |this, cx| {
+                    let Err(error) = result else {
+                        this.remove_tab(id, cx);
+                        return;
+                    };
+                    // 加密私钥缺口令：回收死标签，自动弹口令窗。
+                    if error
+                        .downcast_ref::<session::PassphraseRequired>()
+                        .is_some()
+                    {
+                        this.remove_tab(id, cx);
+                        if let Some(host) = host {
+                            this.prompt_secret(host, PromptKind::Passphrase, window, cx);
+                        } else {
+                            this.status =
+                                "私钥已加密，需要口令（快速连接请改用 -i 对应明文密钥）".into();
+                            cx.notify();
+                        }
+                        return;
+                    }
+                    let rejected = error.downcast_ref::<session::SecretRejected>().is_some();
+                    if rejected {
+                        if let Some(key) = &cache_key {
+                            this.password_cache.remove(key);
+                        }
+                        if secret_from_vault
+                            && let (Some(vault), Some(h)) = (vault.clone(), host.as_ref())
+                            && h.id != 0
+                        {
+                            let row = h.id;
+                            cx.spawn(async move |_, _| {
+                                if let Err(error) = vault.set_password(row, None).await {
+                                    log::warn!("清除失效凭据失败: {error}");
+                                }
+                            })
+                            .detach();
+                            this.status = SharedString::from(
+                                "已保存的凭据被服务器拒绝，已清除；再次点击将重新输入",
+                            );
+                        }
+                    }
+                    if !shell_started {
+                        // 从未建立终端：保留标签页，错误详情已写入终端可继续阅读。
+                        this.status = SharedString::from(format!("连接失败：{addr}"));
+                        cx.notify();
+                        return;
+                    }
+                    this.remove_tab(id, cx);
+                    this.status = SharedString::from(format!(
+                        "连接失败：{addr}（{}）",
+                        session::error_summary(&error)
+                    ));
                     cx.notify();
-                }
+                });
             });
         })
         .detach();
@@ -858,6 +991,7 @@ impl RuLinkApp {
                     .child(div().text_sm().child("认证方式"))
                     .child(h_flex().gap_2().children(methods.into_iter().map(|method| {
                         let auth_id = SharedString::from(format!("auth-{}", auth_label(method)));
+                        let is_selected = method == selected;
                         div()
                             .id(auth_id)
                             .px_3()
@@ -865,11 +999,19 @@ impl RuLinkApp {
                             .rounded(px(5.0))
                             .text_sm()
                             .cursor_pointer()
-                            .bg(if method == selected {
+                            .bg(if is_selected {
                                 pal.accent
                             } else {
                                 pal.segment_bg
                             })
+                            // 选中段文字用主题的 primary_foreground（与主按钮同规则），
+                            // 否则强调色底上会沿用默认文字色导致看不清。
+                            .text_color(if is_selected {
+                                cx.theme().primary_foreground
+                            } else {
+                                pal.text
+                            })
+                            .when(is_selected, |this| this.font_weight(FontWeight::BOLD))
                             .child(auth_label(method))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 if let Some(form) = this.new_host.as_mut() {
@@ -908,10 +1050,25 @@ impl RuLinkApp {
             return div().into_any_element();
         };
         let host = pending.host.addr();
+        let hint = match pending.kind {
+            PromptKind::Password => format!("连接 {host} 需要密码"),
+            PromptKind::Passphrase => format!(
+                "连接 {host} 的私钥已加密，需要口令（{}）",
+                if pending.host.key_path.is_empty() {
+                    "未填路径"
+                } else {
+                    &pending.host.key_path
+                }
+            ),
+        };
         let hint = if self.vault.is_some() {
-            format!("连接 {host} 需要密码")
+            hint
         } else {
-            format!("连接 {host} 需要密码（加密库不可用，仅本次使用，不保存）")
+            format!("{hint}（加密库不可用，仅本次使用，不保存）")
+        };
+        let save_label = match pending.kind {
+            PromptKind::Password => "保存密码（加密存入本地凭据库）",
+            PromptKind::Passphrase => "保存口令（加密存入本地凭据库）",
         };
         let save_row = if self.vault.is_some() && pending.host.id != 0 {
             let checked = pending.save_password;
@@ -933,12 +1090,7 @@ impl RuLinkApp {
                             .text_color(if checked { pal.text } else { pal.muted })
                             .child(if checked { "☑" } else { "☐" }),
                     )
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(pal.muted)
-                            .child("保存密码（加密存入本地凭据库）"),
-                    ),
+                    .child(div().text_sm().text_color(pal.muted).child(save_label)),
             )
         } else {
             None
