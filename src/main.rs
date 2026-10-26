@@ -62,6 +62,10 @@ struct NewHostForm {
     port: Entity<InputState>,
     user: Entity<InputState>,
     key_path: Entity<InputState>,
+    /// 加密私钥口令（可选）。保存时勾选入库则写加密库，否则仅本次内存缓存；绝不落明文。
+    passphrase: Entity<InputState>,
+    /// 表单层"保存口令到加密库"开关（默认否＝仅本次内存持有）。
+    save_secret: bool,
     auth: AuthMethod,
     /// Some(index)＝编辑既有主机（保存时按该下标原位替换）。
     editing: Option<usize>,
@@ -360,6 +364,11 @@ impl RuLinkApp {
                     None => input,
                 }
             }),
+            // 口令永不回填：编辑时留空即"不改动已保存的秘密"。
+            passphrase: cx.new(|cx| {
+                InputState::new(window, cx).placeholder("私钥口令（可选，留空则连接时按需询问）")
+            }),
+            save_secret: false,
             auth,
             editing: edit_index,
         };
@@ -391,6 +400,8 @@ impl RuLinkApp {
         };
         let editing = form.editing;
         let auth = form.auth;
+        let passphrase = form.passphrase.read(cx).value().trim().to_string();
+        let save_secret = form.save_secret;
         let host_raw = form.host.read(cx).value().trim().to_string();
         let mut host = HostConfig {
             id: 0,
@@ -426,8 +437,12 @@ impl RuLinkApp {
                 host.favorite = current.favorite;
                 self.hosts[index] = host.clone();
                 self.persist_host(&host, cx);
+                let note = self.store_form_secret(&host, passphrase.clone(), save_secret, cx);
                 self.new_host = None;
-                self.status = SharedString::from(format!("已更新主机 {label}"));
+                self.status = SharedString::from(format!(
+                    "已更新主机 {label}{}",
+                    note.as_deref().unwrap_or("")
+                ));
                 cx.notify();
                 return;
             }
@@ -439,9 +454,74 @@ impl RuLinkApp {
         }
         self.hosts.push(host.clone());
         self.persist_host(&host, cx);
+        let note = self.store_form_secret(&host, passphrase, save_secret, cx);
         self.new_host = None;
-        self.status = SharedString::from(format!("已保存主机 {label}"));
+        self.status = SharedString::from(format!(
+            "已保存主机 {label}{}",
+            note.as_deref().unwrap_or("")
+        ));
         cx.notify();
+    }
+
+    /// 表单私钥口令的两档落点：勾选入库（加密库）或仅本次内存缓存。
+    /// 空白口令＝不改动既有秘密。返回附注文案（None 表示无需提示）。
+    fn store_form_secret(
+        &mut self,
+        host: &HostConfig,
+        passphrase: String,
+        save: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<String> {
+        if host.auth != AuthMethod::IdentityFile || passphrase.is_empty() {
+            return None;
+        }
+        if save {
+            if let (Some(vault), true) = (self.vault.clone(), host.id != 0) {
+                let id = host.id;
+                self.password_cache.insert(host.addr(), passphrase.clone());
+                cx.spawn(async move |_, _| {
+                    if let Err(error) = vault.set_password(id, Some(&passphrase)).await {
+                        log::warn!("保存私钥口令失败: {error}");
+                    }
+                })
+                .detach();
+                return Some("（口令已加密入库）".to_string());
+            }
+            // 加密库不可用：绝不降级为明文保存，退回本次内存持有。
+            self.password_cache.insert(host.addr(), passphrase);
+            return Some("（加密库不可用，口令仅本次内存持有）".to_string());
+        }
+        self.password_cache.insert(host.addr(), passphrase);
+        Some("（口令仅本次内存持有）".to_string())
+    }
+
+    /// 打开系统文件对话框选择私钥文件，回填表单"私钥路径"。
+    fn browse_key_path(&mut self, cx: &mut Context<Self>) {
+        let Some(form) = self.new_host.as_ref() else {
+            return;
+        };
+        let input = form.key_path.clone();
+        let entity = cx.entity();
+        let entity_id = entity.entity_id();
+        let rx = cx.prompt_for_paths(rgpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("选择私钥文件".into()),
+        });
+        cx.spawn(async move |_, cx| {
+            if let Ok(Ok(Some(paths))) = rx.await {
+                if let Some(path) = paths.first() {
+                    let value = path.to_string_lossy().into_owned();
+                    let _ = cx.with_window(entity_id, move |window, cx| {
+                        let _ = input.update(cx, |state, cx| {
+                            state.set_value(value, window, cx);
+                        });
+                    });
+                }
+            }
+        })
+        .detach();
     }
 
     /// 右键菜单"删除"：进入二次确认，不直接动手。
@@ -1290,7 +1370,62 @@ impl RuLinkApp {
                     }))),
             )
             .when(selected == AuthMethod::IdentityFile, |this| {
-                this.child(labeled_field("私钥路径", &form.key_path, &pal))
+                let save_checked = form.save_secret;
+                this.child(
+                    h_flex()
+                        .gap_2()
+                        .items_end()
+                        .child(div().flex_1().child(labeled_field(
+                            "私钥路径",
+                            &form.key_path,
+                            &pal,
+                        )))
+                        .child(
+                            Button::new("browse-key")
+                                .label("浏览…")
+                                .ghost()
+                                .flex_shrink_0()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.browse_key_path(cx);
+                                })),
+                        ),
+                )
+                .child(
+                    v_flex()
+                        .gap_1()
+                        .child(div().text_sm().child("私钥口令"))
+                        .child(styled_input(
+                            Input::new(&form.passphrase).content_type(InputContentType::Password),
+                            &pal,
+                        )),
+                )
+                .when(self.vault.is_some(), |this| {
+                    this.child(
+                        h_flex()
+                            .id("save-passphrase")
+                            .gap_2()
+                            .items_center()
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(form) = this.new_host.as_mut() {
+                                    form.save_secret = !form.save_secret;
+                                    cx.notify();
+                                }
+                            }))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(if save_checked { pal.text } else { pal.muted })
+                                    .child(if save_checked { "☑" } else { "☐" }),
+                            )
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(pal.muted)
+                                    .child("保存口令（加密存入本地凭据库，默认仅本次内存持有）"),
+                            ),
+                    )
+                })
             })
             .child(
                 h_flex()
