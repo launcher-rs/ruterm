@@ -18,7 +18,7 @@ GUI 会话管理器形态：左侧持久化的主机账号列表，点账号即�
   中间**多级菜单**「会话 / 凭据 / 外观 / 帮助」把设置项按域分散，右侧 ⚙ / 🔑 / 🔒 / `«` 快捷按钮，
   最右为系统窗口控件（最小化 / 最大化 / 关闭）。拖拽与窗口控件走 `WindowControlArea` 命中区，
   交互控件排在 Drag 区**之外**（Windows 的 `WM_NCHITTEST` 只认第一个命中的控制区，父级 Drag 会吞掉栏内按钮点击）。
-- **设置界面**：⚙ 或菜单进入，按 **Tab 分页**——「凭据库与主密码」/「外观」，后续设置项继续加分页即可。
+- **设置界面**：⚙ 或菜单进入，按 **Tab 分页**——「凭据库与主密码」/「外观」/「状态栏」，后续设置项继续加分页即可。
 - **主题**：明 / 暗切换，配色全部取 rgpui 全局 `Theme` 语义色，选择持久化到加密库。
 - **凭据存储**：主机配置、应用设置、known_hosts 合并为**一个加密文件** `rulink.db`
   （toasty ORM + turso AEGIS-256 页级加密），不再有零散的 JSON / 文本档。
@@ -32,6 +32,7 @@ GUI 会话管理器形态：左侧持久化的主机账号列表，点账号即�
   🔒，一键锁定凭据库（锁定后只剩 🔑 解锁入口）。⚠️ 忘记主密码 = 数据不可恢复（无任何后门），请牢记。
 - **状态栏**：底部常驻，左侧整体状态 + 活动会话地址/认证方式 + 远程主机信息，右侧会话计数。
   连接后经 exec 通道一次性探测远端 OS / 内存 / 磁盘 / 负载 / uptime（探测失败则该条目不显示）。
+  要显示哪些条目由设置里的「状态栏」分页勾选（会话信息与远程指标两组），改动即时生效并存入凭据库。
 - **系统托盘**：品牌图标 + 悬停提示 + 右键菜单（显示主界面 / 退出）；点窗口关闭按钮隐藏到托盘，会话后台保活。
 - **品牌图标**：多尺寸 `.ico` 经 `build.rs` + winresource 嵌入 exe（文件 / 任务栏 / 标题栏）。
 
@@ -76,7 +77,7 @@ rulink [user@]host[:port] [-i keyfile]
 | `unlock.txt` | 解锁后端标记（`keyring` / `passphrase`），非敏感明文，用于决定启动是否弹解锁窗 |
 | `vault.db` → `vault.db.migrated` | 旧版手写 SQL 加密库；首启读出迁入 `rulink.db` 后改名保留 |
 | `sessions.json` → `sessions.json.migrated` | 旧版主机构档；迁入加密库后改名保留（加密库不可用时才继续读写原文件） |
-| `settings.json` → `settings.json.migrated` | 旧版应用设置（主题）；迁入 `settings` 表后改名保留 |
+| `settings.json` → `settings.json.migrated` | 旧版应用设置（主题、状态栏偏好）；迁入 `settings` 表后改名保留 |
 | `known_hosts` → `known_hosts.migrated` | 旧版指纹文本；迁入 `known_hosts` 表后改名保留 |
 | `rulink.db.keyring-bak` | 设置 / 更换 / 取消主密码时被替换下的旧库备份（数据校验通过后自动清理） |
 
@@ -112,10 +113,10 @@ rgpui 三个 crate 走 crates.io 正式版本。本地联调 rgpui 时可在 `[p
 
 ```
 src/
-  main.rs       # UI：RuLinkApp（侧边栏、标签栏、终端、状态栏、托盘）+ 解锁弹窗 + 设置弹窗（主密码、主题）+ 应用入口
+  main.rs       # UI：RuLinkApp（侧边栏、标签栏、终端、状态栏、托盘）+ 解锁弹窗 + 设置弹窗（主密码、主题、状态栏显示项）+ 应用入口
   session.rs    # 会话桥接：rgpui-term 外接 IO ⇄ russh 双向字节流（上行泵线程 + 转发任务）+ exec 远程信息探测
   ssh.rs        # SSH 引擎：russh client::Handler、指纹校验（优先查加密库，降级回文本文件）、旁路通道过滤
-  remote.rs     # 远程主机信息：POSIX 探测脚本 + key=value 解析/状态栏摘要（含单测）
+  remote.rs     # 远程主机信息：POSIX 探测脚本 + key=value 解析 + 可勾选指标枚举（含单测）
   config.rs     # 连接目标：命令行解析 + 主机账号 → SshTarget
   paths.rs      # 存储模式判定（便携 `data/` 或全局 `~/.rulink`）与所有数据文件路径
   sessions.rs   # 降级路径：旧版主机/设置 JSON（SessionStore）+ 迁移后改名标记
