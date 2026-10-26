@@ -20,7 +20,7 @@ use rgpui::input_ui::{Input, InputContentType, InputEvent, InputState};
 use rgpui::prelude::*;
 use rgpui::{
     AnyElement, App, Bounds, Button, ButtonVariants, Context, Entity, FocusHandle, Focusable,
-    FontWeight, Hsla, InteractiveElement, IntoElement, MouseButton, ParentElement, Render,
+    FontWeight, Hsla, InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels, Render,
     ScrollableElement, SharedString, StatefulInteractiveElement, Styled, TrayMenuItem, Window,
     WindowBounds, WindowOptions, div, h_flex, px, size, v_flex,
 };
@@ -55,7 +55,7 @@ struct SessionTab {
     terminal_view: Entity<TerminalView>,
 }
 
-/// 新建主机表单（各字段为受控输入状态）。
+/// 新建/编辑主机表单（各字段为受控输入状态）。
 struct NewHostForm {
     name: Entity<InputState>,
     host: Entity<InputState>,
@@ -63,6 +63,15 @@ struct NewHostForm {
     user: Entity<InputState>,
     key_path: Entity<InputState>,
     auth: AuthMethod,
+    /// Some(index)＝编辑既有主机（保存时按该下标原位替换）。
+    editing: Option<usize>,
+}
+
+/// 主机列表右键菜单（真实下标 + 弹出位置，窗口坐标）。
+struct HostContextMenu {
+    index: usize,
+    x: Pixels,
+    y: Pixels,
 }
 
 /// 弹窗索取的秘密类型：登录密码或加密私钥的口令。
@@ -100,6 +109,10 @@ struct RuLinkApp {
     new_host: Option<NewHostForm>,
     /// 等待密码输入的连接。
     pending: Option<PendingConnect>,
+    /// 主机行右键菜单（编辑/删除入口）。
+    context_menu: Option<HostContextMenu>,
+    /// 删除二次确认（真实下标；浮层遮挡期间列表不会变）。
+    confirm_delete: Option<usize>,
     /// 本次运行内缓存的密码（按 user@host:port），避免重复弹窗；绝不落盘。
     password_cache: HashMap<String, String>,
     /// 标签自增 id。
@@ -193,6 +206,8 @@ impl RuLinkApp {
             active_tab: None,
             new_host: None,
             pending: None,
+            context_menu: None,
+            confirm_delete: None,
             password_cache: HashMap::new(),
             next_id: 0,
             status: "就绪".into(),
@@ -285,22 +300,80 @@ impl RuLinkApp {
         }
     }
 
-    /// 打开新建主机表单，填充默认端口。
+    /// 打开新建主机表单。
     fn open_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.new_host = Some(NewHostForm {
-            name: cx.new(|cx| InputState::new(window, cx).placeholder("展示名（留空用主机地址）")),
-            host: cx.new(|cx| InputState::new(window, cx).placeholder("host 或 IP")),
-            port: cx.new(|cx| InputState::new(window, cx).default_value("22")),
-            user: cx.new(|cx| InputState::new(window, cx).placeholder("登录用户名")),
-            key_path: cx.new(|cx| InputState::new(window, cx).placeholder("~/.ssh/id_ed25519")),
-            auth: AuthMethod::Agent,
-        });
+        self.open_form_at(None, window, cx);
+    }
+
+    /// 打开新建 / 编辑表单；edit_index 为 Some 时以该主机字段预填。
+    fn open_form_at(
+        &mut self,
+        edit_index: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let existing = edit_index.and_then(|index| self.hosts.get(index).cloned());
+        let editing = existing.is_some();
+        let auth = existing
+            .as_ref()
+            .map(|host| host.auth)
+            .unwrap_or(AuthMethod::Agent);
+        let edit_index = if editing { edit_index } else { None };
+        let placeholder_name = if editing {
+            ""
+        } else {
+            "展示名（留空用主机地址）"
+        };
+        let form = NewHostForm {
+            name: cx.new(|cx| {
+                let input = InputState::new(window, cx).placeholder(placeholder_name);
+                match &existing {
+                    Some(host) => input.default_value(host.name.clone()),
+                    None => input,
+                }
+            }),
+            host: cx.new(|cx| {
+                let input = InputState::new(window, cx).placeholder("host 或 IP");
+                match &existing {
+                    Some(host) => input.default_value(host.host.clone()),
+                    None => input,
+                }
+            }),
+            port: cx.new(|cx| {
+                let input = InputState::new(window, cx).default_value("22");
+                match &existing {
+                    Some(host) => InputState::new(window, cx).default_value(host.port.to_string()),
+                    None => input,
+                }
+            }),
+            user: cx.new(|cx| {
+                let input = InputState::new(window, cx).placeholder("登录用户名");
+                match &existing {
+                    Some(host) => input.default_value(host.user.clone()),
+                    None => input,
+                }
+            }),
+            key_path: cx.new(|cx| {
+                let input = InputState::new(window, cx).placeholder("~/.ssh/id_ed25519");
+                match &existing {
+                    Some(host) => input.default_value(host.key_path.clone()),
+                    None => input,
+                }
+            }),
+            auth,
+            editing: edit_index,
+        };
+        self.new_host = Some(form);
         // 表单打开即把焦点交给"主机地址"输入框：退格/删除等键位动作只在输入框
         // 持有焦点（"Input" 键位上下文激活）时才会派发，主动聚焦让删除键即时可用。
         if let Some(form) = self.new_host.as_ref() {
             form.host.update(cx, |state, cx| state.focus(window, cx));
         }
-        self.status = "填写主机信息".into();
+        self.status = if editing {
+            "编辑主机".into()
+        } else {
+            "填写主机信息".into()
+        };
         cx.notify();
     }
 
@@ -311,21 +384,16 @@ impl RuLinkApp {
         cx.notify();
     }
 
-    /// 保存新建表单到列表并持久化；校验失败则保留表单。
+    /// 保存新建/编辑表单到列表并持久化；校验失败则保留表单。
     fn save_form(&mut self, cx: &mut Context<Self>) {
         let Some(form) = self.new_host.as_ref() else {
             return;
         };
+        let editing = form.editing;
+        let auth = form.auth;
         let host_raw = form.host.read(cx).value().trim().to_string();
-        // 加密库可用时同步分配主键（max+1，与库内 INSERT 显式 id 对齐）；
-        // 降级模式沿用旧 JSON（id=0，boot_vault 成功回填时会补发）。
-        let id = if self.vault.is_some() {
-            self.hosts.iter().map(|host| host.id).max().unwrap_or(0) + 1
-        } else {
-            0
-        };
-        let host = HostConfig {
-            id,
+        let mut host = HostConfig {
+            id: 0,
             name: form.name.read(cx).value().trim().to_string(),
             host: host_raw.clone(),
             port: form
@@ -336,7 +404,7 @@ impl RuLinkApp {
                 .parse::<u16>()
                 .unwrap_or(22),
             user: form.user.read(cx).value().trim().to_string(),
-            auth: form.auth,
+            auth,
             key_path: form.key_path.read(cx).value().trim().to_string(),
             favorite: false,
         };
@@ -351,10 +419,51 @@ impl RuLinkApp {
         } else {
             host.name.clone()
         };
+        if let Some(index) = editing {
+            // 原位替换：id 与收藏标记沿用原主机；已保存的密码/口令不受影响。
+            if let Some(current) = self.hosts.get(index).cloned() {
+                host.id = current.id;
+                host.favorite = current.favorite;
+                self.hosts[index] = host.clone();
+                self.persist_host(&host, cx);
+                self.new_host = None;
+                self.status = SharedString::from(format!("已更新主机 {label}"));
+                cx.notify();
+                return;
+            }
+        }
+        // 新建：加密库可用时同步分配主键（max+1，与库内 INSERT 显式 id 对齐）；
+        // 降级模式沿用旧 JSON（id=0，boot_vault 成功回填时会补发）。
+        if self.vault.is_some() {
+            host.id = self.hosts.iter().map(|item| item.id).max().unwrap_or(0) + 1;
+        }
         self.hosts.push(host.clone());
         self.persist_host(&host, cx);
         self.new_host = None;
         self.status = SharedString::from(format!("已保存主机 {label}"));
+        cx.notify();
+    }
+
+    /// 右键菜单"删除"：进入二次确认，不直接动手。
+    fn ask_delete(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.context_menu = None;
+        if index < self.hosts.len() {
+            self.confirm_delete = Some(index);
+            cx.notify();
+        }
+    }
+
+    /// 确认删除：走真实删除并持久化（连带清除库内该主机的密码/口令）。
+    fn confirm_delete_now(&mut self, cx: &mut Context<Self>) {
+        let Some(index) = self.confirm_delete.take() else {
+            return;
+        };
+        self.delete_host(index, cx);
+    }
+
+    /// 取消删除确认。
+    fn cancel_delete(&mut self, cx: &mut Context<Self>) {
+        self.confirm_delete = None;
         cx.notify();
     }
 
@@ -726,7 +835,7 @@ impl RuLinkApp {
 }
 
 impl Render for RuLinkApp {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let pal = self.palette(cx);
         v_flex()
             .id("rulink-root")
@@ -761,6 +870,7 @@ impl Render for RuLinkApp {
                     .overflow_hidden(),
             )
             .child(self.render_status_bar().flex_shrink_0().w_full())
+            .child(self.render_overlay(window, cx))
     }
 }
 
@@ -843,6 +953,157 @@ impl RuLinkApp {
             .into_any_element()
     }
 
+    /// 窗口级浮层：主机右键菜单与删除二次确认框（绝对定位渲染在最上层）。
+    fn render_overlay(&self, window: &mut Window, cx: &Context<Self>) -> AnyElement {
+        let pal = self.palette(cx);
+        // 删除二次确认：半透明遮罩 + 居中卡片，点遮罩或"取消"关闭。
+        if let Some(index) = self.confirm_delete {
+            let label = self
+                .hosts
+                .get(index)
+                .map(|host| {
+                    if host.name.is_empty() {
+                        host.addr()
+                    } else {
+                        host.name.clone()
+                    }
+                })
+                .unwrap_or_else(|| "该主机".to_string());
+            return v_flex()
+                .id("delete-backdrop")
+                .absolute()
+                .top(px(0.0))
+                .left(px(0.0))
+                .size_full()
+                .items_center()
+                .justify_center()
+                .bg(rgpui::hsla(0.0, 0.0, 0.0, 0.45))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.cancel_delete(cx);
+                    }),
+                )
+                .child(
+                    v_flex()
+                        .id("delete-dialog")
+                        .w(px(340.0))
+                        .gap_3()
+                        .p_4()
+                        .rounded(px(8.0))
+                        .bg(pal.card_bg)
+                        .border_1()
+                        .border_color(pal.border)
+                        .child(
+                            div()
+                                .text_base()
+                                .font_weight(rgpui::FontWeight(600.0))
+                                .child(format!("删除主机 {label}？")),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(pal.muted)
+                                .child("若该主机已保存密码/口令，将一并从加密库中清除。"),
+                        )
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .justify_end()
+                                .child(Button::new("cancel-delete").label("取消").ghost().on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.cancel_delete(cx);
+                                    }),
+                                ))
+                                .child(
+                                    Button::new("confirm-delete")
+                                        .label("删除")
+                                        .danger()
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.confirm_delete_now(cx);
+                                        })),
+                                ),
+                        )
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|_, _, _, cx| {
+                                // 阻止卡片内点击冒泡到遮罩（否则点对话框也会关闭）。
+                                cx.stop_propagation();
+                            }),
+                        ),
+                )
+                .into_any_element();
+        }
+        // 主机行右键菜单：编辑 / 删除（删除走二次确认）。
+        if let Some(menu) = self.context_menu.as_ref() {
+            let index = menu.index;
+            let bounds = window.bounds();
+            let x = menu.x.min(bounds.size.width - px(150.0)).max(px(0.0));
+            let y = menu.y.min(bounds.size.height - px(100.0)).max(px(0.0));
+            let close = cx.listener(|this, _, _, cx| {
+                this.context_menu = None;
+                cx.notify();
+            });
+            return div()
+                .id("menu-backdrop")
+                .absolute()
+                .top(px(0.0))
+                .left(px(0.0))
+                .size_full()
+                .on_mouse_down(MouseButton::Left, close)
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(|this, _, _, cx| {
+                        this.context_menu = None;
+                        cx.notify();
+                    }),
+                )
+                .child(
+                    v_flex()
+                        .id("host-context-menu")
+                        .absolute()
+                        .top(y)
+                        .left(x)
+                        .min_w(px(140.0))
+                        .py_1()
+                        .rounded(px(6.0))
+                        .bg(pal.card_bg)
+                        .border_1()
+                        .border_color(pal.border)
+                        .child(
+                            div()
+                                .id("ctx-edit-host")
+                                .px_3()
+                                .py_1()
+                                .text_sm()
+                                .cursor_pointer()
+                                .hover(|style| style.bg(pal.card_hover))
+                                .child("编辑")
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.context_menu = None;
+                                    this.open_form_at(Some(index), window, cx);
+                                })),
+                        )
+                        .child(
+                            div()
+                                .id("ctx-delete-host")
+                                .px_3()
+                                .py_1()
+                                .text_sm()
+                                .text_color(pal.danger)
+                                .cursor_pointer()
+                                .hover(|style| style.bg(pal.card_hover))
+                                .child("删除")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.ask_delete(index, cx);
+                                })),
+                        ),
+                )
+                .into_any_element();
+        }
+        div().into_any_element()
+    }
+
     /// 主机账号列表；每行可点击连接、附删除按钮。
     fn render_host_list(&self, cx: &mut Context<Self>) -> AnyElement {
         let pal = self.palette(cx);
@@ -880,7 +1141,6 @@ impl RuLinkApp {
             .children(matched.into_iter().map(|index| {
                 let host = &self.hosts[index];
                 let host_id = SharedString::from(format!("host-row-{index}"));
-                let del_id = SharedString::from(format!("host-del-{index}"));
                 let fav_id = SharedString::from(format!("host-fav-{index}"));
                 let fav_glyph: &'static str = if host.favorite { "★" } else { "☆" };
                 h_flex()
@@ -897,6 +1157,18 @@ impl RuLinkApp {
                     .cursor_pointer()
                     .on_click(
                         cx.listener(move |this, _, window, cx| this.click_host(index, window, cx)),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, event: &rgpui::MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.context_menu = Some(HostContextMenu {
+                                index,
+                                x: event.position.x,
+                                y: event.position.y,
+                            });
+                            cx.notify();
+                        }),
                     )
                     .child(
                         v_flex()
@@ -943,21 +1215,6 @@ impl RuLinkApp {
                                     .text_xs()
                                     .text_color(pal.link)
                                     .child(auth_label(host.auth)),
-                            )
-                            .child(
-                                div()
-                                    .id(del_id)
-                                    .text_sm()
-                                    .text_color(pal.danger)
-                                    .child("删除")
-                                    .cursor_pointer()
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|_, _, _, cx| cx.stop_propagation()),
-                                    )
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.delete_host(index, cx)
-                                    })),
                             ),
                     )
             }))
@@ -976,11 +1233,22 @@ impl RuLinkApp {
             AuthMethod::Password,
         ];
         let selected = form.auth;
+        let editing = form.editing.is_some();
         v_flex()
             .gap_2()
             .p_3()
             .rounded(px(6.0))
             .bg(pal.card_bg)
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(rgpui::FontWeight(600.0))
+                    .child(if editing {
+                        "编辑主机"
+                    } else {
+                        "新建主机"
+                    }),
+            )
             .child(labeled_field("展示名", &form.name, &pal))
             .child(labeled_field("主机地址", &form.host, &pal))
             .child(labeled_field("端口", &form.port, &pal))
@@ -1029,7 +1297,7 @@ impl RuLinkApp {
                     .gap_2()
                     .child(
                         Button::new("save-host")
-                            .label("保存")
+                            .label(if editing { "保存修改" } else { "保存" })
                             .primary()
                             .on_click(cx.listener(|this, _, _, cx| this.save_form(cx))),
                     )
@@ -1129,14 +1397,14 @@ impl RuLinkApp {
             div()
         } else {
             h_flex()
-                .h(px(36.0))
+                .h(px(44.0))
                 .flex_shrink_0()
                 .items_center()
                 .bg(pal.sidebar_bg)
                 .border_b_1()
                 .border_color(pal.border)
-                .px_2()
-                .gap_1()
+                .px_3()
+                .gap_2()
                 .overflow_hidden()
                 .children(self.tabs.iter().map(|tab| {
                     let id = tab.id;
@@ -1145,11 +1413,14 @@ impl RuLinkApp {
                     let close_id = SharedString::from(format!("tab-close-{id}"));
                     h_flex()
                         .id(tab_id)
-                        .px_3()
-                        .py_1()
+                        .h(px(32.0))
+                        .min_w(px(160.0))
+                        .flex_shrink_0()
+                        .px_4()
                         .gap_2()
                         .items_center()
-                        .rounded(px(5.0))
+                        .justify_between()
+                        .rounded(px(6.0))
                         .bg(if active { pal.window_bg } else { pal.card_bg })
                         .cursor_pointer()
                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -1160,7 +1431,7 @@ impl RuLinkApp {
                         .child(
                             div()
                                 .id(close_id)
-                                .text_sm()
+                                .text_base()
                                 .text_color(pal.danger)
                                 .child("×")
                                 .cursor_pointer()
@@ -1203,7 +1474,7 @@ impl RuLinkApp {
         let collapsed = self.split_state.read(cx).is_collapsed();
         let expand_bar = if collapsed {
             h_flex()
-                .h(px(36.0))
+                .h(px(44.0))
                 .flex_shrink_0()
                 .items_center()
                 .px_2()
