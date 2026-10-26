@@ -2,7 +2,7 @@
 //!
 //! 凭据策略：密码不入库，连接时临时输入；私钥只存路径。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -20,6 +20,9 @@ pub enum AuthMethod {
 /// 一台可连接的主机账号。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HostConfig {
+    /// 加密库中的主键（旧 JSON 数据迁移前为 0，入库时分配）
+    #[serde(default)]
+    pub id: i64,
     /// 展示名
     pub name: String,
     /// 主机地址
@@ -124,6 +127,33 @@ impl SessionStore {
                 }
             }
             Err(error) => log::warn!("序列化设置失败: {error}"),
+        }
+    }
+
+    /// 数据目录（~/.rulink），加密库 vault.db 与之同级。
+    pub fn dir(&self) -> PathBuf {
+        self.path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."))
+    }
+
+    /// 迁移完成后把 sessions.json 改名为 sessions.json.migrated（保留现场，不删除）。
+    pub fn mark_migrated(&self) {
+        if !self.path.exists() {
+            return;
+        }
+        let target = self.path.with_extension("json.migrated");
+        if target.exists() {
+            log::warn!(
+                "{} 已存在，保留 {} 不重复改名",
+                target.display(),
+                self.path.display()
+            );
+            return;
+        }
+        if let Err(error) = std::fs::rename(&self.path, &target) {
+            log::warn!("迁移 sessions.json 到加密库后改名失败: {error}");
         }
     }
 

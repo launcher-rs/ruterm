@@ -9,8 +9,10 @@ mod remote;
 mod session;
 mod sessions;
 mod ssh;
+mod vault;
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use rgpui::components::split_pane::{CollapsiblePane, SplitPane, SplitPaneState};
 use rgpui::components::status_bar::{StatusBar, StatusBarItem};
@@ -26,6 +28,7 @@ use rgpui_term::{TerminalBuilder, TerminalView};
 
 use crate::config::SshTarget;
 use crate::sessions::{AuthMethod, HostConfig, SessionStore};
+use crate::vault::Vault;
 
 /// 认证方式的展示名。
 fn auth_label(method: AuthMethod) -> &'static str {
@@ -66,12 +69,16 @@ struct NewHostForm {
 struct PendingConnect {
     host: HostConfig,
     password: Entity<InputState>,
+    /// 是否勾选"保存密码"（仅加密库可用时生效，默认否＝本次内存持有）。
+    save_password: bool,
 }
 
 /// RuLink 主视图：左侧主机账号管理，右侧会话标签终端。
 struct RuLinkApp {
     /// 会话仓库（负责持久化）。
     store: SessionStore,
+    /// 加密凭据库；None 表示启动引导中或已降级为旧 JSON 存储（降级时不保存密码）。
+    vault: Option<Arc<Vault>>,
     /// 已保存的主机账号列表。
     hosts: Vec<HostConfig>,
     /// 主机列表搜索框（按展示名 / user@host:port 子串过滤）。
@@ -170,6 +177,7 @@ impl RuLinkApp {
             .detach();
         let mut app = Self {
             store,
+            vault: None,
             hosts,
             search,
             tabs: Vec::new(),
@@ -182,11 +190,90 @@ impl RuLinkApp {
             split_state,
             focus_handle: cx.focus_handle(),
         };
+        app.boot_vault(cx);
         if let Some(target) = quick {
             let title = target.addr();
             app.connect(title, target, None, window, cx);
         }
         app
+    }
+
+    /// 异步打开加密凭据库：成功则接管主机列表（含一次性迁移旧 JSON 并改名保留），
+    /// 失败则降级回旧 JSON 存储并提示（降级模式下密码只留在内存）。
+    fn boot_vault(&mut self, cx: &mut Context<Self>) {
+        let dir = self.store.dir();
+        let json_hosts = self.hosts.clone();
+        cx.spawn(async move |this, cx| {
+            let opened = async {
+                let vault = Vault::open(&dir).await?;
+                // 旧 JSON 非空且库还是空的 → 一次性导入（id 顺序分配），验证后才改名。
+                if !json_hosts.is_empty() && vault.count().await? == 0 {
+                    let mut imported = json_hosts.clone();
+                    for (index, host) in imported.iter_mut().enumerate() {
+                        host.id = index as i64 + 1;
+                    }
+                    vault.import_hosts(&imported).await?;
+                    Ok::<_, anyhow::Error>((vault, imported))
+                } else {
+                    let hosts = vault.load_hosts().await?;
+                    Ok((vault, hosts))
+                }
+            }
+            .await;
+            let _ = this.update(cx, |this, cx| match opened {
+                Ok((vault, mut hosts)) => {
+                    let vault = Arc::new(vault);
+                    // 开库完成前用户新增的主机（id==0）补发 id 并入库，避免丢失。
+                    let mut next = hosts.iter().map(|host| host.id).max().unwrap_or(0) + 1;
+                    let mut late = Vec::new();
+                    for host in &this.hosts {
+                        if host.id == 0 {
+                            let mut host = host.clone();
+                            host.id = next;
+                            next += 1;
+                            late.push(host);
+                        }
+                    }
+                    for host in late {
+                        hosts.push(host.clone());
+                        let vault = vault.clone();
+                        cx.spawn(async move |_, _| {
+                            if let Err(error) = vault.upsert(&host).await {
+                                log::warn!("凭据库写入失败: {error}");
+                            }
+                        })
+                        .detach();
+                    }
+                    this.hosts = hosts;
+                    this.vault = Some(vault);
+                    this.store.mark_migrated();
+                    cx.notify();
+                }
+                Err(error) => {
+                    log::warn!("加密凭据库不可用: {error}");
+                    this.status = SharedString::from(format!(
+                        "加密凭据库不可用（{error}），沿用旧存储且不保存密码"
+                    ));
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// 持久化一台主机：加密库可用则只写该行，否则整表回写旧 JSON。
+    fn persist_host(&mut self, host: &HostConfig, cx: &mut Context<Self>) {
+        if let Some(vault) = self.vault.clone() {
+            let host = host.clone();
+            cx.spawn(async move |_, _| {
+                if let Err(error) = vault.upsert(&host).await {
+                    log::warn!("凭据库写入失败: {error}");
+                }
+            })
+            .detach();
+        } else {
+            self.store.save(&self.hosts);
+        }
     }
 
     /// 打开新建主机表单，填充默认端口。
@@ -224,7 +311,15 @@ impl RuLinkApp {
             return;
         };
         let host_raw = form.host.read(cx).value().trim().to_string();
+        // 加密库可用时同步分配主键（max+1，与库内 INSERT 显式 id 对齐）；
+        // 降级模式沿用旧 JSON（id=0，boot_vault 成功回填时会补发）。
+        let id = if self.vault.is_some() {
+            self.hosts.iter().map(|host| host.id).max().unwrap_or(0) + 1
+        } else {
+            0
+        };
         let host = HostConfig {
+            id,
             name: form.name.read(cx).value().trim().to_string(),
             host: host_raw.clone(),
             port: form
@@ -250,8 +345,8 @@ impl RuLinkApp {
         } else {
             host.name.clone()
         };
-        self.hosts.push(host);
-        self.store.save(&self.hosts);
+        self.hosts.push(host.clone());
+        self.persist_host(&host, cx);
         self.new_host = None;
         self.status = SharedString::from(format!("已保存主机 {label}"));
         cx.notify();
@@ -260,9 +355,19 @@ impl RuLinkApp {
     /// 删除指定主机并持久化。
     fn delete_host(&mut self, index: usize, cx: &mut Context<Self>) {
         if index < self.hosts.len() {
-            let label = self.hosts[index].name.clone();
-            self.hosts.remove(index);
-            self.store.save(&self.hosts);
+            let removed = self.hosts.remove(index);
+            let label = removed.name.clone();
+            if let Some(vault) = self.vault.clone() {
+                let id = removed.id;
+                cx.spawn(async move |_, _| {
+                    if let Err(error) = vault.remove(id).await {
+                        log::warn!("凭据库删除失败: {error}");
+                    }
+                })
+                .detach();
+            } else {
+                self.store.save(&self.hosts);
+            }
             self.status = SharedString::from(format!("已删除主机 {label}"));
             cx.notify();
         }
@@ -272,12 +377,13 @@ impl RuLinkApp {
     fn toggle_favorite(&mut self, index: usize, cx: &mut Context<Self>) {
         if let Some(host) = self.hosts.get_mut(index) {
             host.favorite = !host.favorite;
-            self.store.save(&self.hosts);
+            let host = host.clone();
+            self.persist_host(&host, cx);
             cx.notify();
         }
     }
 
-    /// 点击主机账号：密码认证优先用缓存，无缓存才弹窗；其余直接连接。
+    /// 点击主机账号：密码认证按 内存缓存 → 加密库已存密码 → 弹窗 的顺序取密码；其余直接连接。
     fn click_host(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(host) = self.hosts.get(index).cloned() else {
             return;
@@ -289,15 +395,50 @@ impl RuLinkApp {
                 self.connect(host.name.clone(), target, Some(key), window, cx);
                 return;
             }
-            let password =
-                cx.new(|cx| InputState::new(window, cx).placeholder("输入密码后点击连接"));
-            password.update(cx, |state, cx| state.focus(window, cx));
-            self.pending = Some(PendingConnect { host, password });
-            cx.notify();
+            if self.pending.is_some() {
+                return;
+            }
+            // 加密库可用：异步查已存密码，命中直连，未命中回到弹窗（默认不保存）。
+            if let (Some(vault), true) = (self.vault.clone(), host.id != 0) {
+                let entity = cx.entity();
+                let entity_id = entity.entity_id();
+                cx.spawn(async move |_, cx| {
+                    let saved = vault.password_of(host.id).await.ok().flatten();
+                    let _ = cx.with_window(entity_id, move |window, cx| {
+                        let _ = entity.update(cx, move |this, cx| {
+                            if this.pending.is_some() {
+                                return;
+                            }
+                            match saved {
+                                Some(password) => {
+                                    let target = SshTarget::from_host(&host, Some(password));
+                                    this.connect(host.name.clone(), target, Some(key), window, cx);
+                                }
+                                None => this.prompt_password(host, window, cx),
+                            }
+                        });
+                    });
+                })
+                .detach();
+                return;
+            }
+            self.prompt_password(host, window, cx);
         } else {
             let target = SshTarget::from_host(&host, None);
             self.connect(host.name.clone(), target, None, window, cx);
         }
+    }
+
+    /// 弹出密码输入面板（默认不保存；加密库可用时提供"保存密码"勾选）。
+    fn prompt_password(&mut self, host: HostConfig, window: &mut Window, cx: &mut Context<Self>) {
+        let password = cx.new(|cx| InputState::new(window, cx).placeholder("输入密码后点击连接"));
+        password.update(cx, |state, cx| state.focus(window, cx));
+        self.pending = Some(PendingConnect {
+            host,
+            password,
+            save_password: false,
+        });
+        cx.notify();
     }
 
     /// 取消待输入密码的连接。
@@ -306,16 +447,26 @@ impl RuLinkApp {
         cx.notify();
     }
 
-    /// 用输入的密码完成待连接，并缓存到本次运行内存中。
+    /// 用输入的密码完成待连接：内存缓存必写；勾选保存且加密库可用时再持久化入库。
     fn confirm_pending(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(pending) = self.pending.as_ref() else {
+        let Some(pending) = self.pending.take() else {
             return;
         };
         let password = pending.password.read(cx).value().to_string();
-        let host = pending.host.clone();
-        self.pending = None;
+        let host = pending.host;
+        let save = pending.save_password;
         let key = host.addr();
         self.password_cache.insert(key.clone(), password.clone());
+        if save && let (Some(vault), true) = (self.vault.clone(), host.id != 0) {
+            let stored = password.clone();
+            let id = host.id;
+            cx.spawn(async move |_, _| {
+                if let Err(error) = vault.set_password(id, Some(&stored)).await {
+                    log::warn!("保存密码失败: {error}");
+                }
+            })
+            .detach();
+        }
         let target = SshTarget::from_host(&host, Some(password));
         self.connect(host.name.clone(), target, Some(key), window, cx);
     }
@@ -757,20 +908,52 @@ impl RuLinkApp {
             return div().into_any_element();
         };
         let host = pending.host.addr();
+        let hint = if self.vault.is_some() {
+            format!("连接 {host} 需要密码")
+        } else {
+            format!("连接 {host} 需要密码（加密库不可用，仅本次使用，不保存）")
+        };
+        let save_row = if self.vault.is_some() && pending.host.id != 0 {
+            let checked = pending.save_password;
+            Some(
+                h_flex()
+                    .id("save-password")
+                    .gap_2()
+                    .items_center()
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(pending) = this.pending.as_mut() {
+                            pending.save_password = !pending.save_password;
+                            cx.notify();
+                        }
+                    }))
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(if checked { pal.text } else { pal.muted })
+                            .child(if checked { "☑" } else { "☐" }),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(pal.muted)
+                            .child("保存密码（加密存入本地凭据库）"),
+                    ),
+            )
+        } else {
+            None
+        };
         v_flex()
             .gap_2()
             .p_3()
             .rounded(px(6.0))
             .bg(pal.card_bg)
-            .child(
-                div()
-                    .text_sm()
-                    .child(format!("连接 {host} 需要密码（仅本次使用，不保存）")),
-            )
+            .child(div().text_sm().child(hint))
             .child(styled_input(
                 Input::new(&pending.password).content_type(InputContentType::Password),
                 &pal,
             ))
+            .children(save_row)
             .child(
                 h_flex()
                     .gap_2()

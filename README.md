@@ -9,7 +9,7 @@ GUI 会话管理器形态：左侧持久化的主机账号列表，点账号即�
 ## 功能现状
 
 - **SSH 会话**：russh 客户端 + 交互式 PTY（`xterm-256color`），网络 IO 全在 tokio 运行时，UI 线程零阻塞。
-- **三种认证**：SSH Agent / 私钥文件（只存路径）/ 密码（连接时临时输入，绝不落盘）。
+- **三种认证**：SSH Agent / 私钥文件（只存路径）/ 密码（弹窗可选"保存密码"，勾选后加密存入本地凭据库，默认仅本次内存持有）。
 - **主机指纹校验**：TOFU known_hosts（`~/.rulink/known_hosts`），指纹不符或写盘失败一律拒绝连接（fail-closed，防中间人）。
 - **多标签会话**：打开、切换、关闭；远端 `exit`、认证失败、断线都会自动移除标签。
 - **主机管理**：新建/删除表单、搜索框实时过滤（按展示名或 `user@host:port`）、★ 收藏置顶并持久化。
@@ -51,7 +51,8 @@ rulink [user@]host[:port] [-i keyfile]
 
 | 路径 | 内容 |
 |------|------|
-| `~/.rulink/sessions.json` | 主机账号列表（含 `favorite` 标记，**不含任何密码**） |
+| `~/.rulink/vault.db` | **加密凭据库**（turso，AEGIS-256 页级加密）：主机配置 + 可选保存的密码；主密钥只存系统凭据管理器，拷贝此文件无法解密 |
+| `~/.rulink/sessions.json` | 旧版主机构档；首启迁入加密库后自动改名为 `sessions.json.migrated` 保留（加密库不可用时才继续读写原文件） |
 | `~/.rulink/settings.json` | 应用级设置（当前为主题模式 `dark` / `light`） |
 | `~/.rulink/known_hosts` | 主机密钥指纹（TOFU，与系统 OpenSSH 文件隔离） |
 
@@ -67,6 +68,9 @@ Windows 下 `~` 取 `%USERPROFILE%`，其他平台取 `$HOME`。
 | `russh` | 0.64 | SSH 客户端（`flate2` / `ring` / `rsa`，关闭默认特性） |
 | `tokio` | 1 | 运行时与网络（rt-multi-thread、net、io-util、time 等） |
 | `serde` / `serde_json` | 1 | 会话与设置持久化 |
+| `turso` | 0.8.3 | 纯 Rust SQLite（加密凭据库引擎，页级 AEAD；关闭默认特性） |
+| `keyring` | 4.2 | 主密钥存取（Windows Credential Manager / Keychain / Secret Service） |
+| `getrandom` | 0.4 | 主密钥随机生成 |
 | `winresource` | 0.1 | 仅 Windows：构建期嵌入 exe 图标资源 |
 
 rgpui 三个 crate 走 crates.io 正式版本。本地联调 rgpui 时可在 `[patch]` 或临时把依赖指回 `path = "../rgpui/crates/..."`（工作区标签 `v1.6.0` 与发布版本一致）。
@@ -80,7 +84,8 @@ src/
   ssh.rs        # SSH 引擎：russh client::Handler、TOFU 指纹校验、旁路通道过滤
   remote.rs     # 远程主机信息：POSIX 探测脚本 + key=value 解析/状态栏摘要（含单测）
   config.rs     # 连接目标：命令行解析 + 主机账号 → SshTarget
-  sessions.rs   # 主机账号与设置的 JSON 持久化（SessionStore）
+  sessions.rs   # 主机账号与设置的 JSON 持久化（SessionStore，降级路径 + vault 目录/迁移标记）
+  vault.rs      # 加密凭据库：keyring 主密钥 + turso AEGIS-256 库 + JSON 一次性迁移 + 主机/密码 CRUD
 ```
 
 数据流：下行 `SshTerminalHandler::data` → `FeedHandle::feed` 灌入终端；
@@ -97,7 +102,7 @@ src/
   Linux/macOS 探测 `$SHELL`。基座已具备（`rgpui-term` 的本地 PTY 后端 `TerminalBuilder::new`，可指定 shell / 工作目录 / 环境变量），
   分三期落地：跑通默认 shell 单标签 → profile 自动发现 + 侧边栏"本地终端"入口 → profile 持久化与默认 shell 设置。
   同时抽出 `SessionBackend` 抽象（`External` / `LocalPty`），UI 层不再假设"一定有 host"。
-- **凭据与安全存储**：主机配置迁入 SQLite，敏感字段对接操作系统凭据库（Windows Credential Manager / Keychain / Secret Service）；密码绝不以明文入库、入日志。
+- ~~**凭据与安全存储**~~：已完成 —— 主机配置与可选密码存入 turso 加密库（AEGIS-256），主密钥由操作系统凭据管理器保管；密码默认仅本次内存持有，勾选"保存密码"才入库。余量：分组 / 备注、导入导出、备份恢复。
 - **自定义标题栏 + 分屏**：`TitleBar` 品牌化顶栏（标签并入标题栏）、`SplitPane` / `DockArea` 多会话分屏。
 - **i18n**：接入 rgpui `I18nManager`，首批中文 / English。
 - **SFTP / 端口转发 / 跳板机**：第二阶段能力。
