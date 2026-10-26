@@ -195,15 +195,22 @@ pub fn derive_key(salt: &[u8; 16], password: &str) -> Result<String> {
     Ok(derived.iter().map(|b| format!("{b:02x}")).collect())
 }
 
-/// 更换主密码时强制生成新盐并写盘（旧盐不得复用，保证新密钥随新口令变化）。
-pub fn rotate_salt(path: &Path) -> Result<[u8; 16]> {
+/// 生成新的派生盐（只生成，不落盘）。
+///
+/// 换主密码时必须等新库就位后才写盘：先覆盖盐的话，一旦搬迁失败，
+/// 旧口令就再也派生不出旧密钥了。
+pub fn generate_salt() -> Result<[u8; 16]> {
     let mut salt = [0u8; 16];
     getrandom::fill(&mut salt).context("生成派生盐失败")?;
+    Ok(salt)
+}
+
+/// 写入派生盐（公开参数，明文存放）。
+pub fn write_salt(path: &Path, salt: &[u8; 16]) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).ok();
     }
-    std::fs::write(path, salt).with_context(|| format!("写入 {}", path.display()))?;
-    Ok(salt)
+    std::fs::write(path, salt).with_context(|| format!("写入 {} 失败", path.display()))
 }
 
 /// 读取数据目录中的解锁后端标记；文件缺失按 keyring 档处理。
@@ -827,7 +834,8 @@ pub(crate) async fn rename_db_bundle(
     target: PathBuf,
     attempts: u32,
 ) -> Result<(), String> {
-    rename_with_retry(rt, base.clone(), target.clone(), attempts).await?;
+    // 先搬边文件再搬主文件：只要 WAL 还留在原处，新库就位后就会把旧库的 WAL
+    // 当成自己的挂上去（页号对不上直接毁数据），所以边文件搬不动就整体作罢。
     let sides = ["-wal", "-shm"]
         .iter()
         .filter_map(|suffix| {
@@ -843,10 +851,32 @@ pub(crate) async fn rename_db_bundle(
         })
         .collect::<Vec<(PathBuf, PathBuf)>>();
     for (side, side_target) in sides {
-        // 边文件一时改不动不影响一致性（旧库已让位，新库自带干净 WAL）。
-        let _ = rename_with_retry(rt, side, side_target, 20).await;
+        rename_with_retry(rt, side, side_target, attempts)
+            .await
+            .map_err(|error| format!("{error}（边文件未让位，主文件保持不动）"))?;
     }
-    Ok(())
+    rename_with_retry(rt, base, target, attempts).await
+}
+
+/// 删除整套库文件（主文件 + WAL/SHM 边文件）。
+///
+/// 只用于已确认无用的残留：暂存库的上一轮草稿，或换密钥成功后的旧库备份。
+pub(crate) fn remove_db_bundle(base: &Path) {
+    let Some(name) = base.file_name().and_then(|n| n.to_str()) else {
+        return;
+    };
+    for suffix in ["", "-wal", "-shm"] {
+        let path = if suffix.is_empty() {
+            base.to_path_buf()
+        } else {
+            base.with_file_name(format!("{name}{suffix}"))
+        };
+        if path.exists()
+            && let Err(error) = std::fs::remove_file(&path)
+        {
+            log::warn!("删除 {} 失败: {error}", path.display());
+        }
+    }
 }
 
 /// 改名保留（同步版：用于从未被打开过的普通文本/JSON 文件）。
@@ -871,6 +901,19 @@ fn rename_preserving(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 每次调用得到唯一临时目录名（测试结束自行删除）。
+    fn temp_dir(prefix: &str) -> PathBuf {
+        let mut suffix = [0u8; 8];
+        getrandom::fill(&mut suffix).unwrap();
+        std::env::temp_dir().join(format!(
+            "{prefix}-{}",
+            suffix
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        ))
+    }
 
     #[test]
     fn hex_key_validation() {
@@ -964,6 +1007,85 @@ mod tests {
             reopened.setting("theme").await.unwrap().as_deref(),
             Some("light")
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 换主密钥的文件搬迁全流程（新建暂存库 → 全量导入 → 旧库让位 → 新库就位）：
+    /// 主机、已存密码、设置与 known_hosts 必须一项不少——曾出现"设置主密码后主机消失"。
+    #[tokio::test]
+    async fn rekey_file_swap_preserves_everything() {
+        let dir = temp_dir("rulink-rekey-test");
+        let mode = StorageMode::Global(dir.clone());
+        let rt = tokio::runtime::Handle::current();
+        let vault = Vault::open(&mode, "0a".repeat(32), rt.clone())
+            .await
+            .expect("打开旧密钥库失败");
+        let host = HostConfig {
+            id: 7,
+            name: "搬迁机".into(),
+            host: "10.0.0.7".into(),
+            port: 22,
+            user: "ops".into(),
+            auth: AuthMethod::Password,
+            key_path: String::new(),
+            favorite: false,
+        };
+        vault.upsert(&host).await.unwrap();
+        vault.set_password(7, Some("pw-7")).await.unwrap();
+        vault.set_setting("theme", "dark").await.unwrap();
+        assert_eq!(
+            vault
+                .check_or_record_known_host("10.0.0.7:22", "fp-7", "ssh-ed25519")
+                .await
+                .unwrap(),
+            Trust::New
+        );
+
+        let dump = vault.export_all().await.unwrap();
+        let db_path = mode.db_path();
+        let staging = db_path.with_file_name("rulink.db.new");
+        remove_db_bundle(&staging);
+        let fresh = Vault::open_at(&staging.to_string_lossy(), "7d".repeat(32), rt.clone())
+            .await
+            .expect("建暂存库失败");
+        fresh.import_dump(&dump).await.unwrap();
+        drop(fresh);
+        drop(vault);
+
+        let backup = db_path.with_file_name("rulink.db.keyring-bak");
+        rename_db_bundle(&rt, db_path.clone(), backup.clone(), 100)
+            .await
+            .expect("旧库让位失败");
+        rename_db_bundle(&rt, staging.clone(), db_path.clone(), 100)
+            .await
+            .expect("新库就位失败");
+
+        let reopened = Vault::open(&mode, "7d".repeat(32), rt.clone())
+            .await
+            .expect("用新密钥重开失败");
+        let hosts = reopened.load_hosts().await.unwrap();
+        assert_eq!(hosts.len(), 1, "搬迁后主机数量不符");
+        assert_eq!(hosts[0].id, 7);
+        assert_eq!(hosts[0].name, "搬迁机");
+        assert_eq!(
+            reopened.password_of(7).await.unwrap().as_deref(),
+            Some("pw-7"),
+            "搬迁后密码丢失"
+        );
+        assert_eq!(
+            reopened.setting("theme").await.unwrap().as_deref(),
+            Some("dark")
+        );
+        assert_eq!(
+            reopened
+                .check_or_record_known_host("10.0.0.7:22", "fp-7", "ssh-ed25519")
+                .await
+                .unwrap(),
+            Trust::Matched
+        );
+        // 新库确认无误后才清理备份与暂存残留。
+        assert!(!staging.exists());
+        remove_db_bundle(&backup);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
