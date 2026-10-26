@@ -1316,6 +1316,7 @@ impl RuLinkApp {
             AuthMethod::Password,
         ];
         let selected = form.auth;
+        let save_checked = form.save_secret;
         let editing = form.editing.is_some();
         v_flex()
             .id("form-backdrop")
@@ -1420,50 +1421,58 @@ impl RuLinkApp {
                                     }))
                             }))),
                     )
-                    .when(selected == AuthMethod::IdentityFile, |this| {
-                        let save_checked = form.save_secret;
-                        this.child(
-                            h_flex()
-                                .gap_2()
-                                .items_end()
-                                .child(div().flex_1().child(labeled_field(
-                                    "私钥路径",
-                                    &form.key_path,
-                                    &pal,
-                                )))
-                                .child(
-                                    Button::new("browse-key")
-                                        .label("浏览…")
-                                        .ghost()
-                                        .flex_shrink_0()
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.browse_key_path(cx);
-                                        })),
-                                ),
-                        )
-                        .child(
-                            v_flex()
-                                .gap_1()
-                                .child(div().text_sm().child("私钥口令"))
-                                .child(styled_input(
-                                    Input::new(&form.passphrase)
-                                        .content_type(InputContentType::Password),
-                                    &pal,
-                                )),
-                        )
-                        .when(self.vault.is_some(), |this| {
-                            this.child(
+                    // 私钥区块常驻布局：非私钥时用 invisible 保留占位（隐藏绘制与事件），
+                    // 切换认证方式弹窗高度不跳变。
+                    .child(
+                        v_flex()
+                            .gap_3()
+                            .when(selected != AuthMethod::IdentityFile, |this| {
+                                this.invisible()
+                            })
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .items_end()
+                                    .child(div().flex_1().child(labeled_field(
+                                        "私钥路径",
+                                        &form.key_path,
+                                        &pal,
+                                    )))
+                                    .child(
+                                        Button::new("browse-key")
+                                            .label("浏览…")
+                                            .ghost()
+                                            .flex_shrink_0()
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.browse_key_path(cx);
+                                            })),
+                                    ),
+                            )
+                            .child(
+                                v_flex()
+                                    .gap_1()
+                                    .child(div().text_sm().child("私钥口令"))
+                                    .child(styled_input(
+                                        Input::new(&form.passphrase)
+                                            .content_type(InputContentType::Password),
+                                        &pal,
+                                    )),
+                            )
+                            .child(
                                 h_flex()
                                     .id("save-passphrase")
                                     .gap_2()
                                     .items_center()
-                                    .cursor_pointer()
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        if let Some(form) = this.new_host.as_mut() {
-                                            form.save_secret = !form.save_secret;
-                                            cx.notify();
-                                        }
-                                    }))
+                                    .when(self.vault.is_some(), |this| {
+                                        this.cursor_pointer().on_click(cx.listener(
+                                            |this, _, _, cx| {
+                                                if let Some(form) = this.new_host.as_mut() {
+                                                    form.save_secret = !form.save_secret;
+                                                    cx.notify();
+                                                }
+                                            },
+                                        ))
+                                    })
                                     .child(
                                         div()
                                             .text_sm()
@@ -1475,11 +1484,14 @@ impl RuLinkApp {
                                             .child(if save_checked { "☑" } else { "☐" }),
                                     )
                                     .child(div().text_sm().text_color(pal.muted).child(
-                                        "保存口令（加密存入本地凭据库，默认仅本次内存持有）",
+                                        if self.vault.is_some() {
+                                            "保存口令（加密存入本地凭据库，默认仅本次内存持有）"
+                                        } else {
+                                            "加密库不可用，口令仅本次内存持有"
+                                        },
                                     )),
-                            )
-                        })
-                    })
+                            ),
+                    )
                     .child(
                         h_flex()
                             .gap_2()
