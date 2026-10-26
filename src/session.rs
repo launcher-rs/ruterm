@@ -7,6 +7,7 @@
 //! 网络 IO 全部在 rgpui 的 tokio 运行时上异步进行，UI 线程零阻塞。
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use bytes::Bytes;
@@ -14,31 +15,42 @@ use rgpui::AppContext;
 use rgpui::Task;
 use rgpui_term::{ExternalHandles, FeedHandle, PtyBoundMessage};
 use russh::Channel;
+use russh::ChannelMsg;
 use russh::client::{Config as SshConfig, Handle, Msg};
 use russh::keys::PrivateKeyWithHashAlg;
 use russh::keys::agent::client::AgentClient;
 use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 
 use crate::config::SshTarget;
-use crate::ssh::SshTerminalHandler;
+use crate::remote::{PROBE_CMD, RemoteInfo};
+use crate::ssh::{SideChannels, SshTerminalHandler};
 
 /// 远端 PTY 的初始尺寸（终端首个 Resize 到达前生效）。
 const INIT_COLS: u16 = 80;
 const INIT_ROWS: u16 = 24;
 
+/// 远程信息探测的整体超时：远端禁用 exec 或命令挂死时放弃，状态栏不显示该项。
+const PROBE_TIMEOUT: Duration = Duration::from_secs(8);
+
 /// 客户端会话通道别名。
 type SessionChannel = Channel<Msg>;
+
+/// 一次 SSH 会话：连接主体 + 远程基本信息回传。
+pub struct SshSession {
+    /// 会话任务，必须被持有（提前 drop 会取消 SSH）。
+    pub join: Task<Result<()>>,
+    /// 远程主机基本信息摘要（探测失败/无信息时发送端被丢弃，收到 `Err`）。
+    pub remote_info: oneshot::Receiver<String>,
+}
 
 /// 在 rgpui 的 tokio 运行时上启动 SSH 会话。
 ///
 /// 返回的任务必须被持有（提前 drop 会取消 SSH）。
-pub fn start<C: AppContext>(
-    target: SshTarget,
-    handles: ExternalHandles,
-    cx: &C,
-) -> Task<Result<()>> {
+pub fn start<C: AppContext>(target: SshTarget, handles: ExternalHandles, cx: &C) -> SshSession {
     let ExternalHandles { feed, rx } = handles;
     let (ui_tx, ui_rx) = mpsc::unbounded_channel::<PtyBoundMessage>();
+    let (info_tx, info_rx) = oneshot::channel::<String>();
 
     // 上行泵：把终端的阻塞通道接到 tokio 通道；send 是非阻塞的，
     // 泵线程只在 recv 上休眠，不碰 UI 也不占运行时。
@@ -56,25 +68,32 @@ pub fn start<C: AppContext>(
     feed.feed(format!("\r\n[rulink] 正在连接 {}…\r\n", target.addr()).into_bytes());
 
     let closing_feed = feed.clone();
-    rgpui::tokio::Tokio::spawn_result(cx, async move {
-        let result = run(target, feed, ui_rx).await;
+    let join = rgpui::tokio::Tokio::spawn_result(cx, async move {
+        let result = run(target, feed, ui_rx, info_tx).await;
         if let Err(error) = &result {
             closing_feed.feed(format!("\r\n[rulink] 会话结束: {error}\r\n").into_bytes());
         }
         // 无论成功失败都以"远端退出"收场，UI 表现与本地 shell 退出一致。
         closing_feed.end_session();
         result
-    })
+    });
+    SshSession {
+        join,
+        remote_info: info_rx,
+    }
 }
 
-/// 建连 → 认证 → 开 PTY/shell → 驱动会话直至断线。
+/// 建连 → 认证 → 开 PTY/shell → 探测远程信息 → 驱动会话直至断线。
 async fn run(
     target: SshTarget,
     feed: FeedHandle,
     ui_rx: mpsc::UnboundedReceiver<PtyBoundMessage>,
+    info_tx: oneshot::Sender<String>,
 ) -> Result<()> {
     let config = Arc::new(SshConfig::default());
-    let handler = SshTerminalHandler::new(feed.clone(), target.host.clone(), target.port);
+    let side = SideChannels::default();
+    let handler =
+        SshTerminalHandler::new(feed.clone(), target.host.clone(), target.port, side.clone());
     let mut handle = russh::client::connect(config, (target.host.as_str(), target.port), handler)
         .await
         .with_context(|| format!("无法连接 {}", target.addr()))?;
@@ -95,13 +114,66 @@ async fn run(
         .await?;
     channel.request_shell(true).await?;
 
-    // 上行转发：独立任务持有通道与终端消息流；会话断线后
-    // data_bytes 会因通道失效而报错，任务自行退出。
+    // 上行转发先落地：探测通道握手即使被慢服务器拖住，也不能延迟按键转发。
     tokio::spawn(forward_uplink(channel, ui_rx));
+
+    probe_remote_info(&handle, side, info_tx).await;
 
     // 驱动会话事件循环（Handler 回调在此期间持续收到下行数据）。
     handle.await.context("SSH 会话异常终止")?;
     Ok(())
+}
+
+/// 另开一条 exec 通道采集远程主机基本信息，结果异步回传状态栏。
+///
+/// 探测失败（远端禁用 exec、通道打不开、命令超时无输出）只记日志，
+/// 不影响已建立的交互会话。
+async fn probe_remote_info(
+    handle: &Handle<SshTerminalHandler>,
+    side: SideChannels,
+    info_tx: oneshot::Sender<String>,
+) {
+    let Ok(probe) = handle.channel_open_session().await else {
+        log::debug!("无法开启远程信息探测通道");
+        return;
+    };
+    side.add(probe.id());
+    let (mut read, write) = probe.split();
+    if write
+        .exec(false, PROBE_CMD.as_bytes().to_vec())
+        .await
+        .is_err()
+    {
+        log::debug!("远程信息探测命令下发失败");
+        return;
+    }
+
+    tokio::spawn(async move {
+        let collected = tokio::time::timeout(PROBE_TIMEOUT, async {
+            let mut buf = Vec::new();
+            while let Some(msg) = read.wait().await {
+                match msg {
+                    ChannelMsg::Data { data } | ChannelMsg::ExtendedData { data, .. } => {
+                        buf.extend_from_slice(&data);
+                    }
+                    ChannelMsg::Eof | ChannelMsg::Close => break,
+                    _ => {}
+                }
+            }
+            String::from_utf8_lossy(&buf).into_owned()
+        })
+        .await;
+        let _ = write.close().await;
+
+        match collected {
+            Ok(raw) => {
+                if let Some(summary) = RemoteInfo::parse(&raw).summary() {
+                    let _ = info_tx.send(summary);
+                }
+            }
+            Err(_) => log::debug!("远程信息探测超时，跳过状态栏展示"),
+        }
+    });
 }
 
 /// 终端 → 远端：按键字节写通道，尺寸变化发 window_change。

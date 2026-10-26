@@ -15,7 +15,7 @@
 | 会话标签页 | `[x]` | 多标签、关闭、激活切换 |
 | CLI 快速连接 | `[x]` | 带参数一次性连接；密码仅走环境变量 / GUI 临时输入 |
 | 主题 | `[x]` | 明 / 暗切换（配色走 `cx.theme()` 语义色，与按钮/状态栏统一），☀/☾ 按钮 + `Ctrl+T`，选择持久化到 `settings.json` |
-| 底部状态栏 | `[x]` | 已实现并验证渲染（左"就绪"/地址/认证，右"会话 N"）；远程信息条目为占位扩展位 |
+| 底部状态栏 | `[x]` | 已实现并验证渲染（左"就绪"/地址/认证/远程信息，右"会话 N"）；远程基本信息经 exec 探测通道填充 |
 | 凭据持久化 | `[ ]` | 密码从不落盘；主机配置存 JSON（`~/.rulink/sessions.json`），见 §四 |
 | 品牌图标 | `[x]` | 从展示板切分 6 图标变体 + logo + 多尺寸 `.ico`；`build.rs`+winresource 嵌入 exe（任务栏/标题栏） |
 | 系统托盘 | `[x]` | 品牌托盘图标 + 悬停提示 + 右键菜单（显示主界面 / 退出），`App::set_tray_*` + `on_tray_menu_action` |
@@ -26,11 +26,16 @@
 
 ### 1. 状态栏增强
 - `[x]` 底部常驻状态栏：整体状态 + 活动会话地址 / 认证方式 + 会话计数。
-- `[ ]` 连接后展示**远程服务器基本信息**：主机名、操作系统及版本、内存使用、磁盘空间、uptime。
-  - 实现路径：SSH 建立后开一条 **exec 通道**（非交互 PTY）执行探测命令
-    （`uname -a` / `cat /etc/os-release` / `free -m` / `df -h /` / `uptime`），
-    解析后写入 `SessionTab.remote_info`（现为 `Option<SharedString>` 占位）。
-  - 需扩展 `ssh.rs` / 会话层，新增只读命令执行能力。
+- `[x]` 连接后展示**远程服务器基本信息**：主机名、操作系统及版本、内存使用、磁盘空间、uptime。
+  - 实现：`src/remote.rs`（探测脚本 + `RemoteInfo` 解析/摘要，含单测）、`src/session.rs`
+    （shell 启动后另开一条 **exec 通道**一次性跑探测脚本，8s 超时，摘要经 `oneshot` 回传写入
+    `SessionTab.remote_info`）、`src/ssh.rs`（`SideChannels` 旁路通道集合）。
+  - 关键坑：russh 会把客户端自开通道（exec）的字节**同时**投递给 `Channel` 接收端与
+    `Handler::data/extended_data/channel_close/exit_status`，不过滤就会把探测输出灌进终端、
+    并在探测通道关闭时误判"远端退出"结束整个会话；故非 PTY 通道一律登记进 `SideChannels` 跳过。
+  - 探测脚本按 POSIX sh 编写（`uname` / `/etc/os-release` / `/proc/meminfo` / `df -hP /` /
+    `/proc/loadavg` / `/proc/uptime`，非 Linux 回退 `uptime -p`），缺项静默跳过，
+    远端禁用 exec 时状态栏该条目直接不显示。
 - `[ ]` **可配置显示项**：设置面板勾选状态栏要显示哪些条目（主机名/OS/内存/磁盘/uptime…）。
 
 ### 2. 侧边栏
@@ -164,7 +169,7 @@ RuLink 不自造 UI 轮子，优先复用 rgpui 现成子系统：
 
 ## 六、实施优先级建议
 
-1. **先收尾状态栏**（验证渲染 + 接入远程信息 exec 通道）——当前正在做。
+1. ~~收尾状态栏（远程信息 exec 通道）~~（已完成：连接后经 exec 探测写入 `remote_info`，见 §二.1）。
 2. ~~侧边栏折叠 + 主题切换~~（已完成：`Ctrl+B` 折叠、`Ctrl+T` / ☀☾ 明暗切换）。
 3. 凭据 SQLite + keyring（安全核心，尽早定型，越晚迁移成本越高）。
 4. 自定义标题栏 + 分屏（结构性改动，成批做）。

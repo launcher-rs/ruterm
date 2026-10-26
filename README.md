@@ -15,7 +15,8 @@ GUI 会话管理器形态：左侧持久化的主机账号列表，点账号即�
 - **主机管理**：新建/删除表单、搜索框实时过滤（按展示名或 `user@host:port`）、★ 收藏置顶并持久化。
 - **布局**：侧边栏可拖拽宽度（WindTerm 式，拖到最小宽度停住）、`«` / `»` 折叠栏。
 - **主题**：明 / 暗切换，配色全部取 rgpui 全局 `Theme` 语义色，选择持久化。
-- **状态栏**：底部常驻，左侧整体状态 + 活动会话地址/认证方式，右侧会话计数。
+- **状态栏**：底部常驻，左侧整体状态 + 活动会话地址/认证方式 + 远程主机信息，右侧会话计数。
+  连接后经 exec 通道一次性探测远端 OS / 内存 / 磁盘 / 负载 / uptime（探测失败则该条目不显示）。
 - **系统托盘**：品牌图标 + 悬停提示 + 右键菜单（显示主界面 / 退出）；点窗口关闭按钮隐藏到托盘，会话后台保活。
 - **品牌图标**：多尺寸 `.ico` 经 `build.rs` + winresource 嵌入 exe（文件 / 任务栏 / 标题栏）。
 
@@ -75,8 +76,9 @@ rgpui 三个 crate 走 crates.io 正式版本。本地联调 rgpui 时可在 `[p
 ```
 src/
   main.rs       # UI：RuLinkApp（侧边栏、标签栏、终端、状态栏、托盘）+ 应用入口
-  session.rs    # 会话桥接：rgpui-term 外接 IO ⇄ russh 双向字节流（上行泵线程 + 转发任务）
-  ssh.rs        # SSH 引擎：russh client::Handler、TOFU 指纹校验
+  session.rs    # 会话桥接：rgpui-term 外接 IO ⇄ russh 双向字节流（上行泵线程 + 转发任务）+ exec 远程信息探测
+  ssh.rs        # SSH 引擎：russh client::Handler、TOFU 指纹校验、旁路通道过滤
+  remote.rs     # 远程主机信息：POSIX 探测脚本 + key=value 解析/状态栏摘要（含单测）
   config.rs     # 连接目标：命令行解析 + 主机账号 → SshTarget
   sessions.rs   # 主机账号与设置的 JSON 持久化（SessionStore）
 ```
@@ -97,7 +99,6 @@ src/
   同时抽出 `SessionBackend` 抽象（`External` / `LocalPty`），UI 层不再假设"一定有 host"。
 - **凭据与安全存储**：主机配置迁入 SQLite，敏感字段对接操作系统凭据库（Windows Credential Manager / Keychain / Secret Service）；密码绝不以明文入库、入日志。
 - **自定义标题栏 + 分屏**：`TitleBar` 品牌化顶栏（标签并入标题栏）、`SplitPane` / `DockArea` 多会话分屏。
-- **状态栏远程信息**：SSH exec 通道探测远端 OS / 内存 / 磁盘 / uptime，填入现有 `remote_info` 占位。
 - **i18n**：接入 rgpui `I18nManager`，首批中文 / English。
 - **SFTP / 端口转发 / 跳板机**：第二阶段能力。
 

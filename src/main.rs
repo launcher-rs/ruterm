@@ -5,6 +5,7 @@
 //! 认证直接连接。仍兼容一次性命令行快速连接（带目标参数时首启动即连上该主机）。
 
 mod config;
+mod remote;
 mod session;
 mod sessions;
 mod ssh;
@@ -45,7 +46,7 @@ struct SessionTab {
     addr: SharedString,
     /// 认证方式，状态栏展示。
     auth: AuthMethod,
-    /// 远程服务器信息（预留扩展位，本次恒为 None；将来由 SSH 查询任务填充后在状态栏展示）。
+    /// 远程服务器基本信息摘要（连接后经 exec 探测异步填充，探测失败保持 None）。
     remote_info: Option<SharedString>,
     /// 渲染用终端视图。
     terminal_view: Entity<TerminalView>,
@@ -353,7 +354,7 @@ impl RuLinkApp {
         };
         let id = self.next_id;
         self.next_id += 1;
-        let session = session::start(target, handles, cx);
+        let session::SshSession { join, remote_info } = session::start(target, handles, cx);
         self.status = SharedString::from(format!("正在连接 {addr}…"));
         self.tabs.push(SessionTab {
             id,
@@ -365,7 +366,7 @@ impl RuLinkApp {
         });
         self.active_tab = Some(id);
         cx.spawn(async move |this, cx| {
-            let result = session.await;
+            let result = join.await;
             let _ = this.update(cx, |this, cx| {
                 if result.is_err()
                     && let Some(key) = &cache_key
@@ -378,6 +379,18 @@ impl RuLinkApp {
                     cx.notify();
                 }
             });
+        })
+        .detach();
+        // 远程基本信息比会话短得多：探测回来时标签可能已关闭，据此判断后再写入。
+        cx.spawn(async move |this, cx| {
+            if let Ok(info) = remote_info.await {
+                let _ = this.update(cx, |this, cx| {
+                    if let Some(tab) = this.tabs.iter_mut().find(|tab| tab.id == id) {
+                        tab.remote_info = Some(SharedString::from(info));
+                        cx.notify();
+                    }
+                });
+            }
         })
         .detach();
         cx.notify();
@@ -899,7 +912,7 @@ impl RuLinkApp {
                     .id("auth")
                     .muted(true),
             );
-            // 远程服务器信息扩展位：将来由 SSH 查询任务写入 tab.remote_info 后自动出现。
+            // 远程基本信息由 SSH 建立后的 exec 探测任务异步写入 tab.remote_info。
             if let Some(info) = tab.remote_info.clone() {
                 left.push(StatusBarItem::new(info).id("remote").muted(true));
             }
