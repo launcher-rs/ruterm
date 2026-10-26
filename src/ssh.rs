@@ -1,4 +1,5 @@
-//! SSH 引擎：russh 客户端事件处理与主机指纹校验（TOFU，记录存于 ~/.rulink）。
+//! SSH 引擎：russh 客户端事件处理与主机指纹校验（TOFU，正常记录存加密库
+//! known_hosts 表；降级模式回退 `~/.rulink/known_hosts` 文件）。
 //!
 //! 本模块只认识"字节"，不认识终端 UI：下行字节全部灌入
 //! [`rgpui_term::FeedHandle`]，会话终止信号（EOF/关闭/退出码）折算成
@@ -14,6 +15,9 @@ use rgpui_term::FeedHandle;
 use russh::ChannelId;
 use russh::client::{self, Session};
 use russh::keys::{HashAlg, PublicKey, PublicKeyOrCertificate};
+
+use crate::paths::StorageMode;
+use crate::vault::{Trust, Vault};
 
 /// 终端侧应当忽略的下行通道集合。
 ///
@@ -44,13 +48,9 @@ impl SideChannels {
     }
 }
 
-/// RuLink 专用 known_hosts 路径（与 OpenSSH 分开，不污染系统文件）。
-pub fn known_hosts_path() -> PathBuf {
-    let home = std::env::var_os("USERPROFILE")
-        .or_else(|| std::env::var_os("HOME"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    home.join(".rulink").join("known_hosts")
+/// 降级模式（无加密库）使用的旧 known_hosts 文件路径。
+pub fn legacy_known_hosts_path() -> PathBuf {
+    StorageMode::detect().legacy_path(crate::paths::LEGACY_KNOWN_HOSTS_FILE)
 }
 
 /// 主机密钥的 SHA-256 指纹（hex 形式，避免依赖 base64 feature）。
@@ -69,16 +69,25 @@ pub struct SshTerminalHandler {
     port: u16,
     /// 非终端通道（exec 探测等），其字节与控制消息都不进终端。
     side: SideChannels,
+    /// 加密凭据库；None 表示降级模式，known_hosts 回退旧文件。
+    vault: Option<Arc<Vault>>,
 }
 
 impl SshTerminalHandler {
-    /// 以下行注入句柄、主机信息与旁路通道集合构造处理器。
-    pub fn new(feed: FeedHandle, host: String, port: u16, side: SideChannels) -> Self {
+    /// 以下行注入句柄、主机信息、旁路通道集合与可选凭据库构造处理器。
+    pub fn new(
+        feed: FeedHandle,
+        host: String,
+        port: u16,
+        side: SideChannels,
+        vault: Option<Arc<Vault>>,
+    ) -> Self {
         Self {
             feed,
             host,
             port,
             side,
+            vault,
         }
     }
 
@@ -87,7 +96,7 @@ impl SshTerminalHandler {
     fn trust_key(&mut self, key: &PublicKey) -> bool {
         let entry_host = format!("[{}]:{}", self.host, self.port);
         let fp = fingerprint_hex(key);
-        let path = known_hosts_path();
+        let path = legacy_known_hosts_path();
 
         let existing = std::fs::read_to_string(&path).unwrap_or_default();
         let mut has_entry_for_host = false;
@@ -156,7 +165,46 @@ impl client::Handler for SshTerminalHandler {
         server_key: &PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
         match server_key {
-            PublicKeyOrCertificate::PublicKey { key, .. } => Ok(self.trust_key(key)),
+            PublicKeyOrCertificate::PublicKey { key, .. } => {
+                let Some(vault) = self.vault.clone() else {
+                    // 降级模式（无加密库）：回退旧 known_hosts 文件逻辑。
+                    return Ok(self.trust_key(key));
+                };
+                let entry_host = format!("[{}]:{}", self.host, self.port);
+                let fp = fingerprint_hex(key);
+                // fail-closed：库查询/写入任何失败都拒绝连接，绝不降级放行。
+                match vault
+                    .check_or_record_known_host(&entry_host, &fp, &key.algorithm().to_string())
+                    .await
+                {
+                    Ok(Trust::Matched) => Ok(true),
+                    Ok(Trust::New) => {
+                        self.feed.feed(
+                            format!("\r\n[rulink] 首次连接 {entry_host}，主机指纹已记入加密库\r\n")
+                                .into_bytes(),
+                        );
+                        Ok(true)
+                    }
+                    Ok(Trust::Mismatch) => {
+                        self.feed.feed(
+                            format!(
+                                "\r\n[rulink] 警告: {entry_host} 的主机密钥指纹与加密库记录不符，拒绝连接（可能是中间人攻击）\r\n"
+                            )
+                            .into_bytes(),
+                        );
+                        Ok(false)
+                    }
+                    Err(error) => {
+                        self.feed.feed(
+                            format!(
+                                "\r\n[rulink] 加密库 known_hosts 不可用（{error}），拒绝连接\r\n"
+                            )
+                            .into_bytes(),
+                        );
+                        Ok(false)
+                    }
+                }
+            }
             PublicKeyOrCertificate::Certificate(_) => {
                 // 证书认证属于后续能力（见首发清单"安全与密钥"），首版一律拒绝。
                 eprintln!("[rulink] 暂不支持 SSH 证书主机认证，拒绝连接");

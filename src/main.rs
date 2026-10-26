@@ -5,6 +5,7 @@
 //! 认证直接连接。仍兼容一次性命令行快速连接（带目标参数时首启动即连上该主机）。
 
 mod config;
+mod paths;
 mod remote;
 mod session;
 mod sessions;
@@ -27,6 +28,7 @@ use rgpui::{
 use rgpui_term::{TerminalBuilder, TerminalView};
 
 use crate::config::SshTarget;
+use crate::paths::StorageMode;
 use crate::sessions::{AuthMethod, HostConfig, SessionStore};
 use crate::vault::Vault;
 
@@ -95,10 +97,28 @@ struct PendingConnect {
     kind: PromptKind,
 }
 
+/// 便携/主密码库的解锁弹窗状态（主密码派生密钥，库文件可带往他机）。
+struct UnlockState {
+    passphrase: Entity<InputState>,
+    /// 首次建库：需要二次输入确认主密码（口令错误将无法重建库）。
+    confirm: Entity<InputState>,
+    is_new: bool,
+    error: Option<SharedString>,
+}
+
+/// "设置 / 更换主密码"弹窗状态（keyring 档迁移为口令档，或轮换口令）。
+struct RekeyState {
+    password: Entity<InputState>,
+    confirm: Entity<InputState>,
+    error: Option<SharedString>,
+}
+
 /// RuLink 主视图：左侧主机账号管理，右侧会话标签终端。
 struct RuLinkApp {
     /// 会话仓库（负责持久化）。
     store: SessionStore,
+    /// 存储模式（便携 / 全局），启动时探测一次。
+    mode: StorageMode,
     /// 加密凭据库；None 表示启动引导中或已降级为旧 JSON 存储（降级时不保存密码）。
     vault: Option<Arc<Vault>>,
     /// 已保存的主机账号列表。
@@ -117,6 +137,10 @@ struct RuLinkApp {
     context_menu: Option<HostContextMenu>,
     /// 删除二次确认（真实下标；浮层遮挡期间列表不会变）。
     confirm_delete: Option<usize>,
+    /// 主密码解锁弹窗（便携模式 / 已设置主密码时启动弹出）。
+    unlock: Option<UnlockState>,
+    /// 设置 / 更换主密码弹窗。
+    rekey: Option<RekeyState>,
     /// 本次运行内缓存的密码（按 user@host:port），避免重复弹窗；绝不落盘。
     password_cache: HashMap<String, String>,
     /// 标签自增 id。
@@ -188,7 +212,8 @@ impl Palette {
 impl RuLinkApp {
     /// 载入已保存主机，可选执行命令行快速连接。
     fn new(quick: Option<SshTarget>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let store = SessionStore::new();
+        let mode = StorageMode::detect();
+        let store = SessionStore::new(&mode);
         let hosts = store.load();
         // 侧边栏 ↔ 主区 分隔面板：初始侧边栏占比约 0.25。
         let split_state = cx.new(SplitPaneState::new);
@@ -203,6 +228,7 @@ impl RuLinkApp {
             .detach();
         let mut app = Self {
             store,
+            mode,
             vault: None,
             hosts,
             search,
@@ -212,13 +238,15 @@ impl RuLinkApp {
             pending: None,
             context_menu: None,
             confirm_delete: None,
+            unlock: None,
+            rekey: None,
             password_cache: HashMap::new(),
             next_id: 0,
             status: "就绪".into(),
             split_state,
             focus_handle: cx.focus_handle(),
         };
-        app.boot_vault(cx);
+        app.boot_vault(window, cx);
         if let Some(target) = quick {
             let title = target.addr();
             app.connect(title, target, None, None, false, window, cx);
@@ -226,67 +254,328 @@ impl RuLinkApp {
         app
     }
 
-    /// 异步打开加密凭据库：成功则接管主机列表（含一次性迁移旧 JSON 并改名保留），
+    /// 异步打开加密凭据库：成功则接管主机列表（含一次性迁移旧库/JSON 并改名保留），
     /// 失败则降级回旧 JSON 存储并提示（降级模式下密码只留在内存）。
-    fn boot_vault(&mut self, cx: &mut Context<Self>) {
-        let dir = self.store.dir();
+    ///
+    /// 便携模式 / 已设置主密码的库强制走主密码解锁：启动弹出解锁对话框，
+    /// 口令错误可重试；全局 keyring 档保持零输入直连。
+    fn boot_vault(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let mode = self.mode.clone();
         let json_hosts = self.hosts.clone();
+        // 口令档需要解锁弹窗：实体在 UI 线程预建。
+        let passphrase_needed = mode.is_portable()
+            || crate::vault::read_unlock_marker(&mode) == crate::vault::UnlockBackend::Passphrase;
+        if passphrase_needed {
+            self.open_unlock_dialog(window, cx);
+        }
         cx.spawn(async move |this, cx| {
-            let opened = async {
-                let vault = Vault::open(&dir).await?;
-                // 旧 JSON 非空且库还是空的 → 一次性导入（id 顺序分配），验证后才改名。
-                if !json_hosts.is_empty() && vault.count().await? == 0 {
-                    let mut imported = json_hosts.clone();
-                    for (index, host) in imported.iter_mut().enumerate() {
-                        host.id = index as i64 + 1;
-                    }
-                    vault.import_hosts(&imported).await?;
-                    Ok::<_, anyhow::Error>((vault, imported))
-                } else {
-                    let hosts = vault.load_hosts().await?;
-                    Ok((vault, hosts))
+            // 库文件在数据目录还是原样，先探测主密钥是否可得。
+            let keyring_key = match crate::vault::load_or_create_master_key() {
+                Ok(key) => Some(key),
+                Err(error) => {
+                    let _ = this.update(cx, |this, cx| {
+                        log::warn!("系统凭据管理器不可用: {error}");
+                        this.status =
+                            SharedString::from(format!("凭据管理器不可用（{error}），不保存密码"));
+                        cx.notify();
+                    });
+                    return;
                 }
+            };
+            // 口令档：启动只负责弹窗，密钥来自用户输入。
+            let backend = crate::vault::read_unlock_marker(&mode);
+            if backend == crate::vault::UnlockBackend::Passphrase {
+                return;
+            }
+            let opened = async {
+                let vault = Vault::open(&mode, keyring_key.clone().unwrap()).await?;
+                Self::after_vault_open(&vault, &mode, keyring_key.as_deref(), &json_hosts).await?;
+                Ok::<_, anyhow::Error>(vault)
             }
             .await;
-            let _ = this.update(cx, |this, cx| match opened {
-                Ok((vault, mut hosts)) => {
-                    let vault = Arc::new(vault);
-                    // 开库完成前用户新增的主机（id==0）补发 id 并入库，避免丢失。
-                    let mut next = hosts.iter().map(|host| host.id).max().unwrap_or(0) + 1;
-                    let mut late = Vec::new();
-                    for host in &this.hosts {
-                        if host.id == 0 {
-                            let mut host = host.clone();
-                            host.id = next;
-                            next += 1;
-                            late.push(host);
-                        }
-                    }
-                    for host in late {
-                        hosts.push(host.clone());
-                        let vault = vault.clone();
-                        cx.spawn(async move |_, _| {
-                            if let Err(error) = vault.upsert(&host).await {
-                                log::warn!("凭据库写入失败: {error}");
-                            }
-                        })
-                        .detach();
-                    }
-                    this.hosts = hosts;
-                    this.vault = Some(vault);
-                    this.store.mark_migrated();
-                    cx.notify();
+            match opened {
+                Ok(vault) => {
+                    let _ = this.update(cx, |this, cx| {
+                        this.attach_vault(vault, cx);
+                    });
                 }
                 Err(error) => {
                     log::warn!("加密凭据库不可用: {error}");
-                    this.status = SharedString::from(format!(
-                        "加密凭据库不可用（{error}），沿用旧存储且不保存密码"
-                    ));
+                    let _ = this.update(cx, |this, cx| {
+                        if this.mode.is_portable()
+                            || crate::vault::read_unlock_marker(&this.mode)
+                                == crate::vault::UnlockBackend::Passphrase
+                        {
+                            // 口令档打不开：交回解锁弹窗处理，不降级 JSON。
+                            cx.notify();
+                        } else {
+                            this.status = SharedString::from(format!(
+                                "加密凭据库不可用（{error}），沿用旧存储且不保存密码"
+                            ));
+                            cx.notify();
+                        }
+                    });
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// 开库成功后的统一接管：补发启动期间新增主机、标记 JSON 迁移、应用库内主题。
+    fn attach_vault(&mut self, vault: Vault, cx: &mut Context<Self>) {
+        let vault = Arc::new(vault);
+        self.unlock = None;
+        // 开库完成前用户新增的主机（id==0）补发 id 并入库，避免丢失。
+        let mut next = self.hosts.iter().map(|host| host.id).max().unwrap_or(0) + 1;
+        let mut late = Vec::new();
+        for host in &self.hosts {
+            if host.id == 0 {
+                let mut host = host.clone();
+                host.id = next;
+                next += 1;
+                late.push(host);
+            }
+        }
+        for host in late {
+            self.hosts.push(host.clone());
+            let vault = vault.clone();
+            cx.spawn(async move |_, _| {
+                if let Err(error) = vault.upsert(&host).await {
+                    log::warn!("凭据库写入失败: {error}");
+                }
+            })
+            .detach();
+        }
+        self.store.mark_migrated();
+        self.vault = Some(vault.clone());
+        cx.notify();
+        // 库内主题优先于启动时的旧 JSON/默认值。
+        cx.spawn(async move |this, cx| {
+            if let Ok(Some(theme)) = vault.setting("theme").await {
+                let dark = theme != "light";
+                let _ = this.update(cx, |_, cx| {
+                    rgpui::theme::Theme::change(
+                        if dark {
+                            rgpui::theme::ThemeMode::Dark
+                        } else {
+                            rgpui::theme::ThemeMode::Light
+                        },
+                        None,
+                        cx,
+                    );
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// 打开解锁弹窗（启动自动弹出；"退出应用"关闭后可经侧边栏 🔑 重新打开）。
+    fn open_unlock_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.unlock.is_some() {
+            return;
+        }
+        let passphrase = cx.new(|cx| InputState::new(window, cx).placeholder("主密码"));
+        let confirm = cx.new(|cx| InputState::new(window, cx).placeholder("再次输入确认"));
+        self.unlock = Some(UnlockState {
+            passphrase,
+            confirm,
+            is_new: !self.mode.db_path().exists(),
+            error: None,
+        });
+        cx.notify();
+    }
+
+    /// 打开口令档加密库并完成一次性迁移（解锁弹窗确认后调用）。
+    fn unlock_passphrase(&mut self, cx: &mut Context<Self>) {
+        let Some(state) = self.unlock.as_ref() else {
+            return;
+        };
+        let mut ctx = &mut *cx;
+        let password = state.passphrase.read(&mut ctx).text().to_string();
+        if state.is_new {
+            let confirm = state.confirm.read(&mut ctx).text().to_string();
+            if confirm != password {
+                if let Some(state) = self.unlock.as_mut() {
+                    state.error = Some("两次输入的主密码不一致".into());
+                }
+                cx.notify();
+                return;
+            }
+        }
+        if password.is_empty() {
+            if let Some(state) = self.unlock.as_mut() {
+                state.error = Some("请输入主密码".into());
+            }
+            cx.notify();
+            return;
+        }
+        let mode = self.mode.clone();
+        let json_hosts = self.hosts.clone();
+        let salt_path = mode.salt_path();
+        let is_new = self.unlock.as_ref().map(|s| s.is_new).unwrap_or(false);
+        cx.spawn(async move |this, cx| {
+            let opened = async {
+                // 盐缺失时生成并写盘（首次建库）；已有盐沿用（解锁）。
+                let salt = crate::vault::load_or_create_salt(&salt_path)?;
+                let hexkey = crate::vault::derive_key(&salt, &password)?;
+                let vault = Vault::open(&mode, hexkey).await?;
+                let keyring_key = crate::vault::load_or_create_master_key().ok();
+                Self::after_vault_open(&vault, &mode, keyring_key.as_deref(), &json_hosts).await?;
+                if is_new {
+                    crate::vault::write_unlock_marker(
+                        &mode,
+                        crate::vault::UnlockBackend::Passphrase,
+                    )?;
+                }
+                Ok::<_, anyhow::Error>(vault)
+            }
+            .await;
+            let _ = this.update(cx, |this, cx| match opened {
+                Ok(vault) => this.attach_vault(vault, cx),
+                Err(error) => {
+                    if let Some(state) = this.unlock.as_mut() {
+                        state.error = Some(if is_new {
+                            format!("创建加密库失败：{error}").into()
+                        } else {
+                            "主密码不正确，请重试（多次输入错误可退出）".into()
+                        });
+                        log::warn!("解锁加密库失败: {error}");
+                    }
                     cx.notify();
                 }
             });
         })
         .detach();
+    }
+
+    /// 退出解锁弹窗（尚未解锁时保持降级 JSON 行为）。
+    fn dismiss_unlock(&mut self, cx: &mut Context<Self>) {
+        self.unlock = None;
+        self.status = "凭据库未解锁，本次运行不保存密码".into();
+        cx.notify();
+    }
+
+    /// 打开"设置 / 更换主密码"弹窗。
+    fn open_rekey_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.vault.is_none() {
+            self.status = "加密库尚未就绪，无法设置主密码".into();
+            cx.notify();
+            return;
+        }
+        let password =
+            cx.new(|cx| InputState::new(window, cx).placeholder("新主密码（至少 8 位）"));
+        let confirm = cx.new(|cx| InputState::new(window, cx).placeholder("再次输入确认"));
+        self.rekey = Some(RekeyState {
+            password,
+            confirm,
+            error: None,
+        });
+        cx.notify();
+    }
+
+    /// 执行主密码设置/更换：argon2 派生新密钥 → 建新库全量搬迁 →
+    /// 旧库改名备份 → 替换 → 解锁标记改为口令档。
+    fn apply_rekey(&mut self, cx: &mut Context<Self>) {
+        let Some(state) = self.rekey.as_ref() else {
+            return;
+        };
+        let mut ctx = &mut *cx;
+        let password = state.password.read(&mut ctx).text().to_string();
+        let confirm = state.confirm.read(&mut ctx).text().to_string();
+        if password.chars().count() < 8 {
+            if let Some(state) = self.rekey.as_mut() {
+                state.error = Some("主密码至少 8 位".into());
+            }
+            cx.notify();
+            return;
+        }
+        if password != confirm {
+            if let Some(state) = self.rekey.as_mut() {
+                state.error = Some("两次输入不一致".into());
+            }
+            cx.notify();
+            return;
+        }
+        let Some(vault) = self.vault.clone() else {
+            return;
+        };
+        let mode = self.mode.clone();
+        cx.spawn(async move |this, cx| {
+            let result = async {
+                let dump = vault.export_all().await?;
+                let salt = crate::vault::rotate_salt(&mode.salt_path())?;
+                let hexkey = crate::vault::derive_key(&salt, &password)?;
+                // turso 无 rekey：新建加密库全量搬迁，再原子换名。
+                let staging = mode.db_path().with_file_name("rulink.db.new");
+                let _ = std::fs::remove_file(&staging);
+                std::fs::create_dir_all(mode.dir())?;
+                let staging_db = staging.to_string_lossy().to_string();
+                {
+                    // 用暂存库句柄导入，完成后释放（Windows 换名前必须关干净）。
+                    let fresh = Vault::open_at(&staging_db, hexkey.clone()).await?;
+                    fresh.import_dump(&dump).await?;
+                }
+                let backup = mode.db_path().with_file_name("rulink.db.keyring-bak");
+                if mode.db_path().exists() {
+                    if std::fs::rename(mode.db_path(), &backup).is_err() {
+                        // 备份名被占用时带时间戳另存，确保旧库不丢。
+                        let stamped = mode.db_path().with_file_name(format!(
+                            "rulink.db.bak-{}",
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0)
+                        ));
+                        std::fs::rename(mode.db_path(), &stamped)?;
+                    }
+                }
+                std::fs::rename(&staging, mode.db_path())?;
+                crate::vault::write_unlock_marker(&mode, crate::vault::UnlockBackend::Passphrase)?;
+                let reopened = Vault::open(&mode, hexkey).await?;
+                Ok::<_, anyhow::Error>(reopened)
+            }
+            .await;
+            let _ = this.update(cx, |this, cx| match result {
+                Ok(vault) => {
+                    this.rekey = None;
+                    this.vault = Some(Arc::new(vault));
+                    this.status = "主密码已生效，下次启动需用其解锁".into();
+                    cx.notify();
+                }
+                Err(error) => {
+                    log::warn!("更换主密码失败: {error}");
+                    if let Some(state) = this.rekey.as_mut() {
+                        state.error = Some(format!("更换失败：{error}").into());
+                    }
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// 一次性迁移 + JSON 导入（boot 与解锁共用）。`keyring_hexkey` 用于读取旧 vault.db。
+    async fn after_vault_open(
+        vault: &Vault,
+        mode: &StorageMode,
+        keyring_hexkey: Option<&str>,
+        json_hosts: &[HostConfig],
+    ) -> anyhow::Result<()> {
+        if let Some(key) = keyring_hexkey {
+            if let Err(error) = crate::vault::migrate_legacy(vault, mode, key).await {
+                log::warn!("旧数据迁移未完成: {error}");
+            }
+        }
+        let existing = vault.load_hosts().await?;
+        if existing.is_empty() && !json_hosts.is_empty() {
+            let mut imported = json_hosts.to_vec();
+            for (index, host) in imported.iter_mut().enumerate() {
+                host.id = index as i64 + 1;
+            }
+            vault.import_hosts(&imported).await?;
+        }
+        Ok(())
     }
 
     /// 持久化一台主机：加密库可用则只写该行，否则整表回写旧 JSON。
@@ -777,7 +1066,7 @@ impl RuLinkApp {
             join,
             remote_info,
             started,
-        } = session::start(target, handles, cx);
+        } = session::start(target, handles, self.vault.clone(), cx);
         self.status = SharedString::from(format!("正在连接 {addr}…"));
         self.tabs.push(SessionTab {
             id,
@@ -909,7 +1198,19 @@ impl RuLinkApp {
             rgpui::theme::ThemeMode::Dark
         };
         rgpui::theme::Theme::change(mode, Some(window), cx);
-        self.store.save_theme(!dark);
+        if let Some(vault) = self.vault.clone() {
+            let tag = if dark { "dark" } else { "light" };
+            let tag = SharedString::from(tag);
+            cx.spawn(async move |_, _| {
+                if let Err(error) = vault.set_setting("theme", &tag).await {
+                    log::warn!("写入库内主题失败: {error}");
+                }
+            })
+            .detach();
+        } else {
+            // 降级模式（无加密库）沿用旧 settings.json。
+            self.store.save_theme(!dark);
+        }
         cx.notify();
     }
 }
@@ -995,6 +1296,28 @@ impl RuLinkApp {
                         h_flex()
                             .gap_1()
                             .child(
+                                Button::new("master-password")
+                                    .label("🔐")
+                                    .ghost()
+                                    .tooltip(if self.mode.is_portable() {
+                                        "更换主密码"
+                                    } else {
+                                        "设置主密码（改用口令解锁）"
+                                    })
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        // 口令档未解锁时本按钮作为重新解锁入口。
+                                        let locked = this.vault.is_none()
+                                            && (this.mode.is_portable()
+                                                || crate::vault::read_unlock_marker(&this.mode)
+                                                    == crate::vault::UnlockBackend::Passphrase);
+                                        if locked {
+                                            this.open_unlock_dialog(window, cx);
+                                        } else {
+                                            this.open_rekey_dialog(window, cx);
+                                        }
+                                    })),
+                            )
+                            .child(
                                 Button::new("toggle-theme")
                                     .label(theme_label)
                                     .ghost()
@@ -1031,9 +1354,193 @@ impl RuLinkApp {
             .into_any_element()
     }
 
+    /// 便携/主密码库的解锁（或首次建库）居中弹窗。
+    fn render_unlock_dialog(&self, cx: &Context<Self>) -> AnyElement {
+        let pal = self.palette(cx);
+        let Some(state) = self.unlock.as_ref() else {
+            return div().into_any_element();
+        };
+        let is_new = state.is_new;
+        v_flex()
+            .id("unlock-backdrop")
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .size_full()
+            .items_center()
+            .justify_center()
+            .bg(rgpui::hsla(0.0, 0.0, 0.0, 0.45))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_, _, _, cx| cx.stop_propagation()),
+            )
+            .child(
+                v_flex()
+                    .id("unlock-dialog")
+                    .w(px(420.0))
+                    .gap_3()
+                    .p_5()
+                    .rounded(px(8.0))
+                    .bg(pal.card_bg)
+                    .border_1()
+                    .border_color(pal.border)
+                    .shadow_md()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                    )
+                    .child(
+                        div()
+                            .text_base()
+                            .font_weight(rgpui::FontWeight(600.0))
+                            .child(if is_new {
+                                "设置主密码"
+                            } else {
+                                "解锁凭据库"
+                            }),
+                    )
+                    .child(div().text_sm().text_color(pal.muted).child(if is_new {
+                        "便携模式首次使用：设置主密码以创建加密库。密码仅用于派生库密钥，\
+                                 不会保存到任何地方——一旦忘记无法恢复，请务必牢记。"
+                    } else {
+                        "输入主密码解锁凭据库（库文件与密码均不离开本机/本目录）。"
+                    }))
+                    .child(styled_input(
+                        Input::new(&state.passphrase).content_type(InputContentType::Password),
+                        &pal,
+                    ))
+                    .when(is_new, |this| {
+                        this.child(styled_input(
+                            Input::new(&state.confirm).content_type(InputContentType::Password),
+                            &pal,
+                        ))
+                    })
+                    .when_some(state.error.as_ref().cloned(), |this, error| {
+                        this.child(div().text_sm().text_color(pal.danger).child(error))
+                    })
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .justify_end()
+                            .child(
+                                Button::new("unlock-cancel")
+                                    .label("退出应用")
+                                    .ghost()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        // 未解锁即退出：保持旧行为，不落任何秘密。
+                                        {
+                                            let cx = &mut *cx;
+                                            this.dismiss_unlock(cx);
+                                        }
+                                        cx.quit();
+                                    })),
+                            )
+                            .child(
+                                Button::new("unlock-confirm")
+                                    .label(if is_new { "创建并解锁" } else { "解锁" })
+                                    .primary()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.unlock_passphrase(cx);
+                                    })),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// "设置 / 更换主密码"居中弹窗。
+    fn render_rekey_dialog(&self, cx: &Context<Self>) -> AnyElement {
+        let pal = self.palette(cx);
+        let Some(state) = self.rekey.as_ref() else {
+            return div().into_any_element();
+        };
+        v_flex()
+            .id("rekey-backdrop")
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .size_full()
+            .items_center()
+            .justify_center()
+            .bg(rgpui::hsla(0.0, 0.0, 0.0, 0.45))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_, _, _, cx| cx.stop_propagation()),
+            )
+            .child(
+                v_flex()
+                    .id("rekey-dialog")
+                    .w(px(420.0))
+                    .gap_3()
+                    .p_5()
+                    .rounded(px(8.0))
+                    .bg(pal.card_bg)
+                    .border_1()
+                    .border_color(pal.border)
+                    .shadow_md()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                    )
+                    .child(
+                        div()
+                            .text_base()
+                            .font_weight(rgpui::FontWeight(600.0))
+                            .child(if self.mode.is_portable() {
+                                "更换主密码"
+                            } else {
+                                "设置主密码"
+                            }),
+                    )
+                    .child(div().text_sm().text_color(pal.muted).child(
+                        "主密码经 Argon2id 派生库密钥：将新建加密库全量搬迁后替换，\
+                                 旧库保留为 rulink.db.keyring-bak。此后每次启动需输入主密码；\
+                                 忘记主密码将无法恢复数据。",
+                    ))
+                    .child(styled_input(
+                        Input::new(&state.password).content_type(InputContentType::Password),
+                        &pal,
+                    ))
+                    .child(styled_input(
+                        Input::new(&state.confirm).content_type(InputContentType::Password),
+                        &pal,
+                    ))
+                    .when_some(state.error.as_ref().cloned(), |this, error| {
+                        this.child(div().text_sm().text_color(pal.danger).child(error))
+                    })
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .justify_end()
+                            .child(Button::new("rekey-cancel").label("取消").ghost().on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    this.rekey = None;
+                                    cx.notify();
+                                }),
+                            ))
+                            .child(
+                                Button::new("rekey-apply")
+                                    .label("保存主密码")
+                                    .primary()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.apply_rekey(cx);
+                                    })),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
     /// 窗口级浮层：主机右键菜单与删除二次确认框（绝对定位渲染在最上层）。
     fn render_overlay(&self, window: &mut Window, cx: &Context<Self>) -> AnyElement {
         let pal = self.palette(cx);
+        // 解锁 / 主密码弹窗优先于一切浮层（库未解锁时其余操作无意义）。
+        if self.unlock.is_some() {
+            return self.render_unlock_dialog(cx);
+        }
+        if self.rekey.is_some() {
+            return self.render_rekey_dialog(cx);
+        }
         // 删除二次确认：半透明遮罩 + 居中卡片，点遮罩或"取消"关闭。
         if let Some(index) = self.confirm_delete {
             let label = self
@@ -1783,9 +2290,11 @@ fn main() {
         // 主题 + 输入子系统必须初始化：否则输入框无配色且
         // 退格/删除等键位动作未注册（无法编辑已输入内容）。
         rgpui::theme::init(cx);
-        // theme::init 默认切到亮色；这里按上次持久化的主题选择应用（缺省暗色），
-        // 使输入框/界面底色与用户上次退出时的选择一致。
-        let dark = SessionStore::new().load_settings().dark();
+        // theme::init 默认切到亮色；库内主题要等开库后才能读到，这里先按
+        // 旧 settings.json（降级/迁移前）或默认暗色起窗，避免闪一下亮色。
+        let dark = SessionStore::new(&StorageMode::detect())
+            .load_settings()
+            .dark();
         rgpui::theme::Theme::change(
             if dark {
                 rgpui::theme::ThemeMode::Dark

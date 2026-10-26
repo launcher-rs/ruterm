@@ -88,7 +88,13 @@ pub fn error_summary(error: &anyhow::Error) -> String {
 /// 在 rgpui 的 tokio 运行时上启动 SSH 会话。
 ///
 /// 返回的任务必须被持有（提前 drop 会取消 SSH）。
-pub fn start<C: AppContext>(target: SshTarget, handles: ExternalHandles, cx: &C) -> SshSession {
+/// `vault` 用于加密库内的 known_hosts 校验；None 时回退旧文件（降级模式）。
+pub fn start<C: AppContext>(
+    target: SshTarget,
+    handles: ExternalHandles,
+    vault: Option<Arc<crate::vault::Vault>>,
+    cx: &C,
+) -> SshSession {
     let ExternalHandles { feed, rx } = handles;
     let (ui_tx, ui_rx) = mpsc::unbounded_channel::<PtyBoundMessage>();
     let (info_tx, info_rx) = oneshot::channel::<String>();
@@ -112,7 +118,7 @@ pub fn start<C: AppContext>(target: SshTarget, handles: ExternalHandles, cx: &C)
     let closing_feed = feed.clone();
     let started_flag = started.clone();
     let join = rgpui::tokio::Tokio::spawn_result(cx, async move {
-        let result = run(target, feed, ui_rx, info_tx, started_flag).await;
+        let result = run(target, feed, ui_rx, info_tx, started_flag, vault).await;
         if let Err(error) = &result {
             closing_feed
                 .feed(format!("\r\n[rulink] 会话结束: {}\r\n", error_summary(error)).into_bytes());
@@ -135,11 +141,17 @@ async fn run(
     ui_rx: mpsc::UnboundedReceiver<PtyBoundMessage>,
     info_tx: oneshot::Sender<String>,
     started: Arc<AtomicBool>,
+    vault: Option<Arc<crate::vault::Vault>>,
 ) -> Result<()> {
     let config = Arc::new(SshConfig::default());
     let side = SideChannels::default();
-    let handler =
-        SshTerminalHandler::new(feed.clone(), target.host.clone(), target.port, side.clone());
+    let handler = SshTerminalHandler::new(
+        feed.clone(),
+        target.host.clone(),
+        target.port,
+        side.clone(),
+        vault,
+    );
     let mut handle = russh::client::connect(config, (target.host.as_str(), target.port), handler)
         .await
         .with_context(|| format!("无法连接 {}", target.addr()))?;

@@ -2,7 +2,7 @@
 //!
 //! 凭据策略：密码不入库，连接时临时输入；私钥只存路径。
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
@@ -88,16 +88,12 @@ pub struct SessionStore {
 }
 
 impl SessionStore {
-    /// 使用 ~/.rulink/sessions.json 构造仓库。
-    pub fn new() -> Self {
-        let home = std::env::var_os("USERPROFILE")
-            .or_else(|| std::env::var_os("HOME"))
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."));
-        let dir = home.join(".rulink");
+    /// 按存储模式构造旧 JSON 仓库（便携=data/，全局=~/.rulink；降级路径保留）。
+    pub fn new(mode: &crate::paths::StorageMode) -> Self {
+        let dir = mode.dir();
         Self {
-            path: dir.join("sessions.json"),
-            settings_path: dir.join("settings.json"),
+            path: dir.join(crate::paths::LEGACY_SESSIONS_FILE),
+            settings_path: dir.join(crate::paths::LEGACY_SETTINGS_FILE),
         }
     }
 
@@ -128,14 +124,6 @@ impl SessionStore {
             }
             Err(error) => log::warn!("序列化设置失败: {error}"),
         }
-    }
-
-    /// 数据目录（~/.rulink），加密库 vault.db 与之同级。
-    pub fn dir(&self) -> PathBuf {
-        self.path
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from("."))
     }
 
     /// 迁移完成后把 sessions.json 改名为 sessions.json.migrated（保留现场，不删除）。
