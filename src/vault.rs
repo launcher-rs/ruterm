@@ -13,7 +13,9 @@
 //! 改名保留 `.migrated`、绝不删除。turso 无 rekey 能力，更换主密钥走
 //! "新建加密库 + 全量搬迁 + 旧库改名备份 + 替换"路径。
 
-use std::path::Path;
+use std::future::Future;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
 use argon2::Argon2;
@@ -221,14 +223,28 @@ pub fn write_unlock_marker(mode: &StorageMode, backend: UnlockBackend) -> Result
     Ok(())
 }
 
-/// 加密凭据库句柄（toasty Db 内部自带连接池，Mutex 仅收敛共享语义）。
+/// 加密凭据库句柄。
+///
+/// toasty 的连接池（depool `Runtime::Tokio1` + 巡检 `tokio::spawn`）以及 turso 的
+/// 异步 IO **都要求运行在 tokio 运行时上下文里**，而 rgpui 的 `cx.spawn` 把 future
+/// 放在主线程轮询、`background_spawn` 放在自己的线程池上——两者都不是 tokio。
+/// 因此句柄自带运行时 `Handle`，所有库操作统一 `spawn` 到运行时执行，
+/// 调用方可以从任意上下文 await（russh 会话内即已在运行时上）。
 pub struct Vault {
-    db: Mutex<toasty::Db>,
+    db: Arc<Mutex<toasty::Db>>,
+    rt: tokio::runtime::Handle,
 }
+
+/// 一次库操作：在运行时任务里取得库句柄。
+type DbCell = Arc<Mutex<toasty::Db>>;
 
 impl Vault {
     /// 用给定主密钥打开（或创建）mode 数据目录下的单文件加密库并建表。
-    pub async fn open(mode: &StorageMode, hexkey: String) -> Result<Self> {
+    pub async fn open(
+        mode: &StorageMode,
+        hexkey: String,
+        rt: tokio::runtime::Handle,
+    ) -> Result<Self> {
         anyhow::ensure!(
             valid_hex_key(&hexkey),
             "主密钥格式无效（应为 64 位十六进制）"
@@ -236,46 +252,56 @@ impl Vault {
         mode.ensure_dir()
             .with_context(|| format!("无法创建 {}", mode.dir().display()))?;
         let path = mode.db_path().to_string_lossy().to_string();
-        let driver = Turso::file(&path).experimental_encryption(EncryptionOpts {
-            cipher: "aegis256".to_string(),
-            hexkey,
-        });
-        let mut db = toasty::Db::builder()
-            .models(toasty::models!(HostRow, SettingRow, KnownHostRow))
-            .build(driver)
+        let db = rt
+            .spawn(connect(path, hexkey, false))
             .await
-            .context("无法打开加密凭据库（主密码或库文件可能不正确）")?;
-        // CREATE TABLE 不带 IF NOT EXISTS：先探测 hosts 表是否已存在，
-        // 缺表才建（库能成功打开本身已证明密钥正确）。
-        let hosts_ready = Query::<List<HostRow>>::all()
-            .exec(&mut db as &mut dyn toasty::Executor)
-            .await
-            .is_ok();
-        if !hosts_ready {
-            db.push_schema()
-                .await
-                .context("凭据库建表失败（若升级后仍报错，请检查库文件完整性）")?;
-        }
-        Ok(Self { db: Mutex::new(db) })
+            .context("凭据库任务意外中止")??;
+        Ok(Self {
+            db: Arc::new(Mutex::new(db)),
+            rt,
+        })
     }
 
     /// 在指定文件路径打开加密库（更换主密码的暂存库 `rulink.db.new` 用）。
-    pub async fn open_at(path: &str, hexkey: String) -> Result<Self> {
+    pub async fn open_at(path: &str, hexkey: String, rt: tokio::runtime::Handle) -> Result<Self> {
         anyhow::ensure!(
             valid_hex_key(&hexkey),
             "主密钥格式无效（应为 64 位十六进制）"
         );
-        let driver = Turso::file(path).experimental_encryption(EncryptionOpts {
-            cipher: "aegis256".to_string(),
-            hexkey,
-        });
-        let db = toasty::Db::builder()
-            .models(toasty::models!(HostRow, SettingRow, KnownHostRow))
-            .build(driver)
+        let db = rt
+            .spawn(connect(path.to_string(), hexkey, true))
             .await
-            .context("无法创建新加密库")?;
-        db.push_schema().await.context("新加密库建表失败")?;
-        Ok(Self { db: Mutex::new(db) })
+            .context("凭据库任务意外中止")??;
+        Ok(Self {
+            db: Arc::new(Mutex::new(db)),
+            rt,
+        })
+    }
+
+    /// 本库所属运行时（换库时把文件操作也派发上去用）。
+    pub fn runtime(&self) -> tokio::runtime::Handle {
+        self.rt.clone()
+    }
+
+    /// 把一段异步工作投递到运行时执行。
+    async fn dispatch<R, F>(&self, f: F) -> Result<R>
+    where
+        F: Future<Output = Result<R>> + Send + 'static,
+        R: Send + 'static,
+    {
+        self.rt
+            .spawn(f)
+            .await
+            .context("凭据库任务意外中止（运行时可能已关闭）")?
+    }
+
+    /// 在一次运行时任务里持有库句柄执行操作。
+    async fn job<R, F>(&self, make: impl FnOnce(DbCell) -> F) -> Result<R>
+    where
+        F: Future<Output = Result<R>> + Send + 'static,
+        R: Send + 'static,
+    {
+        self.dispatch(make(self.db.clone())).await
     }
 
     /// 主机总数（测试与诊断用）。
@@ -286,12 +312,15 @@ impl Vault {
 
     /// 读取全部主机（不含密码列）。
     pub async fn load_hosts(&self) -> Result<Vec<HostConfig>> {
-        let mut db = self.db.lock().await;
-        let rows = Query::<List<HostRow>>::all()
-            .exec(&mut *db as &mut dyn toasty::Executor)
-            .await
-            .context("读取凭据库失败")?;
-        Ok(rows.iter().map(|row| row.to_host_config()).collect())
+        self.job(|cell| async move {
+            let mut db = cell.lock().await;
+            let rows = Query::<List<HostRow>>::all()
+                .exec(&mut *db as &mut dyn toasty::Executor)
+                .await
+                .context("读取凭据库失败")?;
+            Ok(rows.iter().map(|row| row.to_host_config()).collect())
+        })
+        .await
     }
 
     /// 批量导入（一次性迁移用）。
@@ -302,90 +331,82 @@ impl Vault {
         Ok(())
     }
 
-    /// 保存主机配置；已保存的密码列保持原样（本方法永不写密码）。
+    /// 保存主机配置；已保存的密码列保持原样（本方法永不改密码）。
     pub async fn upsert(&self, host: &HostConfig) -> Result<()> {
-        let existing = self.password_of(host.id).await?;
-        self.write_host(host, existing.as_deref()).await
+        let host = host.clone();
+        self.job(move |cell| async move {
+            let mut db = cell.lock().await;
+            let stored = fetch_host(&mut db, host.id)
+                .await?
+                .and_then(|(_, secret)| secret);
+            put_host(&mut db, &host, stored).await
+        })
+        .await
     }
 
     /// 写入或清除某主机的保存密码（password=None 表示清除）。
     pub async fn set_password(&self, id: i64, password: Option<&str>) -> Result<()> {
-        let mut db = self.db.lock().await;
-        let row = Query::<List<HostRow>>::all()
-            .filter(HostRow::fields().id().eq(id))
-            .first()
-            .exec(&mut *db as &mut dyn toasty::Executor)
-            .await
-            .context("读取主机行失败")?;
-        drop(db);
-        let Some(row) = row else { return Ok(()) };
-        let host = row.to_host_config();
-        self.write_host(&host, password).await
+        let password = password.map(str::to_string);
+        self.job(move |cell| async move {
+            let mut db = cell.lock().await;
+            let Some((host, _)) = fetch_host(&mut db, id).await? else {
+                return Ok(());
+            };
+            put_host(&mut db, &host, password).await
+        })
+        .await
     }
 
     /// 读取某主机已保存的密码（未保存则为 None）。
     pub async fn password_of(&self, id: i64) -> Result<Option<String>> {
-        let mut db = self.db.lock().await;
-        let row = Query::<List<HostRow>>::all()
-            .filter(HostRow::fields().id().eq(id))
-            .first()
-            .exec(&mut *db as &mut dyn toasty::Executor)
-            .await
-            .context("读取保存密码失败")?;
-        Ok(row.and_then(|row| row.password))
-    }
-
-    /// 主机行落库（upsert by id；password 由调用方决定，None 写 NULL）。
-    async fn write_host(&self, host: &HostConfig, password: Option<&str>) -> Result<()> {
-        let mut db = self.db.lock().await;
-        HostRow::upsert_by_id(host.id)
-            .name(host.name.as_str())
-            .host(host.host.as_str())
-            .port(host.port as i64)
-            .user(host.user.as_str())
-            .auth(auth_tag(host.auth))
-            .key_path(host.key_path.as_str())
-            .favorite(host.favorite)
-            .password(password.map(str::to_string))
-            .exec(&mut *db as &mut dyn toasty::Executor)
-            .await
-            .context("写入凭据库失败")?;
-        Ok(())
+        self.job(move |cell| async move {
+            let mut db = cell.lock().await;
+            Ok(fetch_host(&mut db, id)
+                .await?
+                .and_then(|(_, secret)| secret))
+        })
+        .await
     }
 
     /// 删除主机（连带其密码行）。
     pub async fn remove(&self, id: i64) -> Result<()> {
-        let mut db = self.db.lock().await;
-        Query::<List<HostRow>>::all()
-            .filter(HostRow::fields().id().eq(id))
-            .delete()
-            .exec(&mut *db as &mut dyn toasty::Executor)
-            .await
-            .context("删除凭据库记录失败")?;
-        Ok(())
+        self.job(move |cell| async move {
+            let mut db = cell.lock().await;
+            Query::<List<HostRow>>::all()
+                .filter(HostRow::fields().id().eq(id))
+                .delete()
+                .exec(&mut *db as &mut dyn toasty::Executor)
+                .await
+                .context("删除凭据库记录失败")?;
+            Ok(())
+        })
+        .await
     }
 
     /// 读取设置项（缺失为 None）。
     pub async fn setting(&self, name: &str) -> Result<Option<String>> {
-        let mut db = self.db.lock().await;
-        let row = Query::<List<SettingRow>>::all()
-            .filter(SettingRow::fields().name().eq(name.to_string()))
-            .first()
-            .exec(&mut *db as &mut dyn toasty::Executor)
-            .await
-            .context("读取设置失败")?;
-        Ok(row.map(|row| row.value))
+        let name = name.to_string();
+        self.job(move |cell| async move {
+            let mut db = cell.lock().await;
+            let row = Query::<List<SettingRow>>::all()
+                .filter(SettingRow::fields().name().eq(name))
+                .first()
+                .exec(&mut *db as &mut dyn toasty::Executor)
+                .await
+                .context("读取设置失败")?;
+            Ok(row.map(|row| row.value))
+        })
+        .await
     }
 
     /// 写入设置项（存在则覆盖）。
     pub async fn set_setting(&self, name: &str, value: &str) -> Result<()> {
-        let mut db = self.db.lock().await;
-        SettingRow::upsert_by_name(name.to_string())
-            .value(value)
-            .exec(&mut *db as &mut dyn toasty::Executor)
-            .await
-            .context("写入设置失败")?;
-        Ok(())
+        let (name, value) = (name.to_string(), value.to_string());
+        self.job(move |cell| async move {
+            let mut db = cell.lock().await;
+            put_setting(&mut db, &name, &value).await
+        })
+        .await
     }
 
     /// known_hosts 判定（fail-closed）：命中比对、不符拒绝、缺失写入并信任。
@@ -398,93 +419,187 @@ impl Vault {
         fingerprint: &str,
         algorithm: &str,
     ) -> Result<Trust> {
-        let mut db = self.db.lock().await;
-        let existing = Query::<List<KnownHostRow>>::all()
-            .filter(KnownHostRow::fields().host_port().eq(host_port.to_string()))
-            .first()
-            .exec(&mut *db as &mut dyn toasty::Executor)
-            .await
-            .context("读取 known_hosts 失败")?;
-        match existing {
-            Some(row) if row.fingerprint == fingerprint => Ok(Trust::Matched),
-            Some(_) => Ok(Trust::Mismatch),
-            None => {
-                KnownHostRow::upsert_by_host_port(host_port.to_string())
-                    .fingerprint(fingerprint)
-                    .algorithm(algorithm)
-                    .exec(&mut *db as &mut dyn toasty::Executor)
+        let (host_port, fingerprint, algorithm) = (
+            host_port.to_string(),
+            fingerprint.to_string(),
+            algorithm.to_string(),
+        );
+        self.job(move |cell| async move {
+            let mut db = cell.lock().await;
+            let existing = Query::<List<KnownHostRow>>::all()
+                .filter(KnownHostRow::fields().host_port().eq(host_port.clone()))
+                .first()
+                .exec(&mut *db as &mut dyn toasty::Executor)
+                .await
+                .context("读取 known_hosts 失败")?;
+            match existing {
+                Some(row) if row.fingerprint == fingerprint => Ok(Trust::Matched),
+                Some(_) => Ok(Trust::Mismatch),
+                None => put_known_host(&mut db, &host_port, &fingerprint, &algorithm)
                     .await
-                    .context("写入 known_hosts 失败")?;
-                Ok(Trust::New)
+                    .map(|()| Trust::New),
             }
-        }
+        })
+        .await
+    }
+
+    /// 批量写入 known_hosts（一次性迁移与换库搬迁用，已存在则覆盖）。
+    pub async fn record_known_hosts(&self, entries: Vec<(String, String, String)>) -> Result<()> {
+        self.job(move |cell| async move {
+            let mut db = cell.lock().await;
+            for (host_port, fingerprint, algorithm) in entries {
+                put_known_host(&mut db, &host_port, &fingerprint, &algorithm).await?;
+            }
+            Ok(())
+        })
+        .await
     }
 
     /// 导出本库全部数据（换主密钥时搬迁用）。
     pub async fn export_all(&self) -> Result<VaultDump> {
-        let hosts = {
-            let mut db = self.db.lock().await;
-            Query::<List<HostRow>>::all()
+        self.job(|cell| async move {
+            let mut db = cell.lock().await;
+            let hosts = Query::<List<HostRow>>::all()
                 .exec(&mut *db as &mut dyn toasty::Executor)
                 .await
-                .context("导出主机失败")?
-        };
-        let mut dumped = Vec::new();
-        for row in hosts {
-            dumped.push((row.to_host_config(), row.password));
-        }
-        let settings = {
-            let mut db = self.db.lock().await;
-            Query::<List<SettingRow>>::all()
-                .exec(&mut *db as &mut dyn toasty::Executor)
-                .await
-                .context("导出设置失败")?
-        };
-        let known = {
-            let mut db = self.db.lock().await;
-            Query::<List<KnownHostRow>>::all()
-                .exec(&mut *db as &mut dyn toasty::Executor)
-                .await
-                .context("导出 known_hosts 失败")?
-        };
-        Ok(VaultDump {
-            hosts: dumped,
-            settings: settings
+                .context("导出主机失败")?;
+            let dumped: Vec<(HostConfig, Option<String>)> = hosts
                 .iter()
-                .map(|s| (s.name.clone(), s.value.clone()))
-                .collect(),
-            known_hosts: known
-                .iter()
-                .map(|k| {
-                    (
-                        k.host_port.clone(),
-                        k.fingerprint.clone(),
-                        k.algorithm.clone(),
-                    )
-                })
-                .collect(),
+                .map(|row| (row.to_host_config(), row.password.clone()))
+                .collect();
+            let settings = Query::<List<SettingRow>>::all()
+                .exec(&mut *db as &mut dyn toasty::Executor)
+                .await
+                .context("导出设置失败")?;
+            let known = Query::<List<KnownHostRow>>::all()
+                .exec(&mut *db as &mut dyn toasty::Executor)
+                .await
+                .context("导出 known_hosts 失败")?;
+            Ok(VaultDump {
+                hosts: dumped,
+                settings: settings
+                    .iter()
+                    .map(|s| (s.name.clone(), s.value.clone()))
+                    .collect(),
+                known_hosts: known
+                    .iter()
+                    .map(|k| {
+                        (
+                            k.host_port.clone(),
+                            k.fingerprint.clone(),
+                            k.algorithm.clone(),
+                        )
+                    })
+                    .collect(),
+            })
         })
+        .await
     }
 
     /// 导入另一库导出的全部数据（换主密钥后写入新库）。
     pub async fn import_dump(&self, dump: &VaultDump) -> Result<()> {
-        for (host, password) in &dump.hosts {
-            self.write_host(host, password.as_deref()).await?;
-        }
-        for (name, value) in &dump.settings {
-            self.set_setting(name, value).await?;
-        }
-        for (host_port, fingerprint, algorithm) in &dump.known_hosts {
-            let mut db = self.db.lock().await;
-            KnownHostRow::upsert_by_host_port(host_port.to_string())
-                .fingerprint(fingerprint.as_str())
-                .algorithm(algorithm.as_str())
-                .exec(&mut *db as &mut dyn toasty::Executor)
-                .await
-                .context("导入 known_hosts 失败")?;
-        }
-        Ok(())
+        let (hosts, settings, known_hosts) = (
+            dump.hosts.clone(),
+            dump.settings.clone(),
+            dump.known_hosts.clone(),
+        );
+        self.job(move |cell| async move {
+            let mut db = cell.lock().await;
+            for (host, password) in &hosts {
+                put_host(&mut db, host, password.clone()).await?;
+            }
+            for (name, value) in &settings {
+                put_setting(&mut db, name, value).await?;
+            }
+            for (host_port, fingerprint, algorithm) in &known_hosts {
+                put_known_host(&mut db, host_port, fingerprint, algorithm).await?;
+            }
+            Ok(())
+        })
+        .await
     }
+}
+
+/// 打开（并按需建表）加密库——必须在 tokio 运行时任务内执行。
+/// `fresh` 为 true 时直接建表（暂存新库），否则先探测 `hosts` 表是否已存在
+/// （toasty 生成的 `CREATE TABLE` 不带 `IF NOT EXISTS`）。
+async fn connect(path: String, hexkey: String, fresh: bool) -> Result<toasty::Db> {
+    let driver = Turso::file(&path).experimental_encryption(EncryptionOpts {
+        cipher: "aegis256".to_string(),
+        hexkey,
+    });
+    let mut db = toasty::Db::builder()
+        .models(toasty::models!(HostRow, SettingRow, KnownHostRow))
+        .build(driver)
+        .await
+        .context("无法打开加密凭据库（主密码或库文件可能不正确）")?;
+    if fresh {
+        db.push_schema().await.context("新加密库建表失败")?;
+        return Ok(db);
+    }
+    // 库能成功打开本身已证明密钥正确：查询报"缺表"才建表。
+    let hosts_ready = Query::<List<HostRow>>::all()
+        .exec(&mut db as &mut dyn toasty::Executor)
+        .await
+        .is_ok();
+    if !hosts_ready {
+        db.push_schema()
+            .await
+            .context("凭据库建表失败（若升级后仍报错，请检查库文件完整性）")?;
+    }
+    Ok(db)
+}
+
+/// 主机行落库（upsert by id；password=None 写 NULL）。
+async fn put_host(db: &mut toasty::Db, host: &HostConfig, password: Option<String>) -> Result<()> {
+    HostRow::upsert_by_id(host.id)
+        .name(host.name.as_str())
+        .host(host.host.as_str())
+        .port(host.port as i64)
+        .user(host.user.as_str())
+        .auth(auth_tag(host.auth))
+        .key_path(host.key_path.as_str())
+        .favorite(host.favorite)
+        .password(password)
+        .exec(db as &mut dyn toasty::Executor)
+        .await
+        .context("写入凭据库失败")?;
+    Ok(())
+}
+
+/// 读取单行主机：配置 + 已保存密码（行不存在为 None）。
+async fn fetch_host(db: &mut toasty::Db, id: i64) -> Result<Option<(HostConfig, Option<String>)>> {
+    let row = Query::<List<HostRow>>::all()
+        .filter(HostRow::fields().id().eq(id))
+        .first()
+        .exec(db as &mut dyn toasty::Executor)
+        .await
+        .context("读取主机行失败")?;
+    Ok(row.map(|row| (row.to_host_config(), row.password)))
+}
+
+async fn put_setting(db: &mut toasty::Db, name: &str, value: &str) -> Result<()> {
+    SettingRow::upsert_by_name(name.to_string())
+        .value(value)
+        .exec(db as &mut dyn toasty::Executor)
+        .await
+        .context("写入设置失败")?;
+    Ok(())
+}
+
+async fn put_known_host(
+    db: &mut toasty::Db,
+    host_port: &str,
+    fingerprint: &str,
+    algorithm: &str,
+) -> Result<()> {
+    KnownHostRow::upsert_by_host_port(host_port.to_string())
+        .fingerprint(fingerprint)
+        .algorithm(algorithm)
+        .exec(db as &mut dyn toasty::Executor)
+        .await
+        .context("写入 known_hosts 失败")?;
+    Ok(())
 }
 
 /// 两库之间搬迁用的全量快照（仅存在于进程内存，含密码明文——库级加密下
@@ -502,7 +617,7 @@ pub struct VaultDump {
 /// 用旧版 hand-SQL 加密库（keyring 主密钥）读出 hosts 行（含密码列）。
 /// 库损坏/密钥不对返回 Err（调用方据此回退改名，不动数据）。
 async fn read_legacy_vault(
-    path: &Path,
+    path: PathBuf,
     hexkey: String,
 ) -> Result<Vec<(HostConfig, Option<String>)>> {
     let db = Builder::new_local(path.to_string_lossy().as_ref())
@@ -585,17 +700,31 @@ pub async fn migrate_legacy(
     let mut migrated_vault = false;
     let legacy_db_path = mode.legacy_path(crate::paths::LEGACY_VAULT_FILE);
     if legacy_db_path.exists() {
+        // 新库里已有主机 = 上次已导入、只是旧库文件当时没改走（句柄未释放）：
+        // 跳过导入，免得用旧数据覆盖用户这段时间的新增/修改，仅再试着归档。
+        let already_imported = vault.count().await.unwrap_or(0) > 0;
         // 先读原路径、成功后才改名：中途失败时旧库原样保留，不破坏现场。
-        match read_legacy_vault(&legacy_db_path, keyring_hexkey.to_string()).await {
+        // 旧库走 turso 直连，同样必须在运行时上下文里执行。
+        let read = vault
+            .dispatch(read_legacy_vault(
+                legacy_db_path.clone(),
+                keyring_hexkey.to_string(),
+            ))
+            .await;
+        match read {
             Ok(hosts) => {
-                for (host, password) in &hosts {
-                    vault.upsert(host).await?;
-                    if password.is_some() {
-                        vault.set_password(host.id, password.as_deref()).await?;
+                if already_imported {
+                    log::warn!("凭据库已有数据，跳过旧 vault.db 导入（仅归档旧文件）");
+                } else {
+                    for (host, password) in &hosts {
+                        vault.upsert(host).await?;
+                        if password.is_some() {
+                            vault.set_password(host.id, password.as_deref()).await?;
+                        }
                     }
                 }
-                rename_preserving(&legacy_db_path);
-                migrated_vault = true;
+                archive_legacy(vault, &legacy_db_path);
+                migrated_vault = !already_imported;
             }
             Err(error) => {
                 // 旧库打不开（密钥不符/损坏）：不动文件，交由上层保持现有行为。
@@ -620,22 +749,104 @@ pub async fn migrate_legacy(
     let kh_path = mode.legacy_path(crate::paths::LEGACY_KNOWN_HOSTS_FILE);
     if kh_path.exists() {
         if let Ok(text) = std::fs::read_to_string(&kh_path) {
-            for (host_port, fingerprint, algorithm) in parse_legacy_known_hosts(&text) {
-                let mut db = vault.db.lock().await;
-                KnownHostRow::upsert_by_host_port(host_port)
-                    .fingerprint(fingerprint.as_str())
-                    .algorithm(algorithm.as_str())
-                    .exec(&mut *db as &mut dyn toasty::Executor)
-                    .await
-                    .context("导入 known_hosts 失败")?;
-            }
+            vault
+                .record_known_hosts(parse_legacy_known_hosts(&text))
+                .await?;
         }
         rename_preserving(&kh_path);
     }
     Ok(migrated_vault)
 }
 
-/// 改名保留（`.migrated` 已存在则不动原文件，只警告）。
+/// 旧文件归档：改名 `.migrated` 保留现场，**后台**重试。
+///
+/// turso 连接的回收由运行时异步完成，Windows 上句柄可能滞留数秒；前台等待会拖住
+/// 开库后的首屏，故丢给运行时慢慢改。目标已存在时不动原文件；改不动也只保留原样，
+/// 下次启动会再试（届时新库已有数据，导入会被跳过，不会覆盖用户的新改动）。
+fn archive_legacy(vault: &Vault, path: &Path) {
+    let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
+        return;
+    };
+    let target = path.with_file_name(format!("{file_name}.migrated"));
+    if target.exists() {
+        log::warn!(
+            "{} 已存在，保留 {} 不重复改名",
+            target.display(),
+            path.display()
+        );
+        return;
+    }
+    let from = path.to_path_buf();
+    let display = path.display().to_string();
+    let background = vault.rt.clone();
+    vault.rt.spawn(async move {
+        // 最长约 30 秒：足够覆盖连接回收，又不必让用户等待。
+        match rename_db_bundle(&background, from, target, 300).await {
+            Ok(()) => log::info!("旧库已归档为 .migrated: {display}"),
+            Err(error) => log::warn!("迁移后改名 {display} 失败: {error}"),
+        }
+    });
+}
+
+/// 文件换名（带重试，每 100ms 一次）：turso/toasty 的连接由 tokio 运行时异步回收，
+/// Windows 上句柄可能滞留片刻，立刻改名会撞上"文件被占用"；休眠必须在运行时内进行。
+pub(crate) async fn rename_with_retry(
+    rt: &tokio::runtime::Handle,
+    from: PathBuf,
+    to: PathBuf,
+    attempts: u32,
+) -> Result<(), String> {
+    let (from_desc, to_desc) = (from.display().to_string(), to.display().to_string());
+    let moved = rt
+        .spawn(async move {
+            let mut last: Option<std::io::Error> = None;
+            for _ in 0..attempts {
+                match std::fs::rename(&from, &to) {
+                    Ok(()) => return Ok(()),
+                    Err(error) => {
+                        last = Some(error);
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                }
+            }
+            Err(last.unwrap_or_else(|| std::io::Error::other("文件仍被占用")))
+        })
+        .await
+        .map_err(|error| format!("换名任务意外中止: {error}"))?;
+    moved.map_err(|error| format!("换名 {from_desc} → {to_desc} 失败: {error}"))
+}
+
+/// 连同 SQLite 的 `-wal` / `-shm` 边文件一起换名：边文件按主文件名配对，
+/// 只挪走主文件会让旧库的 WAL 挂到新库上（密钥不同），必须整套搬走。
+pub(crate) async fn rename_db_bundle(
+    rt: &tokio::runtime::Handle,
+    base: PathBuf,
+    target: PathBuf,
+    attempts: u32,
+) -> Result<(), String> {
+    rename_with_retry(rt, base.clone(), target.clone(), attempts).await?;
+    let sides = ["-wal", "-shm"]
+        .iter()
+        .filter_map(|suffix| {
+            let name = base.file_name()?.to_str()?;
+            let side = base.with_file_name(format!("{name}{suffix}"));
+            side.exists().then(|| {
+                let target_name = target.file_name().and_then(|n| n.to_str()).unwrap_or("db");
+                (
+                    side,
+                    target.with_file_name(format!("{target_name}{suffix}")),
+                )
+            })
+        })
+        .collect::<Vec<(PathBuf, PathBuf)>>();
+    for (side, side_target) in sides {
+        // 边文件一时改不动不影响一致性（旧库已让位，新库自带干净 WAL）。
+        let _ = rename_with_retry(rt, side, side_target, 20).await;
+    }
+    Ok(())
+}
+
+/// 改名保留（同步版：用于从未被打开过的普通文本/JSON 文件）。
 fn rename_preserving(path: &Path) {
     let target = path.with_file_name(format!(
         "{}.migrated",
@@ -680,7 +891,8 @@ mod tests {
         ));
         let mode = StorageMode::Global(dir.clone());
         let hexkey = "0f".repeat(32);
-        let vault = Vault::open(&mode, hexkey.clone())
+        let rt = tokio::runtime::Handle::current();
+        let vault = Vault::open(&mode, hexkey.clone(), rt.clone())
             .await
             .expect("打开加密库失败");
 
@@ -736,17 +948,106 @@ mod tests {
         assert_eq!(trust, Trust::Mismatch);
 
         // 换密钥重开必须失败（页级加密真实生效），同密钥重开数据仍在。
-        let wrong = Vault::open(&mode, "1f".repeat(32)).await;
+        let wrong = Vault::open(&mode, "1f".repeat(32), rt.clone()).await;
         assert!(wrong.is_err(), "错误主密钥不应打开数据库");
         vault.remove(3).await.unwrap();
         assert_eq!(vault.count().await.unwrap(), 0);
         drop(vault);
-        let reopened = Vault::open(&mode, hexkey).await.expect("重开失败");
+        let reopened = Vault::open(&mode, hexkey, rt.clone())
+            .await
+            .expect("重开失败");
         assert_eq!(reopened.load_hosts().await.unwrap().len(), 0);
         assert_eq!(
             reopened.setting("theme").await.unwrap().as_deref(),
             Some("light")
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 简易轮询执行器：刻意**不在** tokio 上下文里 poll future，
+    /// 用来复现 rgpui 主线程（`cx.spawn`）await 凭据库操作的场景。
+    fn bare_block_on<F: Future>(fut: F) -> F::Output {
+        use std::task::{Context, Poll, Wake};
+
+        struct ParkWaker(std::thread::Thread);
+
+        impl Wake for ParkWaker {
+            fn wake(self: Arc<Self>) {
+                self.0.unpark();
+            }
+        }
+
+        let waker = std::task::Waker::from(Arc::new(ParkWaker(std::thread::current())));
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = std::pin::pin!(fut);
+        let start = std::time::Instant::now();
+        loop {
+            if let Poll::Ready(value) = fut.as_mut().poll(&mut cx) {
+                return value;
+            }
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(30),
+                "凭据库操作迟迟没有进展"
+            );
+            std::thread::park_timeout(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// 回归：库操作必须能在非 tokio 线程上 await（rgpui 的 `cx.spawn` 在主线程
+    /// 轮询、`background_spawn` 在自己的线程池），否则撞上
+    /// "there is no reactor running, must be called from the context of a Tokio 1.x runtime"。
+    #[test]
+    fn vault_operations_work_off_runtime() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let handle = rt.handle().clone();
+        let mut suffix = [0u8; 8];
+        getrandom::fill(&mut suffix).unwrap();
+        let tag: String = suffix.iter().map(|b| format!("{b:02x}")).collect();
+        let dir = std::env::temp_dir().join(format!("rulink-offrt-test-{tag}"));
+        let mode = StorageMode::Global(dir.clone());
+        let host = HostConfig {
+            id: 1,
+            name: "离线机".into(),
+            host: "h.example".into(),
+            port: 22,
+            user: "u".into(),
+            auth: AuthMethod::Password,
+            key_path: String::new(),
+            favorite: false,
+        };
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                assert!(
+                    tokio::runtime::Handle::try_current().is_err(),
+                    "测试线程本身不该有运行时上下文"
+                );
+                let opened = bare_block_on(async {
+                    let vault = Vault::open(&mode, "0e".repeat(32), handle.clone()).await?;
+                    vault.upsert(&host).await?;
+                    vault.set_password(1, Some("pw")).await?;
+                    vault.set_setting("theme", "light").await?;
+                    let trust = vault
+                        .check_or_record_known_host("[h.example]:22", "fp", "ssh-ed25519")
+                        .await?;
+                    anyhow::Ok((
+                        vault.load_hosts().await?,
+                        trust,
+                        vault.password_of(1).await?,
+                        vault.setting("theme").await?,
+                    ))
+                });
+                let (hosts, trust, secret, theme) = opened.expect("非运行时上下文里操作凭据库失败");
+                assert_eq!(hosts.len(), 1);
+                assert_eq!(hosts[0].name, "离线机");
+                assert_eq!(trust, Trust::New);
+                assert_eq!(secret.as_deref(), Some("pw"));
+                assert_eq!(theme.as_deref(), Some("light"));
+            });
+        });
+        drop(rt);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -761,6 +1062,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let mode = StorageMode::Global(dir.clone());
         let hexkey = "0c".repeat(32);
+        let rt = tokio::runtime::Handle::current();
 
         // --- 造旧 vault.db（turso 0.7 手写 SCHEMA，keyring 同款密钥） ---
         let legacy_path = dir.join(crate::paths::LEGACY_VAULT_FILE);
@@ -811,7 +1113,9 @@ mod tests {
         .unwrap();
 
         // --- 新库 + 迁移 ---
-        let vault = Vault::open(&mode, hexkey.clone()).await.unwrap();
+        let vault = Vault::open(&mode, hexkey.clone(), rt.clone())
+            .await
+            .unwrap();
         let migrated = migrate_legacy(&vault, &mode, &hexkey).await.unwrap();
         assert!(migrated);
 
@@ -834,7 +1138,14 @@ mod tests {
             .unwrap();
         assert_eq!(trust, Trust::Matched);
 
-        // 旧文件全部改名保留，绝不删除。
+        // 旧文件全部改名保留，绝不删除。旧库归档在后台重试（句柄回收是异步的），
+        // 这里轮询等待它完成。
+        for _ in 0..100 {
+            if dir.join("vault.db.migrated").exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
         assert!(!legacy_path.exists());
         assert!(dir.join("vault.db.migrated").exists());
         assert!(dir.join("settings.json.migrated").exists());

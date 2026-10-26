@@ -262,6 +262,8 @@ impl RuLinkApp {
     fn boot_vault(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let mode = self.mode.clone();
         let json_hosts = self.hosts.clone();
+        // 凭据库（toasty/turso）必须跑在 tokio 运行时上，句柄在此处取出后交给任务。
+        let runtime = rgpui::tokio::Tokio::handle(cx);
         // 口令档需要解锁弹窗：实体在 UI 线程预建。
         let passphrase_needed = mode.is_portable()
             || crate::vault::read_unlock_marker(&mode) == crate::vault::UnlockBackend::Passphrase;
@@ -288,7 +290,8 @@ impl RuLinkApp {
                 return;
             }
             let opened = async {
-                let vault = Vault::open(&mode, keyring_key.clone().unwrap()).await?;
+                let vault =
+                    Vault::open(&mode, keyring_key.clone().unwrap(), runtime.clone()).await?;
                 Self::after_vault_open(&vault, &mode, keyring_key.as_deref(), &json_hosts).await?;
                 Ok::<_, anyhow::Error>(vault)
             }
@@ -414,12 +417,13 @@ impl RuLinkApp {
         let json_hosts = self.hosts.clone();
         let salt_path = mode.salt_path();
         let is_new = self.unlock.as_ref().map(|s| s.is_new).unwrap_or(false);
+        let runtime = rgpui::tokio::Tokio::handle(cx);
         cx.spawn(async move |this, cx| {
             let opened = async {
                 // 盐缺失时生成并写盘（首次建库）；已有盐沿用（解锁）。
                 let salt = crate::vault::load_or_create_salt(&salt_path)?;
                 let hexkey = crate::vault::derive_key(&salt, &password)?;
-                let vault = Vault::open(&mode, hexkey).await?;
+                let vault = Vault::open(&mode, hexkey, runtime.clone()).await?;
                 let keyring_key = crate::vault::load_or_create_master_key().ok();
                 Self::after_vault_open(&vault, &mode, keyring_key.as_deref(), &json_hosts).await?;
                 if is_new {
@@ -497,10 +501,14 @@ impl RuLinkApp {
             cx.notify();
             return;
         }
-        let Some(vault) = self.vault.clone() else {
+        let Some(vault) = self.vault.take() else {
             return;
         };
         let mode = self.mode.clone();
+        // 换名需要旧库文件句柄已释放：句柄交给本任务独占，搬迁后即 drop。
+        let runtime = vault.runtime();
+        self.status = "正在更换主密码…".into();
+        cx.notify();
         cx.spawn(async move |this, cx| {
             let result = async {
                 let dump = vault.export_all().await?;
@@ -513,26 +521,51 @@ impl RuLinkApp {
                 let staging_db = staging.to_string_lossy().to_string();
                 {
                     // 用暂存库句柄导入，完成后释放（Windows 换名前必须关干净）。
-                    let fresh = Vault::open_at(&staging_db, hexkey.clone()).await?;
+                    let fresh =
+                        Vault::open_at(&staging_db, hexkey.clone(), runtime.clone()).await?;
                     fresh.import_dump(&dump).await?;
                 }
-                let backup = mode.db_path().with_file_name("rulink.db.keyring-bak");
-                if mode.db_path().exists() {
-                    if std::fs::rename(mode.db_path(), &backup).is_err() {
+                drop(vault);
+                let db_path = mode.db_path();
+                if db_path.exists() {
+                    let backup = db_path.with_file_name("rulink.db.keyring-bak");
+                    let backup = if backup.exists() {
                         // 备份名被占用时带时间戳另存，确保旧库不丢。
-                        let stamped = mode.db_path().with_file_name(format!(
+                        db_path.with_file_name(format!(
                             "rulink.db.bak-{}",
                             std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .map(|d| d.as_secs())
                                 .unwrap_or(0)
-                        ));
-                        std::fs::rename(mode.db_path(), &stamped)?;
+                        ))
+                    } else {
+                        backup
+                    };
+                    crate::vault::rename_db_bundle(&runtime, db_path.clone(), backup.clone(), 100)
+                        .await
+                        .map_err(|error| {
+                            anyhow::anyhow!("旧库让位失败（数据原样保留，可直接重试）: {error}")
+                        })?;
+                    // 新库就位失败时把旧库放回原处，绝不留下"两头空"。
+                    if let Err(error) = crate::vault::rename_db_bundle(
+                        &runtime,
+                        staging.clone(),
+                        db_path.clone(),
+                        100,
+                    )
+                    .await
+                    {
+                        let _ =
+                            crate::vault::rename_db_bundle(&runtime, backup, db_path, 100).await;
+                        return Err(anyhow::anyhow!("新库就位失败: {error}"));
                     }
+                } else {
+                    crate::vault::rename_db_bundle(&runtime, staging, db_path, 100)
+                        .await
+                        .map_err(anyhow::Error::msg)?;
                 }
-                std::fs::rename(&staging, mode.db_path())?;
                 crate::vault::write_unlock_marker(&mode, crate::vault::UnlockBackend::Passphrase)?;
-                let reopened = Vault::open(&mode, hexkey).await?;
+                let reopened = Vault::open(&mode, hexkey, runtime).await?;
                 Ok::<_, anyhow::Error>(reopened)
             }
             .await;
@@ -548,9 +581,36 @@ impl RuLinkApp {
                     if let Some(state) = this.rekey.as_mut() {
                         state.error = Some(format!("更换失败：{error}").into());
                     }
+                    this.restore_vault(cx);
                     cx.notify();
                 }
             });
+        })
+        .detach();
+    }
+
+    /// 换密钥失败后尽力恢复库句柄：keyring 档直接重开；口令档旧密钥只存在于
+    /// 解锁输入中，交回侧边栏 🔐 的解锁弹窗。
+    fn restore_vault(&mut self, cx: &mut Context<Self>) {
+        if self.vault.is_some() {
+            return;
+        }
+        if crate::vault::read_unlock_marker(&self.mode) == crate::vault::UnlockBackend::Passphrase {
+            self.status = "凭据库未就绪，点击侧边栏 🔐 重新解锁".into();
+            return;
+        }
+        let mode = self.mode.clone();
+        let runtime = rgpui::tokio::Tokio::handle(cx);
+        cx.spawn(async move |this, cx| {
+            let Ok(key) = crate::vault::load_or_create_master_key() else {
+                return;
+            };
+            if let Ok(vault) = Vault::open(&mode, key, runtime).await {
+                let _ = this.update(cx, |this, cx| {
+                    this.vault = Some(Arc::new(vault));
+                    cx.notify();
+                });
+            }
         })
         .detach();
     }
