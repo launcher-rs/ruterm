@@ -19,11 +19,14 @@ use rgpui::components::split_pane::{CollapsiblePane, SplitPane, SplitPaneState};
 use rgpui::components::status_bar::{StatusBar, StatusBarItem};
 use rgpui::input_ui::{Input, InputContentType, InputEvent, InputState};
 use rgpui::prelude::*;
+use rgpui::tabs::{Tab, TabBar};
+use rgpui::title_bar::TITLE_BAR_HEIGHT;
 use rgpui::{
-    AnyElement, App, Bounds, Button, ButtonVariants, Context, Entity, FocusHandle, Focusable,
-    FontWeight, Hsla, InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels, Render,
-    ScrollableElement, SharedString, StatefulInteractiveElement, Styled, TrayMenuItem, Window,
-    WindowBounds, WindowOptions, div, h_flex, px, size, v_flex,
+    AnyElement, App, Bounds, Button, ButtonVariants, Context, DropdownMenu, Entity, FocusHandle,
+    Focusable, FontWeight, Hsla, Icon, IconName, InteractiveElement, IntoElement, MouseButton,
+    ParentElement, Pixels, PopupMenu, PopupMenuItem, Render, ScrollableElement, SharedString,
+    StatefulInteractiveElement, Styled, TrayMenuItem, Window, WindowBounds, WindowControlArea,
+    WindowOptions, div, h_flex, px, size, v_flex,
 };
 use rgpui_term::{TerminalBuilder, TerminalView};
 
@@ -108,6 +111,8 @@ struct UnlockState {
 
 /// 设置弹窗状态：主密码表单（含当前口令校验）与应用偏好。
 struct SettingsState {
+    /// 当前分页（见 `SETTINGS_TAB_*`）。
+    tab: usize,
     /// 已是口令档时要求的"当前主密码"——应用可能在托盘里挂很久，
     /// 不验证就能换密钥等于没有锁。库未解锁时不显示。
     current: Option<Entity<InputState>>,
@@ -136,6 +141,11 @@ fn password_placeholder(passphrase_mode: bool) -> &'static str {
         "主密码（可不设置）"
     }
 }
+
+/// 设置弹窗分页：凭据库与主密码。
+const SETTINGS_TAB_VAULT: usize = 0;
+/// 设置弹窗分页：外观。
+const SETTINGS_TAB_APPEARANCE: usize = 1;
 
 /// RuLink 主视图：左侧主机账号管理，右侧会话标签终端。
 struct RuLinkApp {
@@ -517,7 +527,17 @@ impl RuLinkApp {
     /// 打开设置弹窗：主密码管理与主题偏好（主密码相关操作集中在设置里，
     /// 侧边栏只留入口）。
     fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.settings.is_some() {
+        self.open_settings_at(SETTINGS_TAB_VAULT, window, cx);
+    }
+
+    /// 打开设置弹窗并直接停在指定分页（标题栏菜单按入口意图分页）。
+    fn open_settings_at(&mut self, tab: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(state) = self.settings.as_mut() {
+            // 已开着：只换分页（搬迁途中锁住分页，避免切走看不到结果）。
+            if !state.busy {
+                state.tab = tab;
+                cx.notify();
+            }
             return;
         }
         let passphrase_mode =
@@ -544,6 +564,7 @@ impl RuLinkApp {
             .unwrap_or(&password)
             .update(cx, |state, cx| state.focus(window, cx));
         self.settings = Some(SettingsState {
+            tab,
             current,
             password: Some(password),
             confirm: Some(confirm),
@@ -551,6 +572,18 @@ impl RuLinkApp {
             info: None,
             busy: false,
         });
+        cx.notify();
+    }
+
+    /// 切换设置弹窗分页；主密码搬迁途中锁住分页，免得用户切走看不到结果。
+    fn select_settings_tab(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let Some(state) = self.settings.as_mut() else {
+            return;
+        };
+        if state.busy || state.tab == ix {
+            return;
+        }
+        state.tab = ix;
         cx.notify();
     }
 
@@ -1542,13 +1575,18 @@ impl RuLinkApp {
         Palette::from_theme(cx)
     }
 
-    /// 切换明暗主题：翻转全局 Theme 模式并持久化，界面（含状态栏/按钮）随之重取配色。
+    /// 切换明暗主题：翻转当前模式后落到 `apply_theme`。
     fn toggle_theme(&self, window: &mut Window, cx: &mut Context<Self>) {
         let dark = cx.theme().is_dark();
+        self.apply_theme(!dark, window, cx);
+    }
+
+    /// 设定明暗主题：翻转全局 Theme 模式并持久化，界面（含状态栏/按钮）随之重取配色。
+    fn apply_theme(&self, dark: bool, window: &mut Window, cx: &mut Context<Self>) {
         let mode = if dark {
-            rgpui::theme::ThemeMode::Light
-        } else {
             rgpui::theme::ThemeMode::Dark
+        } else {
+            rgpui::theme::ThemeMode::Light
         };
         rgpui::theme::Theme::change(mode, Some(window), cx);
         if let Some(vault) = self.vault.clone() {
@@ -1562,7 +1600,7 @@ impl RuLinkApp {
             .detach();
         } else {
             // 降级模式（无加密库）沿用旧 settings.json。
-            self.store.save_theme(!dark);
+            self.store.save_theme(dark);
         }
         cx.notify();
     }
@@ -1594,6 +1632,7 @@ impl Render for RuLinkApp {
                     }
                 }),
             )
+            .child(self.render_title_bar(window, cx))
             .child(
                 SplitPane::horizontal(self.split_state.clone())
                     .show_collapse_buttons(false)
@@ -1609,7 +1648,328 @@ impl Render for RuLinkApp {
 }
 
 impl RuLinkApp {
-    /// 左侧栏：标题 + 主题切换 / 新建按钮 / 主机列表面板。
+    /// 标题栏右侧的窗口控制按钮：登记为 `WindowControlArea`，交给系统
+    /// HTMINBUTTON / HTMAXBUTTON / HTCLOSE（关闭仍会走 `on_window_should_close`，
+    /// 即隐藏到托盘）。
+    #[allow(clippy::too_many_arguments)]
+    fn window_control(
+        id: &'static str,
+        icon: IconName,
+        area: WindowControlArea,
+        fg: Hsla,
+        hover_bg: Hsla,
+        active_bg: Hsla,
+        hover_fg: Hsla,
+    ) -> AnyElement {
+        div()
+            .id(id)
+            .flex()
+            .w(TITLE_BAR_HEIGHT)
+            .h_full()
+            .flex_shrink_0()
+            .justify_center()
+            .content_center()
+            .items_center()
+            .text_color(fg)
+            .hover(|style| style.bg(hover_bg).text_color(hover_fg))
+            .active(|style| style.bg(active_bg).text_color(hover_fg))
+            .window_control_area(area)
+            .child(Icon::new(icon).small())
+            .into_any_element()
+    }
+
+    /// 自定义标题栏：品牌 + 菜单（会话 / 凭据 / 外观 / 帮助）+ 快捷按钮 + 窗口控制。
+    ///
+    /// 这里不套框架的 `TitleBar`：它把 children 整体放进 `WindowControlArea::Drag`
+    /// 命中区，而 Windows 的 WM_NCHITTEST 只取**第一个**命中的控制区，父级 Drag 先入表，
+    /// 栏内按钮一律被判定为 caption，点击被系统吃掉（hover 仍在、click 永不触发）。
+    /// 改成把拖拽区拆成"品牌段"与"中间空档"两个兄弟节点，交互控件落在 Drag 区之外。
+    fn render_title_bar(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let pal = self.palette(cx);
+        let bar_bg = cx.theme().tokens.title_bar;
+        let bar_border = cx.theme().title_bar_border;
+        let fg = cx.theme().foreground;
+        let plain_hover_bg = cx.theme().secondary_hover;
+        let plain_active_bg = cx.theme().secondary_active;
+        let plain_hover_fg = cx.theme().secondary_foreground;
+        let close_hover_bg = cx.theme().danger;
+        let close_active_bg = cx.theme().danger_active;
+        let close_hover_fg = cx.theme().danger_foreground;
+        let dark = cx.theme().is_dark();
+        let maximized = window.is_maximized();
+        // 只有口令档（已设置主密码）才有"锁定/解锁"概念，keyring 档免密无锁可上。
+        let passphrase_mode =
+            crate::vault::read_unlock_marker(&self.mode) == crate::vault::UnlockBackend::Passphrase;
+        let locked = passphrase_mode && self.vault.is_none();
+        let vault_state: &'static str = if !passphrase_mode {
+            "免主密码（系统密钥环）"
+        } else if locked {
+            "主密码档 · 已锁定"
+        } else {
+            "主密码档 · 已解锁"
+        };
+        let entity = cx.entity();
+
+        // 会话菜单：新建主机、侧栏折叠、托盘与退出。
+        let session = entity.clone();
+        let session2 = entity.clone();
+        let session_menu = move |menu: PopupMenu, _: &mut Window, _: &mut Context<PopupMenu>| {
+            // 菜单构建器要求 `Fn`（可重复调用），每次重建时重新克隆实体句柄交给各项回调。
+            let session = session.clone();
+            let session2 = session2.clone();
+            menu.item(
+                PopupMenuItem::new("新建主机…").on_click(move |_, window, cx| {
+                    session.update(cx, |this, cx| this.open_form(window, cx));
+                }),
+            )
+            .item(
+                PopupMenuItem::new("折叠 / 展开侧边栏 (Ctrl+B)").on_click(move |_, _, cx| {
+                    session2.update(cx, |this, cx| {
+                        this.split_state.update(cx, |state, cx| {
+                            state.toggle_collapse(CollapsiblePane::First, cx);
+                        });
+                        cx.notify();
+                    });
+                }),
+            )
+            .separator()
+            .item(
+                PopupMenuItem::new("隐藏到托盘").on_click(move |_, window, _| {
+                    window.hide_window();
+                }),
+            )
+            .item(
+                PopupMenuItem::new("退出 RuLink")
+                    .danger(true)
+                    .on_click(move |_, _, cx| cx.quit()),
+            )
+        };
+
+        // 凭据菜单：解锁 / 主密码设置 / 锁定，末尾附当前档位（只读）。
+        let unlock = entity.clone();
+        let settings = entity.clone();
+        let lock = entity.clone();
+        let vault_menu = move |menu: PopupMenu, _: &mut Window, _: &mut Context<PopupMenu>| {
+            let unlock = unlock.clone();
+            let settings = settings.clone();
+            let lock = lock.clone();
+            let menu = if locked {
+                menu.item(
+                    PopupMenuItem::new("解锁凭据库…").on_click(move |_, window, cx| {
+                        unlock.update(cx, |this, cx| this.open_unlock_dialog(window, cx));
+                    }),
+                )
+            } else {
+                menu.item(PopupMenuItem::new("主密码与凭据库设置…").on_click(
+                    move |_, window, cx| {
+                        settings.update(cx, |this, cx| {
+                            this.open_settings_at(SETTINGS_TAB_VAULT, window, cx);
+                        });
+                    },
+                ))
+            };
+            let menu = if passphrase_mode && !locked {
+                menu.item(
+                    PopupMenuItem::new("锁定凭据库").on_click(move |_, window, cx| {
+                        lock.update(cx, |this, cx| this.lock_vault(window, cx));
+                    }),
+                )
+            } else {
+                menu
+            };
+            menu.separator()
+                .item(PopupMenuItem::new(vault_state).disabled(true))
+        };
+
+        // 外观菜单：明暗二选一（当前项打勾），外加设置面板的外观分页。
+        let to_dark = entity.clone();
+        let to_light = entity.clone();
+        let appearance = entity.clone();
+        let appearance_menu =
+            move |menu: PopupMenu, _: &mut Window, _: &mut Context<PopupMenu>| {
+                let to_dark = to_dark.clone();
+                let to_light = to_light.clone();
+                let appearance = appearance.clone();
+                menu.item(PopupMenuItem::new("暗色主题").checked(dark).on_click(
+                    move |_, window, cx| {
+                        to_dark.update(cx, |this, cx| this.apply_theme(true, window, cx));
+                    },
+                ))
+                .item(PopupMenuItem::new("亮色主题").checked(!dark).on_click(
+                    move |_, window, cx| {
+                        to_light.update(cx, |this, cx| this.apply_theme(false, window, cx));
+                    },
+                ))
+                .separator()
+                .item(
+                    PopupMenuItem::new("外观设置…").on_click(move |_, window, cx| {
+                        appearance.update(cx, |this, cx| {
+                            this.open_settings_at(SETTINGS_TAB_APPEARANCE, window, cx);
+                        });
+                    }),
+                )
+            };
+
+        let help_menu = move |menu: PopupMenu, _: &mut Window, _: &mut Context<PopupMenu>| {
+            menu.label("RuLink")
+                .item(
+                    PopupMenuItem::new(concat!("版本 ", env!("CARGO_PKG_VERSION"))).disabled(true),
+                )
+                .separator()
+                .item(PopupMenuItem::new("Ctrl+B 折叠 / 展开侧边栏").disabled(true))
+                .item(PopupMenuItem::new("Ctrl+T 切换明暗主题").disabled(true))
+        };
+
+        let menu_button = |id: &'static str, label: &'static str| {
+            Button::new(id)
+                .label(label)
+                .compact()
+                .ghost()
+                .text_color(fg)
+        };
+
+        h_flex()
+            .id("title-bar")
+            .flex_shrink_0()
+            .w_full()
+            .h(TITLE_BAR_HEIGHT)
+            .items_center()
+            .pl(px(12.0))
+            .border_b_1()
+            .border_color(bar_border)
+            .bg(bar_bg)
+            .text_color(fg)
+            // 可拖动段一：品牌与锁定提示。
+            .child(
+                h_flex()
+                    .id("titlebar-brand")
+                    .h_full()
+                    .items_center()
+                    .gap_2()
+                    .pr_3()
+                    .flex_shrink_0()
+                    .window_control_area(WindowControlArea::Drag)
+                    .child(
+                        div()
+                            .text_base()
+                            .font_weight(FontWeight(700.0))
+                            .child("RuLink"),
+                    )
+                    .when(locked, |this| {
+                        this.child(div().text_sm().text_color(pal.muted).child("已锁定"))
+                    }),
+            )
+            // 菜单区：交互控件，必须落在 Drag 命中区之外。
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_1()
+                    .flex_shrink_0()
+                    .child(menu_button("menu-session", "会话").dropdown_menu(session_menu))
+                    .child(menu_button("menu-vault", "凭据").dropdown_menu(vault_menu))
+                    .child(menu_button("menu-appearance", "外观").dropdown_menu(appearance_menu))
+                    .child(menu_button("menu-help", "帮助").dropdown_menu(help_menu)),
+            )
+            // 可拖动段二：菜单与右侧按钮之间的空档。
+            .child(
+                div()
+                    .id("titlebar-gap")
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .window_control_area(WindowControlArea::Drag),
+            )
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_1()
+                    .flex_shrink_0()
+                    .pr_1()
+                    // 口令档且未解锁：只留重新解锁入口（其余操作都需要库）。
+                    .when(locked, |this| {
+                        this.child(
+                            Button::new("unlock-vault")
+                                .label("🔑")
+                                .compact()
+                                .ghost()
+                                .tooltip("输入主密码解锁凭据库")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.open_unlock_dialog(window, cx);
+                                })),
+                        )
+                    })
+                    .child(
+                        Button::new("open-settings")
+                            .label("⚙")
+                            .compact()
+                            .ghost()
+                            .tooltip("设置（凭据库 / 外观分页）")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_settings(window, cx);
+                            })),
+                    )
+                    // 已设主密码才出现锁定按钮：锁定后需重新输入口令才能用库。
+                    .when(passphrase_mode && !locked, |this| {
+                        this.child(
+                            Button::new("lock-vault")
+                                .label("🔒")
+                                .compact()
+                                .ghost()
+                                .tooltip("锁定凭据库（需主密码解锁）")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.lock_vault(window, cx);
+                                })),
+                        )
+                    })
+                    .child(
+                        Button::new("sidebar-collapse")
+                            .label("«")
+                            .compact()
+                            .ghost()
+                            .tooltip("折叠侧边栏 (Ctrl+B)")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.split_state.update(cx, |state, cx| {
+                                    state.collapse(CollapsiblePane::First, cx);
+                                });
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(Self::window_control(
+                "win-minimize",
+                IconName::WindowMinimize,
+                WindowControlArea::Min,
+                fg,
+                plain_hover_bg,
+                plain_active_bg,
+                plain_hover_fg,
+            ))
+            .child(Self::window_control(
+                "win-maximize",
+                if maximized {
+                    IconName::WindowRestore
+                } else {
+                    IconName::WindowMaximize
+                },
+                WindowControlArea::Max,
+                fg,
+                plain_hover_bg,
+                plain_active_bg,
+                plain_hover_fg,
+            ))
+            .child(Self::window_control(
+                "win-close",
+                IconName::WindowClose,
+                WindowControlArea::Close,
+                fg,
+                close_hover_bg,
+                close_active_bg,
+                close_hover_fg,
+            ))
+            .into_any_element()
+    }
+
+    /// 左侧栏：新建按钮 / 搜索框 / 主机列表面板（品牌与全局入口已移至标题栏）。
     /// 宽度与折叠由外层 SplitPane 负责，这里只填充第一面板区域。
     fn render_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
         let pal = self.palette(cx);
@@ -1619,97 +1979,14 @@ impl RuLinkApp {
             self.render_host_list(cx)
         };
 
-        let dark = cx.theme().is_dark();
-        let theme_label: &'static str = if dark { "☀" } else { "☾" };
-        let theme_tooltip: &'static str = if dark {
-            "切换到亮色主题 (Ctrl+T)"
-        } else {
-            "切换到暗色主题 (Ctrl+T)"
-        };
         // 搜索框只在主机列表模式下出现（待输入密码时隐藏；表单已是居中弹窗，不占列表）。
         let list_mode = self.pending.is_none();
-        // 只有口令档（已设置主密码）才有"锁定/解锁"概念，keyring 档免密无锁可上。
-        let passphrase_mode =
-            crate::vault::read_unlock_marker(&self.mode) == crate::vault::UnlockBackend::Passphrase;
-        let locked = passphrase_mode && self.vault.is_none();
 
         v_flex()
             .size_full()
             .bg(pal.sidebar_bg)
             .p_3()
             .gap_2()
-            .child(
-                h_flex()
-                    .w_full()
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        div()
-                            .text_lg()
-                            .font_weight(rgpui::FontWeight(700.0))
-                            .child("RuLink"),
-                    )
-                    .child(
-                        h_flex()
-                            .gap_1()
-                            // 口令档且未解锁：只留重新解锁入口（其余操作都需要库）。
-                            .when(locked, |this| {
-                                this.child(
-                                    Button::new("unlock-vault")
-                                        .label("🔑")
-                                        .ghost()
-                                        .tooltip("输入主密码解锁凭据库")
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.open_unlock_dialog(window, cx);
-                                        })),
-                                )
-                            })
-                            .when(!locked, |this| {
-                                this.child(
-                                    Button::new("open-settings")
-                                        .label("⚙")
-                                        .ghost()
-                                        .tooltip("设置（主密码、主题）")
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.open_settings(window, cx);
-                                        })),
-                                )
-                            })
-                            // 已设主密码才出现锁定按钮：锁定后需重新输入口令才能用库。
-                            .when(passphrase_mode && !locked, |this| {
-                                this.child(
-                                    Button::new("lock-vault")
-                                        .label("🔒")
-                                        .ghost()
-                                        .tooltip("锁定凭据库（需主密码解锁）")
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.lock_vault(window, cx);
-                                        })),
-                                )
-                            })
-                            .child(
-                                Button::new("toggle-theme")
-                                    .label(theme_label)
-                                    .ghost()
-                                    .tooltip(theme_tooltip)
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.toggle_theme(window, cx);
-                                    })),
-                            )
-                            .child(
-                                Button::new("sidebar-collapse")
-                                    .label("«")
-                                    .ghost()
-                                    .tooltip("折叠侧边栏 (Ctrl+B)")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.split_state.update(cx, |state, cx| {
-                                            state.collapse(CollapsiblePane::First, cx);
-                                        });
-                                        cx.notify();
-                                    })),
-                            ),
-                    ),
-            )
             .child(
                 Button::new("new-host")
                     .label("+ 新建主机")
@@ -1818,7 +2095,7 @@ impl RuLinkApp {
             .into_any_element()
     }
 
-    /// 设置居中弹窗：凭据库信息、主密码管理（含当前口令校验）与主题偏好。
+    /// 设置居中弹窗：分页展示「凭据库与主密码」与「外观」。
     fn render_settings_dialog(&self, cx: &Context<Self>) -> AnyElement {
         let pal = self.palette(cx);
         let Some(state) = self.settings.as_ref() else {
@@ -1828,6 +2105,11 @@ impl RuLinkApp {
             crate::vault::read_unlock_marker(&self.mode) == crate::vault::UnlockBackend::Passphrase;
         let unlocked = self.vault.is_some();
         let dark = cx.theme().is_dark();
+        let body = if state.tab == SETTINGS_TAB_APPEARANCE {
+            self.render_appearance_tab(&pal, dark, cx)
+        } else {
+            self.render_vault_tab(&pal, state, passphrase_mode, unlocked, cx)
+        };
         v_flex()
             .id("settings-backdrop")
             .absolute()
@@ -1844,7 +2126,7 @@ impl RuLinkApp {
             .child(
                 v_flex()
                     .id("settings-dialog")
-                    .w(px(460.0))
+                    .w(px(520.0))
                     .gap_3()
                     .p_5()
                     .rounded(px(8.0))
@@ -1859,187 +2141,223 @@ impl RuLinkApp {
                     .child(
                         div()
                             .text_base()
-                            .font_weight(rgpui::FontWeight(600.0))
+                            .font_weight(FontWeight(600.0))
                             .child("设置"),
                     )
                     .child(
-                        div()
-                            .text_base()
-                            .font_weight(rgpui::FontWeight(600.0))
-                            .child("凭据库与主密码"),
+                        TabBar::new("settings-tabs")
+                            .underline()
+                            .children(vec![
+                                Tab::new().label("凭据库与主密码"),
+                                Tab::new().label("外观"),
+                            ])
+                            .selected_index(state.tab)
+                            .on_change({
+                                let entity = cx.entity();
+                                move |ix, _window, cx| {
+                                    entity.update(cx, |this, cx| {
+                                        this.select_settings_tab(ix, cx);
+                                    });
+                                }
+                            }),
                     )
-                    .child(div().text_sm().text_color(pal.muted).child(format!(
-                        "位置：{}　解锁方式：{}",
-                        self.mode.dir().display(),
-                        if passphrase_mode {
-                            "主密码（Argon2id 派生）"
-                        } else {
-                            "系统凭据管理器（无需输入）"
-                        }
-                    )))
-                    .child(div().text_sm().text_color(pal.muted).child(if passphrase_mode {
+                    .child(body)
+                    .child(
+                        h_flex().gap_2().justify_end().child(
+                            Button::new("settings-close")
+                                .label("关闭")
+                                .ghost()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.close_settings(cx);
+                                })),
+                        ),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// 「凭据库与主密码」分页：库位置与解锁方式、主密码设置/更换/取消、一键锁定。
+    fn render_vault_tab(
+        &self,
+        pal: &Palette,
+        state: &SettingsState,
+        passphrase_mode: bool,
+        unlocked: bool,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        v_flex()
+            .id("settings-tab-vault")
+            .gap_3()
+            .child(div().text_sm().text_color(pal.muted).child(format!(
+                "位置：{}　解锁方式：{}",
+                self.mode.dir().display(),
+                if passphrase_mode {
+                    "主密码（Argon2id 派生）"
+                } else {
+                    "系统凭据管理器（无需输入）"
+                }
+            )))
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(pal.muted)
+                    .child(if passphrase_mode {
                         "主密码只用于派生库密钥，不会写入任何文件；忘记主密码将无法恢复数据。\
-                                 每次启动需输入主密码，库文件可凭口令带往其他机器解锁。"
+                         每次启动需输入主密码，库文件可凭口令带往其他机器解锁。"
                     } else {
                         "当前由系统凭据管理器免密解锁，开箱即用。建议设置主密码：库文件可凭口令\
-                                 带往其他机器，他人取到文件也无法读取；忘记主密码将无法恢复数据。"
-                    }))
-                    .when(!unlocked, |this| {
-                        this.child(
-                            div()
-                                .text_sm()
-                                .text_color(pal.danger)
-                                .child("凭据库未解锁，无法设置或更换主密码。"),
-                        )
-                    })
-                    .when(unlocked, |this| {
-                        let form = state.password.as_ref().zip(state.confirm.as_ref());
-                        let this = match form {
-                            Some((password, confirm)) => {
-                                let this = this.child(
-                                    div()
-                                        .text_base()
-                                        .font_weight(rgpui::FontWeight(600.0))
-                                        .child(if passphrase_mode {
+                         带往其他机器，他人取到文件也无法读取；忘记主密码将无法恢复数据。"
+                    }),
+            )
+            .when(!unlocked, |this| {
+                this.child(
+                    div()
+                        .text_sm()
+                        .text_color(pal.danger)
+                        .child("凭据库未解锁，无法设置或更换主密码。"),
+                )
+            })
+            .when(unlocked, |this| {
+                let form = state.password.as_ref().zip(state.confirm.as_ref());
+                match form {
+                    Some((password, confirm)) => {
+                        let this =
+                            this.child(div().text_base().font_weight(FontWeight(600.0)).child(
+                                if passphrase_mode {
+                                    "更换主密码"
+                                } else {
+                                    "设置主密码（可选）"
+                                },
+                            ));
+                        let this = match state.current.as_ref() {
+                            Some(current) => this.child(styled_input(
+                                Input::new(current).content_type(InputContentType::Password),
+                                &pal,
+                            )),
+                            None => this,
+                        };
+                        this.child(styled_input(
+                            Input::new(password).content_type(InputContentType::Password),
+                            &pal,
+                        ))
+                        .child(styled_input(
+                            Input::new(confirm).content_type(InputContentType::Password),
+                            &pal,
+                        ))
+                        .when_some(state.error.as_ref().cloned(), |this, error| {
+                            this.child(div().text_sm().text_color(pal.danger).child(error))
+                        })
+                        .when(state.busy, |this| {
+                            this.child(
+                                div()
+                                    .text_sm()
+                                    .text_color(pal.muted)
+                                    .child("正在新建加密库并全量搬迁，请稍候…"),
+                            )
+                        })
+                        .when(!state.busy, |this| {
+                            this.child(
+                                h_flex()
+                                    .gap_2()
+                                    .justify_end()
+                                    .when(passphrase_mode, |this| {
+                                        this.child(
+                                            Button::new("rekey-cancel")
+                                                .label("取消主密码")
+                                                .ghost()
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.cancel_master_password(cx);
+                                                })),
+                                        )
+                                    })
+                                    .child(
+                                        Button::new("rekey-apply")
+                                            .label(if passphrase_mode {
+                                                "更换主密码"
+                                            } else {
+                                                "设置主密码"
+                                            })
+                                            .primary()
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.apply_rekey(cx);
+                                            })),
+                                    ),
+                            )
+                        })
+                    }
+                    // 提交成功后表单已销毁（明文口令不留界面），只留结果与重开入口。
+                    None => this
+                        .when_some(state.info.as_ref().cloned(), |this, info| {
+                            this.child(div().text_sm().text_color(pal.accent).child(info))
+                        })
+                        .when_some(state.error.as_ref().cloned(), |this, error| {
+                            this.child(div().text_sm().text_color(pal.danger).child(error))
+                        })
+                        .when(!state.busy, |this| {
+                            this.child(
+                                h_flex().gap_2().justify_end().child(
+                                    Button::new("rekey-reopen")
+                                        .label(if passphrase_mode {
                                             "更换主密码"
                                         } else {
-                                            "设置主密码（可选）"
-                                        }),
-                                );
-                                let this = match state.current.as_ref() {
-                                    Some(current) => this.child(styled_input(
-                                        Input::new(current).content_type(InputContentType::Password),
-                                        &pal,
-                                    )),
-                                    None => this,
-                                };
-                                this.child(styled_input(
-                                    Input::new(password).content_type(InputContentType::Password),
-                                    &pal,
-                                ))
-                                .child(styled_input(
-                                    Input::new(confirm).content_type(InputContentType::Password),
-                                    &pal,
-                                ))
-                                .when_some(state.error.as_ref().cloned(), |this, error| {
-                                    this.child(div().text_sm().text_color(pal.danger).child(error))
-                                })
-                                .when(state.busy, |this| {
-                                    this.child(
-                                        div()
-                                            .text_sm()
-                                            .text_color(pal.muted)
-                                            .child("正在新建加密库并全量搬迁，请稍候…"),
-                                    )
-                                })
-                                .when(!state.busy, |this| {
-                                    this.child(
-                                        h_flex()
-                                            .gap_2()
-                                            .justify_end()
-                                            .when(passphrase_mode, |this| {
-                                                this.child(
-                                                    Button::new("rekey-cancel")
-                                                        .label("取消主密码")
-                                                        .ghost()
-                                                        .on_click(cx.listener(|this, _, _, cx| {
-                                                            this.cancel_master_password(cx);
-                                                        })),
-                                                )
-                                            })
-                                            .child(
-                                                Button::new("rekey-apply")
-                                                    .label(if passphrase_mode {
-                                                        "更换主密码"
-                                                    } else {
-                                                        "设置主密码"
-                                                    })
-                                                    .primary()
-                                                    .on_click(cx.listener(|this, _, _, cx| {
-                                                        this.apply_rekey(cx);
-                                                    })),
-                                            ),
-                                    )
-                                })
-                            }
-                            // 提交成功后表单已销毁（明文口令不留界面），只留结果与重开入口。
-                            None => this
-                                .when_some(state.info.as_ref().cloned(), |this, info| {
-                                    this.child(div().text_sm().text_color(pal.accent).child(info))
-                                })
-                                .when_some(state.error.as_ref().cloned(), |this, error| {
-                                    this.child(div().text_sm().text_color(pal.danger).child(error))
-                                })
-                                .when(!state.busy, |this| {
-                                    this.child(
-                                        h_flex().gap_2().justify_end().child(
-                                            Button::new("rekey-reopen")
-                                                .label(if passphrase_mode {
-                                                    "更换主密码"
-                                                } else {
-                                                    "设置主密码"
-                                                })
-                                                .ghost()
-                                                .on_click(cx.listener(|this, _, window, cx| {
-                                                    this.reopen_password_form(window, cx);
-                                                })),
-                                        ),
-                                    )
-                                }),
-                        };
-                        this
-                    })
-                    .child(
-                        div()
-                            .text_base()
-                            .font_weight(rgpui::FontWeight(600.0))
-                            .child("外观"),
-                    )
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .items_center()
-                            .child(
-                                div().text_sm().text_color(pal.muted).child(format!(
-                                    "当前主题：{}",
-                                    if dark { "暗色" } else { "亮色" }
-                                )),
-                            )
-                            .child(
-                                Button::new("settings-toggle-theme")
-                                    .label(if dark {
-                                        "切换到亮色"
-                                    } else {
-                                        "切换到暗色"
-                                    })
-                                    .ghost()
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.toggle_theme(window, cx);
-                                    })),
-                            ),
-                    )
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .justify_end()
-                            .when(passphrase_mode && unlocked, |this| {
-                                this.child(
-                                    Button::new("settings-lock")
-                                        .label("锁定凭据库")
+                                            "设置主密码"
+                                        })
                                         .ghost()
                                         .on_click(cx.listener(|this, _, window, cx| {
-                                            this.lock_vault(window, cx);
+                                            this.reopen_password_form(window, cx);
                                         })),
-                                )
+                                ),
+                            )
+                        }),
+                }
+            })
+            .when(passphrase_mode && unlocked, |this| {
+                this.child(
+                    h_flex().gap_2().justify_end().child(
+                        Button::new("settings-lock")
+                            .label("锁定凭据库")
+                            .ghost()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.lock_vault(window, cx);
+                            })),
+                    ),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// 「外观」分页：明暗主题（与 `Ctrl+T`、标题栏 ☀☾ 同一开关）。
+    fn render_appearance_tab(&self, pal: &Palette, dark: bool, cx: &Context<Self>) -> AnyElement {
+        v_flex()
+            .id("settings-tab-appearance")
+            .gap_3()
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(pal.muted)
+                    .child("主题切换立即生效并写入凭据库，下次启动沿用。"),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(pal.muted)
+                            .child(format!("当前主题：{}", if dark { "暗色" } else { "亮色" })),
+                    )
+                    .child(
+                        Button::new("settings-toggle-theme")
+                            .label(if dark {
+                                "切换到亮色"
+                            } else {
+                                "切换到暗色"
                             })
-                            .child(
-                                Button::new("settings-close")
-                                    .label("关闭")
-                                    .ghost()
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.close_settings(cx);
-                                    })),
-                            ),
+                            .ghost()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.toggle_theme(window, cx);
+                            })),
                     ),
             )
             .into_any_element()
@@ -2828,8 +3146,13 @@ fn main() {
                 ))),
                 titlebar: Some(rgpui::TitlebarOptions {
                     title: Some("RuLink".into()),
+                    // 隐藏系统标题栏，改由应用自绘（品牌 + 菜单 + 窗口控制按钮）。
+                    appears_transparent: true,
                     ..Default::default()
                 }),
+                // 客户区装饰：窗口样式改为 WS_THICKFRAME 无边框（DWM 仍画圆角与可拖边框），
+                // 拖拽与窗口控制由标题栏里显式登记的 WindowControlArea 命中区交给系统。
+                app_owns_titlebar_drag: true,
                 ..Default::default()
             },
             |window, cx| {
