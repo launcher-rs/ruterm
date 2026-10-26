@@ -6181,8 +6181,10 @@ dependencies = [
 name = "rulink"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm 0.11.1",
  "anyhow",
  "argon2 0.5.3",
+ "base64 0.23.1",
  "bytes",
  "getrandom 0.4.3",
  "keyring",
@@ -6193,6 +6195,7 @@ dependencies = [
  "russh",
  "serde",
  "serde_json",
+ "sha2 0.11.1",
  "toasty",
  "toasty-driver-turso",
  "tokio",

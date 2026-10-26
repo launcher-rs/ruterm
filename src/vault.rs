@@ -1,6 +1,12 @@
 //! 凭据保险库：主机配置、应用设置与 known_hosts 统一存放在单文件加密数据库
 //! （toasty ORM + turso 页级加密 AEGIS-256）。
 //!
+//! 密码列另有**应用层字段加密**（AES-256-GCM）：密钥由主密钥域分离派生
+//! （`SHA-256(主密钥 ‖ "rulink-field-key-v1")`），每条密码随机 12 字节 nonce，
+//! 列内存 `base64(nonce ‖ 密文 ‖ 标签)`。即使库文件页级加密被绕过或某个页面
+//! 被明文导出，密码列依然是不可读的密文；库级加密负责整体防护，字段加密
+//! 负责"最敏感的那一列"。
+//!
 //! 解锁后端有两档（[`UnlockBackend`]）：
 //! - **keyring**：主密钥为 32 随机字节的十六进制串，只保存在操作系统凭据管理器
 //!   （Windows 凭据管理器 / macOS 钥匙串 / Linux libsecret）中，不落盘、不入库；
@@ -17,6 +23,8 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::paths::StorageMode;
+use crate::sessions::{AuthMethod, HostConfig};
 use anyhow::{Context as _, Result};
 use argon2::Argon2;
 use keyring::Entry;
@@ -24,9 +32,6 @@ use toasty::stmt::{List, Query};
 use toasty_driver_turso::{EncryptionOpts, Turso};
 use tokio::sync::Mutex;
 use turso::{Builder, Value};
-
-use crate::paths::StorageMode;
-use crate::sessions::{AuthMethod, HostConfig};
 
 /// 凭据管理器中的服务名与账户名（keyring 档主密钥条目）。
 const KEYRING_SERVICE: &str = "rulink";
@@ -38,7 +43,7 @@ mod schema {
 
     use crate::sessions::HostConfig;
 
-    /// 主机行；password 列为可选密文文本（库级加密下按原样存取，未保存则 NULL）。
+    /// 主机行；password 列存字段加密后的密文（见模块头的说明），未保存则 NULL。
     #[derive(Debug, Model)]
     #[table = "hosts"]
     pub struct Host {
@@ -143,6 +148,85 @@ fn valid_hex_key(hex: &str) -> bool {
     hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// 密码列的应用层字段加密（AES-256-GCM）。
+///
+/// 密钥由主密钥**域分离**派生，与页级加密用的密钥不同；密文自带随机 nonce，
+/// 同一密码两次写入的密文也不同。既不依赖库级加密是否真的生效，也不必
+/// 担心单页导出泄露明文。
+mod field {
+    use aes_gcm::{
+        Aes256Gcm, KeyInit, Nonce,
+        aead::{Aead, consts::U12},
+    };
+    use anyhow::{Context as _, Result};
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use sha2::{Digest as _, Sha256};
+
+    /// 派生字段密钥用的域分离标签（改动它等于换了一把钥匙，旧密文将解不开）。
+    const FIELD_KEY_INFO: &[u8] = b"rulink-field-key-v1";
+
+    /// GCM nonce 长度（字节）。
+    const NONCE_LEN: usize = 12;
+
+    type FieldNonce = Nonce<U12>;
+
+    /// 字节切片 → GCM nonce。
+    fn nonce_of(bytes: &[u8]) -> Result<FieldNonce> {
+        FieldNonce::try_from(bytes).map_err(|_| anyhow::anyhow!("nonce 长度不合法"))
+    }
+
+    /// 主密钥（十六进制串）→ 字段密钥（32 字节）。
+    pub fn derive_field_key(hexkey: &str) -> Result<[u8; 32]> {
+        anyhow::ensure!(
+            super::valid_hex_key(hexkey),
+            "主密钥格式无效（应为 64 位十六进制）"
+        );
+        let mut master = [0u8; 32];
+        for (byte, pair) in master.iter_mut().zip(hexkey.as_bytes().chunks(2)) {
+            *byte = u8::from_str_radix(std::str::from_utf8(pair).context("主密钥编码异常")?, 16)
+                .context("主密钥十六进制解析失败")?;
+        }
+        let mut hash = Sha256::new();
+        hash.update(master);
+        hash.update(FIELD_KEY_INFO);
+        let digest = hash.finalize();
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&digest);
+        Ok(key)
+    }
+
+    /// 明文密码 → 入库字符串（`base64(nonce ‖ 密文 ‖ 标签)`）。
+    pub fn encrypt(field_key: &[u8; 32], plaintext: &str) -> Result<String> {
+        let cipher = Aes256Gcm::new_from_slice(field_key)
+            .map_err(|error| anyhow::anyhow!("字段加密初始化失败: {error}"))?;
+        let mut nonce = [0u8; NONCE_LEN];
+        getrandom::fill(&mut nonce).context("生成字段加密随机数失败")?;
+        let mut blob = Vec::with_capacity(NONCE_LEN + plaintext.len() + 16);
+        blob.extend_from_slice(&nonce);
+        blob.extend(
+            cipher
+                .encrypt(&nonce_of(&nonce)?, plaintext.as_bytes())
+                .map_err(|error| anyhow::anyhow!("密码字段加密失败: {error}"))?,
+        );
+        Ok(STANDARD.encode(blob))
+    }
+
+    /// 入库字符串 → 明文密码；密钥不符或数据被篡改一律 Err（绝不降级返回原样）。
+    pub fn decrypt(field_key: &[u8; 32], stored: &str) -> Result<String> {
+        let cipher = Aes256Gcm::new_from_slice(field_key)
+            .map_err(|error| anyhow::anyhow!("字段加密初始化失败: {error}"))?;
+        let blob = STANDARD
+            .decode(stored)
+            .map_err(|error| anyhow::anyhow!("密码字段格式无效: {error}"))?;
+        anyhow::ensure!(blob.len() > NONCE_LEN + 16, "密码字段长度不足，疑为损坏");
+        let (nonce, ciphertext) = blob.split_at(NONCE_LEN);
+        let plaintext = cipher
+            .decrypt(&nonce_of(nonce)?, ciphertext)
+            .map_err(|_| anyhow::anyhow!("密码字段解密失败（主密钥不匹配或数据被篡改）"))?;
+        String::from_utf8(plaintext).context("密码字段不是合法文本")
+    }
+}
+
 /// 从凭据管理器读取 keyring 档主密钥；没有条目时生成随机密钥并写入。
 ///
 /// 若已有条目但格式非法，直接报错而不是覆盖——覆盖会让旧库永久无法解密。
@@ -240,6 +324,8 @@ pub fn write_unlock_marker(mode: &StorageMode, backend: UnlockBackend) -> Result
 pub struct Vault {
     db: Arc<Mutex<toasty::Db>>,
     rt: tokio::runtime::Handle,
+    /// password 列的字段密钥（主密钥域分离派生，仅存在于进程内存）。
+    field_key: [u8; 32],
 }
 
 /// 一次库操作：在运行时任务里取得库句柄。
@@ -256,6 +342,7 @@ impl Vault {
             valid_hex_key(&hexkey),
             "主密钥格式无效（应为 64 位十六进制）"
         );
+        let field_key = field::derive_field_key(&hexkey)?;
         mode.ensure_dir()
             .with_context(|| format!("无法创建 {}", mode.dir().display()))?;
         let path = mode.db_path().to_string_lossy().to_string();
@@ -266,6 +353,7 @@ impl Vault {
         Ok(Self {
             db: Arc::new(Mutex::new(db)),
             rt,
+            field_key,
         })
     }
 
@@ -275,6 +363,7 @@ impl Vault {
             valid_hex_key(&hexkey),
             "主密钥格式无效（应为 64 位十六进制）"
         );
+        let field_key = field::derive_field_key(&hexkey)?;
         let db = rt
             .spawn(connect(path.to_string(), hexkey, true))
             .await
@@ -282,6 +371,7 @@ impl Vault {
         Ok(Self {
             db: Arc::new(Mutex::new(db)),
             rt,
+            field_key,
         })
     }
 
@@ -340,35 +430,36 @@ impl Vault {
 
     /// 保存主机配置；已保存的密码列保持原样（本方法永不改密码）。
     pub async fn upsert(&self, host: &HostConfig) -> Result<()> {
-        let host = host.clone();
+        let (host, field_key) = (host.clone(), self.field_key);
         self.job(move |cell| async move {
             let mut db = cell.lock().await;
-            let stored = fetch_host(&mut db, host.id)
+            let stored = fetch_host(&mut db, host.id, &field_key)
                 .await?
                 .and_then(|(_, secret)| secret);
-            put_host(&mut db, &host, stored).await
+            put_host(&mut db, &host, stored.as_deref(), &field_key).await
         })
         .await
     }
 
     /// 写入或清除某主机的保存密码（password=None 表示清除）。
     pub async fn set_password(&self, id: i64, password: Option<&str>) -> Result<()> {
-        let password = password.map(str::to_string);
+        let (password, field_key) = (password.map(str::to_string), self.field_key);
         self.job(move |cell| async move {
             let mut db = cell.lock().await;
-            let Some((host, _)) = fetch_host(&mut db, id).await? else {
+            let Some((host, _)) = fetch_host(&mut db, id, &field_key).await? else {
                 return Ok(());
             };
-            put_host(&mut db, &host, password).await
+            put_host(&mut db, &host, password.as_deref(), &field_key).await
         })
         .await
     }
 
     /// 读取某主机已保存的密码（未保存则为 None）。
     pub async fn password_of(&self, id: i64) -> Result<Option<String>> {
+        let field_key = self.field_key;
         self.job(move |cell| async move {
             let mut db = cell.lock().await;
-            Ok(fetch_host(&mut db, id)
+            Ok(fetch_host(&mut db, id, &field_key)
                 .await?
                 .and_then(|(_, secret)| secret))
         })
@@ -464,16 +555,23 @@ impl Vault {
 
     /// 导出本库全部数据（换主密钥时搬迁用）。
     pub async fn export_all(&self) -> Result<VaultDump> {
-        self.job(|cell| async move {
+        let field_key = self.field_key;
+        self.job(move |cell| async move {
             let mut db = cell.lock().await;
             let hosts = Query::<List<HostRow>>::all()
                 .exec(&mut *db as &mut dyn toasty::Executor)
                 .await
                 .context("导出主机失败")?;
-            let dumped: Vec<(HostConfig, Option<String>)> = hosts
-                .iter()
-                .map(|row| (row.to_host_config(), row.password.clone()))
-                .collect();
+            let mut dumped = Vec::with_capacity(hosts.len());
+            for row in hosts.iter() {
+                let secret = row
+                    .password
+                    .as_deref()
+                    .map(|stored| field::decrypt(&field_key, stored))
+                    .transpose()
+                    .context("导出密码失败")?;
+                dumped.push((row.to_host_config(), secret));
+            }
             let settings = Query::<List<SettingRow>>::all()
                 .exec(&mut *db as &mut dyn toasty::Executor)
                 .await
@@ -505,15 +603,16 @@ impl Vault {
 
     /// 导入另一库导出的全部数据（换主密钥后写入新库）。
     pub async fn import_dump(&self, dump: &VaultDump) -> Result<()> {
-        let (hosts, settings, known_hosts) = (
+        let (hosts, settings, known_hosts, field_key) = (
             dump.hosts.clone(),
             dump.settings.clone(),
             dump.known_hosts.clone(),
+            self.field_key,
         );
         self.job(move |cell| async move {
             let mut db = cell.lock().await;
             for (host, password) in &hosts {
-                put_host(&mut db, host, password.clone()).await?;
+                put_host(&mut db, host, password.as_deref(), &field_key).await?;
             }
             for (name, value) in &settings {
                 put_setting(&mut db, name, value).await?;
@@ -522,6 +621,18 @@ impl Vault {
                 put_known_host(&mut db, host_port, fingerprint, algorithm).await?;
             }
             Ok(())
+        })
+        .await
+    }
+}
+
+#[cfg(test)]
+impl Vault {
+    /// 口令列的入库原文（不经字段解密），测试用。
+    async fn raw_password_column(&self, id: i64) -> Result<Option<String>> {
+        self.job(move |cell| async move {
+            let mut db = cell.lock().await;
+            raw_password_of(&mut db, id).await
         })
         .await
     }
@@ -558,7 +669,17 @@ async fn connect(path: String, hexkey: String, fresh: bool) -> Result<toasty::Db
 }
 
 /// 主机行落库（upsert by id；password=None 写 NULL）。
-async fn put_host(db: &mut toasty::Db, host: &HostConfig, password: Option<String>) -> Result<()> {
+///
+/// 传入的是**明文**口令，写库前就地字段加密；调用方拿不到密文，也就无从日志。
+async fn put_host(
+    db: &mut toasty::Db,
+    host: &HostConfig,
+    password: Option<&str>,
+    field_key: &[u8; 32],
+) -> Result<()> {
+    let sealed = password
+        .map(|plain| field::encrypt(field_key, plain))
+        .transpose()?;
     HostRow::upsert_by_id(host.id)
         .name(host.name.as_str())
         .host(host.host.as_str())
@@ -567,22 +688,48 @@ async fn put_host(db: &mut toasty::Db, host: &HostConfig, password: Option<Strin
         .auth(auth_tag(host.auth))
         .key_path(host.key_path.as_str())
         .favorite(host.favorite)
-        .password(password)
+        .password(sealed)
         .exec(db as &mut dyn toasty::Executor)
         .await
         .context("写入凭据库失败")?;
     Ok(())
 }
 
-/// 读取单行主机：配置 + 已保存密码（行不存在为 None）。
-async fn fetch_host(db: &mut toasty::Db, id: i64) -> Result<Option<(HostConfig, Option<String>)>> {
+/// 读取单行主机：配置 + 已解密口令（行不存在为 None）。
+async fn fetch_host(
+    db: &mut toasty::Db,
+    id: i64,
+    field_key: &[u8; 32],
+) -> Result<Option<(HostConfig, Option<String>)>> {
+    let row = host_row(db, id).await?;
+    Ok(match row {
+        Some(row) => {
+            let secret = row
+                .password
+                .as_deref()
+                .map(|stored| field::decrypt(field_key, stored))
+                .transpose()?;
+            Some((row.to_host_config(), secret))
+        }
+        None => None,
+    })
+}
+
+/// 单行主机原始读取（口令列保持库中形态，不解密）。
+async fn host_row(db: &mut toasty::Db, id: i64) -> Result<Option<HostRow>> {
     let row = Query::<List<HostRow>>::all()
         .filter(HostRow::fields().id().eq(id))
         .first()
         .exec(db as &mut dyn toasty::Executor)
         .await
         .context("读取主机行失败")?;
-    Ok(row.map(|row| (row.to_host_config(), row.password)))
+    Ok(row)
+}
+
+/// 测试用：直接读出口令列的入库字符串，用来证明列里绝不是明文。
+#[cfg(test)]
+async fn raw_password_of(db: &mut toasty::Db, id: i64) -> Result<Option<String>> {
+    Ok(host_row(db, id).await?.and_then(|row| row.password))
 }
 
 async fn put_setting(db: &mut toasty::Db, name: &str, value: &str) -> Result<()> {
@@ -609,8 +756,8 @@ async fn put_known_host(
     Ok(())
 }
 
-/// 两库之间搬迁用的全量快照（仅存在于进程内存，含密码明文——库级加密下
-/// 解密后的原生形态；绝不写日志、绝不落盘）。
+/// 两库之间搬迁用的全量快照（仅存在于进程内存，含口令明文——字段解密后的
+/// 原生形态；绝不写日志、绝不落盘）。
 pub struct VaultDump {
     pub hosts: Vec<(HostConfig, Option<String>)>,
     pub settings: Vec<(String, String)>,
@@ -1299,6 +1446,96 @@ mod tests {
         assert!(valid_hex_key(&a));
         assert_ne!(a, derive_key(&salt, "错误马电池").unwrap());
         assert_ne!(a, derive_key(&[8u8; 16], "正确马电池").unwrap());
+    }
+
+    #[test]
+    fn field_key_is_derived_and_domain_separated() {
+        let hexkey = "0123456789abcdef".repeat(4);
+        let key = field::derive_field_key(&hexkey).unwrap();
+        // 同一主密钥恒定派生出同一把字段密钥。
+        assert_eq!(key, field::derive_field_key(&hexkey).unwrap());
+        // 与页级加密密钥不同（域分离），换主密钥则换字段密钥。
+        assert_ne!(&key[..], &hexkey.as_bytes()[..32]);
+        assert_ne!(key, field::derive_field_key(&"00".repeat(32)).unwrap());
+        assert!(field::derive_field_key("不是十六进制").is_err());
+    }
+
+    #[test]
+    fn secret_field_encrypt_roundtrip_and_tamper_checks() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        let key = field::derive_field_key(&"0a".repeat(32)).unwrap();
+        let other = field::derive_field_key(&"0b".repeat(32)).unwrap();
+        let plain = "s3cret-密码";
+
+        let sealed = field::encrypt(&key, plain).unwrap();
+        // 列里存的既不是明文，也不是可辨识的 base64 明文片段。
+        assert!(!sealed.contains(plain));
+        assert!(!sealed.contains("s3cret"));
+        assert_eq!(field::decrypt(&key, &sealed).unwrap(), plain);
+        // 每次写入随机 nonce：同一口令两次密文不同，杜绝"两行相等=同密码"的旁路。
+        assert_ne!(sealed, field::encrypt(&key, plain).unwrap());
+        // 换钥匙、篡改字节、非法编码都必须失败，绝不返回原样或空串。
+        assert!(field::decrypt(&other, &sealed).is_err());
+        let mut bytes = STANDARD.decode(&sealed).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x01;
+        assert!(field::decrypt(&key, &STANDARD.encode(bytes)).is_err());
+        assert!(field::decrypt(&key, "短短短短").is_err());
+        assert!(field::decrypt(&key, "!!!不是base64!!!").is_err());
+    }
+
+    /// 端到端：口令列落库的是密文，读出来的是明文；换主密钥搬迁后依旧如此。
+    #[tokio::test]
+    async fn password_column_never_holds_plaintext() {
+        let dir = temp_dir("rulink-field-test");
+        let mode = StorageMode::Global(dir.clone());
+        let rt = tokio::runtime::Handle::current();
+        let old_key = "11".repeat(32);
+        let vault = Vault::open(&mode, old_key.clone(), rt.clone())
+            .await
+            .unwrap();
+        let host = HostConfig {
+            id: 5,
+            name: "密文机".into(),
+            host: "5.example".into(),
+            port: 22,
+            user: "u".into(),
+            auth: AuthMethod::Password,
+            key_path: String::new(),
+            favorite: false,
+        };
+        vault.upsert(&host).await.unwrap();
+        vault.set_password(5, Some("明文口令")).await.unwrap();
+        let stored = vault
+            .raw_password_column(5)
+            .await
+            .unwrap()
+            .expect("口令列应有值");
+        assert!(!stored.contains("明文口令"));
+        assert_eq!(
+            vault.password_of(5).await.unwrap().as_deref(),
+            Some("明文口令")
+        );
+
+        // 换主密钥 = 换字段密钥：必须解密后重新加密，旧密文带到新库解不开。
+        let dump = vault.export_all().await.unwrap();
+        let new_key = "22".repeat(32);
+        let staging = mode.db_path().with_file_name("rulink.db.new");
+        remove_db_bundle(&staging);
+        let fresh = Vault::open_at(&staging.to_string_lossy(), new_key.clone(), rt.clone())
+            .await
+            .unwrap();
+        fresh.import_dump(&dump).await.unwrap();
+        let fresh_stored = fresh.raw_password_column(5).await.unwrap().unwrap();
+        assert!(!fresh_stored.contains("明文口令"));
+        assert_ne!(fresh_stored, stored);
+        assert_eq!(
+            fresh.password_of(5).await.unwrap().as_deref(),
+            Some("明文口令")
+        );
+        drop(fresh);
+        drop(vault);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
