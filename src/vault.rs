@@ -888,13 +888,18 @@ pub async fn migrate_legacy(
         }
     }
 
-    // settings.json：theme → Setting("theme")
+    // settings.json：theme / status_bar → Setting
     let settings_path = mode.legacy_path(crate::paths::LEGACY_SETTINGS_FILE);
     if settings_path.exists() {
         if let Ok(text) = std::fs::read_to_string(&settings_path)
             && let Ok(settings) = serde_json::from_str::<crate::sessions::Settings>(&text)
         {
             vault.set_setting("theme", &settings.theme).await?;
+            if !settings.status_bar.is_empty() {
+                vault
+                    .set_setting("status_bar", &settings.status_bar)
+                    .await?;
+            }
         }
         rename_preserving(&settings_path);
     }

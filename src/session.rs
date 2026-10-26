@@ -70,8 +70,8 @@ type SessionChannel = Channel<Msg>;
 pub struct SshSession {
     /// 会话任务，必须被持有（提前 drop 会取消 SSH）。
     pub join: Task<Result<()>>,
-    /// 远程主机基本信息摘要（探测失败/无信息时发送端被丢弃，收到 `Err`）。
-    pub remote_info: oneshot::Receiver<String>,
+    /// 远程主机基本信息（探测失败/无信息时发送端被丢弃，收到 `Err`）。
+    pub remote_info: oneshot::Receiver<RemoteInfo>,
     /// shell 是否成功开启。失败发生在开启之前＝没建立过终端，标签页应保留展示错误。
     pub started: Arc<AtomicBool>,
 }
@@ -97,7 +97,7 @@ pub fn start<C: AppContext>(
 ) -> SshSession {
     let ExternalHandles { feed, rx } = handles;
     let (ui_tx, ui_rx) = mpsc::unbounded_channel::<PtyBoundMessage>();
-    let (info_tx, info_rx) = oneshot::channel::<String>();
+    let (info_tx, info_rx) = oneshot::channel::<RemoteInfo>();
     let started = Arc::new(AtomicBool::new(false));
 
     // 上行泵：把终端的阻塞通道接到 tokio 通道；send 是非阻塞的，
@@ -139,7 +139,7 @@ async fn run(
     target: SshTarget,
     feed: FeedHandle,
     ui_rx: mpsc::UnboundedReceiver<PtyBoundMessage>,
-    info_tx: oneshot::Sender<String>,
+    info_tx: oneshot::Sender<RemoteInfo>,
     started: Arc<AtomicBool>,
     vault: Option<Arc<crate::vault::Vault>>,
 ) -> Result<()> {
@@ -190,7 +190,7 @@ async fn run(
 async fn probe_remote_info(
     handle: &Handle<SshTerminalHandler>,
     side: SideChannels,
-    info_tx: oneshot::Sender<String>,
+    info_tx: oneshot::Sender<RemoteInfo>,
 ) {
     let Ok(probe) = handle.channel_open_session().await else {
         log::debug!("无法开启远程信息探测通道");
@@ -226,8 +226,9 @@ async fn probe_remote_info(
 
         match collected {
             Ok(raw) => {
-                if let Some(summary) = RemoteInfo::parse(&raw).summary() {
-                    let _ = info_tx.send(summary);
+                let info = RemoteInfo::parse(&raw);
+                if !info.is_empty() {
+                    let _ = info_tx.send(info);
                 }
             }
             Err(_) => log::debug!("远程信息探测超时，跳过状态栏展示"),

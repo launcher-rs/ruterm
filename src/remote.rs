@@ -39,29 +39,63 @@ impl RemoteInfo {
         self.fields.get(key).map(String::as_str)
     }
 
-    /// 状态栏摘要：发行版优先于内核标识，其余按固定顺序以 ` · ` 连接。
-    ///
-    /// 全部缺项（远端禁用 exec 或非 Linux 无相应文件）时返回 `None`，
-    /// 状态栏据此不显示远程条目。
-    pub fn summary(&self) -> Option<String> {
-        let mut parts = Vec::new();
-        if let Some(name) = self.get("os").or(self.get("sys")) {
-            parts.push(name.to_string());
+    /// 该次探测是否什么都没探到（远端禁用 exec 或全部缺项）。
+    pub fn is_empty(&self) -> bool {
+        self.fields.is_empty()
+    }
+
+    /// 单项指标文案（含标签）；缺项返回 `None`，状态栏据此跳过该条目。
+    pub fn item(&self, metric: Metric) -> Option<String> {
+        match metric {
+            // 发行版优先，缺 os-release 时回退内核标识，且不加标签。
+            Metric::Os => self
+                .get("os")
+                .or_else(|| self.get("sys"))
+                .map(str::to_string),
+            other => self
+                .get(other.key())
+                .map(|value| format!("{} {value}", other.label())),
         }
-        for (key, label) in [
-            ("mem", "内存"),
-            ("disk", "磁盘"),
-            ("load", "负载"),
-            ("up", "运行"),
-        ] {
-            if let Some(value) = self.get(key) {
-                parts.push(format!("{label} {value}"));
-            }
+    }
+}
+
+/// 状态栏可单独开关的远程指标。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Metric {
+    Os,
+    Mem,
+    Disk,
+    Load,
+    Up,
+}
+
+impl Metric {
+    /// 展示顺序。
+    pub const ALL: [Metric; 5] = [Self::Os, Self::Mem, Self::Disk, Self::Load, Self::Up];
+
+    /// 探测输出里的键名，同时用作设置持久化的稳定 id。
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Os => "os",
+            Self::Mem => "mem",
+            Self::Disk => "disk",
+            Self::Load => "load",
+            Self::Up => "up",
         }
-        if parts.is_empty() {
-            None
-        } else {
-            Some(parts.join(" · "))
+    }
+
+    fn key(self) -> &'static str {
+        self.id()
+    }
+
+    /// 条目标签（设置界面与状态栏共用）。
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Os => "系统",
+            Self::Mem => "内存",
+            Self::Disk => "磁盘",
+            Self::Load => "负载",
+            Self::Up => "运行",
         }
     }
 }
@@ -70,34 +104,50 @@ impl RemoteInfo {
 mod tests {
     use super::*;
 
+    /// 全部指标按展示顺序拼成一行（测试与"整行摘要"式断言用）。
+    fn line(info: &RemoteInfo) -> Option<String> {
+        let parts: Vec<String> = Metric::ALL.iter().filter_map(|m| info.item(*m)).collect();
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join(" · "))
+        }
+    }
+
     #[test]
     fn parses_typical_linux_probe() {
         let raw = "host=rulink-demo\nsys=Linux 6.8.0-45-generic\nos=Ubuntu 24.04.1 LTS\n\
                    mem=1.2/7.7G\ndisk=23G/98G(24%)\nload=0.13\nup=3d4h\n";
         let info = RemoteInfo::parse(raw);
-        assert_eq!(info.get("os"), Some("Ubuntu 24.04.1 LTS"));
+        assert_eq!(info.item(Metric::Os).as_deref(), Some("Ubuntu 24.04.1 LTS"));
         assert_eq!(
-            info.summary().as_deref(),
+            line(&info).as_deref(),
             Some("Ubuntu 24.04.1 LTS · 内存 1.2/7.7G · 磁盘 23G/98G(24%) · 负载 0.13 · 运行 3d4h")
         );
     }
 
     #[test]
     fn ignores_noise_and_missing_items() {
-        // stderr 混入的报错行、空值、未知键都不应进入摘要。
+        // stderr 混入的报错行、空值、未知键都不应成为条目。
         let raw = "df: /: not mounted\ncat: no such file\nload=\nfoo=bar\nup=0d1h\n";
         let info = RemoteInfo::parse(raw);
-        assert_eq!(info.summary().as_deref(), Some("运行 0d1h"));
+        assert_eq!(info.item(Metric::Load), None);
+        assert_eq!(line(&info).as_deref(), Some("运行 0d1h"));
     }
 
     #[test]
     fn falls_back_to_kernel_when_no_os_release() {
         let info = RemoteInfo::parse("sys=FreeBSD 14.1-RELEASE\n");
-        assert_eq!(info.summary().as_deref(), Some("FreeBSD 14.1-RELEASE"));
+        assert_eq!(
+            info.item(Metric::Os).as_deref(),
+            Some("FreeBSD 14.1-RELEASE")
+        );
     }
 
     #[test]
-    fn empty_probe_yields_no_summary() {
-        assert_eq!(RemoteInfo::parse("").summary(), None);
+    fn empty_probe_yields_no_items() {
+        let info = RemoteInfo::parse("");
+        assert!(info.is_empty());
+        assert_eq!(line(&info), None);
     }
 }

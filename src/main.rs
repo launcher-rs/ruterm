@@ -22,16 +22,18 @@ use rgpui::prelude::*;
 use rgpui::tabs::{Tab, TabBar};
 use rgpui::title_bar::TITLE_BAR_HEIGHT;
 use rgpui::{
-    AnyElement, App, Bounds, Button, ButtonVariants, Context, DropdownMenu, Entity, FocusHandle,
-    Focusable, FontWeight, Hsla, Icon, IconName, InteractiveElement, IntoElement, MouseButton,
-    ParentElement, Pixels, PopupMenu, PopupMenuItem, Render, ScrollableElement, SharedString,
-    StatefulInteractiveElement, Styled, TrayMenuItem, Window, WindowBounds, WindowControlArea,
-    WindowOptions, div, h_flex, px, size, v_flex,
+    AnyElement, App, Bounds, Button, ButtonVariants, Checkbox, Context, DropdownMenu, Entity,
+    FocusHandle, Focusable, FontWeight, Hsla, Icon, IconName, InteractiveElement, IntoElement,
+    MouseButton, ParentElement, Pixels, PopupMenu, PopupMenuItem, Render, ScrollableElement,
+    SharedString, StatefulInteractiveElement, Styled, TrayMenuItem, Window, WindowBounds,
+    WindowControlArea, WindowOptions, div, h_flex, px, size, v_flex,
 };
 use rgpui_term::{TerminalBuilder, TerminalView};
+use serde::{Deserialize, Serialize};
 
 use crate::config::SshTarget;
 use crate::paths::StorageMode;
+use crate::remote::{Metric, RemoteInfo};
 use crate::sessions::{AuthMethod, HostConfig, SessionStore};
 use crate::vault::Vault;
 
@@ -54,8 +56,8 @@ struct SessionTab {
     addr: SharedString,
     /// 认证方式，状态栏展示。
     auth: AuthMethod,
-    /// 远程服务器基本信息摘要（连接后经 exec 探测异步填充，探测失败保持 None）。
-    remote_info: Option<SharedString>,
+    /// 远程服务器基本信息（连接后经 exec 探测异步填充，探测失败保持 None）。
+    remote_info: Option<RemoteInfo>,
     /// 渲染用终端视图。
     terminal_view: Entity<TerminalView>,
 }
@@ -146,6 +148,72 @@ fn password_placeholder(passphrase_mode: bool) -> &'static str {
 const SETTINGS_TAB_VAULT: usize = 0;
 /// 设置弹窗分页：外观。
 const SETTINGS_TAB_APPEARANCE: usize = 1;
+/// 设置弹窗分页：状态栏显示项。
+const SETTINGS_TAB_STATUS: usize = 2;
+
+/// 状态栏显示项偏好：条目多寡因人的使用习惯差别很大，交给用户勾选。
+///
+/// 远程指标按 `Metric::id()` 记账，缺项一律视为显示（新增指标默认出现，
+/// 老配置不会把它悄悄关掉）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatusBarPrefs {
+    /// 活动会话地址 `user@host:port`。
+    #[serde(default = "shown")]
+    pub addr: bool,
+    /// 认证方式徽标。
+    #[serde(default = "shown")]
+    pub auth: bool,
+    /// 远程指标开关（键为 `Metric::id()`）。
+    #[serde(default)]
+    pub metrics: HashMap<String, bool>,
+}
+
+/// 状态栏里可勾选的一个显示项。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StatusPref {
+    Addr,
+    Auth,
+    Metric(Metric),
+}
+
+/// 反序列化缺字段时的默认：显示。
+fn shown() -> bool {
+    true
+}
+
+impl Default for StatusBarPrefs {
+    fn default() -> Self {
+        Self {
+            addr: true,
+            auth: true,
+            metrics: HashMap::new(),
+        }
+    }
+}
+
+impl StatusBarPrefs {
+    /// 该远程指标是否显示（未记录即显示）。
+    fn metric_on(&self, metric: Metric) -> bool {
+        *self.metrics.get(metric.id()).unwrap_or(&true)
+    }
+
+    fn set_metric(&mut self, metric: Metric, on: bool) {
+        self.metrics.insert(metric.id().to_string(), on);
+    }
+
+    /// 序列化为入库/入文件的字符串。
+    fn to_json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
+    }
+
+    /// 解析库内 / settings.json 里的偏好；损坏或为空时回默认（全显示）。
+    fn from_json(text: &str) -> Self {
+        if text.is_empty() {
+            return Self::default();
+        }
+        serde_json::from_str(text).unwrap_or_default()
+    }
+}
 
 /// RuLink 主视图：左侧主机账号管理，右侧会话标签终端。
 struct RuLinkApp {
@@ -184,6 +252,8 @@ struct RuLinkApp {
     next_id: usize,
     /// 状态栏左侧的瞬态消息（连接/保存/删除/断开等节点更新）。
     status: SharedString,
+    /// 状态栏显示项偏好（勾选哪些条目），随加密库 / settings.json 持久化。
+    status_bar: StatusBarPrefs,
     /// 侧边栏 ↔ 主区 的分隔面板状态（拖拽调整宽度 + 折叠/展开）。
     split_state: Entity<SplitPaneState>,
     focus_handle: FocusHandle,
@@ -252,6 +322,8 @@ impl RuLinkApp {
         let mode = StorageMode::detect();
         let store = SessionStore::new(&mode);
         let hosts = store.load();
+        // 开库前先用旧 settings.json 里的状态栏偏好，库打开后再被库内值覆盖。
+        let status_bar = StatusBarPrefs::from_json(&store.load_settings().status_bar);
         // 侧边栏 ↔ 主区 分隔面板：初始侧边栏占比约 0.25。
         let split_state = cx.new(SplitPaneState::new);
         split_state.update(cx, |state, cx| {
@@ -281,6 +353,7 @@ impl RuLinkApp {
             password_cache: HashMap::new(),
             next_id: 0,
             status: "就绪".into(),
+            status_bar,
             split_state,
             focus_handle: cx.focus_handle(),
         };
@@ -417,6 +490,16 @@ impl RuLinkApp {
                         cx,
                     );
                     cx.notify();
+                });
+            }
+            // 状态栏显示项同样以库内为准。
+            if let Ok(Some(json)) = vault.setting("status_bar").await {
+                let prefs = StatusBarPrefs::from_json(&json);
+                let _ = this.update(cx, |this, cx| {
+                    if this.status_bar != prefs {
+                        this.status_bar = prefs;
+                        cx.notify();
+                    }
                 });
             }
         })
@@ -1534,7 +1617,7 @@ impl RuLinkApp {
             if let Ok(info) = remote_info.await {
                 let _ = this.update(cx, |this, cx| {
                     if let Some(tab) = this.tabs.iter_mut().find(|tab| tab.id == id) {
-                        tab.remote_info = Some(SharedString::from(info));
+                        tab.remote_info = Some(info);
                         cx.notify();
                     }
                 });
@@ -1781,15 +1864,17 @@ impl RuLinkApp {
                 .item(PopupMenuItem::new(vault_state).disabled(true))
         };
 
-        // 外观菜单：明暗二选一（当前项打勾），外加设置面板的外观分页。
+        // 外观菜单：明暗二选一（当前项打勾），外加设置面板的外观 / 状态栏分页。
         let to_dark = entity.clone();
         let to_light = entity.clone();
         let appearance = entity.clone();
+        let status = entity.clone();
         let appearance_menu =
             move |menu: PopupMenu, _: &mut Window, _: &mut Context<PopupMenu>| {
                 let to_dark = to_dark.clone();
                 let to_light = to_light.clone();
                 let appearance = appearance.clone();
+                let status = status.clone();
                 menu.item(PopupMenuItem::new("暗色主题").checked(dark).on_click(
                     move |_, window, cx| {
                         to_dark.update(cx, |this, cx| this.apply_theme(true, window, cx));
@@ -1805,6 +1890,13 @@ impl RuLinkApp {
                     PopupMenuItem::new("外观设置…").on_click(move |_, window, cx| {
                         appearance.update(cx, |this, cx| {
                             this.open_settings_at(SETTINGS_TAB_APPEARANCE, window, cx);
+                        });
+                    }),
+                )
+                .item(
+                    PopupMenuItem::new("状态栏显示项…").on_click(move |_, window, cx| {
+                        status.update(cx, |this, cx| {
+                            this.open_settings_at(SETTINGS_TAB_STATUS, window, cx);
                         });
                     }),
                 )
@@ -2105,10 +2197,10 @@ impl RuLinkApp {
             crate::vault::read_unlock_marker(&self.mode) == crate::vault::UnlockBackend::Passphrase;
         let unlocked = self.vault.is_some();
         let dark = cx.theme().is_dark();
-        let body = if state.tab == SETTINGS_TAB_APPEARANCE {
-            self.render_appearance_tab(&pal, dark, cx)
-        } else {
-            self.render_vault_tab(&pal, state, passphrase_mode, unlocked, cx)
+        let body = match state.tab {
+            SETTINGS_TAB_APPEARANCE => self.render_appearance_tab(&pal, dark, cx),
+            SETTINGS_TAB_STATUS => self.render_status_tab(&pal, cx),
+            _ => self.render_vault_tab(&pal, state, passphrase_mode, unlocked, cx),
         };
         v_flex()
             .id("settings-backdrop")
@@ -2150,6 +2242,7 @@ impl RuLinkApp {
                             .children(vec![
                                 Tab::new().label("凭据库与主密码"),
                                 Tab::new().label("外观"),
+                                Tab::new().label("状态栏"),
                             ])
                             .selected_index(state.tab)
                             .on_change({
@@ -2359,6 +2452,68 @@ impl RuLinkApp {
                                 this.toggle_theme(window, cx);
                             })),
                     ),
+            )
+            .into_any_element()
+    }
+
+    /// 「状态栏」分页：勾选底部状态栏要显示哪些条目，改动即时生效并写入凭据库。
+    fn render_status_tab(&self, pal: &Palette, cx: &Context<Self>) -> AnyElement {
+        let entity = cx.entity();
+        let row =
+            |id: String, label: String, on: bool, pref: StatusPref, entity: Entity<RuLinkApp>| {
+                Checkbox::new(id)
+                    .label(label)
+                    .checked(on)
+                    .on_change(move |value, _window, cx| {
+                        entity.update(cx, |this, cx| this.set_status_pref(pref, value, cx));
+                    })
+            };
+        let mut metrics = Vec::new();
+        for metric in Metric::ALL {
+            metrics.push(row(
+                format!("status-{}", metric.id()),
+                metric.label().to_string(),
+                self.status_bar.metric_on(metric),
+                StatusPref::Metric(metric),
+                entity.clone(),
+            ));
+        }
+        v_flex()
+            .id("settings-tab-status")
+            .gap_3()
+            .child(
+                div().text_sm().text_color(pal.muted).child(
+                    "勾选底部状态栏要显示的条目，取消勾选即隐藏；改动立即生效并写入凭据库。",
+                ),
+            )
+            .child(
+                v_flex()
+                    .gap_2()
+                    .child(div().text_sm().text_color(pal.muted).child("会话信息"))
+                    .child(row(
+                        "status-addr".into(),
+                        "连接地址（user@host:port）".into(),
+                        self.status_bar.addr,
+                        StatusPref::Addr,
+                        entity.clone(),
+                    ))
+                    .child(row(
+                        "status-auth".into(),
+                        "认证方式".into(),
+                        self.status_bar.auth,
+                        StatusPref::Auth,
+                        entity,
+                    )),
+            )
+            .child(
+                v_flex()
+                    .gap_2()
+                    .child(
+                        div().text_sm().text_color(pal.muted).child(
+                            "远程主机信息（连接后经 exec 探测取得，远端没探到的项自动不显示）",
+                        ),
+                    )
+                    .children(metrics),
             )
             .into_any_element()
     }
@@ -3045,7 +3200,7 @@ impl RuLinkApp {
             .child(body)
     }
 
-    /// 底部状态栏：左侧瞬态状态 + 活动会话信息（地址/认证/远程指标占位），右侧会话计数。
+    /// 底部状态栏：左侧瞬态状态 + 活动会话信息（按用户勾选的显示项拼装），右侧会话计数。
     fn render_status_bar(&self) -> StatusBar {
         let active = self
             .active_tab
@@ -3053,15 +3208,27 @@ impl RuLinkApp {
 
         let mut left = vec![StatusBarItem::new(self.status.clone()).id("status")];
         if let Some(tab) = active {
-            left.push(StatusBarItem::new(tab.addr.clone()).id("addr"));
-            left.push(
-                StatusBarItem::new(auth_label(tab.auth))
-                    .id("auth")
-                    .muted(true),
-            );
+            if self.status_bar.addr {
+                left.push(StatusBarItem::new(tab.addr.clone()).id("addr"));
+            }
+            if self.status_bar.auth {
+                left.push(
+                    StatusBarItem::new(auth_label(tab.auth))
+                        .id("auth")
+                        .muted(true),
+                );
+            }
             // 远程基本信息由 SSH 建立后的 exec 探测任务异步写入 tab.remote_info。
-            if let Some(info) = tab.remote_info.clone() {
-                left.push(StatusBarItem::new(info).id("remote").muted(true));
+            if let Some(info) = tab.remote_info.as_ref() {
+                for metric in Metric::ALL {
+                    if !self.status_bar.metric_on(metric) {
+                        continue;
+                    }
+                    // 远端没探到该项就整条不显示，不留空占位。
+                    if let Some(text) = info.item(metric) {
+                        left.push(StatusBarItem::new(SharedString::from(text)).id(metric.id()));
+                    }
+                }
             }
         }
         let right = vec![
@@ -3070,6 +3237,32 @@ impl RuLinkApp {
                 .muted(true),
         ];
         StatusBar::new().left(left).right(right)
+    }
+
+    /// 勾选状态栏显示项：即时生效并持久化（库内优先，降级时写 settings.json）。
+    fn set_status_pref(&mut self, pref: StatusPref, on: bool, cx: &mut Context<Self>) {
+        match pref {
+            StatusPref::Addr => self.status_bar.addr = on,
+            StatusPref::Auth => self.status_bar.auth = on,
+            StatusPref::Metric(metric) => self.status_bar.set_metric(metric, on),
+        }
+        cx.notify();
+        self.persist_status_bar(cx);
+    }
+
+    /// 状态栏偏好落库；加密库不可用时退回旧 settings.json。
+    fn persist_status_bar(&self, cx: &mut Context<Self>) {
+        let json = self.status_bar.to_json();
+        let Some(vault) = self.vault.clone() else {
+            self.store.save_status_bar(&json);
+            return;
+        };
+        cx.spawn(async move |_, _| {
+            if let Err(error) = vault.set_setting("status_bar", &json).await {
+                log::warn!("写入库内状态栏偏好失败: {error}");
+            }
+        })
+        .detach();
     }
 }
 
@@ -3203,4 +3396,39 @@ fn main() {
             _ => {}
         });
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Metric, StatusBarPrefs};
+
+    #[test]
+    fn status_bar_prefs_default_to_everything_shown() {
+        let prefs = StatusBarPrefs::default();
+        assert!(prefs.addr && prefs.auth);
+        assert!(Metric::ALL.iter().all(|m| prefs.metric_on(*m)));
+    }
+
+    #[test]
+    fn status_bar_prefs_roundtrip_and_tolerate_partial_json() {
+        let mut prefs = StatusBarPrefs::default();
+        prefs.addr = false;
+        prefs.set_metric(Metric::Mem, false);
+        let restored = StatusBarPrefs::from_json(&prefs.to_json());
+        assert_eq!(restored, prefs);
+
+        // 只写了一部分指标：未记录的（含以后新增的）一律按"显示"处理。
+        let partial =
+            StatusBarPrefs::from_json(r#"{"addr":true,"auth":false,"metrics":{"mem":false}}"#);
+        assert!(!partial.auth);
+        assert!(!partial.metric_on(Metric::Mem));
+        assert!(partial.metric_on(Metric::Disk));
+
+        // 空串与损坏内容回落到默认值，不让状态栏被一条坏数据清空。
+        assert_eq!(StatusBarPrefs::from_json(""), StatusBarPrefs::default());
+        assert_eq!(
+            StatusBarPrefs::from_json("{ not json"),
+            StatusBarPrefs::default()
+        );
+    }
 }

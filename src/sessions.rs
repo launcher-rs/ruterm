@@ -71,6 +71,9 @@ pub struct Settings {
     /// 主题模式："dark" / "light"；缺省按暗色。
     #[serde(default)]
     pub theme: String,
+    /// 状态栏显示项偏好（序列化成 JSON 字符串；空串表示未设置）。
+    #[serde(default)]
+    pub status_bar: String,
 }
 
 impl Settings {
@@ -105,11 +108,10 @@ impl SessionStore {
         }
     }
 
-    /// 保存主题选择（"dark" / "light"）；失败仅记日志。
-    pub fn save_theme(&self, dark: bool) {
-        let settings = Settings {
-            theme: if dark { "dark" } else { "light" }.to_string(),
-        };
+    /// 就地改一项设置后整体回写（读-改-写，避免各设置项互相覆盖）。
+    pub fn update_settings(&self, f: impl FnOnce(&mut Settings)) {
+        let mut settings = self.load_settings();
+        f(&mut settings);
         if let Some(parent) = self.settings_path.parent()
             && let Err(error) = std::fs::create_dir_all(parent)
         {
@@ -124,6 +126,19 @@ impl SessionStore {
             }
             Err(error) => log::warn!("序列化设置失败: {error}"),
         }
+    }
+
+    /// 保存主题选择（"dark" / "light"）；失败仅记日志。
+    pub fn save_theme(&self, dark: bool) {
+        self.update_settings(|settings| {
+            settings.theme = if dark { "dark" } else { "light" }.to_string();
+        });
+    }
+
+    /// 降级模式（无加密库）下保存状态栏偏好。
+    pub fn save_status_bar(&self, json: &str) {
+        let json = json.to_string();
+        self.update_settings(|settings| settings.status_bar = json);
     }
 
     /// 迁移完成后把 sessions.json 改名为 sessions.json.migrated（保留现场，不删除）。
