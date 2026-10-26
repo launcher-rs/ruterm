@@ -11,12 +11,13 @@
 | SSH 连接与终端 | `[x]` | russh + rgpui-term（外部 IO 后端），交互式 PTY |
 | 本地终端（系统 Shell） | `[ ]` | 待接入 rgpui-term 本地 PTY 后端：cmd / PowerShell / pwsh7 / Git Bash / WSL，见 §五 |
 | 认证方式 | `[x]` | 密码 / 私钥(IdentityFile，表单可填口令、`浏览…`选择密钥文件；加密私钥自动弹口令窗) / Agent；口令与密码同走"默认内存 + 勾选入加密库"两档 |
-| 主机指纹校验 | `[x]` | TOFU known_hosts，不匹配 / 写入失败一律拒绝（fail-closed，防 MITM） |
+| 主机指纹校验 | `[x]` | TOFU known_hosts **存入加密库**（`known_hosts` 表），不匹配 / 写入失败 / 查询失败一律拒绝（fail-closed，防 MITM） |
 | 会话标签页 | `[x]` | 多标签、关闭、激活切换；加高加大（44px 栏高、160px 最小标签宽），观感更大气 |
 | CLI 快速连接 | `[x]` | 带参数一次性连接；密码仅走环境变量 / GUI 临时输入 |
-| 主题 | `[x]` | 明 / 暗切换（配色走 `cx.theme()` 语义色，与按钮/状态栏统一），☀/☾ 按钮 + `Ctrl+T`，选择持久化到 `settings.json` |
+| 主题 | `[x]` | 明 / 暗切换（配色走 `cx.theme()` 语义色，与按钮/状态栏统一），☀/☾ 按钮 + `Ctrl+T`，选择持久化到加密库 `settings` 表 |
 | 底部状态栏 | `[x]` | 已实现并验证渲染（左"就绪"/地址/认证/远程信息，右"会话 N"）；远程基本信息经 exec 探测通道填充 |
-| 凭据持久化 | `[x]` | 主机配置与可选保存的密码存入 **turso 加密库**（`~/.rulink/vault.db`，AEGIS-256 页级加密）；主密钥随机 32 字节只存 Windows 凭据管理器（keyring），不落盘。库不可用时降级旧 `sessions.json` 且禁用密码保存，见 §四 |
+| 凭据持久化 | `[x]` | 主机配置、应用设置、known_hosts 三类数据合并入**单个加密文件** `rulink.db`（toasty 0.11 ORM + turso 0.7 AEGIS-256 页级加密），全局模式位于 `~/.rulink/`、便携模式位于 exe 旁 `data/`；解锁两档并存：默认 keyring 随机 32 字节主密钥（零输入），或用户**主密码**（argon2id 派生，可带往他机解锁）。库不可用时降级旧 `sessions.json` 且禁用密码保存，见 §四 |
+| 便携 / 全局双模式 | `[x]` | 启动时只探测不创建：exe 同目录存在 `data/` → 便携模式（数据随 exe 走），否则全局模式 `~/.rulink`；便携模式强制主密码，见 §四 |
 | 品牌图标 | `[x]` | 从展示板切分 6 图标变体 + logo + 多尺寸 `.ico`；`build.rs`+winresource 嵌入 exe（任务栏/标题栏） |
 | 系统托盘 | `[x]` | 品牌托盘图标 + 悬停提示 + 右键菜单（显示主界面 / 退出），`App::set_tray_*` + `on_tray_menu_action` |
 
@@ -55,7 +56,8 @@
 
 ### 3. 主题
 - `[x]` 明 / 暗主题切换（rgpui `Theme::change(ThemeMode)` + 配色统一走 `cx.theme()` 语义色），侧边栏 ☀/☾ 按钮 + `Ctrl+T`。
-- `[x]` 启动项记忆上次主题选择（持久化到 `~/.rulink/settings.json`，下次启动自动应用）。
+- `[x]` 启动项记忆上次主题选择（持久化到加密库 `settings` 表的 `theme` 项，库打开/解锁完成后自动应用；
+      库不可用时回退读写 `settings.json`）。
 - `[ ]` 终端配色方案（多套预设，可自定义前景/背景/16 色）。
 - `[ ]` 自定义字体与字号、行高（终端 + UI）。
 
@@ -76,7 +78,7 @@
 
 ### 7. 其它主流能力
 - `[x]` 主机列表搜索：侧边栏顶部搜索框，按展示名 / `user@host:port` 子串实时过滤（无匹配显示"无匹配主机"）。
-- `[x]` 主机收藏：每行 ★/☆ 切换按钮（`stop_propagation` 不触发连接），收藏主机稳定排序置顶，`favorite` 字段持久化到 `sessions.json`（`#[serde(default)]` 兼容旧数据）。
+- `[x]` 主机收藏：每行 ★/☆ 切换按钮（`stop_propagation` 不触发连接），收藏主机稳定排序置顶，`favorite` 字段持久化到加密库 `hosts` 表。
 - `[ ]` 主机分组、最近连接。
 - `[ ]` 断线提示 + 手动 / 自动重连、连接超时设置。
 - `[ ]` 命令片段库、快捷命令、多主机同时执行。
@@ -112,9 +114,25 @@ RuLink 不自造 UI 轮子，优先复用 rgpui 现成子系统：
 ## 四、凭据与安全存储（重点，用户明确诉求：讨厌反复输入密码）
 
 ### 目标
-- `[x]` 主机配置、用户名、私钥路径、（可选）密码迁入**结构化存储**：纯 Rust 的 turso（SQLite 兼容）
-      加密库 `~/.rulink/vault.db`，取代 JSON；表 `hosts(id, name, host, port, user, auth, key_path, favorite, password)`。
-      分组、备注、导入导出、备份恢复为后续增量。
+- `[x]` 主机配置、用户名、私钥路径、（可选）密码迁入**结构化存储**：**toasty 0.11 ORM**
+      （声明式 `#[derive(Model)]`）+ 底层 turso 0.7 页级加密，单文件 `rulink.db`；
+      表 `hosts(id, name, host, port, user, auth, key_path, favorite, password)`、
+      `settings(name, value)`、`known_hosts(host_port, fingerprint, algorithm)`。
+      分组、备注、备份恢复为后续增量。
+- `[x]` **一个文件装下所有本地数据**：`settings.json`（主题等）与 `known_hosts` 文本文件
+      全部并入同一加密库；`.rulink` 目录不再有第三个业务文件。
+- `[x]` **便携 / 全局双模式**（`src/paths.rs`）：启动时 `StorageMode::detect()` 只看 exe 同目录
+      `data/` 是否存在（**只探测不创建**，绝不往别人机器的工作目录落文件）→ 存在即便携模式
+      （数据全在 `data/rulink.db`，随 exe 拷贝）；否则全局模式（`~/.rulink/rulink.db`）。
+- `[x]` **解锁两档并存**：
+      - *keyring 档*（全局模式默认）：`getrandom` 生成 32 字节主密钥存系统凭据管理器，
+        启动零输入， UX 与升级前一致。
+      - *主密码档*：用户自定义口令经 **argon2id** 派生主密钥（盐 16 字节明文存
+        `kdf-salt.bin`，属公开参数）；便携模式**强制**此档（保证拷往他机可解），
+        全局模式可随时"设置主密码"升级为此档（侧边栏头部 🔐 按钮 → 弹窗）。
+      - *换密钥*：turso 无 rekey 能力，故实现为**新建加密库全量搬迁**——内存导出
+        → 以新密钥打开暂存库 `rulink.db.new` → 导入 → 旧库改名 `rulink.db.keyring-bak`
+        （占用则带时间戳）→ 换名上岗 → 写 `unlock.txt` 后端标记 → 重开句柄。
 - `[x]` 连接时**免重复输入**：优先用 Agent / 私钥；勾选过"保存"的主机自动从加密库取码直连。
 - `[x]` **加密私钥口令（passphrase）**：连接时 russh 报 `KeyIsEncrypted` → 会话回传
       `PassphraseRequired` 信号 → UI 自动弹口令窗（同样支持"保存口令"入加密库）；
@@ -128,20 +146,28 @@ RuLink 不自造 UI 轮子，优先复用 rgpui 现成子系统：
 
 ### 安全约束（不可妥协，沿用现有基线并加强）
 - `[x]` **密码 / passphrase 绝不以明文入库、入日志、入命令行**：密码只存 AEGIS-256 页级加密库，
-      磁盘上为密文（含认证标签，冒烟测试确认明文不可见）；主密钥只在内存与系统凭据管理器之间流动。
-- `[x]` 敏感字段加密：主密钥经 **keyring** 对接操作系统凭据库（Windows Credential Manager，
-      `service=rulink / account=vault-key`），库文件与密钥分离，拷贝 vault.db 无法解密。
-- `[x]` 本地加密库文件方案：主密钥为 `getrandom` 生成 32 字节（非口令 KDF，免去解锁口令 UX），
-      算法为 AEAD（AEGIS-256）；口令/密钥不落盘。凭据管理器条目损坏时**拒绝覆盖**以防旧库被锁死。
-- `[x]` known_hosts 指纹校验保持 fail-closed；指纹冲突必须拒绝连接（本次未触及，维持原行为）。
+      磁盘上为密文（含认证标签，端到端测试确认换密钥必然打不开）；主密钥只在内存与
+      系统凭据管理器 / 弹窗输入之间流动，从不写入文件、从不作为命令行参数传递。
+- `[x]` keyring 档：主密钥经 **keyring** 对接操作系统凭据库（Windows Credential Manager，
+      `service=rulink / account=vault-key`），库文件与密钥分离，单独拷贝 `rulink.db` 无法解密；
+      条目内容非法时**拒绝自动覆盖**，以防旧库被锁死。
+- `[x]` 主密码档：argon2id 派生，强度**取决于口令本身**；一旦忘记主密码，数据**不可恢复**
+      （Argon2 无任何后门）——解锁弹窗与 README 均已明示。便携库可带往其他机器，
+      在同一口令下正常解锁。
+- `[x]` known_hosts 指纹校验入加密库并保持 fail-closed：无记录 → 记入并信任（TOFU）；
+      指纹不符 → 拒绝连接；**库查询/写入报错同样拒绝**（降级模式回退旧文本文件）。
 - `[x]` 提供"仅本次会话内存持有密码"与"持久保存"两档，**默认前者**：密码弹窗带
       "☐ 保存密码（加密存入本地凭据库）"勾选，默认不勾选。
 
 ### 迁移策略
-- `[x]` 一次性从 `sessions.json` 迁移到加密库（首启检测到空库 + 非空 JSON 自动导入并分配主键）；
-      导入-改名间新增的主机也会补发 id 入库。**导入 / 导出（含加密导出包）为后续增量。**
-- `[x]` 迁移前不删除旧文件：加密库打开并导入验证成功后，旧文件仅改名为
-      `sessions.json.migrated` 保留现场；库打开失败则整体降级回 JSON 路径并在状态栏提示。
+- `[x]` 一次性迁移到单文件库（`migrate_legacy`）：旧手写 SQL 的 `vault.db`（keyring 密钥）
+      读出 hosts → 写入 toasty 新库；`sessions.json` 非空且新库为空时按序导入并分配主键；
+      `settings.json` 的主题写入 `settings` 表；`known_hosts` 文本逐行解析入表。
+      导入 / 改名间新增的主机也会补发 id 入库。**导入 / 导出 UI 为后续增量。**
+- `[x]` 迁移前不删除旧文件：**读取成功后**才逐个改名为 `.migrated`（`vault.db.migrated` /
+      `sessions.json.migrated` / `settings.json.migrated` / `known_hosts.migrated`）保留现场；
+      任一步失败则旧文件原样保留，整体降级回 JSON 路径并在状态栏提示。
+- `[ ]` 分组 / 备注、导入导出界面、备份恢复。
 
 ---
 
@@ -167,11 +193,11 @@ RuLink 不自造 UI 轮子，优先复用 rgpui 现成子系统：
 ### 3. 会话形态与 UI
 - `[ ]` 侧边栏新增"本地终端"分区（与主机列表并列），或顶部"+ 新建会话"下拉选择目标类型（SSH / 本地 shell）。
 - `[ ]` 标签标题区分来源：本地会话显示 `shell 名 + 当前目录`，远程会话保持 `user@host`（现有 `SessionTab.addr` 语义扩展为"连接描述"）。
-- `[ ]` 默认 shell 可设置（`settings.json` 增 `default_local_shell`），启动时可记忆上次使用的 profile。
+- `[ ]` 默认 shell 可设置（加密库 `settings` 表增 `default_local_shell` 项），启动时可记忆上次使用的 profile。
 - `[ ]` 每个本地会话可选起始工作目录（含"打开当前目录的终端"入口）。
 
 ### 4. Shell Profile（类 Windows Terminal 的 profile 概念）
-- `[ ]` `sessions.json` 增本地条目类型（或独立 `profiles.json`）：名称、可执行路径、参数数组、起始目录、环境变量、图标/配色。
+- `[ ]` `hosts` 表增本地条目类型（或新增 `profiles` 表）：名称、可执行路径、参数数组、起始目录、环境变量、图标/配色。
 - `[ ]` 保留与收藏、搜索、置顶复用现有主机列表机制（★ 收藏 + 搜索过滤天然适用）。
 - `[ ]` 从系统自动发现 profile（注册表 / PATH / `wsl -l`），一键添加。
 
@@ -192,7 +218,9 @@ RuLink 不自造 UI 轮子，优先复用 rgpui 现成子系统：
 
 1. ~~收尾状态栏（远程信息 exec 通道）~~（已完成：连接后经 exec 探测写入 `remote_info`，见 §二.1）。
 2. ~~侧边栏折叠 + 主题切换~~（已完成：`Ctrl+B` 折叠、`Ctrl+T` / ☀☾ 明暗切换）。
-3. ~~凭据 SQLite + keyring（安全核心，尽早定型，越晚迁移成本越高）~~（已完成：turso 加密库 + keyring 主密钥 + JSON 一次性迁移，见 §四；余量：分组/备注、导入导出、备份恢复）。
+3. ~~凭据 SQLite + keyring（安全核心，尽早定型，越晚迁移成本越高）~~（已完成：toasty ORM 单文件加密库
+   `rulink.db`（hosts/settings/known_hosts 三表）+ keyring 或 argon2 主密码双档解锁 + 便携/全局双模式
+   + 旧文件一次性迁移，见 §四；余量：分组/备注、导入导出界面、备份恢复）。
 4. 自定义标题栏 + 分屏（结构性改动，成批做）。
 5. i18n（文案抽取宜在功能稳定后统一做，避免反复）。
 6. **本地终端**（§五：cmd / PowerShell / pwsh7 / Git Bash / WSL）——基座已在 rgpui-term，一期只是接本地 PTY，投入小、日常价值高，可与凭据存储并行推进。
