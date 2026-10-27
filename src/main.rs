@@ -2410,6 +2410,7 @@ impl RuLinkApp {
             "主密码档 · 已解锁"
         };
         let entity = cx.entity();
+        let sidebar_collapsed = self.split_state.read(cx).is_collapsed();
 
         // 会话菜单：新建主机、本地终端、侧栏折叠、设置入口、托盘与退出。
         // 前四项挂 action（而非 on_click）：rgpui 会按键绑定在项右侧自动显示
@@ -2583,35 +2584,59 @@ impl RuLinkApp {
                     .h_full()
                     .window_control_area(WindowControlArea::Drag),
             )
+            // 右侧：内容级操作（侧栏折叠 / 设置 / 锁定）+ 细分隔线 + 系统窗口按钮。
+            // 窗口按钮贴右缘、整高整宽，是系统语义；内容按钮缩成 28px 圆角块并留出间距，
+            // 否则"设置"和"最小化"一样大、挤成一排，看着像多出来的一个窗口按钮。
             .child(
                 h_flex()
                     .items_center()
                     .gap_1()
                     .flex_shrink_0()
-                    .pr_1()
+                    .pr_3()
+                    .child(
+                        Button::new("sidebar-collapse")
+                            .icon(if sidebar_collapsed {
+                                IconName::PanelLeftOpen
+                            } else {
+                                IconName::PanelLeftClose
+                            })
+                            .compact()
+                            .ghost()
+                            .text_color(fg)
+                            .tooltip("折叠 / 展开侧边栏 (Ctrl+B)")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.split_state.update(cx, |state, cx| {
+                                    state.toggle_collapse(CollapsiblePane::First, cx);
+                                });
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("open-settings")
+                            .icon(IconName::Settings)
+                            .compact()
+                            .ghost()
+                            .text_color(fg)
+                            .tooltip("设置 (Ctrl+,)")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_settings(window, cx);
+                            })),
+                    )
                     // 口令档且未解锁：只留重新解锁入口（其余操作都需要库）。
                     .when(locked, |this| {
                         this.child(
                             Button::new("unlock-vault")
+                                // 图标集里没有钥匙/锁，保留 emoji（口令档才会出现）。
                                 .label("🔑")
                                 .compact()
                                 .ghost()
+                                .text_color(fg)
                                 .tooltip("输入主密码解锁凭据库")
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.open_unlock_dialog(window, cx);
                                 })),
                         )
                     })
-                    .child(
-                        Button::new("open-settings")
-                            .label("⚙")
-                            .compact()
-                            .ghost()
-                            .tooltip("设置（凭据库 / 外观分页）")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.open_settings(window, cx);
-                            })),
-                    )
                     // 已设主密码才出现锁定按钮：锁定后需重新输入口令才能用库。
                     .when(passphrase_mode && !locked, |this| {
                         this.child(
@@ -2619,26 +2644,16 @@ impl RuLinkApp {
                                 .label("🔒")
                                 .compact()
                                 .ghost()
+                                .text_color(fg)
                                 .tooltip("锁定凭据库（需主密码解锁）")
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.lock_vault(window, cx);
                                 })),
                         )
-                    })
-                    .child(
-                        Button::new("sidebar-collapse")
-                            .label("«")
-                            .compact()
-                            .ghost()
-                            .tooltip("折叠侧边栏 (Ctrl+B)")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.split_state.update(cx, |state, cx| {
-                                    state.collapse(CollapsiblePane::First, cx);
-                                });
-                                cx.notify();
-                            })),
-                    ),
+                    }),
             )
+            // 内容按钮与窗口按钮之间的细分隔线，明确"这是两条不同的按钮带"。
+            .child(div().w(px(1.0)).h(px(16.0)).flex_shrink_0().bg(bar_border))
             .child(Self::window_control(
                 "win-minimize",
                 IconName::WindowMinimize,
