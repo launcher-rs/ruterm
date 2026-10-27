@@ -12,7 +12,7 @@
 | 本地终端（系统 Shell） | `[x]` | 侧边栏树顶「本地终端」是**可折叠分组**：子项为本机探测到的每个 shell（各取 exe 的系统默认图标），点一下即开对应终端标签；启动后台静默扫一次（含 WSL），「一键扫描」可在右键菜单 / 设置「终端」分页手动刷新；标签与 SSH 会话并存，进程退出自动收标签；profile 持久化、起始目录、环境变量见 §五 |
 | 认证方式 | `[x]` | 密码 / 私钥(IdentityFile，表单可填口令、`浏览…`选择密钥文件；加密私钥自动弹口令窗) / Agent；口令与密码同走"默认内存 + 勾选入加密库"两档 |
 | 主机指纹校验 | `[x]` | TOFU known_hosts **存入加密库**（`known_hosts` 表），不匹配 / 写入失败 / 查询失败一律拒绝（fail-closed，防 MITM） |
-| 会话标签页 | `[x]` | 多标签、关闭、激活切换；标签栏在主区顶部（44px 栏高、160px 最小标签宽），不放标题栏；活动标签用主题语义色 `tab_active` + 强调色描边，与 `tab_bar` 底色区分 |
+| 会话标签页 | `[x]` | 多标签、关闭、激活切换；标签栏在主区顶部（44px 栏高、160px 最小标签宽），不放标题栏；**平铺式标签**：不描边、标签之间不留缝，活动标签用主题语义色 `tab_active` 打底 + 顶部 2px 强调线，非活动标签不显示 `×`（切过去再关） |
 | 侧边栏主机列表 | `[x]` | 分组（文件夹）树：折叠三角 + 文件夹/认证方式图标 + 组名 + 数量，★ 收藏置顶；组与归属、折叠态存加密库 `settings` 表 `sidebar` 键（JSON，不动 `hosts` 表结构）。新建/编辑/删除/移动/分组管理全部收进右键菜单，顶部不再放常驻大按钮 |
 | CLI 快速连接 | `[x]` | 带参数一次性连接；密码仅走环境变量 / GUI 临时输入 |
 | 主题 | `[x]` | 明 / 暗切换（配色走 `cx.theme()` 语义色，与按钮/状态栏统一），标题栏「外观」菜单（当前项打勾）+ `Ctrl+T`，选择持久化到加密库 `settings` 表 |
@@ -138,7 +138,7 @@
       （图标集里没有钥匙/锁，这两个仍用 emoji）。侧栏按钮改为 `toggle_collapse`，折叠后图标翻转成 `PanelLeftOpen`，
       原实现只会 `collapse`，折叠后再点没反应。
 - `[ ]` ~~会话标签并入标题栏（类 WindTerm 的"标签即标题栏"）~~：**已实现又撤回**——用户明确要求终端标签不要放在
-      自定义标题栏上，标签栏回到主区顶部（44px 行高、活动标签 `card_bg`/`window_bg` 区分、`×` 关闭）。
+      自定义标题栏上，标签栏回到主区顶部（44px 行高、平铺无描边、活动标签顶部强调线、仅活动标签显示 `×`）。
       标题栏只留品牌 / 菜单 / 快捷按钮 / 窗口控件，中间整段仍是拖拽区。技术上标签条与 Drag 段必须互为
       **兄弟**节点（父级 Drag 会吞掉标签点击，同 §二.5 首条 `TitleBar` 未采用的原因），若日后重提可直接复用该结论。
 - `[ ]` Windows 下与 Mica 材质 / 圆角协调（当前保留 `WS_THICKFRAME`，DWM 仍绘制圆角）。
@@ -189,7 +189,7 @@ RuLink 不自造 UI 轮子，优先复用 rgpui 现成子系统：
 | 系统托盘 | `tray::{TrayMenuItem, TrayIconEvent}` + `App::set_tray_*`（已用） |
 | 国际化 | `i18n::I18nManager` |
 | 命令注册 / 快捷键 | `actions!` 声明动作 + `cx.bind_keys`（App 级 `KeyBinding`）+ 根元素 `.on_action(cx.listener(...))`；`commands::CommandRegistry`、`key_context` 备用。局部覆盖用 `KeyBinding::new("tab", NoAction {}, Some("Terminal"))`：`Keymap::bindings_for_input` 按上下文深度降序解析，遇到 `NoAction` 即 `break`，可截掉框架在 `Root` 上下文里对同一按键的绑定（终端 Tab 补全即此法恢复） |
-| 标签栏配色 | 主题语义色 `tab_bar` / `tab_active` / `tab_active_foreground` / `tab_foreground`（明暗两套自带区分），活动标签再叠 `primary` 描边；不硬编码颜色 |
+| 标签栏配色 | 主题语义色 `tab_bar` / `tab_active` / `tab_active_foreground` / `tab_foreground`（明暗两套自带区分），活动标签顶部叠 2px `primary` 强调线（不再整圈描边）；不硬编码颜色 |
 | 主机行 / 分组行 / 空白处右键菜单 | `menu::context_menu::{ContextMenuExt::context_menu, PopupMenu, PopupMenuItem}`：包装器把元素转 `relative` 并在 `deferred(anchored().snap_to_window_with_margin(8px).with_priority(1))` 的**独立图层**渲染菜单。手搭 `absolute` 浮层不可行——它留在普通图层，被后画兄弟节点压住 hitbox，菜单项只吃得到 hover 吃不到 mouse-up。`context_menu` 要求元素同时是 `InteractiveElement + ParentElement + Styled`，ElementId 由内层 `.id()` 派生；包装器的 hitbox 注册在子节点**之后**，故两层菜单不能嵌套（一次右键弹两个），空白区菜单须作行的兄弟节点。`PopupMenuItem::on_click` 的闭包要求 `Send + Sync`，捕获 `Entity<T>` 后 `entity.update(cx, ..)` 即可拿到 `&mut RuLinkApp`（`Entity` 恒 `Send + Sync`，内部是 `PhantomData<fn(T)->T>`） |
 | 布局约束范式 | `examples/showcase/src/bin/app_suite.rs`（flex_grow + min_h(0) 有界布局范式，状态栏布局修复即据此） |
 | exe 的系统默认图标 | 无现成组件：`SHGetFileInfoW(SHGFI_ICON \| SHGFI_LARGEICON)` 取 `HICON` → `GetIconInfo` + `CreateDIBSection`（32bpp 顶向下）+ `DrawIconEx(DI_NORMAL)` → BGRA 转 RGBA（`alpha == 0` 的 RGB 归零）→ `png::Encoder` → `rgpui::Image::from_bytes(ImageFormat::Png, ..)`。`windows 0.62`（`Win32_UI_Shell` / `Win32_Storage_FileSystem` / `Win32_Graphics_Gdi` / `Win32_UI_WindowsAndMessaging`）+ `png 0.18`，无新增大件。另注：`extract_icon` 在 rsproxy 镜像上不可得，故手写 |

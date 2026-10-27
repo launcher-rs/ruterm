@@ -4416,8 +4416,7 @@ impl RuLinkApp {
                 .bg(pal.tab_bar_bg)
                 .border_b_1()
                 .border_color(pal.border)
-                .px_3()
-                .gap_2()
+                .pl_2()
                 .overflow_hidden()
                 .children(self.tabs.iter().map(|tab| {
                     let id = tab.id;
@@ -4426,50 +4425,61 @@ impl RuLinkApp {
                     let close_id = SharedString::from(format!("tab-close-{id}"));
                     h_flex()
                         .id(tab_id)
-                        .h(px(32.0))
+                        // 平铺式标签：不描边、标签间不留缝，活动项靠底色 + 顶部强调线区分。
+                        .relative()
+                        .h_full()
                         .min_w(px(160.0))
                         .flex_shrink_0()
-                        .px_4()
+                        .px_3()
                         .gap_2()
                         .items_center()
-                        .justify_between()
-                        .rounded(px(6.0))
-                        // 活动/非活动只差底色与描边不足以分辨（浅色主题下 tab_bar 与
-                        // tab_active 仅隔一档灰），再给活动标签一圈强调色描边。
                         .bg(if active {
                             pal.tab_active_bg
                         } else {
                             Hsla::transparent_black()
                         })
-                        .border_1()
-                        .border_color(if active { pal.accent } else { pal.border })
                         .text_color(if active {
                             pal.tab_active_fg
                         } else {
                             pal.tab_fg
                         })
+                        .when(!active, |this| this.hover(|this| this.bg(pal.card_hover)))
                         .cursor_pointer()
-                        .hover(|this| this.bg(pal.card_hover))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.active_tab = Some(id);
                             cx.notify();
                         }))
+                        .when(active, |this| {
+                            this.child(
+                                div()
+                                    .absolute()
+                                    .top_0()
+                                    .left_0()
+                                    .right_0()
+                                    .h(px(2.0))
+                                    .bg(pal.accent),
+                            )
+                        })
                         .child(div().flex_1().min_w_0().truncate().child(tab.title.clone()))
-                        .child(
-                            div()
-                                .id(close_id)
-                                .text_base()
-                                .text_color(pal.danger)
-                                .child("×")
-                                .cursor_pointer()
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|_, _, _, cx| cx.stop_propagation()),
-                                )
-                                .on_click(
-                                    cx.listener(move |this, _, _, cx| this.close_tab(id, cx)),
-                                ),
-                        )
+                        // 只有活动标签常驻 ×：非活动项的 × 更挡标题，切换过去再关即可。
+                        .when(active, |this| {
+                            this.child(
+                                div()
+                                    .id(close_id)
+                                    .text_base()
+                                    .text_color(pal.muted)
+                                    .child("×")
+                                    .cursor_pointer()
+                                    .hover(|this| this.text_color(pal.danger))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                                    )
+                                    .on_click(
+                                        cx.listener(move |this, _, _, cx| this.close_tab(id, cx)),
+                                    ),
+                            )
+                        })
                 }))
         };
 
