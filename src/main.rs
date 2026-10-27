@@ -150,6 +150,15 @@ const SETTINGS_TAB_APPEARANCE: usize = 1;
 /// 设置弹窗分页：状态栏显示项。
 const SETTINGS_TAB_STATUS: usize = 2;
 
+/// 设置弹窗固定宽高：切分页不重排，弹窗不随内容忽大忽小。
+const SETTINGS_DIALOG_W: f32 = 640.0;
+const SETTINGS_DIALOG_H: f32 = 470.0;
+/// 内容区高度：弹窗高 − 上下内边距（20×2）− 标题行 − 两条间距 − 底部按钮行。
+/// 超出部分由内容区自身滚动，不再把弹窗撑高。
+const SETTINGS_CONTENT_H: f32 = 352.0;
+/// 左侧分页导航宽度。
+const SETTINGS_NAV_W: f32 = 148.0;
+
 /// 状态栏显示项偏好：条目多寡因人的使用习惯差别很大，交给用户勾选。
 ///
 /// 远程指标按 `Metric::id()` 记账，缺项一律视为显示（新增指标默认出现，
@@ -2202,25 +2211,33 @@ impl RuLinkApp {
             _ => self.render_vault_tab(&pal, state, passphrase_mode, unlocked, cx),
         };
         let entity = cx.entity();
-        // 竖排分页条目：左侧导航列表，选中项加底色与粗体，悬停有反馈。
+        // 竖排分页条目：不套底色不描边，选中项靠左侧强调色竖条 + 粗体区分，
+        // 未选中项只弱化文字色（竖条留空占位，文字位置不跳）。
         let tab_item =
             |id: &'static str, label: &'static str, ix: usize, entity: Entity<RuLinkApp>| {
                 let selected = state.tab == ix;
                 h_flex()
                     .id(id)
                     .h(px(30.0))
-                    .px_3()
                     .items_center()
+                    .gap_2()
+                    .pr_3()
                     .rounded(px(6.0))
                     .text_sm()
                     .text_color(if selected { pal.text } else { pal.muted })
-                    .when(selected, |item| {
-                        item.bg(pal.segment_bg).font_weight(FontWeight(600.0))
-                    })
+                    .when(selected, |item| item.font_weight(FontWeight(600.0)))
                     .hover(|style| style.bg(pal.card_hover).text_color(pal.text))
                     .on_click(move |_, _, cx| {
                         entity.update(cx, |this, cx| this.select_settings_tab(ix, cx));
                     })
+                    .child(
+                        div()
+                            .w(px(2.0))
+                            .h(px(16.0))
+                            .flex_shrink_0()
+                            .rounded(px(1.0))
+                            .bg(if selected { pal.accent } else { pal.card_bg }),
+                    )
                     .child(label)
             };
         v_flex()
@@ -2239,9 +2256,13 @@ impl RuLinkApp {
             .child(
                 v_flex()
                     .id("settings-dialog")
-                    .w(px(620.0))
+                    // 尺寸固定：切分页不再让弹窗忽大忽小，超出部分交给内容区滚动。
+                    .w(px(SETTINGS_DIALOG_W))
+                    .h(px(SETTINGS_DIALOG_H))
+                    .flex_shrink_0()
                     .gap_3()
                     .p_5()
+                    .overflow_hidden()
                     .rounded(px(8.0))
                     .bg(pal.card_bg)
                     .border_1()
@@ -2255,15 +2276,17 @@ impl RuLinkApp {
                         div()
                             .text_base()
                             .font_weight(FontWeight(600.0))
+                            .flex_shrink_0()
                             .child("设置"),
                     )
                     .child(
                         h_flex()
-                            .gap_5()
-                            .items_start()
+                            .flex_shrink_0()
+                            .items_stretch()
+                            .gap_4()
                             .child(
                                 v_flex()
-                                    .w(px(132.0))
+                                    .w(px(SETTINGS_NAV_W))
                                     .flex_shrink_0()
                                     .gap_1()
                                     .child(tab_item(
@@ -2285,13 +2308,25 @@ impl RuLinkApp {
                                         entity,
                                     )),
                             )
-                            .child(v_flex().flex_1().min_w_0().child(body)),
+                            // 导航与内容之间只留一条分隔线，不再各套一个框。
+                            .child(div().w(px(1.0)).flex_shrink_0().bg(pal.border))
+                            .child(
+                                v_flex()
+                                    .flex_1()
+                                    .min_w_0()
+                                    // 显式定高：滚动容器要有确定边界，否则内容只会溢出被裁。
+                                    .h(px(SETTINGS_CONTENT_H))
+                                    .pl_5()
+                                    .overflow_y_scrollbar()
+                                    .child(body),
+                            ),
                     )
                     .child(
-                        h_flex().gap_2().justify_end().child(
+                        h_flex().flex_shrink_0().gap_2().justify_end().child(
                             Button::new("settings-close")
                                 .label("关闭")
-                                .ghost()
+                                .secondary()
+                                .outline()
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.close_settings(cx);
                                 })),
@@ -2389,7 +2424,8 @@ impl RuLinkApp {
                                         this.child(
                                             Button::new("rekey-cancel")
                                                 .label("取消主密码")
-                                                .ghost()
+                                                .secondary()
+                                                .outline()
                                                 .on_click(cx.listener(|this, _, _, cx| {
                                                     this.cancel_master_password(cx);
                                                 })),
@@ -2441,7 +2477,8 @@ impl RuLinkApp {
                     h_flex().gap_2().justify_end().child(
                         Button::new("settings-lock")
                             .label("锁定凭据库")
-                            .ghost()
+                            .secondary()
+                            .outline()
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.lock_vault(window, cx);
                             })),
@@ -2479,7 +2516,8 @@ impl RuLinkApp {
                             } else {
                                 "切换到暗色"
                             })
-                            .ghost()
+                            .secondary()
+                            .outline()
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.toggle_theme(window, cx);
                             })),

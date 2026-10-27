@@ -19,7 +19,7 @@
 | 凭据持久化 | `[x]` | 主机配置、应用设置、known_hosts 三类数据合并入**单个加密文件** `rulink.db`（toasty 0.11 ORM + turso 0.7 AEGIS-256 页级加密，`hosts.password` 列再叠 **AES-256-GCM 字段加密**），全局模式位于 `~/.rulink/`、便携模式位于 exe 旁 `data/`；解锁两档并存：默认 keyring 随机 32 字节主密钥（零输入），或用户**主密码**（argon2id 派生，可带往他机解锁）。库不可用时降级旧 `sessions.json` 且禁用密码保存，见 §四 |
 | 便携 / 全局双模式 | `[x]` | 启动时只探测不创建：exe 同目录存在 `data/` → 便携模式（数据随 exe 走），否则全局模式 `~/.rulink`；主密码为可选项（设置 / 更换 / 取消均在设置里），见 §四 |
 | 自定义标题栏 | `[x]` | 应用自绘顶栏：品牌标识 + 「会话 / 凭据 / 外观 / 帮助」多级菜单 + ⚙/🔑/🔒/`«` 快捷按钮 + 系统窗口控件；拖拽与窗口控制走 `WindowControlArea` 命中区，交互控件排在 Drag 区之外 |
-| 设置界面 | `[x]` | ⚙ 打开设置弹窗，**左侧竖排分页导航**（凭据库与主密码 / 外观 / 状态栏）+ 右侧内容区，新设置项继续追加分页 |
+| 设置界面 | `[x]` | ⚙ 打开设置弹窗（固定 640×470，切分页尺寸不变），**左侧竖排分页导航**（凭据库与主密码 / 外观 / 状态栏）+ 右侧定高滚动内容区，新设置项继续追加分页 |
 | 品牌图标 | `[x]` | 从展示板切分 6 图标变体 + logo + 多尺寸 `.ico`；`build.rs`+winresource 嵌入 exe（任务栏/标题栏） |
 | 系统托盘 | `[x]` | 品牌托盘图标 + 悬停提示 + 右键菜单（显示主界面 / 退出），`App::set_tray_*` + `on_tray_menu_action` |
 
@@ -104,6 +104,7 @@
 - `[x]` 主机收藏：每行 ★/☆ 切换按钮（`stop_propagation` 不触发连接），收藏主机稳定排序置顶，`favorite` 字段持久化到加密库 `hosts` 表。
 - `[x]` **设置弹窗（左侧竖排分页）**（标题栏 ⚙ 或菜单进入）：「凭据库与主密码」分页显示数据目录与解锁方式、
       设置 / 更换 / 取消主密码、锁定凭据库；「外观」分页放明暗主题；「状态栏」分页勾选底部条目。
+      弹窗为固定尺寸，切分页不再忽大忽小，内容超出时由分页自身滚动。
       新增设置项继续追加分页即可，主密码相关操作不再散落在侧边栏。已设主密码时标题栏额外出现
       🔒，点击即锁定库（丢弃句柄与内存密钥，需口令重新解锁）。
 - `[~]` 设置项扩展：状态栏显示项（已完成，见 §二.1）、字体字号、默认 shell 等，继续按分页追加。
@@ -131,7 +132,7 @@ RuLink 不自造 UI 轮子，优先复用 rgpui 现成子系统：
 | 侧边栏可拖拽宽度 / 折叠 | `SplitPane`（已用）/ `TaskPane` 自动隐藏轨道（备用） |
 | 分屏 / 停靠 | `SplitPane`、`DockArea` |
 | 自定义标题栏 | `TitlebarOptions::appears_transparent` + `app_owns_titlebar_drag` + `WindowControlArea`（Drag/Min/Max/Close）；`title_bar::TitleBar` 因 Drag 命中区吞掉栏内按钮点击而未采用，改自绘一行 |
-| 标题栏菜单 / 设置分页 | `menu::{PopupMenu, PopupMenuItem, DropdownMenu}`（`Button::dropdown_menu`）；设置分页导航自绘（`h_flex` 行 + `when(selected)` 底色，不用 `tabs::TabBar`——它只有横向模式） |
+| 标题栏菜单 / 设置分页 | `menu::{PopupMenu, PopupMenuItem, DropdownMenu}`（`Button::dropdown_menu`）；设置分页导航自绘（`h_flex` 行 + 选中项强调色竖条 + 粗体，不用 `tabs::TabBar`——它只有横向模式） |
 | 主题切换 | `theme::Theme::change` |
 | 系统托盘 | `tray::{TrayMenuItem, TrayIconEvent}` + `App::set_tray_*`（已用） |
 | 国际化 | `i18n::I18nManager` |
