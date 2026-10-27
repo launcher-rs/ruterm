@@ -3972,9 +3972,8 @@ impl RuLinkApp {
         // 搜索命中本机 shell 时，主机没有命中也不该再叠一句"无匹配主机"（看着像整体没结果）。
         let local_hit = !local_rows.is_empty();
         let mut list = v_flex().gap_px().min_h_full().children(local_rows);
-        // 首启动（既没主机也没建过分组）：用一个提示代替空壳「未分组」文件夹。
+        // 首启动（既没主机也没建过分组）：不画空壳「未分组」文件夹。
         let bare = self.hosts.is_empty() && !searching && buckets.len() == 1;
-        let mut shown = 0usize;
         if !bare {
             for (name, rows) in &buckets {
                 // 搜索时：空组不显示，折叠也照常展开；平时：空组仍显示，便于往里挪主机。
@@ -3982,7 +3981,6 @@ impl RuLinkApp {
                     continue;
                 }
                 let collapsed = !searching && self.sidebar.collapsed(name);
-                shown += 1;
                 list = list.child(self.render_group_row(name, rows.len(), collapsed, &pal, cx));
                 if collapsed {
                     continue;
@@ -3993,19 +3991,16 @@ impl RuLinkApp {
                 );
             }
         }
-        if shown == 0 && !(searching && local_hit) {
-            let hint = if bare {
-                "暂无主机：在列表空白处点右键选「新建主机…」，或用「会话」菜单 / Ctrl+N。"
-            } else {
-                "无匹配主机"
-            };
+        // 树顶已有本机 shell 列表，首启动不再塞"暂无主机"那行大字（空着比提示好看）；
+        // 只在搜索没命中时给一行反馈。
+        if searching && !local_hit {
             list = list.child(
                 div()
                     .px_2()
                     .py_1()
                     .text_sm()
                     .text_color(pal.muted)
-                    .child(hint),
+                    .child("无匹配主机"),
             );
         }
         list.child(blank).into_any_element()
