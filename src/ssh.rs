@@ -71,6 +71,8 @@ pub struct SshTerminalHandler {
     side: SideChannels,
     /// 加密凭据库；None 表示降级模式，known_hosts 回退旧文件。
     vault: Option<Arc<Vault>>,
+    /// 交互通道结束信号：让会话任务退出 `handle.await`，释放底层连接。
+    ended: tokio::sync::mpsc::UnboundedSender<()>,
 }
 
 impl SshTerminalHandler {
@@ -81,6 +83,7 @@ impl SshTerminalHandler {
         port: u16,
         side: SideChannels,
         vault: Option<Arc<Vault>>,
+        ended: tokio::sync::mpsc::UnboundedSender<()>,
     ) -> Self {
         Self {
             feed,
@@ -88,6 +91,7 @@ impl SshTerminalHandler {
             port,
             side,
             vault,
+            ended,
         }
     }
 
@@ -260,6 +264,7 @@ impl client::Handler for SshTerminalHandler {
             return Ok(());
         }
         self.feed.end_session();
+        let _ = self.ended.send(());
         Ok(())
     }
 
@@ -272,6 +277,7 @@ impl client::Handler for SshTerminalHandler {
             return Ok(());
         }
         self.feed.end_session();
+        let _ = self.ended.send(());
         Ok(())
     }
 
@@ -286,6 +292,7 @@ impl client::Handler for SshTerminalHandler {
         }
         log::info!("远端进程退出，状态码 {exit_status}");
         self.feed.end_session();
+        let _ = self.ended.send(());
         Ok(())
     }
 }

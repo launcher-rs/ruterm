@@ -74,6 +74,8 @@ pub struct SshSession {
     pub remote_info: oneshot::Receiver<RemoteInfo>,
     /// shell 是否成功开启。失败发生在开启之前＝没建立过终端，标签页应保留展示错误。
     pub started: Arc<AtomicBool>,
+    /// 主动断开信号：标签被关闭时发送，会话任务随即释放连接。
+    pub disconnect: oneshot::Sender<()>,
 }
 
 /// anyhow 错误链拍平成一行（状态栏与终端展示用，避免只看到顶层语境）。
@@ -98,6 +100,7 @@ pub fn start<C: AppContext>(
     let ExternalHandles { feed, rx } = handles;
     let (ui_tx, ui_rx) = mpsc::unbounded_channel::<PtyBoundMessage>();
     let (info_tx, info_rx) = oneshot::channel::<RemoteInfo>();
+    let (disconnect_tx, disconnect_rx) = oneshot::channel::<()>();
     let started = Arc::new(AtomicBool::new(false));
 
     // 上行泵：把终端的阻塞通道接到 tokio 通道；send 是非阻塞的，
@@ -118,7 +121,16 @@ pub fn start<C: AppContext>(
     let closing_feed = feed.clone();
     let started_flag = started.clone();
     let join = rgpui::tokio::Tokio::spawn_result(cx, async move {
-        let result = run(target, feed, ui_rx, info_tx, started_flag, vault).await;
+        let result = run(
+            target,
+            feed,
+            ui_rx,
+            info_tx,
+            started_flag,
+            vault,
+            disconnect_rx,
+        )
+        .await;
         if let Err(error) = &result {
             closing_feed
                 .feed(format!("\r\n[rulink] 会话结束: {}\r\n", error_summary(error)).into_bytes());
@@ -131,6 +143,7 @@ pub fn start<C: AppContext>(
         join,
         remote_info: info_rx,
         started,
+        disconnect: disconnect_tx,
     }
 }
 
@@ -142,15 +155,20 @@ async fn run(
     info_tx: oneshot::Sender<RemoteInfo>,
     started: Arc<AtomicBool>,
     vault: Option<Arc<crate::vault::Vault>>,
+    mut disconnect: oneshot::Receiver<()>,
 ) -> Result<()> {
     let config = Arc::new(SshConfig::default());
     let side = SideChannels::default();
+    // Handler 在交互通道 EOF/close/exit-status 时发信号：会话到此为止，
+    // 不能继续等 `handle`（TCP 连接还在，会一直挂着，UI 看起来毫无反应）。
+    let (ended_tx, mut ended_rx) = mpsc::unbounded_channel::<()>();
     let handler = SshTerminalHandler::new(
         feed.clone(),
         target.host.clone(),
         target.port,
         side.clone(),
         vault,
+        ended_tx,
     );
     let mut handle = russh::client::connect(config, (target.host.as_str(), target.port), handler)
         .await
@@ -178,8 +196,14 @@ async fn run(
 
     probe_remote_info(&handle, side, info_tx).await;
 
-    // 驱动会话事件循环（Handler 回调在此期间持续收到下行数据）。
-    handle.await.context("SSH 会话异常终止")?;
+    // 三条收场路径：远端通道结束、本地关标签、连接本身异常终止。
+    // 前两者都主动丢弃 handle，让 SSH 连接随会话一起释放。
+    tokio::select! {
+        _ = &mut disconnect => log::info!("本地关闭会话 {}", target.addr()),
+        _ = ended_rx.recv() => log::info!("远端会话结束 {}", target.addr()),
+        // 连接异常终止（网络断开等）时把错误上抛给 UI。
+        result = handle => result.context("SSH 会话异常终止")?,
+    }
     Ok(())
 }
 

@@ -25,10 +25,11 @@ use rgpui::title_bar::TITLE_BAR_HEIGHT;
 use rgpui::{
     AbsoluteLength, AnyElement, App, Bounds, Button, ButtonVariants, Checkbox, ClickEvent, Context,
     ContextMenuExt, Div, DropdownMenu, Entity, FocusHandle, Focusable, FontWeight, Hsla, Icon,
-    IconName, Image, ImageFormat, InteractiveElement, IntoElement, KeyBinding, MouseButton,
-    NoAction, ParentElement, Pixels, PopupMenu, PopupMenuItem, Render, ScrollableElement,
-    SharedString, Stateful, StatefulInteractiveElement, Styled, TrayMenuItem, Window, WindowBounds,
-    WindowControlArea, WindowOptions, actions, div, h_flex, img, px, size, v_flex,
+    IconName, Image, ImageFormat, InteractiveElement, IntoElement, KeyBinding, KeyDownEvent,
+    MouseButton, NoAction, ParentElement, Pixels, PopupMenu, PopupMenuItem, Render,
+    ScrollableElement, SharedString, Stateful, StatefulInteractiveElement, Styled, TrayMenuItem,
+    Window, WindowBounds, WindowControlArea, WindowOptions, actions, div, h_flex, img, px, size,
+    v_flex,
 };
 use rgpui_term::{Event as TerminalEvent, TerminalBuilder, TerminalView, TextStyle, ThemeManager};
 use serde::{Deserialize, Serialize};
@@ -77,6 +78,25 @@ struct SessionTab {
     remote_info: Option<RemoteInfo>,
     /// 渲染用终端视图。
     terminal_view: Entity<TerminalView>,
+    /// 会话已结束（远端 exit / 断线 / 连接失败）。标签保留终端内容并显示重连条。
+    ended: bool,
+    /// 结束原因是失败（连接失败 / 异常中断）：状态栏文案由失败路径负责，不被"已断开"覆盖。
+    failed: bool,
+    /// 重连所需参数；本地终端没有会话概念，为 None。
+    resume: Option<Resume>,
+    /// 主动断开当前 SSH 会话（关闭标签时发送；本地终端为 None）。
+    disconnect: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+/// 断线标签的重连参数快照。
+#[derive(Clone)]
+struct Resume {
+    /// 原连接目标（含仅内存持有的密码/口令，绝不落盘）。
+    target: SshTarget,
+    /// 来源主机（None＝命令行快速连接）；重连时优先用列表里的最新配置。
+    host: Option<HostConfig>,
+    /// 秘密是否取自加密库：重连仍失败时据此清掉库里的坏凭据。
+    secret_from_vault: bool,
 }
 
 /// 新建/编辑主机表单（各字段为受控输入状态）。
@@ -91,6 +111,8 @@ struct NewHostForm {
     /// 表单层"保存口令到加密库"开关（默认否＝仅本次内存持有）。
     save_secret: bool,
     auth: AuthMethod,
+    /// 保存到的分组；None＝未分组。从分组右键进入时预填该组，编辑时预填原归属。
+    group: Option<SharedString>,
     /// Some(index)＝编辑既有主机（保存时按该下标原位替换）。
     editing: Option<usize>,
 }
@@ -430,6 +452,17 @@ impl SidebarPrefs {
         }
         if let Some(group) = self.groups.iter_mut().find(|group| group.name == name) {
             group.collapsed = !group.collapsed;
+        }
+    }
+
+    /// 展开分组（新主机落进折叠组时调用，避免保存后"看不见"）。
+    fn expand(&mut self, name: &str) {
+        if name == UNGROUPED {
+            self.ungrouped_collapsed = false;
+            return;
+        }
+        if let Some(group) = self.groups.iter_mut().find(|group| group.name == name) {
+            group.collapsed = false;
         }
     }
 
@@ -1391,15 +1424,27 @@ impl RuLinkApp {
         }
     }
 
-    /// 打开新建主机表单。
+    /// 打开新建主机表单（未分组）。
     fn open_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.open_form_at(None, window, cx);
+        self.open_form_at(None, None, window, cx);
+    }
+
+    /// 打开新建主机表单并预选分组（分组右键「新建主机…」进入）。
+    fn open_form_in_group(
+        &mut self,
+        group: Option<SharedString>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_form_at(None, group, window, cx);
     }
 
     /// 打开新建 / 编辑表单；edit_index 为 Some 时以该主机字段预填。
+    /// `group` 是新建主机的预选分组（编辑时为 None，按原归属预填）。
     fn open_form_at(
         &mut self,
         edit_index: Option<usize>,
+        group: Option<SharedString>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1410,6 +1455,14 @@ impl RuLinkApp {
             .map(|host| host.auth)
             .unwrap_or(AuthMethod::Agent);
         let edit_index = if editing { edit_index } else { None };
+        // 新建用调用方给的分组；编辑回填主机当前归属（可在表单里改）。
+        let group = match existing.as_ref() {
+            Some(host) => self
+                .sidebar
+                .group_of(host.id)
+                .map(|name| SharedString::from(name.to_string())),
+            None => group,
+        };
         let placeholder_name = if editing {
             ""
         } else {
@@ -1457,6 +1510,7 @@ impl RuLinkApp {
             }),
             save_secret: false,
             auth,
+            group,
             editing: edit_index,
         };
         self.new_host = Some(form);
@@ -1489,6 +1543,7 @@ impl RuLinkApp {
         let auth = form.auth;
         let passphrase = form.passphrase.read(cx).value().trim().to_string();
         let save_secret = form.save_secret;
+        let group = form.group.clone();
         let host_raw = form.host.read(cx).value().trim().to_string();
         let mut host = HostConfig {
             id: 0,
@@ -1517,6 +1572,10 @@ impl RuLinkApp {
         } else {
             host.name.clone()
         };
+        let group_note = group
+            .as_deref()
+            .map(|name| format!("（分组：{name}）"))
+            .unwrap_or_default();
         if let Some(index) = editing {
             // 原位替换：id 与收藏标记沿用原主机；已保存的密码/口令不受影响。
             if let Some(current) = self.hosts.get(index).cloned() {
@@ -1525,9 +1584,10 @@ impl RuLinkApp {
                 self.hosts[index] = host.clone();
                 self.persist_host(&host, cx);
                 let note = self.store_form_secret(&host, passphrase.clone(), save_secret, cx);
+                self.apply_form_group(&host, group, cx);
                 self.new_host = None;
                 self.status = SharedString::from(format!(
-                    "已更新主机 {label}{}",
+                    "已更新主机 {label}{}{group_note}",
                     note.as_deref().unwrap_or("")
                 ));
                 cx.notify();
@@ -1542,12 +1602,29 @@ impl RuLinkApp {
         self.hosts.push(host.clone());
         self.persist_host(&host, cx);
         let note = self.store_form_secret(&host, passphrase, save_secret, cx);
+        self.apply_form_group(&host, group, cx);
         self.new_host = None;
         self.status = SharedString::from(format!(
-            "已保存主机 {label}{}",
+            "已保存主机 {label}{}{group_note}",
             note.as_deref().unwrap_or("")
         ));
         cx.notify();
+    }
+
+    /// 把刚保存的主机落到表单选定的分组，并展开该组让新主机立刻可见。
+    /// 未分组（None）同时清掉旧归属。
+    fn apply_form_group(
+        &mut self,
+        host: &HostConfig,
+        group: Option<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        let name = group.as_ref().map(|name| name.to_string());
+        self.sidebar.assign_to(host.id, name.as_deref());
+        if let Some(name) = name.as_deref() {
+            self.sidebar.expand(name);
+        }
+        self.persist_sidebar(cx);
     }
 
     /// 表单私钥口令的两档落点：勾选入库（加密库）或仅本次内存缓存。
@@ -1934,6 +2011,38 @@ impl RuLinkApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.active_tab = Some(id);
+        self.start_ssh(
+            id,
+            title,
+            target,
+            cache_key,
+            host,
+            secret_from_vault,
+            false,
+            window,
+            cx,
+        );
+    }
+
+    /// 在指定标签槽位启动 SSH 会话：`reconnect` 为真时原位替换该标签的终端，
+    /// 否则追加为新标签。会话结束（远端 exit / 断线）由终端 `CloseTerminal`
+    /// 事件收尾——标签不摘除，改为展示断开横幅。
+    #[allow(clippy::too_many_arguments)]
+    fn start_ssh(
+        &mut self,
+        id: usize,
+        title: String,
+        target: SshTarget,
+        cache_key: Option<String>,
+        host: Option<HostConfig>,
+        secret_from_vault: bool,
+        reconnect: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Ok(mut builder) = TerminalBuilder::new_external(None) else {
             log::error!("无法创建外接终端后端");
             return;
@@ -1944,7 +2053,8 @@ impl RuLinkApp {
         };
         let terminal = cx.new(|cx| builder.subscribe(cx));
         let style = self.terminal_text_style(cx);
-        let terminal_view = cx.new(|cx| TerminalView::new_with_style(terminal, style, window, cx));
+        let terminal_view =
+            cx.new(|cx| TerminalView::new_with_style(terminal.clone(), style, window, cx));
         // 状态栏展示用的连接位置与认证方式，须在 target 被 session::start 消费前取出。
         let addr = format!("{}@{}:{}", target.user, target.host, target.port);
         let auth = if target.password.is_some() {
@@ -1954,24 +2064,52 @@ impl RuLinkApp {
         } else {
             AuthMethod::Agent
         };
-        let id = self.next_id;
-        self.next_id += 1;
+        let resume = Resume {
+            target: target.clone(),
+            host: host.clone(),
+            secret_from_vault,
+        };
         let session::SshSession {
             join,
             remote_info,
             started,
+            disconnect,
         } = session::start(target, handles, self.vault.clone(), cx);
+        // 会话结束（远端 exit / 断线 / 连接失败）→ 保留标签并展示断开横幅。
+        let close_view = terminal_view.clone();
+        cx.subscribe(&terminal, move |this, _, event: &TerminalEvent, cx| {
+            // 只认当前标签的终端：重连后旧终端若迟来 CloseTerminal，不能把新会话标成已断开。
+            if matches!(event, TerminalEvent::CloseTerminal)
+                && this.tab_is_current(id, &close_view)
+            {
+                this.end_session_tab(id, cx);
+            }
+        })
+        .detach();
         self.status = SharedString::from(format!("正在连接 {addr}…"));
-        self.tabs.push(SessionTab {
+        let tab = SessionTab {
             id,
             title: title.into(),
             addr: addr.clone().into(),
             auth: Some(auth),
             remote_info: None,
-            terminal_view,
-        });
+            terminal_view: terminal_view.clone(),
+            ended: false,
+            failed: false,
+            resume: Some(resume),
+            disconnect: Some(disconnect),
+        };
+        match self.tabs.iter_mut().find(|tab| tab.id == id) {
+            Some(existing) if reconnect => *existing = tab,
+            Some(_) => log::warn!("标签 id {id} 已存在，忽略重复落标签"),
+            None => self.tabs.push(tab),
+        }
         self.active_tab = Some(id);
+        // 重连后把焦点交回新终端，键入住处即可继续敲命令。
+        let focus = terminal_view.read(cx).focus_handle(cx);
+        focus.focus(window, cx);
         let vault = self.vault.clone();
+        let current_view = terminal_view.clone();
         cx.spawn(async move |this, cx| {
             let result = join.await;
             let shell_started = started.load(std::sync::atomic::Ordering::SeqCst);
@@ -1981,8 +2119,11 @@ impl RuLinkApp {
             let entity_id = entity.entity_id();
             let _ = cx.with_window(entity_id, move |window, cx| {
                 let _ = entity.update(cx, move |this, cx| {
+                    if !this.tab_is_current(id, &current_view) {
+                        return;
+                    }
+                    // 正常结束（远端 exit / 断线）由终端的 CloseTerminal 收尾，这里无事可做。
                     let Err(error) = result else {
-                        this.remove_tab(id, cx);
                         return;
                     };
                     // 加密私钥缺口令：回收死标签，自动弹口令窗。
@@ -2005,6 +2146,11 @@ impl RuLinkApp {
                         if let Some(key) = &cache_key {
                             this.password_cache.remove(key);
                         }
+                        // 凭据已被拒绝：带着同一份秘密重连只会再失败一次，
+                        // 关掉重连入口，提示用户回列表重新点击以输入新凭据。
+                        if let Some(tab) = this.tabs.iter_mut().find(|tab| tab.id == id) {
+                            tab.resume = None;
+                        }
                         if secret_from_vault
                             && let (Some(vault), Some(h)) = (vault.clone(), host.as_ref())
                             && h.id != 0
@@ -2021,27 +2167,29 @@ impl RuLinkApp {
                             );
                         }
                     }
-                    if !shell_started {
-                        // 从未建立终端：保留标签页，错误详情已写入终端可继续阅读。
-                        this.status = SharedString::from(format!("连接失败：{addr}"));
-                        cx.notify();
-                        return;
-                    }
-                    this.remove_tab(id, cx);
-                    this.status = SharedString::from(format!(
-                        "连接失败：{addr}（{}）",
-                        session::error_summary(&error)
-                    ));
-                    cx.notify();
+                    let message = if shell_started {
+                        format!(
+                            "连接中断：{addr}（{}）",
+                            session::error_summary(&error)
+                        )
+                    } else {
+                        format!("连接失败：{addr}")
+                    };
+                    this.fail_session_tab(id, message.into(), cx);
                 });
             });
         })
         .detach();
-        // 远程基本信息比会话短得多：探测回来时标签可能已关闭，据此判断后再写入。
+        // 远程基本信息比会话短得多：探测回来时标签可能已关闭/重连，据此判断后再写入。
+        let info_view = terminal_view.clone();
         cx.spawn(async move |this, cx| {
             if let Ok(info) = remote_info.await {
                 let _ = this.update(cx, |this, cx| {
-                    if let Some(tab) = this.tabs.iter_mut().find(|tab| tab.id == id) {
+                    if let Some(tab) = this
+                        .tabs
+                        .iter_mut()
+                        .find(|tab| tab.id == id && tab.terminal_view == info_view)
+                    {
                         tab.remote_info = Some(info);
                         cx.notify();
                     }
@@ -2050,6 +2198,90 @@ impl RuLinkApp {
         })
         .detach();
         cx.notify();
+    }
+
+    /// 标签仍属于当前这次连接（未被同 id 的新会话替换/移除）。
+    fn tab_is_current(&self, id: usize, view: &Entity<TerminalView>) -> bool {
+        self.tabs
+            .iter()
+            .any(|tab| tab.id == id && tab.terminal_view == *view)
+    }
+
+    /// 终端报告会话结束：保留终端内容与标签，展示断开横幅（可重连）。
+    fn end_session_tab(&mut self, id: usize, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) else {
+            return;
+        };
+        if tab.ended {
+            return;
+        }
+        tab.ended = true;
+        let (title, failed, active) = (tab.title.clone(), tab.failed, self.active_tab == Some(id));
+        if active && !failed {
+            self.status = SharedString::from(format!(
+                "会话已断开 {title}，按回车或点击「重新连接」恢复"
+            ));
+        }
+        cx.notify();
+    }
+
+    /// 会话以失败收场：标记断开原因，状态栏给出错误摘要（终端里另有完整错误文本）。
+    fn fail_session_tab(&mut self, id: usize, message: SharedString, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) else {
+            return;
+        };
+        tab.failed = true;
+        if self.active_tab == Some(id) {
+            self.status = message;
+        }
+        cx.notify();
+    }
+
+    /// 重连一个已断开的标签：优先用列表里的最新主机配置，其余沿用原连接参数。
+    fn reconnect_tab(&mut self, id: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((title, resume)) = self
+            .tabs
+            .iter()
+            .find(|tab| tab.id == id && tab.ended)
+            .and_then(|tab| {
+                tab.resume
+                    .clone()
+                    .map(|resume| (tab.title.to_string(), resume))
+            })
+        else {
+            return;
+        };
+        let secret_from_vault = resume.secret_from_vault;
+        let current_host = resume
+            .host
+            .as_ref()
+            .and_then(|host| self.hosts.iter().find(|item| item.id == host.id));
+        let (target, host, cache_key) = match current_host {
+            Some(host) => {
+                // 主机可能被编辑过：地址/端口/用户/认证方式以最新配置为准，
+                // 秘密沿用原会话（仅内存），避免重连时再弹一次窗。
+                let password = (host.auth == AuthMethod::Password)
+                    .then(|| resume.target.password.clone())
+                    .flatten();
+                let mut target = SshTarget::from_host(host, password);
+                if host.auth == AuthMethod::IdentityFile {
+                    target.passphrase = resume.target.passphrase.clone();
+                }
+                (target, Some(host.clone()), Some(host.addr()))
+            }
+            None => (resume.target, resume.host, None),
+        };
+        self.start_ssh(
+            id,
+            title,
+            target,
+            cache_key,
+            host,
+            secret_from_vault,
+            true,
+            window,
+            cx,
+        );
     }
 
     /// 用户点击标签关闭按钮。
@@ -2065,6 +2297,12 @@ impl RuLinkApp {
             .find(|tab| tab.id == id)
             .map(|tab| tab.title.clone());
         let before = self.tabs.len();
+        // 关标签＝主动断开：通知会话任务释放 SSH 连接，而不是留一条后台挂着的连接。
+        if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id)
+            && let Some(disconnect) = tab.disconnect.take()
+        {
+            let _ = disconnect.send(());
+        }
         self.tabs.retain(|tab| tab.id != id);
         if self.tabs.len() == before {
             return;
@@ -2144,6 +2382,48 @@ impl RuLinkApp {
         cx: &mut Context<Self>,
     ) {
         self.open_settings(window, cx);
+    }
+
+    /// 是否有浮层占着键盘（弹窗 / 表单 / 待输密码面板）。
+    fn overlay_open(&self) -> bool {
+        self.unlock.is_some()
+            || self.settings.is_some()
+            || self.confirm_delete.is_some()
+            || self.new_host.is_some()
+            || self.group_prompt.is_some()
+            || self.pending.is_some()
+    }
+
+    /// 回车重连：只在焦点落在「已断开的终端」上、且没有弹窗时生效。
+    ///
+    /// 断开的终端仍持有焦点，但按键已无处可写；在捕获阶段拦截回车，
+    /// 与 WindTerm「Remote channel is closed，按回车重新连接」的行为对齐。
+    fn capture_session_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.keystroke.key != "enter" || self.overlay_open() {
+            return;
+        }
+        let Some(id) = self.active_tab else {
+            return;
+        };
+        let Some(tab) = self.tabs.iter().find(|tab| tab.id == id) else {
+            return;
+        };
+        let reconnectable = tab.ended && tab.resume.is_some();
+        let terminal_focused = tab
+            .terminal_view
+            .read(cx)
+            .focus_handle(cx)
+            .is_focused(window);
+        if !reconnectable || !terminal_focused {
+            return;
+        }
+        cx.stop_propagation();
+        self.reconnect_tab(id, window, cx);
     }
 
     /// 启动时静默补扫一次：`detect()` 只查文件，WSL 得跑 `wsl.exe -l`，
@@ -2303,6 +2583,10 @@ impl RuLinkApp {
             auth: None,
             remote_info: None,
             terminal_view,
+            ended: false,
+            failed: false,
+            resume: None,
+            disconnect: None,
         });
         self.active_tab = Some(id);
         // 本地 shell 退出（exit / Ctrl+D / 进程被杀）与 SSH 会话结束一样直接收标签。
@@ -2333,6 +2617,8 @@ impl Render for RuLinkApp {
             .on_action(cx.listener(Self::new_host))
             .on_action(cx.listener(Self::new_local_terminal))
             .on_action(cx.listener(Self::open_settings_action))
+            // 捕获阶段先看到回车：断开的终端已写不到远端，回车要用来重连而不是被它吞掉。
+            .capture_key_down(cx.listener(Self::capture_session_key))
             .child(self.render_title_bar(window, cx))
             .child(
                 SplitPane::horizontal(self.split_state.clone())
@@ -3466,6 +3752,13 @@ impl RuLinkApp {
         menu: PopupMenu,
     ) -> PopupMenu {
         let menu = menu.min_w(px(168.0));
+        // 「新建主机…」落在右键目标所在的分组：分组上直接进该组，
+        // 主机上沿用该主机的组，空白处则是未分组。
+        let target_group = match &target {
+            MenuTarget::Group(name) if name.as_str() != UNGROUPED => Some(name.clone()),
+            MenuTarget::Host(_) => current_group.clone(),
+            _ => None,
+        };
         let menu = match &target {
             MenuTarget::Host(index) => {
                 let index = *index;
@@ -3476,7 +3769,7 @@ impl RuLinkApp {
                     false,
                     false,
                     move |this, window, cx| {
-                        this.open_form_at(Some(index), window, cx);
+                        this.open_form_at(Some(index), None, window, cx);
                     },
                 ))
                 .separator()
@@ -3490,8 +3783,8 @@ impl RuLinkApp {
                 None,
                 false,
                 false,
-                |this, window, cx| {
-                    this.open_form(window, cx);
+                move |this, window, cx| {
+                    this.open_form_in_group(target_group.clone(), window, cx);
                 },
             ))
             .item(Self::menu_item(
@@ -4100,6 +4393,46 @@ impl RuLinkApp {
                                     .child(labeled_field("用户名", &form.user, &pal)),
                             ),
                     )
+                    .child({
+                        // 分组选择：新建时默认未分组（从分组右键进入则预选该组），
+                        // 编辑时预填原归属；保存即落到这里选中的组。
+                        let mut options: Vec<SharedString> =
+                            vec![SharedString::from(UNGROUPED)];
+                        options.extend(
+                            self.sidebar
+                                .names()
+                                .map(|name| SharedString::from(name.to_string())),
+                        );
+                        let selected = form
+                            .group
+                            .as_ref()
+                            .and_then(|group| options.iter().position(|option| option == group))
+                            .or(Some(0));
+                        let change_options = options.clone();
+                        let entity = cx.entity();
+                        v_flex()
+                            .gap_1()
+                            .child(div().text_sm().child("分组"))
+                            .child(
+                                Select::new(options)
+                                    .id("host-group")
+                                    .selected(selected)
+                                    .w_full()
+                                    .on_change(move |index, _name, _window, cx| {
+                                        let group = if index == 0 {
+                                            None
+                                        } else {
+                                            change_options.get(index).cloned()
+                                        };
+                                        entity.update(cx, |this, cx| {
+                                            if let Some(form) = this.new_host.as_mut() {
+                                                form.group = group;
+                                                cx.notify();
+                                            }
+                                        });
+                                    }),
+                            )
+                    })
                     .child(
                         v_flex()
                             .gap_1()
@@ -4460,6 +4793,17 @@ impl RuLinkApp {
                                     .bg(pal.accent),
                             )
                         })
+                        // 结束的会话在后台也要一眼看见：标题前加一个危险色圆点。
+                        .when(tab.ended, |this| {
+                            this.child(
+                                div()
+                                    .w(px(6.0))
+                                    .h(px(6.0))
+                                    .flex_shrink_0()
+                                    .rounded(px(3.0))
+                                    .bg(pal.danger),
+                            )
+                        })
                         .child(div().flex_1().min_w_0().truncate().child(tab.title.clone()))
                         // 只有活动标签常驻 ×：非活动项的 × 更挡标题，切换过去再关即可。
                         .when(active, |this| {
@@ -4490,6 +4834,7 @@ impl RuLinkApp {
             .map(|tab| {
                 // 内边距取终端自己的底色，四周才像终端的一部分而不是白框。
                 div()
+                    .relative()
                     .flex_1()
                     .min_h_0()
                     .overflow_hidden()
@@ -4497,6 +4842,9 @@ impl RuLinkApp {
                     .px_3()
                     .py_2()
                     .child(tab.terminal_view.clone())
+                    .when(tab.ended, |this| {
+                        this.child(self.render_ended_banner(tab, cx))
+                    })
                     .into_any_element()
             })
             .unwrap_or_else(|| {
@@ -4514,6 +4862,66 @@ impl RuLinkApp {
             });
 
         v_flex().flex_1().h_full().child(tab_bar).child(body)
+    }
+
+    /// 会话断开横幅：浮在终端顶部，说明连接已结束并提供重连入口。
+    ///
+    /// 标签不自动关闭（与 WindTerm 一致）：终端内容留在原处可回看，按回车
+    /// 或点「重新连接」在原标签内重建会话；凭据已被服务器拒绝时不提供重连
+    /// （重试同一份秘密只会再失败一次），提示回到列表重新点击。
+    fn render_ended_banner(&self, tab: &SessionTab, cx: &mut Context<Self>) -> AnyElement {
+        let pal = self.palette(cx);
+        let theme = cx.theme();
+        let fg = theme.warning_foreground;
+        let id = tab.id;
+        let reconnectable = tab.resume.is_some();
+        h_flex()
+            .id(SharedString::from(format!("ended-banner-{id}")))
+            .absolute()
+            .top(px(8.0))
+            .left(px(8.0))
+            .right(px(8.0))
+            .px_3()
+            .py_2()
+            .gap_2()
+            .items_center()
+            .rounded(px(6.0))
+            .bg(theme.warning)
+            .text_color(fg)
+            .shadow_md()
+            .child(div().text_sm().font_weight(FontWeight(600.0)).child("远程通道已关闭"))
+            .child(div().text_sm().child("会话已断开连接。"))
+            .child(div().flex_1())
+            .child(div().text_xs().child(if reconnectable {
+                "按回车重新连接"
+            } else {
+                "请从左侧重新点击该主机连接"
+            }))
+            .when(reconnectable, |this| {
+                this.child(
+                    Button::new(SharedString::from(format!("reconnect-{id}")))
+                        .label("重新连接")
+                        .primary()
+                        .compact()
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.reconnect_tab(id, window, cx);
+                        })),
+                )
+            })
+            .child(
+                div()
+                    .id(SharedString::from(format!("ended-close-{id}")))
+                    .px_1()
+                    .text_base()
+                    .cursor_pointer()
+                    .text_color(fg)
+                    .hover(|this| this.text_color(pal.danger))
+                    .child("×")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.close_tab(id, cx);
+                    })),
+            )
+            .into_any_element()
     }
 
     /// 底部状态栏：左侧瞬态状态 + 活动会话信息（按用户勾选的显示项拼装），右侧会话计数。
@@ -4954,6 +5362,22 @@ mod tests {
             SidebarPrefs::from_json("{ not json"),
             SidebarPrefs::default()
         );
+    }
+
+    #[test]
+    fn sidebar_prefs_expand_clears_collapse_for_group_and_ungrouped() {
+        // 新主机落进折叠组时要把组展开，否则保存后像"没存进去"。
+        let mut prefs = SidebarPrefs::default();
+        prefs.add("生产");
+        prefs.toggle("生产");
+        prefs.toggle("未分组");
+        prefs.expand("生产");
+        prefs.expand("未分组");
+        assert!(!prefs.collapsed("生产"));
+        assert!(!prefs.collapsed("未分组"));
+        // 不存在的组名不应改动任何状态。
+        prefs.expand("没有这个组");
+        assert!(!prefs.collapsed("生产"));
     }
 
     #[test]
