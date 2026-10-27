@@ -19,7 +19,6 @@ use rgpui::components::split_pane::{CollapsiblePane, SplitPane, SplitPaneState};
 use rgpui::components::status_bar::{StatusBar, StatusBarItem};
 use rgpui::input_ui::{Input, InputContentType, InputEvent, InputState};
 use rgpui::prelude::*;
-use rgpui::tabs::{Tab, TabBar};
 use rgpui::title_bar::TITLE_BAR_HEIGHT;
 use rgpui::{
     AnyElement, App, Bounds, Button, ButtonVariants, Checkbox, Context, DropdownMenu, Entity,
@@ -2187,7 +2186,7 @@ impl RuLinkApp {
             .into_any_element()
     }
 
-    /// 设置居中弹窗：分页展示「凭据库与主密码」与「外观」。
+    /// 设置居中弹窗：左侧竖排分页导航（凭据库与主密码 / 外观 / 状态栏），右侧为当前分页内容。
     fn render_settings_dialog(&self, cx: &Context<Self>) -> AnyElement {
         let pal = self.palette(cx);
         let Some(state) = self.settings.as_ref() else {
@@ -2202,6 +2201,28 @@ impl RuLinkApp {
             SETTINGS_TAB_STATUS => self.render_status_tab(&pal, cx),
             _ => self.render_vault_tab(&pal, state, passphrase_mode, unlocked, cx),
         };
+        let entity = cx.entity();
+        // 竖排分页条目：左侧导航列表，选中项加底色与粗体，悬停有反馈。
+        let tab_item =
+            |id: &'static str, label: &'static str, ix: usize, entity: Entity<RuLinkApp>| {
+                let selected = state.tab == ix;
+                h_flex()
+                    .id(id)
+                    .h(px(30.0))
+                    .px_3()
+                    .items_center()
+                    .rounded(px(6.0))
+                    .text_sm()
+                    .text_color(if selected { pal.text } else { pal.muted })
+                    .when(selected, |item| {
+                        item.bg(pal.segment_bg).font_weight(FontWeight(600.0))
+                    })
+                    .hover(|style| style.bg(pal.card_hover).text_color(pal.text))
+                    .on_click(move |_, _, cx| {
+                        entity.update(cx, |this, cx| this.select_settings_tab(ix, cx));
+                    })
+                    .child(label)
+            };
         v_flex()
             .id("settings-backdrop")
             .absolute()
@@ -2218,7 +2239,7 @@ impl RuLinkApp {
             .child(
                 v_flex()
                     .id("settings-dialog")
-                    .w(px(520.0))
+                    .w(px(620.0))
                     .gap_3()
                     .p_5()
                     .rounded(px(8.0))
@@ -2237,24 +2258,35 @@ impl RuLinkApp {
                             .child("设置"),
                     )
                     .child(
-                        TabBar::new("settings-tabs")
-                            .underline()
-                            .children(vec![
-                                Tab::new().label("凭据库与主密码"),
-                                Tab::new().label("外观"),
-                                Tab::new().label("状态栏"),
-                            ])
-                            .selected_index(state.tab)
-                            .on_change({
-                                let entity = cx.entity();
-                                move |ix, _window, cx| {
-                                    entity.update(cx, |this, cx| {
-                                        this.select_settings_tab(ix, cx);
-                                    });
-                                }
-                            }),
+                        h_flex()
+                            .gap_5()
+                            .items_start()
+                            .child(
+                                v_flex()
+                                    .w(px(132.0))
+                                    .flex_shrink_0()
+                                    .gap_1()
+                                    .child(tab_item(
+                                        "settings-tab-vault",
+                                        "凭据库与主密码",
+                                        SETTINGS_TAB_VAULT,
+                                        entity.clone(),
+                                    ))
+                                    .child(tab_item(
+                                        "settings-tab-appearance",
+                                        "外观",
+                                        SETTINGS_TAB_APPEARANCE,
+                                        entity.clone(),
+                                    ))
+                                    .child(tab_item(
+                                        "settings-tab-status",
+                                        "状态栏",
+                                        SETTINGS_TAB_STATUS,
+                                        entity,
+                                    )),
+                            )
+                            .child(v_flex().flex_1().min_w_0().child(body)),
                     )
-                    .child(body)
                     .child(
                         h_flex().gap_2().justify_end().child(
                             Button::new("settings-close")
