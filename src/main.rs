@@ -15,6 +15,7 @@ mod vault;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use rgpui::components::Select;
 use rgpui::components::split_pane::{CollapsiblePane, SplitPane, SplitPaneState};
@@ -86,6 +87,12 @@ struct SessionTab {
     resume: Option<Resume>,
     /// 主动断开当前 SSH 会话（关闭标签时发送；本地终端为 None）。
     disconnect: Option<tokio::sync::oneshot::Sender<()>>,
+    /// 本轮连续自动重连已尝试次数（0＝不在自动重连中，手动重连会清零）。
+    auto_retry_attempt: u32,
+    /// 已排定一次自动重连（横幅展示等待与取消入口）。
+    auto_retry_pending: bool,
+    /// 本次会话 shell 成功开启的时刻：稳定运行过一阵后再断线，自动重连次数重新计。
+    connected_at: Option<Instant>,
 }
 
 /// 断线标签的重连参数快照。
@@ -192,6 +199,8 @@ const SETTINGS_TAB_APPEARANCE: usize = 1;
 const SETTINGS_TAB_STATUS: usize = 2;
 /// 设置弹窗分页：终端外观（字号 / 行高 / 配色方案）。
 const SETTINGS_TAB_TERMINAL: usize = 3;
+/// 设置弹窗分页：会话行为（自动重连 / 连接超时）。
+const SETTINGS_TAB_SESSION: usize = 4;
 
 /// 设置弹窗固定宽高：切分页不重排，弹窗不随内容忽大忽小。
 const SETTINGS_DIALOG_W: f32 = 640.0;
@@ -339,6 +348,87 @@ impl TerminalPrefs {
     fn nudge_line_height(&mut self, steps: i32) {
         let next = self.line_height + LINE_HEIGHT_STEP * steps as f32;
         self.line_height = next;
+        self.clamp();
+    }
+
+    /// 序列化为入库/入文件的字符串。
+    fn to_json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
+    }
+
+    /// 解析库内 / settings.json 里的偏好；损坏或为空时回默认。
+    fn from_json(text: &str) -> Self {
+        if text.is_empty() {
+            return Self::default();
+        }
+        let mut prefs: Self = serde_json::from_str(text).unwrap_or_default();
+        prefs.clamp();
+        prefs
+    }
+}
+
+/// 连接超时范围（秒）：太短会把慢服务器误判成不通，太长则白等。
+const CONNECT_TIMEOUT_MIN: u64 = 5;
+const CONNECT_TIMEOUT_MAX: u64 = 120;
+const CONNECT_TIMEOUT_STEP: u64 = 5;
+const CONNECT_TIMEOUT_DEFAULT: u64 = 15;
+/// 自动重连最多连续尝试次数：断网时无限重试既吵又费资源，5 次后交给用户手动决定。
+const AUTO_RECONNECT_MAX: u32 = 5;
+/// 会话稳定存活超过这个时长后再次断线，重新计算自动重连次数（避免历史断线把额度吃光）。
+const AUTO_RECONNECT_HEALTHY: Duration = Duration::from_secs(30);
+
+/// 第 n 次自动重连前的等待：退避避免对刚恢复的网络连打。
+fn auto_reconnect_delay(attempt: u32) -> Duration {
+    Duration::from_secs(match attempt {
+        0 | 1 => 1,
+        2 => 2,
+        3 => 5,
+        4 => 10,
+        _ => 20,
+    })
+}
+
+/// 会话行为偏好：断线自动重连与建连超时。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionPrefs {
+    /// 连接意外中断（网络断开、服务端掉线）后自动重连；远端主动 `exit` 不触发。
+    #[serde(default = "auto_reconnect_default")]
+    pub auto_reconnect: bool,
+    /// 建连 + 认证 + 开 shell 的总超时（秒）。
+    #[serde(default = "connect_timeout_default")]
+    pub connect_timeout: u64,
+}
+
+fn auto_reconnect_default() -> bool {
+    true
+}
+
+fn connect_timeout_default() -> u64 {
+    CONNECT_TIMEOUT_DEFAULT
+}
+
+impl Default for SessionPrefs {
+    fn default() -> Self {
+        Self {
+            auto_reconnect: true,
+            connect_timeout: CONNECT_TIMEOUT_DEFAULT,
+        }
+    }
+}
+
+impl SessionPrefs {
+    /// 超时夹回合法区间（库里可能是历史版本写下的越界值）。
+    fn clamp(&mut self) {
+        self.connect_timeout = self
+            .connect_timeout
+            .clamp(CONNECT_TIMEOUT_MIN, CONNECT_TIMEOUT_MAX);
+    }
+
+    /// 超时增减一档，结果仍夹在合法区间内。
+    fn nudge_connect_timeout(&mut self, steps: i32) {
+        let delta = CONNECT_TIMEOUT_STEP as i64 * i64::from(steps);
+        let next = (self.connect_timeout as i64 + delta).max(0) as u64;
+        self.connect_timeout = next;
         self.clamp();
     }
 
@@ -568,6 +658,8 @@ struct RuLinkApp {
     status_bar: StatusBarPrefs,
     /// 终端外观偏好（字号 / 行高 / 配色方案），同样双层持久化。
     terminal: TerminalPrefs,
+    /// 会话行为偏好（自动重连 / 连接超时），同样双层持久化。
+    session_prefs: SessionPrefs,
     /// 侧边栏 ↔ 主区 的分隔面板状态（拖拽调整宽度 + 折叠/展开）。
     split_state: Entity<SplitPaneState>,
     focus_handle: FocusHandle,
@@ -652,6 +744,7 @@ impl RuLinkApp {
         let settings = store.load_settings();
         let status_bar = StatusBarPrefs::from_json(&settings.status_bar);
         let terminal = TerminalPrefs::from_json(&settings.terminal);
+        let session_prefs = SessionPrefs::from_json(&settings.session);
         let sidebar = SidebarPrefs::from_json(&settings.sidebar);
         // 终端配色预设管理器：全局一份，`TerminalView::set_theme` 与自建样式都从这里取。
         if !cx.has_global::<ThemeManager>() {
@@ -693,6 +786,7 @@ impl RuLinkApp {
             status: "就绪".into(),
             status_bar,
             terminal,
+            session_prefs,
             split_state,
             focus_handle: cx.focus_handle(),
         };
@@ -850,6 +944,16 @@ impl RuLinkApp {
                 let _ = this.update(cx, |this, cx| {
                     if this.terminal != prefs {
                         this.terminal = prefs;
+                        cx.notify();
+                    }
+                });
+            }
+            // 会话行为（自动重连 / 连接超时）同样以库内为准。
+            if let Ok(Some(json)) = vault.setting("session").await {
+                let prefs = SessionPrefs::from_json(&json);
+                let _ = this.update(cx, |this, cx| {
+                    if this.session_prefs != prefs {
+                        this.session_prefs = prefs;
                         cx.notify();
                     }
                 });
@@ -2021,6 +2125,7 @@ impl RuLinkApp {
             cache_key,
             host,
             secret_from_vault,
+            0,
             false,
             window,
             cx,
@@ -2028,8 +2133,9 @@ impl RuLinkApp {
     }
 
     /// 在指定标签槽位启动 SSH 会话：`reconnect` 为真时原位替换该标签的终端，
-    /// 否则追加为新标签。会话结束（远端 exit / 断线）由终端 `CloseTerminal`
-    /// 事件收尾——标签不摘除，改为展示断开横幅。
+    /// 否则追加为新标签。`retry_attempt` 为自动重连的连续次数（手动连接为 0）。
+    /// 会话结束（远端 exit / 断线）由终端 `CloseTerminal` 事件收尾——标签不摘除，
+    /// 改为展示断开横幅。
     #[allow(clippy::too_many_arguments)]
     fn start_ssh(
         &mut self,
@@ -2039,6 +2145,7 @@ impl RuLinkApp {
         cache_key: Option<String>,
         host: Option<HostConfig>,
         secret_from_vault: bool,
+        retry_attempt: u32,
         reconnect: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -2073,14 +2180,20 @@ impl RuLinkApp {
             join,
             remote_info,
             started,
+            ready,
             disconnect,
-        } = session::start(target, handles, self.vault.clone(), cx);
+        } = session::start(
+            target,
+            handles,
+            self.vault.clone(),
+            Duration::from_secs(self.session_prefs.connect_timeout),
+            cx,
+        );
         // 会话结束（远端 exit / 断线 / 连接失败）→ 保留标签并展示断开横幅。
         let close_view = terminal_view.clone();
         cx.subscribe(&terminal, move |this, _, event: &TerminalEvent, cx| {
             // 只认当前标签的终端：重连后旧终端若迟来 CloseTerminal，不能把新会话标成已断开。
-            if matches!(event, TerminalEvent::CloseTerminal)
-                && this.tab_is_current(id, &close_view)
+            if matches!(event, TerminalEvent::CloseTerminal) && this.tab_is_current(id, &close_view)
             {
                 this.end_session_tab(id, cx);
             }
@@ -2098,6 +2211,9 @@ impl RuLinkApp {
             failed: false,
             resume: Some(resume),
             disconnect: Some(disconnect),
+            auto_retry_attempt: retry_attempt,
+            auto_retry_pending: false,
+            connected_at: None,
         };
         match self.tabs.iter_mut().find(|tab| tab.id == id) {
             Some(existing) if reconnect => *existing = tab,
@@ -2108,6 +2224,25 @@ impl RuLinkApp {
         // 重连后把焦点交回新终端，键入住处即可继续敲命令。
         let focus = terminal_view.read(cx).focus_handle(cx);
         focus.focus(window, cx);
+        // shell 真正开起来才算"连接可用"：记录时刻供断线后判断会话是否稳定过。
+        let ready_view = terminal_view.clone();
+        cx.spawn(async move |this, cx| {
+            if ready.await.is_err() {
+                return;
+            }
+            let _ = this.update(cx, |this, cx| {
+                if let Some(tab) = this
+                    .tabs
+                    .iter_mut()
+                    .find(|tab| tab.id == id && tab.terminal_view == ready_view)
+                {
+                    tab.connected_at = Some(Instant::now());
+                    tab.auto_retry_pending = false;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
         let vault = self.vault.clone();
         let current_view = terminal_view.clone();
         cx.spawn(async move |this, cx| {
@@ -2168,14 +2303,11 @@ impl RuLinkApp {
                         }
                     }
                     let message = if shell_started {
-                        format!(
-                            "连接中断：{addr}（{}）",
-                            session::error_summary(&error)
-                        )
+                        format!("连接中断：{addr}（{}）", session::error_summary(&error))
                     } else {
                         format!("连接失败：{addr}")
                     };
-                    this.fail_session_tab(id, message.into(), cx);
+                    this.fail_session_tab(id, message.into(), shell_started, cx);
                 });
             });
         })
@@ -2218,27 +2350,124 @@ impl RuLinkApp {
         tab.ended = true;
         let (title, failed, active) = (tab.title.clone(), tab.failed, self.active_tab == Some(id));
         if active && !failed {
-            self.status = SharedString::from(format!(
-                "会话已断开 {title}，按回车或点击「重新连接」恢复"
-            ));
+            self.status =
+                SharedString::from(format!("会话已断开 {title}，按回车或点击「重新连接」恢复"));
         }
         cx.notify();
     }
 
     /// 会话以失败收场：标记断开原因，状态栏给出错误摘要（终端里另有完整错误文本）。
-    fn fail_session_tab(&mut self, id: usize, message: SharedString, cx: &mut Context<Self>) {
-        let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) else {
-            return;
-        };
-        tab.failed = true;
-        if self.active_tab == Some(id) {
-            self.status = message;
+    ///
+    /// 网络类失败按设置排定自动重连（退避 + 次数上限）；首次连接就失败不自动重试，
+    /// 避免把写错的地址反复重连。
+    fn fail_session_tab(
+        &mut self,
+        id: usize,
+        message: SharedString,
+        shell_started: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let mut schedule = None;
+        let auto_enabled = self.session_prefs.auto_reconnect;
+        if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) {
+            tab.failed = true;
+            // 失败也按"已结束"落标签：终端事件可能迟到，横幅与重连入口要立刻可用。
+            tab.ended = true;
+            // 稳定跑过一阵的会话：这是新一轮断线，重试次数清零。
+            if tab
+                .connected_at
+                .is_some_and(|at| at.elapsed() >= AUTO_RECONNECT_HEALTHY)
+            {
+                tab.auto_retry_attempt = 0;
+            }
+            tab.connected_at = None;
+            if self.active_tab == Some(id) {
+                self.status = message;
+            }
+            let in_streak = tab.auto_retry_attempt > 0;
+            if auto_enabled
+                && tab.resume.is_some()
+                && (shell_started || in_streak)
+                && tab.auto_retry_attempt < AUTO_RECONNECT_MAX
+            {
+                let attempt = tab.auto_retry_attempt + 1;
+                let delay = auto_reconnect_delay(attempt);
+                tab.auto_retry_attempt = attempt;
+                tab.auto_retry_pending = true;
+                schedule = Some((attempt, delay, tab.terminal_view.clone()));
+            }
+            cx.notify();
         }
-        cx.notify();
+        if let Some((attempt, delay, view)) = schedule {
+            if self.active_tab == Some(id) {
+                self.status = SharedString::from(format!(
+                    "连接中断，{} 秒后自动重连（第 {attempt} 次，共 {AUTO_RECONNECT_MAX} 次）",
+                    delay.as_secs()
+                ));
+            }
+            self.schedule_auto_reconnect(id, view, attempt, delay, cx);
+        }
+    }
+
+    /// 延迟到点后在原标签重连；期间关标签、手动重连、取消或关掉开关都会让本次排定作废。
+    fn schedule_auto_reconnect(
+        &mut self,
+        id: usize,
+        view: Entity<TerminalView>,
+        attempt: u32,
+        delay: Duration,
+        cx: &mut Context<Self>,
+    ) {
+        let entity = cx.entity();
+        let entity_id = entity.entity_id();
+        cx.spawn(async move |_, cx| {
+            cx.background_executor().timer(delay).await;
+            let _ = cx.with_window(entity_id, move |window, cx| {
+                let _ = entity.update(cx, move |this, cx| {
+                    let still_pending = this.tabs.iter().any(|tab| {
+                        tab.id == id
+                            && tab.terminal_view == view
+                            && tab.auto_retry_pending
+                            && tab.ended
+                    });
+                    if !still_pending || !this.session_prefs.auto_reconnect {
+                        if let Some(tab) = this.tabs.iter_mut().find(|tab| tab.id == id) {
+                            tab.auto_retry_pending = false;
+                            cx.notify();
+                        }
+                        return;
+                    }
+                    this.reconnect_tab_with(id, attempt, window, cx);
+                });
+            });
+        })
+        .detach();
+    }
+
+    /// 取消本轮自动重连：已排定的那次作废，等待用户按回车或点「重新连接」。
+    fn cancel_auto_reconnect(&mut self, id: usize, cx: &mut Context<Self>) {
+        if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) {
+            tab.auto_retry_pending = false;
+            tab.auto_retry_attempt = AUTO_RECONNECT_MAX;
+            cx.notify();
+        }
+        self.status = "已取消自动重连，按回车或点击「重新连接」手动恢复".into();
+    }
+
+    /// 手动重连一个已断开的标签（重置自动重连计数）。
+    fn reconnect_tab(&mut self, id: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.reconnect_tab_with(id, 0, window, cx);
     }
 
     /// 重连一个已断开的标签：优先用列表里的最新主机配置，其余沿用原连接参数。
-    fn reconnect_tab(&mut self, id: usize, window: &mut Window, cx: &mut Context<Self>) {
+    /// `retry_attempt` 为自动重连的连续次数（手动重连传 0）。
+    fn reconnect_tab_with(
+        &mut self,
+        id: usize,
+        retry_attempt: u32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some((title, resume)) = self
             .tabs
             .iter()
@@ -2278,6 +2507,7 @@ impl RuLinkApp {
             cache_key,
             host,
             secret_from_vault,
+            retry_attempt,
             true,
             window,
             cx,
@@ -2587,6 +2817,9 @@ impl RuLinkApp {
             failed: false,
             resume: None,
             disconnect: None,
+            auto_retry_attempt: 0,
+            auto_retry_pending: false,
+            connected_at: None,
         });
         self.active_tab = Some(id);
         // 本地 shell 退出（exit / Ctrl+D / 进程被杀）与 SSH 会话结束一样直接收标签。
@@ -3099,7 +3332,7 @@ impl RuLinkApp {
             .into_any_element()
     }
 
-    /// 设置居中弹窗：左侧竖排分页导航（凭据库与主密码 / 外观 / 状态栏 / 终端），右侧为当前分页内容。
+    /// 设置居中弹窗：左侧竖排分页导航（凭据库与主密码 / 外观 / 状态栏 / 终端 / 会话），右侧为当前分页内容。
     fn render_settings_dialog(&self, cx: &Context<Self>) -> AnyElement {
         let pal = self.palette(cx);
         let Some(state) = self.settings.as_ref() else {
@@ -3113,6 +3346,7 @@ impl RuLinkApp {
             SETTINGS_TAB_APPEARANCE => self.render_appearance_tab(&pal, dark, cx),
             SETTINGS_TAB_STATUS => self.render_status_tab(&pal, cx),
             SETTINGS_TAB_TERMINAL => self.render_terminal_tab(&pal, cx),
+            SETTINGS_TAB_SESSION => self.render_session_tab(&pal, cx),
             _ => self.render_vault_tab(&pal, state, passphrase_mode, unlocked, cx),
         };
         let entity = cx.entity();
@@ -3216,6 +3450,12 @@ impl RuLinkApp {
                                         "settings-tab-terminal",
                                         "终端",
                                         SETTINGS_TAB_TERMINAL,
+                                        entity.clone(),
+                                    ))
+                                    .child(tab_item(
+                                        "settings-tab-session",
+                                        "会话",
+                                        SETTINGS_TAB_SESSION,
                                         entity,
                                     )),
                             )
@@ -3600,6 +3840,64 @@ impl RuLinkApp {
                         + "扫描结果列在左侧「本地终端」分组里，点一下即开对应终端。",
                 ),
             )
+            .into_any_element()
+    }
+
+    /// 「会话」分页：断线自动重连与连接超时，改动即时生效并写入凭据库。
+    fn render_session_tab(&self, pal: &Palette, cx: &Context<Self>) -> AnyElement {
+        let auto = cx.entity();
+        v_flex()
+            .id("settings-tab-session")
+            .gap_3()
+            .child(div().text_sm().text_color(pal.muted).child(
+                "连接意外中断（断网、服务端掉线）后自动重建 SSH 会话；远端主动 exit 不触发自动重连。",
+            ))
+            .child(
+                Checkbox::new("session-auto-reconnect")
+                    .label("断线后自动重连")
+                    .checked(self.session_prefs.auto_reconnect)
+                    .on_change(move |value, _window, cx| {
+                        auto.update(cx, |this, cx| this.set_auto_reconnect(value, cx));
+                    }),
+            )
+            .child(div().text_xs().text_color(pal.muted).child(format!(
+                "首次连接就失败（地址写错、端口不通）不自动重试；断线后最多连续重试 \
+                 {AUTO_RECONNECT_MAX} 次，退避 1 / 2 / 5 / 10 / 20 秒，\
+                 会话稳定运行 30 秒后重新计数。等待期间可在横幅里取消或按回车立即重连。"
+            )))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        div()
+                            .w(px(72.0))
+                            .text_sm()
+                            .text_color(pal.muted)
+                            .child("连接超时"),
+                    )
+                    .child(stepper(
+                        "session-timeout-minus",
+                        "−",
+                        cx.listener(|this, _, _, cx| this.nudge_connect_timeout(-1, cx)),
+                    ))
+                    .child(
+                        div()
+                            .w(px(64.0))
+                            .text_center()
+                            .text_sm()
+                            .flex_shrink_0()
+                            .child(format!("{} 秒", self.session_prefs.connect_timeout)),
+                    )
+                    .child(stepper(
+                        "session-timeout-plus",
+                        "+",
+                        cx.listener(|this, _, _, cx| this.nudge_connect_timeout(1, cx)),
+                    )),
+            )
+            .child(div().text_xs().text_color(pal.muted).child(
+                "超时覆盖 DNS、TCP、握手、认证与开启 shell 的全过程；超时即结束本次尝试并报「连接超时」。",
+            ))
             .into_any_element()
     }
 
@@ -4396,8 +4694,7 @@ impl RuLinkApp {
                     .child({
                         // 分组选择：新建时默认未分组（从分组右键进入则预选该组），
                         // 编辑时预填原归属；保存即落到这里选中的组。
-                        let mut options: Vec<SharedString> =
-                            vec![SharedString::from(UNGROUPED)];
+                        let mut options: Vec<SharedString> = vec![SharedString::from(UNGROUPED)];
                         options.extend(
                             self.sidebar
                                 .names()
@@ -4410,28 +4707,25 @@ impl RuLinkApp {
                             .or(Some(0));
                         let change_options = options.clone();
                         let entity = cx.entity();
-                        v_flex()
-                            .gap_1()
-                            .child(div().text_sm().child("分组"))
-                            .child(
-                                Select::new(options)
-                                    .id("host-group")
-                                    .selected(selected)
-                                    .w_full()
-                                    .on_change(move |index, _name, _window, cx| {
-                                        let group = if index == 0 {
-                                            None
-                                        } else {
-                                            change_options.get(index).cloned()
-                                        };
-                                        entity.update(cx, |this, cx| {
-                                            if let Some(form) = this.new_host.as_mut() {
-                                                form.group = group;
-                                                cx.notify();
-                                            }
-                                        });
-                                    }),
-                            )
+                        v_flex().gap_1().child(div().text_sm().child("分组")).child(
+                            Select::new(options)
+                                .id("host-group")
+                                .selected(selected)
+                                .w_full()
+                                .on_change(move |index, _name, _window, cx| {
+                                    let group = if index == 0 {
+                                        None
+                                    } else {
+                                        change_options.get(index).cloned()
+                                    };
+                                    entity.update(cx, |this, cx| {
+                                        if let Some(form) = this.new_host.as_mut() {
+                                            form.group = group;
+                                            cx.notify();
+                                        }
+                                    });
+                                }),
+                        )
                     })
                     .child(
                         v_flex()
@@ -4867,14 +5161,30 @@ impl RuLinkApp {
     /// 会话断开横幅：浮在终端顶部，说明连接已结束并提供重连入口。
     ///
     /// 标签不自动关闭（与 WindTerm 一致）：终端内容留在原处可回看，按回车
-    /// 或点「重新连接」在原标签内重建会话；凭据已被服务器拒绝时不提供重连
-    /// （重试同一份秘密只会再失败一次），提示回到列表重新点击。
+    /// 或点「重新连接」在原标签内重建会话；开启了自动重连时先按退避等待并显示
+    /// 倒计时，可随时取消。凭据已被服务器拒绝时不提供重连（重试同一份秘密只会
+    /// 再失败一次），提示回到列表重新点击。
     fn render_ended_banner(&self, tab: &SessionTab, cx: &mut Context<Self>) -> AnyElement {
         let pal = self.palette(cx);
         let theme = cx.theme();
         let fg = theme.warning_foreground;
         let id = tab.id;
         let reconnectable = tab.resume.is_some();
+        let attempt = tab.auto_retry_attempt;
+        let pending = tab.auto_retry_pending && reconnectable;
+        let exhausted = reconnectable && !pending && attempt >= AUTO_RECONNECT_MAX;
+        let hint = if pending {
+            format!(
+                "正在自动重连（第 {attempt} 次，{} 秒后）",
+                auto_reconnect_delay(attempt).as_secs()
+            )
+        } else if exhausted {
+            "自动重连已停止，按回车手动重连".to_string()
+        } else if reconnectable {
+            "按回车重新连接".to_string()
+        } else {
+            "请从左侧重新点击该主机连接".to_string()
+        };
         h_flex()
             .id(SharedString::from(format!("ended-banner-{id}")))
             .absolute()
@@ -4889,14 +5199,31 @@ impl RuLinkApp {
             .bg(theme.warning)
             .text_color(fg)
             .shadow_md()
-            .child(div().text_sm().font_weight(FontWeight(600.0)).child("远程通道已关闭"))
-            .child(div().text_sm().child("会话已断开连接。"))
-            .child(div().flex_1())
-            .child(div().text_xs().child(if reconnectable {
-                "按回车重新连接"
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(FontWeight(600.0))
+                    .child("远程通道已关闭"),
+            )
+            .child(div().text_sm().child(if tab.failed {
+                "连接中断。"
             } else {
-                "请从左侧重新点击该主机连接"
+                "会话已断开连接。"
             }))
+            .child(div().flex_1())
+            .child(div().text_xs().child(hint))
+            .when(pending, |this| {
+                this.child(
+                    Button::new(SharedString::from(format!("cancel-retry-{id}")))
+                        .label("取消自动重连")
+                        .secondary()
+                        .outline()
+                        .compact()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.cancel_auto_reconnect(id, cx);
+                        })),
+                )
+            })
             .when(reconnectable, |this| {
                 this.child(
                     Button::new(SharedString::from(format!("reconnect-{id}")))
@@ -5090,6 +5417,46 @@ impl RuLinkApp {
         .detach();
     }
 
+    /// 会话行为改动：记账 → 持久化（库内优先，降级时写 settings.json）。
+    fn set_session_prefs(&mut self, mut prefs: SessionPrefs, cx: &mut Context<Self>) {
+        prefs.clamp();
+        if prefs == self.session_prefs {
+            return;
+        }
+        self.session_prefs = prefs;
+        cx.notify();
+        self.persist_session(cx);
+    }
+
+    /// 开关断线自动重连。
+    fn set_auto_reconnect(&mut self, auto_reconnect: bool, cx: &mut Context<Self>) {
+        let mut prefs = self.session_prefs.clone();
+        prefs.auto_reconnect = auto_reconnect;
+        self.set_session_prefs(prefs, cx);
+    }
+
+    /// 连接超时增减一档。
+    fn nudge_connect_timeout(&mut self, steps: i32, cx: &mut Context<Self>) {
+        let mut prefs = self.session_prefs.clone();
+        prefs.nudge_connect_timeout(steps);
+        self.set_session_prefs(prefs, cx);
+    }
+
+    /// 会话行为偏好落库；加密库不可用时退回旧 settings.json。
+    fn persist_session(&self, cx: &mut Context<Self>) {
+        let json = self.session_prefs.to_json();
+        let Some(vault) = self.vault.clone() else {
+            self.store.save_session(&json);
+            return;
+        };
+        cx.spawn(async move |_, _| {
+            if let Err(error) = vault.set_setting("session", &json).await {
+                log::warn!("写入库内会话偏好失败: {error}");
+            }
+        })
+        .detach();
+    }
+
     /// 分组偏好落库；加密库不可用时退回旧 settings.json。
     fn persist_sidebar(&self, cx: &mut Context<Self>) {
         let json = self.sidebar.to_json();
@@ -5268,8 +5635,9 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        FONT_SIZE_MAX, FONT_SIZE_MIN, LINE_HEIGHT_MAX, LINE_HEIGHT_MIN, Metric, SidebarPrefs,
-        StatusBarPrefs, TERMINAL_THEME_DEFAULT, TerminalPrefs,
+        AUTO_RECONNECT_MAX, CONNECT_TIMEOUT_DEFAULT, CONNECT_TIMEOUT_MAX, CONNECT_TIMEOUT_MIN,
+        FONT_SIZE_MAX, FONT_SIZE_MIN, LINE_HEIGHT_MAX, LINE_HEIGHT_MIN, Metric, SessionPrefs,
+        SidebarPrefs, StatusBarPrefs, TERMINAL_THEME_DEFAULT, TerminalPrefs, auto_reconnect_delay,
     };
 
     #[test]
@@ -5378,6 +5746,50 @@ mod tests {
         // 不存在的组名不应改动任何状态。
         prefs.expand("没有这个组");
         assert!(!prefs.collapsed("生产"));
+    }
+
+    #[test]
+    fn session_prefs_roundtrip_and_clamp() {
+        let prefs = SessionPrefs::default();
+        assert!(prefs.auto_reconnect, "默认开启自动重连");
+        assert_eq!(prefs.connect_timeout, CONNECT_TIMEOUT_DEFAULT);
+        assert_eq!(SessionPrefs::from_json(&prefs.to_json()), prefs);
+
+        // 越界/坏数据夹回区间，空串与损坏 JSON 回默认值。
+        let tiny = SessionPrefs::from_json(r#"{"auto_reconnect":false,"connect_timeout":1}"#);
+        assert!(!tiny.auto_reconnect);
+        assert_eq!(tiny.connect_timeout, CONNECT_TIMEOUT_MIN);
+        let huge = SessionPrefs::from_json(r#"{"connect_timeout":9999}"#);
+        assert_eq!(huge.connect_timeout, CONNECT_TIMEOUT_MAX);
+        assert_eq!(SessionPrefs::from_json(""), SessionPrefs::default());
+        assert_eq!(
+            SessionPrefs::from_json("{ not json"),
+            SessionPrefs::default()
+        );
+
+        // 步进在区间端点停住。
+        let mut low = SessionPrefs {
+            connect_timeout: CONNECT_TIMEOUT_MIN,
+            ..Default::default()
+        };
+        low.nudge_connect_timeout(-3);
+        assert_eq!(low.connect_timeout, CONNECT_TIMEOUT_MIN);
+        let mut high = SessionPrefs {
+            connect_timeout: CONNECT_TIMEOUT_MAX,
+            ..Default::default()
+        };
+        high.nudge_connect_timeout(3);
+        assert_eq!(high.connect_timeout, CONNECT_TIMEOUT_MAX);
+    }
+
+    #[test]
+    fn auto_reconnect_backoff_grows_and_caps() {
+        let delays: Vec<u64> = (1..=AUTO_RECONNECT_MAX)
+            .map(|attempt| auto_reconnect_delay(attempt).as_secs())
+            .collect();
+        assert_eq!(delays, vec![1, 2, 5, 10, 20]);
+        // 超出上限的序号也封顶在 20 秒，不会算出离谱的等待。
+        assert_eq!(auto_reconnect_delay(99).as_secs(), 20);
     }
 
     #[test]

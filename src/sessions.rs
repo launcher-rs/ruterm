@@ -77,6 +77,9 @@ pub struct Settings {
     /// 终端外观偏好（字号 / 行高 / 配色方案，序列化成 JSON 字符串）。
     #[serde(default)]
     pub terminal: String,
+    /// 会话行为偏好（自动重连 / 连接超时，序列化成 JSON 字符串）。
+    #[serde(default)]
+    pub session: String,
     /// 侧边栏分组（文件夹）偏好（序列化成 JSON 字符串）。
     #[serde(default)]
     pub sidebar: String,
@@ -151,6 +154,12 @@ impl SessionStore {
     pub fn save_terminal(&self, json: &str) {
         let json = json.to_string();
         self.update_settings(|settings| settings.terminal = json);
+    }
+
+    /// 降级模式（无加密库）下保存会话行为偏好。
+    pub fn save_session(&self, json: &str) {
+        let json = json.to_string();
+        self.update_settings(|settings| settings.session = json);
     }
 
     /// 降级模式（无加密库）下保存侧边栏分组偏好。

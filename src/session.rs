@@ -74,6 +74,8 @@ pub struct SshSession {
     pub remote_info: oneshot::Receiver<RemoteInfo>,
     /// shell 是否成功开启。失败发生在开启之前＝没建立过终端，标签页应保留展示错误。
     pub started: Arc<AtomicBool>,
+    /// shell 成功开启时发送一次：UI 据此记录"连接真正可用"的时刻（判断会话是否稳定过）。
+    pub ready: oneshot::Receiver<()>,
     /// 主动断开信号：标签被关闭时发送，会话任务随即释放连接。
     pub disconnect: oneshot::Sender<()>,
 }
@@ -91,15 +93,18 @@ pub fn error_summary(error: &anyhow::Error) -> String {
 ///
 /// 返回的任务必须被持有（提前 drop 会取消 SSH）。
 /// `vault` 用于加密库内的 known_hosts 校验；None 时回退旧文件（降级模式）。
+/// `connect_timeout` 覆盖"建连 → 认证 → 开 shell"整个阶段。
 pub fn start<C: AppContext>(
     target: SshTarget,
     handles: ExternalHandles,
     vault: Option<Arc<crate::vault::Vault>>,
+    connect_timeout: Duration,
     cx: &C,
 ) -> SshSession {
     let ExternalHandles { feed, rx } = handles;
     let (ui_tx, ui_rx) = mpsc::unbounded_channel::<PtyBoundMessage>();
     let (info_tx, info_rx) = oneshot::channel::<RemoteInfo>();
+    let (ready_tx, ready_rx) = oneshot::channel::<()>();
     let (disconnect_tx, disconnect_rx) = oneshot::channel::<()>();
     let started = Arc::new(AtomicBool::new(false));
 
@@ -129,6 +134,8 @@ pub fn start<C: AppContext>(
             started_flag,
             vault,
             disconnect_rx,
+            connect_timeout,
+            ready_tx,
         )
         .await;
         if let Err(error) = &result {
@@ -143,11 +150,13 @@ pub fn start<C: AppContext>(
         join,
         remote_info: info_rx,
         started,
+        ready: ready_rx,
         disconnect: disconnect_tx,
     }
 }
 
 /// 建连 → 认证 → 开 PTY/shell → 探测远程信息 → 驱动会话直至断线。
+#[allow(clippy::too_many_arguments)]
 async fn run(
     target: SshTarget,
     feed: FeedHandle,
@@ -156,40 +165,57 @@ async fn run(
     started: Arc<AtomicBool>,
     vault: Option<Arc<crate::vault::Vault>>,
     mut disconnect: oneshot::Receiver<()>,
+    connect_timeout: Duration,
+    ready: oneshot::Sender<()>,
 ) -> Result<()> {
-    let config = Arc::new(SshConfig::default());
-    let side = SideChannels::default();
-    // Handler 在交互通道 EOF/close/exit-status 时发信号：会话到此为止，
-    // 不能继续等 `handle`（TCP 连接还在，会一直挂着，UI 看起来毫无反应）。
-    let (ended_tx, mut ended_rx) = mpsc::unbounded_channel::<()>();
-    let handler = SshTerminalHandler::new(
-        feed.clone(),
-        target.host.clone(),
-        target.port,
-        side.clone(),
-        vault,
-        ended_tx,
-    );
-    let mut handle = russh::client::connect(config, (target.host.as_str(), target.port), handler)
-        .await
-        .with_context(|| format!("无法连接 {}", target.addr()))?;
+    // 建连 → 认证 → 开 shell 整体限时：服务器不响应时应明确报超时，
+    // 而不是让标签永远停在"正在连接"（拖住自动重连的退避节奏）。
+    let setup = async {
+        let config = Arc::new(SshConfig::default());
+        let side = SideChannels::default();
+        // Handler 在交互通道 EOF/close/exit-status 时发信号：会话到此为止，
+        // 不能继续等 `handle`（TCP 连接还在，会一直挂着，UI 看起来毫无反应）。
+        let (ended_tx, ended_rx) = mpsc::unbounded_channel::<()>();
+        let handler = SshTerminalHandler::new(
+            feed.clone(),
+            target.host.clone(),
+            target.port,
+            side.clone(),
+            vault,
+            ended_tx,
+        );
+        let mut handle =
+            russh::client::connect(config, (target.host.as_str(), target.port), handler)
+                .await
+                .with_context(|| format!("无法连接 {}", target.addr()))?;
 
-    authenticate(&mut handle, &target).await?;
+        authenticate(&mut handle, &target).await?;
 
-    let channel = handle.channel_open_session().await?;
-    channel
-        .request_pty(
-            true,
-            "xterm-256color",
-            u32::from(INIT_COLS),
-            u32::from(INIT_ROWS),
-            0,
-            0,
-            &[],
-        )
-        .await?;
-    channel.request_shell(true).await?;
-    started.store(true, Ordering::SeqCst);
+        let channel = handle.channel_open_session().await?;
+        channel
+            .request_pty(
+                true,
+                "xterm-256color",
+                u32::from(INIT_COLS),
+                u32::from(INIT_ROWS),
+                0,
+                0,
+                &[],
+            )
+            .await?;
+        channel.request_shell(true).await?;
+        started.store(true, Ordering::SeqCst);
+        let _ = ready.send(());
+        Ok::<_, anyhow::Error>((handle, channel, side, ended_rx))
+    };
+    let (handle, channel, side, mut ended_rx) =
+        match tokio::time::timeout(connect_timeout, setup).await {
+            Ok(result) => result?,
+            Err(_) => anyhow::bail!(
+                "连接超时（{} 秒内未完成握手、认证或开启 shell）",
+                connect_timeout.as_secs()
+            ),
+        };
 
     // 上行转发先落地：探测通道握手即使被慢服务器拖住，也不能延迟按键转发。
     tokio::spawn(forward_uplink(channel, ui_rx));

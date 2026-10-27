@@ -888,7 +888,7 @@ pub async fn migrate_legacy(
         }
     }
 
-    // settings.json：theme / status_bar / terminal → Setting
+    // settings.json：theme / status_bar / terminal / session → Setting
     let settings_path = mode.legacy_path(crate::paths::LEGACY_SETTINGS_FILE);
     if settings_path.exists() {
         if let Ok(text) = std::fs::read_to_string(&settings_path)
@@ -898,6 +898,7 @@ pub async fn migrate_legacy(
             for (key, value) in [
                 ("status_bar", &settings.status_bar),
                 ("terminal", &settings.terminal),
+                ("session", &settings.session),
             ] {
                 if !value.is_empty() {
                     vault.set_setting(key, value).await?;
