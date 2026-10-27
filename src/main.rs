@@ -2105,15 +2105,9 @@ impl RuLinkApp {
                     .child(menu_button("menu-appearance", "外观").dropdown_menu(appearance_menu))
                     .child(menu_button("menu-help", "帮助").dropdown_menu(help_menu)),
             )
-            // 可拖动段二：菜单与右侧按钮之间的空档。
-            .child(
-                div()
-                    .id("titlebar-gap")
-                    .flex_1()
-                    .min_w_0()
-                    .h_full()
-                    .window_control_area(WindowControlArea::Drag),
-            )
+            // 会话标签条（WindTerm 式"标签即标题栏"）：有会话时占据菜单与右侧按钮之间，
+            // 无会话时整段仍是拖拽区。
+            .child(self.render_title_bar_tabs(&pal, cx))
             .child(
                 h_flex()
                     .items_center()
@@ -2204,7 +2198,85 @@ impl RuLinkApp {
             .into_any_element()
     }
 
-    /// 左侧栏：新建按钮 / 搜索框 / 主机列表面板（品牌与全局入口已移至标题栏）。
+    /// 标题栏里的会话标签条（类 WindTerm 的"标签即标题栏"）。
+    /// 标签是交互控件，只能与拖拽段互为**兄弟**：Windows `WM_NCHITTEST` 取第一个命中的
+    /// 控制区，把标签嵌进 Drag 容器会让点击被判定成 caption（同自绘标题栏不采用 rgpui
+    /// `TitleBar` 的原因）。标签放不下时横向裁剪，末尾空档仍可拖动窗口。
+    fn render_title_bar_tabs(&self, pal: &Palette, cx: &mut Context<Self>) -> AnyElement {
+        let gap = || {
+            div()
+                .id("titlebar-gap")
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .window_control_area(WindowControlArea::Drag)
+        };
+
+        if self.tabs.is_empty() {
+            return gap().into_any_element();
+        }
+
+        h_flex()
+            .id("titlebar-tabs")
+            .h_full()
+            .flex_1()
+            .min_w_0()
+            .items_center()
+            .gap_1()
+            .overflow_x_hidden()
+            .children(self.tabs.iter().map(|tab| {
+                let id = tab.id;
+                let active = self.active_tab == Some(id);
+                let tab_id = SharedString::from(format!("titlebar-tab-{id}"));
+                let close_id = SharedString::from(format!("titlebar-tab-close-{id}"));
+                h_flex()
+                    .id(tab_id)
+                    .h_full()
+                    .min_w(px(96.0))
+                    .max_w(px(220.0))
+                    .flex_shrink_0()
+                    .px_3()
+                    .gap_2()
+                    .items_center()
+                    // 活动标签用编辑区底色 + 强调色下划线，与非活动标签只差这两项，
+                    // 高度恒定，切换时标题栏不会上下跳。
+                    .bg(if active {
+                        pal.window_bg
+                    } else {
+                        Hsla::transparent_black()
+                    })
+                    .border_b_2()
+                    .border_color(if active {
+                        pal.accent
+                    } else {
+                        Hsla::transparent_black()
+                    })
+                    .text_color(if active { pal.text } else { pal.muted })
+                    .cursor_pointer()
+                    .hover(|this| this.bg(pal.card_hover))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.active_tab = Some(id);
+                        cx.notify();
+                    }))
+                    .child(div().flex_1().min_w_0().truncate().child(tab.title.clone()))
+                    .child(
+                        div()
+                            .id(close_id)
+                            .text_base()
+                            .text_color(pal.danger)
+                            .child("×")
+                            .cursor_pointer()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                            )
+                            .on_click(cx.listener(move |this, _, _, cx| this.close_tab(id, cx))),
+                    )
+            }))
+            .child(gap())
+            .into_any_element()
+    }
+
     /// 宽度与折叠由外层 SplitPane 负责，这里只填充第一面板区域。
     fn render_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
         let pal = self.palette(cx);
@@ -3394,61 +3466,9 @@ impl RuLinkApp {
             .into_any_element()
     }
 
-    /// 右侧主区：标签栏 + 当前终端。
+    /// 右侧主区：当前终端（会话标签已并入标题栏）。
     fn render_main(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let pal = self.palette(cx);
-        let tab_bar = if self.tabs.is_empty() {
-            div()
-        } else {
-            h_flex()
-                .h(px(44.0))
-                .flex_shrink_0()
-                .items_center()
-                .bg(pal.sidebar_bg)
-                .border_b_1()
-                .border_color(pal.border)
-                .px_3()
-                .gap_2()
-                .overflow_hidden()
-                .children(self.tabs.iter().map(|tab| {
-                    let id = tab.id;
-                    let active = self.active_tab == Some(id);
-                    let tab_id = SharedString::from(format!("tab-{id}"));
-                    let close_id = SharedString::from(format!("tab-close-{id}"));
-                    h_flex()
-                        .id(tab_id)
-                        .h(px(32.0))
-                        .min_w(px(160.0))
-                        .flex_shrink_0()
-                        .px_4()
-                        .gap_2()
-                        .items_center()
-                        .justify_between()
-                        .rounded(px(6.0))
-                        .bg(if active { pal.window_bg } else { pal.card_bg })
-                        .cursor_pointer()
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.active_tab = Some(id);
-                            cx.notify();
-                        }))
-                        .child(div().child(tab.title.clone()))
-                        .child(
-                            div()
-                                .id(close_id)
-                                .text_base()
-                                .text_color(pal.danger)
-                                .child("×")
-                                .cursor_pointer()
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|_, _, _, cx| cx.stop_propagation()),
-                                )
-                                .on_click(
-                                    cx.listener(move |this, _, _, cx| this.close_tab(id, cx)),
-                                ),
-                        )
-                }))
-        };
 
         let body = self
             .active_tab
@@ -3500,12 +3520,7 @@ impl RuLinkApp {
             div().into_any_element()
         };
 
-        v_flex()
-            .flex_1()
-            .h_full()
-            .child(expand_bar)
-            .child(tab_bar)
-            .child(body)
+        v_flex().flex_1().h_full().child(expand_bar).child(body)
     }
 
     /// 底部状态栏：左侧瞬态状态 + 活动会话信息（按用户勾选的显示项拼装），右侧会话计数。
