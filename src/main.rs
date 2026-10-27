@@ -3987,24 +3987,22 @@ impl RuLinkApp {
         // 搜索命中本机 shell 时，主机没有命中也不该再叠一句"无匹配主机"（看着像整体没结果）。
         let local_hit = !local_rows.is_empty();
         let mut list = v_flex().gap_px().min_h_full().children(local_rows);
-        // 首启动（既没主机也没建过分组）：不画空壳「未分组」文件夹。
-        let bare = self.hosts.is_empty() && !searching && buckets.len() == 1;
-        if !bare {
-            for (name, rows) in &buckets {
-                // 搜索时：空组不显示，折叠也照常展开；平时：空组仍显示，便于往里挪主机。
-                if searching && rows.is_empty() {
-                    continue;
-                }
-                let collapsed = !searching && self.sidebar.collapsed(name);
-                list = list.child(self.render_group_row(name, rows.len(), collapsed, &pal, cx));
-                if collapsed {
-                    continue;
-                }
-                list = list.children(
-                    rows.iter()
-                        .map(|&index| self.render_host_row(index, &pal, cx)),
-                );
+        for (name, rows) in &buckets {
+            // 「未分组」只是兜底桶：没有未分组主机时根本不渲染——否则刚建完分组、一台主机都没加时，
+            // 它会和空的新组并排出现，看着像凭空多了一个组。自定义空组保留（那是有意建的容器）。
+            // 搜索态下空组一律隐藏、折叠强制展开，否则命中的主机看不见。
+            if rows.is_empty() && (searching || name == UNGROUPED) {
+                continue;
             }
+            let collapsed = !searching && self.sidebar.collapsed(name);
+            list = list.child(self.render_group_row(name, rows.len(), collapsed, &pal, cx));
+            if collapsed {
+                continue;
+            }
+            list = list.children(
+                rows.iter()
+                    .map(|&index| self.render_host_row(index, &pal, cx)),
+            );
         }
         // 树顶已有本机 shell 列表，首启动不再塞"暂无主机"那行大字（空着比提示好看）；
         // 只在搜索没命中时给一行反馈。
