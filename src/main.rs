@@ -24,9 +24,10 @@ use rgpui::title_bar::TITLE_BAR_HEIGHT;
 use rgpui::{
     AbsoluteLength, AnyElement, App, Bounds, Button, ButtonVariants, Checkbox, ClickEvent, Context,
     DropdownMenu, Entity, FocusHandle, Focusable, FontWeight, Hsla, Icon, IconName,
-    InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels, PopupMenu, PopupMenuItem,
-    Render, ScrollableElement, SharedString, StatefulInteractiveElement, Styled, TrayMenuItem,
-    Window, WindowBounds, WindowControlArea, WindowOptions, div, h_flex, px, size, v_flex,
+    InteractiveElement, IntoElement, KeyBinding, MouseButton, ParentElement, Pixels, PopupMenu,
+    PopupMenuItem, Render, ScrollableElement, SharedString, StatefulInteractiveElement, Styled,
+    TrayMenuItem, Window, WindowBounds, WindowControlArea, WindowOptions, actions, div, h_flex, px,
+    size, v_flex,
 };
 use rgpui_term::{TerminalBuilder, TerminalView, TextStyle, ThemeManager};
 use serde::{Deserialize, Serialize};
@@ -36,6 +37,11 @@ use crate::paths::StorageMode;
 use crate::remote::{Metric, RemoteInfo};
 use crate::sessions::{AuthMethod, HostConfig, SessionStore};
 use crate::vault::Vault;
+
+// 应用级动作：既绑到全局快捷键，也挂在标题栏菜单项上。rgpui 会按键绑定
+// 在菜单项右侧自动渲染按键（`PopupMenu::render_key_binding`），因此不再需要在
+// 「帮助」菜单里用纯文字罗列快捷键。
+actions!(rulink, [ToggleSidebar, ToggleTheme, NewHost, OpenSettings]);
 
 /// 认证方式的展示名。
 fn auth_label(method: AuthMethod) -> &'static str {
@@ -1810,6 +1816,39 @@ impl RuLinkApp {
         }
         cx.notify();
     }
+
+    /// Ctrl+B / 菜单项：折叠或展开侧边栏（走分隔面板状态）。
+    fn toggle_sidebar(&mut self, _: &ToggleSidebar, _: &mut Window, cx: &mut Context<Self>) {
+        self.split_state.update(cx, |state, cx| {
+            state.toggle_collapse(CollapsiblePane::First, cx);
+        });
+        cx.notify();
+    }
+
+    /// Ctrl+T / 菜单项：切换明暗主题。
+    fn toggle_theme_action(
+        &mut self,
+        _: &ToggleTheme,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_theme(window, cx);
+    }
+
+    /// Ctrl+N / 菜单项：打开新建主机表单。
+    fn new_host(&mut self, _: &NewHost, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_form(window, cx);
+    }
+
+    /// Ctrl+, / 菜单项与 ⚙：打开设置弹窗。
+    fn open_settings_action(
+        &mut self,
+        _: &OpenSettings,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_settings(window, cx);
+    }
 }
 
 impl Render for RuLinkApp {
@@ -1823,21 +1862,10 @@ impl Render for RuLinkApp {
             .overflow_hidden()
             .bg(pal.window_bg)
             .text_color(pal.text)
-            .on_key_down(
-                cx.listener(|this, event: &rgpui::KeyDownEvent, window, cx| {
-                    // Ctrl+B 折叠 / 展开侧边栏（走分隔面板状态）。
-                    if event.keystroke.key == "b" && event.keystroke.modifiers.control {
-                        this.split_state.update(cx, |state, cx| {
-                            state.toggle_collapse(CollapsiblePane::First, cx);
-                        });
-                        cx.notify();
-                    }
-                    // Ctrl+T 切换明暗主题。
-                    if event.keystroke.key == "t" && event.keystroke.modifiers.control {
-                        this.toggle_theme(window, cx);
-                    }
-                }),
-            )
+            .on_action(cx.listener(Self::toggle_sidebar))
+            .on_action(cx.listener(Self::toggle_theme_action))
+            .on_action(cx.listener(Self::new_host))
+            .on_action(cx.listener(Self::open_settings_action))
             .child(self.render_title_bar(window, cx))
             .child(
                 SplitPane::horizontal(self.split_state.clone())
@@ -1916,39 +1944,23 @@ impl RuLinkApp {
         };
         let entity = cx.entity();
 
-        // 会话菜单：新建主机、侧栏折叠、托盘与退出。
-        let session = entity.clone();
-        let session2 = entity.clone();
+        // 会话菜单：新建主机、侧栏折叠、设置入口、托盘与退出。
+        // 前三项挂 action（而非 on_click）：rgpui 会按键绑定在项右侧自动显示 Ctrl+N / Ctrl+B / Ctrl+,。
         let session_menu = move |menu: PopupMenu, _: &mut Window, _: &mut Context<PopupMenu>| {
-            // 菜单构建器要求 `Fn`（可重复调用），每次重建时重新克隆实体句柄交给各项回调。
-            let session = session.clone();
-            let session2 = session2.clone();
-            menu.item(
-                PopupMenuItem::new("新建主机…").on_click(move |_, window, cx| {
-                    session.update(cx, |this, cx| this.open_form(window, cx));
-                }),
-            )
-            .item(
-                PopupMenuItem::new("折叠 / 展开侧边栏 (Ctrl+B)").on_click(move |_, _, cx| {
-                    session2.update(cx, |this, cx| {
-                        this.split_state.update(cx, |state, cx| {
-                            state.toggle_collapse(CollapsiblePane::First, cx);
-                        });
-                        cx.notify();
-                    });
-                }),
-            )
-            .separator()
-            .item(
-                PopupMenuItem::new("隐藏到托盘").on_click(move |_, window, _| {
-                    window.hide_window();
-                }),
-            )
-            .item(
-                PopupMenuItem::new("退出 RuLink")
-                    .danger(true)
-                    .on_click(move |_, _, cx| cx.quit()),
-            )
+            menu.item(PopupMenuItem::new("新建主机…").action(Box::new(NewHost)))
+                .item(PopupMenuItem::new("折叠 / 展开侧边栏").action(Box::new(ToggleSidebar)))
+                .item(PopupMenuItem::new("设置…").action(Box::new(OpenSettings)))
+                .separator()
+                .item(
+                    PopupMenuItem::new("隐藏到托盘").on_click(move |_, window, _| {
+                        window.hide_window();
+                    }),
+                )
+                .item(
+                    PopupMenuItem::new("退出 RuLink")
+                        .danger(true)
+                        .on_click(move |_, _, cx| cx.quit()),
+                )
         };
 
         // 凭据菜单：解锁 / 主密码设置 / 锁定，末尾附当前档位（只读）。
@@ -2010,6 +2022,8 @@ impl RuLinkApp {
                         to_light.update(cx, |this, cx| this.apply_theme(false, window, cx));
                     },
                 ))
+                // 明暗二选一是"设为"，这条是"翻转"，与 Ctrl+T 同义，故挂 action 显示按键。
+                .item(PopupMenuItem::new("切换明暗主题").action(Box::new(ToggleTheme)))
                 .separator()
                 .item(
                     PopupMenuItem::new("外观设置…").on_click(move |_, window, cx| {
@@ -2034,14 +2048,11 @@ impl RuLinkApp {
                 )
             };
 
+        // 帮助菜单只留版本信息：快捷键已随各菜单项右侧显示，不再单列一份文字清单。
         let help_menu = move |menu: PopupMenu, _: &mut Window, _: &mut Context<PopupMenu>| {
-            menu.label("RuLink")
-                .item(
-                    PopupMenuItem::new(concat!("版本 ", env!("CARGO_PKG_VERSION"))).disabled(true),
-                )
-                .separator()
-                .item(PopupMenuItem::new("Ctrl+B 折叠 / 展开侧边栏").disabled(true))
-                .item(PopupMenuItem::new("Ctrl+T 切换明暗主题").disabled(true))
+            menu.label("RuLink").item(
+                PopupMenuItem::new(concat!("版本 ", env!("CARGO_PKG_VERSION"))).disabled(true),
+            )
         };
 
         let menu_button = |id: &'static str, label: &'static str| {
@@ -3734,6 +3745,13 @@ fn main() {
             cx,
         );
         rgpui::input_ui::init(cx);
+        // 全局快捷键：与菜单项上的 action 同名，菜单里会自动显示这组按键。
+        cx.bind_keys([
+            KeyBinding::new("ctrl-b", ToggleSidebar, None),
+            KeyBinding::new("ctrl-t", ToggleTheme, None),
+            KeyBinding::new("ctrl-n", NewHost, None),
+            KeyBinding::new("ctrl-,", OpenSettings, None),
+        ]);
         let opened = cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(Bounds::centered(

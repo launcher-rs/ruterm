@@ -18,7 +18,7 @@
 | 底部状态栏 | `[x]` | 已实现并验证渲染（左"就绪"/地址/认证/远程信息，右"会话 N"）；远程基本信息经 exec 探测通道填充，显示哪些条目可在「状态栏」分页勾选 |
 | 凭据持久化 | `[x]` | 主机配置、应用设置、known_hosts 三类数据合并入**单个加密文件** `rulink.db`（toasty 0.11 ORM + turso 0.7 AEGIS-256 页级加密，`hosts.password` 列再叠 **AES-256-GCM 字段加密**），全局模式位于 `~/.rulink/`、便携模式位于 exe 旁 `data/`；解锁两档并存：默认 keyring 随机 32 字节主密钥（零输入），或用户**主密码**（argon2id 派生，可带往他机解锁）。库不可用时降级旧 `sessions.json` 且禁用密码保存，见 §四 |
 | 便携 / 全局双模式 | `[x]` | 启动时只探测不创建：exe 同目录存在 `data/` → 便携模式（数据随 exe 走），否则全局模式 `~/.rulink`；主密码为可选项（设置 / 更换 / 取消均在设置里），见 §四 |
-| 自定义标题栏 | `[x]` | 应用自绘顶栏：品牌标识 + 「会话 / 凭据 / 外观 / 帮助」多级菜单 + ⚙/🔑/🔒/`«` 快捷按钮 + 系统窗口控件；拖拽与窗口控制走 `WindowControlArea` 命中区，交互控件排在 Drag 区之外 |
+| 自定义标题栏 | `[x]` | 应用自绘顶栏：品牌标识 + 「会话 / 凭据 / 外观 / 帮助」多级菜单（有快捷键的项右侧自动显示按键徽标）+ ⚙/🔑/🔒/`«` 快捷按钮 + 系统窗口控件；拖拽与窗口控制走 `WindowControlArea` 命中区，交互控件排在 Drag 区之外 |
 | 设置界面 | `[x]` | ⚙ 打开设置弹窗（固定 640×470，切分页尺寸不变），**左侧竖排分页导航**（凭据库与主密码 / 外观 / 状态栏 / 终端）+ 右侧定高滚动内容区，新设置项继续追加分页 |
 | 品牌图标 | `[x]` | 从展示板切分 6 图标变体 + logo + 多尺寸 `.ico`；`build.rs`+winresource 嵌入 exe（任务栏/标题栏） |
 | 系统托盘 | `[x]` | 品牌托盘图标 + 悬停提示 + 右键菜单（显示主界面 / 退出），`App::set_tray_*` + `on_tray_menu_action` |
@@ -90,10 +90,17 @@
 - `[x]` 保留窗口拖动、双击最大化、系统按钮：拖拽段登记 `WindowControlArea::Drag`（HTCAPTION，双击最大化由系统处理），
       最小化 / 最大化 / 关闭分别登记 `Min` / `Max` / `Close`（HTMINBUTTON / HTMAXBUTTON / HTCLOSE），
       关闭仍经 `on_window_should_close` → 隐藏到托盘。
-- `[x]` **标题栏多级菜单**：「会话」（新建主机 / 折叠侧栏 / 隐藏到托盘 / 退出）·
+- `[x]` **标题栏多级菜单**：「会话」（新建主机 `Ctrl+N` / 折叠侧栏 `Ctrl+B` / 设置… `Ctrl+,` · 隐藏到托盘 · 退出）·
       「凭据」（解锁 · 主密码与凭据库设置 · 锁定 · 末尾只读显示当前档位）·
-      「外观」（暗色 / 亮色打勾单选 + 外观设置 · 状态栏显示项 · 终端外观分页入口）·「帮助」（版本与快捷键）。
+      「外观」（暗色 / 亮色打勾单选 + 切换明暗主题 `Ctrl+T` · 外观设置 · 状态栏显示项 · 终端外观分页入口）·
+      「帮助」（只留版本号）。
       菜单用 `Button::dropdown_menu` + `PopupMenu`，构建器是 `Fn`，实体句柄需在闭包内重新 `clone` 再交给各项 `on_click`。
+- `[x]` **快捷键随菜单项原生显示**：四个命令声明为 action（`actions!(rulink, [ToggleSidebar, ToggleTheme, NewHost, OpenSettings])`），
+      `main()` 里 `cx.bind_keys` 绑定 `Ctrl+B` / `Ctrl+T` / `Ctrl+N` / `Ctrl+,`，根元素用 `.on_action(cx.listener(...))` 接收；
+      菜单项改挂 `.action(Box::new(X))`，rgpui 的 `PopupMenu::render_key_binding` 会按该 action 的键绑定
+      在项右侧自动渲染按键徽标（`Kbd`），因此标签里不再手写 `(Ctrl+B)`，「帮助」菜单里那份纯文字快捷键清单也删掉了。
+      点击仍生效：`PopupMenuItem` 只有 `on_click` 没有 shortcut 字段，但 `confirm()` 里 handler 优先于 action，
+      单独挂 action 一样能派发（实测菜单点击与键盘两条通路都通）。
 - `[x]` 设置入口收进标题栏：⚙ 打开**分页式**设置弹窗（凭据库与主密码 / 外观 / 状态栏），🔑 / 🔒 随锁定态切换，
       侧边栏头部品牌行与 ⚙/🔒 按钮移除。菜单项可**直达指定分页**（弹窗已开时只换分页，不重复创建）。
 - `[ ]` 会话标签并入标题栏（类 WindTerm 的"标签即标题栏"）。
@@ -139,12 +146,12 @@ RuLink 不自造 UI 轮子，优先复用 rgpui 现成子系统：
 | 侧边栏可拖拽宽度 / 折叠 | `SplitPane`（已用）/ `TaskPane` 自动隐藏轨道（备用） |
 | 分屏 / 停靠 | `SplitPane`、`DockArea` |
 | 自定义标题栏 | `TitlebarOptions::appears_transparent` + `app_owns_titlebar_drag` + `WindowControlArea`（Drag/Min/Max/Close）；`title_bar::TitleBar` 因 Drag 命中区吞掉栏内按钮点击而未采用，改自绘一行 |
-| 标题栏菜单 / 设置分页 | `menu::{PopupMenu, PopupMenuItem, DropdownMenu}`（`Button::dropdown_menu`）；设置分页导航自绘（`h_flex` 行 + 选中项强调色竖条 + 粗体，不用 `tabs::TabBar`——它只有横向模式） |
+| 标题栏菜单 / 设置分页 | `menu::{PopupMenu, PopupMenuItem, DropdownMenu}`（`Button::dropdown_menu`）；菜单项挂 `.action(...)` 即由 `PopupMenu::render_key_binding` 自动在右侧渲染 `Kbd` 按键徽标（`PopupMenuItem` 本身无 shortcut 字段）；设置分页导航自绘（`h_flex` 行 + 选中项强调色竖条 + 粗体，不用 `tabs::TabBar`——它只有横向模式） |
 | 主题切换 | `theme::Theme::change` |
 | 终端配色 / 字号 | `rgpui-term`：`ThemeManager`（全局，9 套预设）+ `TextStyle`；新建走 `TerminalView::new_with_style`，已开终端经 `text_style_mut()` 原地刷新 |
 | 系统托盘 | `tray::{TrayMenuItem, TrayIconEvent}` + `App::set_tray_*`（已用） |
 | 国际化 | `i18n::I18nManager` |
-| 命令注册 / 快捷键 | `commands::CommandRegistry`、`key_context` |
+| 命令注册 / 快捷键 | `actions!` 声明动作 + `cx.bind_keys`（App 级 `KeyBinding`）+ 根元素 `.on_action(cx.listener(...))`；`commands::CommandRegistry`、`key_context` 备用 |
 | 布局约束范式 | `examples/showcase/src/bin/app_suite.rs`（flex_grow + min_h(0) 有界布局范式，状态栏布局修复即据此） |
 
 ---
