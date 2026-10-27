@@ -11,21 +11,26 @@ GUI 会话管理器形态：左侧持久化的主机账号列表，点账号即�
 - **SSH 会话**：russh 客户端 + 交互式 PTY（`xterm-256color`），网络 IO 全在 tokio 运行时，UI 线程零阻塞。
 - **三种认证**：SSH Agent / 私钥文件（只存路径；可选手输或"浏览…"系统文件对话框选取；加密私钥可在表单直填口令或连接时自动弹口令窗）/ 密码。口令与密码均可勾选"保存"，加密存入本地凭据库，默认仅本次内存持有。
 - **主机指纹校验**：TOFU known_hosts 直接存入加密库的 `known_hosts` 表；指纹不符、写入或查询失败一律拒绝连接（fail-closed，防中间人）。
-- **多标签会话**：标签画在**标题栏**里（类 WindTerm 的"标签即标题栏"，主区整高留给终端），点击切换、`×` 关闭；
-  远端 `exit`、认证失败、断线都会自动移除标签。
+- **本地终端**：与 SSH 并列的本地 + 远程统一终端。`TerminalBuilder::new` 走 rgpui-term 内置 ConPTY 后端
+  拉起本机 shell（探测顺序 `pwsh` → `powershell` → `%COMSPEC%`），入口在「会话」菜单 →「本地终端…」
+  或 `Ctrl+Shift+T`；标签名即 shell 名，起始目录为进程当前目录，shell 退出（`exit` / Ctrl+D / 被杀）自动收标签。
+  进程拉起与通道握手在后台 await，**成功才落标签**，失败只写状态栏，不留空标签。
+- **多标签会话**：标签栏在主区顶部，点击切换、`×` 关闭；远端 `exit`、认证失败、断线都会自动移除标签。
+  活动标签用主题语义色 `tab_active` 打底再叠一圈强调色描边，与 `tab_bar` 底色分开，明暗两套都一眼可辨。
 - **主机管理**：新建/编辑/删除、搜索框实时过滤（按展示名或 `user@host:port`）、★ 收藏置顶并持久化；编辑与删除收在主机行**右键菜单**，删除弹二次确认（已保存的密码/口令一并从加密库清除）；新建/编辑为**居中弹窗**表单（切换认证方式高度恒定），不再挤在侧边栏。
 - **布局**：侧边栏可拖拽宽度（WindTerm 式，拖到最小宽度停住）、`«` / `»` 折叠栏。
 - **自定义标题栏**：应用自绘顶栏（`appears_transparent` + `app_owns_titlebar_drag`），左侧品牌标识与锁定提示，
-  中间**多级菜单**「会话 / 凭据 / 外观 / 帮助」把设置项按域分散，菜单之后是**会话标签条**，
+  中间**多级菜单**「会话 / 凭据 / 外观 / 帮助」把设置项按域分散，
   右侧 ⚙ / 🔑 / 🔒 / `«` 快捷按钮，最右为系统窗口控件（最小化 / 最大化 / 关闭）。拖拽与窗口控件走 `WindowControlArea` 命中区，
   交互控件排在 Drag 区**之外**（Windows 的 `WM_NCHITTEST` 只认第一个命中的控制区，父级 Drag 会吞掉栏内按钮点击）。
-  菜单项挂的是 rgpui **action**，有快捷键的项右侧自动渲染按键徽标（`Ctrl+N` / `Ctrl+B` / `Ctrl+,` / `Ctrl+T`），
+  菜单项挂的是 rgpui **action**，有快捷键的项右侧自动渲染按键徽标（`Ctrl+N` / `Ctrl+Shift+T` / `Ctrl+B` / `Ctrl+,` / `Ctrl+T`），
   标签里不再手写快捷键文字，「帮助」菜单只留版本号。
 - **设置界面**：⚙ 或菜单进入，**左侧竖排分页导航**——「凭据库与主密码」/「外观」/「状态栏」/「终端」，右侧为当前分页内容；
   弹窗固定大小，切分页不会忽大忽小，内容超出时分页自身滚动，后续设置项继续加分页即可。
 - **主题**：明 / 暗切换，配色全部取 rgpui 全局 `Theme` 语义色，选择持久化到加密库。
 - **终端外观**：「终端」分页调字号（10–32px）、行高与配色方案，内置 9 套预设
   （One Dark/Light、Solarized、Dracula、Nord、Gruvbox、GitHub Light），改动即刻刷到所有已开终端。
+  终端内容区四周留内边距，底色随配色预设的 `background`，不会在浅色主题下显成一圈白框。
 - **凭据存储**：主机配置、应用设置、known_hosts 合并为**一个加密文件** `rulink.db`
   （toasty ORM + turso AEGIS-256 页级加密），不再有零散的 JSON / 文本档。
   密码 / 私钥口令另有**第二层字段加密**：`hosts.password` 列存 AES-256-GCM 密文
@@ -47,11 +52,13 @@ GUI 会话管理器形态：左侧持久化的主机账号列表，点账号即�
 | 按键 | 动作 |
 |------|------|
 | `Ctrl+N` | 新建主机 |
+| `Ctrl+Shift+T` | 新建本地终端标签 |
 | `Ctrl+B` | 折叠 / 展开侧边栏 |
 | `Ctrl+T` | 切换明暗主题 |
 | `Ctrl+,` | 打开设置 |
 
-四个按键都是 rgpui action 绑定，标题栏菜单里对应项右侧会自动显示同样的按键徽标。
+五个按键都是 rgpui action 绑定，标题栏菜单里对应项右侧会自动显示同样的按键徽标。
+终端内的 `Tab` / `Shift+Tab` 不被焦点导航吃掉，原样送进 PTY（shell 文件名补全可用）。
 
 ## 构建与运行
 
@@ -106,7 +113,7 @@ Windows 下 `~` 取 `%USERPROFILE%`，其他平台取 `$HOME`。
 |-------|------|------|
 | `rgpui` | 1.6.0 | GUI 框架（启用 `tokio` 特性：异步运行时集成） |
 | `rgpui-platform` | 1.6.0 | 平台应用入口（`rgpui_platform::application()`） |
-| `rgpui-term` | 1.6.0 | 终端组件（本项目用外接 IO 后端 `TerminalBuilder::new_external`） |
+| `rgpui-term` | 1.6.0 | 终端组件（SSH 用外接 IO 后端 `TerminalBuilder::new_external`，本地终端用内置 PTY 后端 `TerminalBuilder::new`） |
 | `russh` | 0.64 | SSH 客户端（`flate2` / `ring` / `rsa`，关闭默认特性） |
 | `tokio` | 1 | 运行时与网络（rt-multi-thread、net、io-util、time 等） |
 | `serde` / `serde_json` | 1 | 降级路径（`sessions.json` / `settings.json`）持久化 |
@@ -123,7 +130,7 @@ rgpui 三个 crate 走 crates.io 正式版本。本地联调 rgpui 时可在 `[p
 
 ```
 src/
-  main.rs       # UI：RuLinkApp（侧边栏、标题栏（含会话标签）、终端、状态栏、托盘）+ 解锁弹窗 + 设置弹窗（主密码、主题、状态栏显示项、终端外观）+ 应用入口
+  main.rs       # UI：RuLinkApp（侧边栏、标签栏、终端、状态栏、托盘）+ 解锁弹窗 + 设置弹窗（主密码、主题、状态栏显示项、终端外观）+ 应用入口
   session.rs    # 会话桥接：rgpui-term 外接 IO ⇄ russh 双向字节流（上行泵线程 + 转发任务）+ exec 远程信息探测
   ssh.rs        # SSH 引擎：russh client::Handler、指纹校验（优先查加密库，降级回文本文件）、旁路通道过滤
   remote.rs     # 远程主机信息：POSIX 探测脚本 + key=value 解析 + 可勾选指标枚举（含单测）
@@ -142,18 +149,20 @@ src/
 
 近期重点：
 
-- **本地终端（系统 Shell）** —— 计划中，尚未实现。目标是本地 + 远程统一终端：
-  在 Windows 接入 **cmd**、**Windows PowerShell 5.x**、**PowerShell 7 (pwsh)**、**Git Bash**、**WSL**（`wsl -d <发行版>`），
-  Linux/macOS 探测 `$SHELL`。基座已具备（`rgpui-term` 的本地 PTY 后端 `TerminalBuilder::new`，可指定 shell / 工作目录 / 环境变量），
-  分三期落地：跑通默认 shell 单标签 → profile 自动发现 + 侧边栏"本地终端"入口 → profile 持久化与默认 shell 设置。
-  同时抽出 `SessionBackend` 抽象（`External` / `LocalPty`），UI 层不再假设"一定有 host"。
+- ~~**本地终端（系统 Shell）**~~：一期已完成 —— `TerminalBuilder::new` 直连 rgpui-term 本地 PTY（ConPTY），
+  Windows 探测 `pwsh` → `powershell` → `%COMSPEC%`，Linux/macOS 探测 `$SHELL`，标签与状态栏与 SSH 会话并存。
+  余量：**Git Bash**、**WSL**（`wsl -d <发行版>`）探测，profile 自动发现与持久化、起始目录 / 环境变量 /
+  默认 shell 设置，以及抽出 `SessionBackend` 抽象（`External` / `LocalPty`）让 UI 层不再假设"一定有 host"。
+- **侧边栏列表分组**：主机列表改成分组（文件夹）树，可跨组拖拽、组内排序；**本地终端条目并入这棵树**
+  （与 SSH 主机同样双击开会话），并去掉顶部常驻的「+ 新建主机」大按钮，新建收进主机行**右键菜单**与
+  「会话」菜单，把顶部空间整块留给列表。
 - ~~**凭据与安全存储**~~：已完成 —— 主机 / 设置 / known_hosts 合并为单个 toasty + turso 加密库
   （AEGIS-256 页级加密），密码字段再叠一层 AES-256-GCM 字段加密，解锁支持系统凭据管理器随机密钥与
   用户主密码（argon2id）两档，主密码可在设置里
   设置 / 更换 / 取消，并支持便携 / 全局双模式；
   密码默认仅本次内存持有，勾选"保存密码"才入库。余量：分组 / 备注、导入导出界面、备份恢复。
-- **自定义标题栏 + 分屏**：标题栏已落地（品牌标识 + 多级菜单 + 窗口控件）；余下**会话标签并入标题栏**
-  （类 WindTerm）与 `SplitPane` / `DockArea` 多会话分屏。
+- **自定义标题栏 + 分屏**：标题栏已落地（品牌标识 + 多级菜单 + 窗口控件）；会话标签经确认保留在
+  主区标签栏（不并入标题栏），余下 `SplitPane` / `DockArea` 多会话分屏。
 - **i18n**：接入 rgpui `I18nManager`，首批中文 / English。
 - **SFTP / 端口转发 / 跳板机**：第二阶段能力。
 

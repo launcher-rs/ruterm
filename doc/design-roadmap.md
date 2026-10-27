@@ -9,10 +9,10 @@
 | 能力 | 状态 | 说明 |
 |------|------|------|
 | SSH 连接与终端 | `[x]` | russh + rgpui-term（外部 IO 后端），交互式 PTY |
-| 本地终端（系统 Shell） | `[ ]` | 待接入 rgpui-term 本地 PTY 后端：cmd / PowerShell / pwsh7 / Git Bash / WSL，见 §五 |
+| 本地终端（系统 Shell） | `[~]` | 一期已通：rgpui-term 本地 PTY 拉起默认 shell（pwsh7 → Windows PowerShell → `COMSPEC`），标签与 SSH 会话并存，进程退出自动收标签；Git Bash / WSL / profile 持久化见 §五 |
 | 认证方式 | `[x]` | 密码 / 私钥(IdentityFile，表单可填口令、`浏览…`选择密钥文件；加密私钥自动弹口令窗) / Agent；口令与密码同走"默认内存 + 勾选入加密库"两档 |
 | 主机指纹校验 | `[x]` | TOFU known_hosts **存入加密库**（`known_hosts` 表），不匹配 / 写入失败 / 查询失败一律拒绝（fail-closed，防 MITM） |
-| 会话标签页 | `[x]` | 多标签、关闭、激活切换；标签并入标题栏（类 WindTerm），主区整高留给终端 |
+| 会话标签页 | `[x]` | 多标签、关闭、激活切换；标签栏在主区顶部（44px 栏高、160px 最小标签宽），不放标题栏；活动标签用主题语义色 `tab_active` + 强调色描边，与 `tab_bar` 底色区分 |
 | CLI 快速连接 | `[x]` | 带参数一次性连接；密码仅走环境变量 / GUI 临时输入 |
 | 主题 | `[x]` | 明 / 暗切换（配色走 `cx.theme()` 语义色，与按钮/状态栏统一），标题栏「外观」菜单（当前项打勾）+ `Ctrl+T`，选择持久化到加密库 `settings` 表 |
 | 底部状态栏 | `[x]` | 已实现并验证渲染（左"就绪"/地址/认证/远程信息，右"会话 N"）；远程基本信息经 exec 探测通道填充，显示哪些条目可在「状态栏」分页勾选 |
@@ -63,6 +63,14 @@
       保留占位（绘制与命中整体跳过），切换认证方式弹窗不再忽大忽小；加密库不可用时勾选行
       置灰并提示"仅本次内存持有"。
 - `[ ]` 折叠后保留窄图标轨道，悬停可临时展开（现折叠为完全收起 + `»` 展开栏；窄轨道悬停展开可后续按需增强）。
+- `[ ]` **分组（文件夹）存放**：主机列表按分组树组织，可新建 / 重命名 / 删除分组、折叠展开分组，
+      主机跨分组拖拽移动；分组与排序入加密库 `hosts`（增 `group_path` / `sort_order` 列或独立 `groups` 表）。
+      当前只有扁平列表 + ★ 收藏置顶，见 §四余量。
+- `[ ]` **本地终端并入主机列表**：本地 shell 作为一类条目出现在同一棵树里（可与 SSH 主机同分组），
+      双击即开一个本地标签；一期先做成「会话」菜单 → 本地终端（`Ctrl+Shift+T`）的直接入口。
+- `[ ]` **新建入口收敛**：去掉侧边栏顶部常驻的「+ 新建主机」大按钮，改为**主机行右键菜单**「新建主机」
+      （空白处右键亦可）+ 标题栏「会话」菜单「新建主机…」，把顶部空间整块留给列表与分组。
+- `[ ]` **分组内排序**：组内支持手动拖拽定序与按名称 / 最近使用自动排序两种模式，排序结果持久化。
 
 ### 3. 主题
 - `[x]` 明 / 暗主题切换（rgpui `Theme::change(ThemeMode)` + 配色统一走 `cx.theme()` 语义色），标题栏「外观」菜单（当前项打勾）+ `Ctrl+T`。
@@ -103,11 +111,10 @@
       单独挂 action 一样能派发（实测菜单点击与键盘两条通路都通）。
 - `[x]` 设置入口收进标题栏：⚙ 打开**分页式**设置弹窗（凭据库与主密码 / 外观 / 状态栏），🔑 / 🔒 随锁定态切换，
       侧边栏头部品牌行与 ⚙/🔒 按钮移除。菜单项可**直达指定分页**（弹窗已开时只换分页，不重复创建）。
-- `[x]` **会话标签并入标题栏**（类 WindTerm 的"标签即标题栏"）：主区顶部那条 44px 标签栏删除，标签改画在
-      「菜单区」与右侧快捷按钮（⚙ 设置 / 锁定 / `«` 折叠）之间——活动标签用编辑区底色 + 强调色下划线（高度恒定，切换不跳），
-      标题过长 `truncate`，末尾 `×` 关闭（`on_mouse_down` 阻止冒泡，不误触切换）。无会话时该段整条退回为拖拽区。
-      标签与拖拽段互为**兄弟**节点（`flex_1` 标签条 + 内部 `flex_1` Drag 空档），否则父级 Drag 会吞掉标签点击；
-      实测：标签点击切换、`×` 关闭、空档拖动窗口（位移与鼠标一致）均正常。
+- `[ ]` ~~会话标签并入标题栏（类 WindTerm 的"标签即标题栏"）~~：**已实现又撤回**——用户明确要求终端标签不要放在
+      自定义标题栏上，标签栏回到主区顶部（44px 行高、活动标签 `card_bg`/`window_bg` 区分、`×` 关闭）。
+      标题栏只留品牌 / 菜单 / 快捷按钮 / 窗口控件，中间整段仍是拖拽区。技术上标签条与 Drag 段必须互为
+      **兄弟**节点（父级 Drag 会吞掉标签点击，同 §二.5 首条 `TitleBar` 未采用的原因），若日后重提可直接复用该结论。
 - `[ ]` Windows 下与 Mica 材质 / 圆角协调（当前保留 `WS_THICKFRAME`，DWM 仍绘制圆角）。
 
 ### 6. 分屏窗口
@@ -155,7 +162,8 @@ RuLink 不自造 UI 轮子，优先复用 rgpui 现成子系统：
 | 终端配色 / 字号 | `rgpui-term`：`ThemeManager`（全局，9 套预设）+ `TextStyle`；新建走 `TerminalView::new_with_style`，已开终端经 `text_style_mut()` 原地刷新 |
 | 系统托盘 | `tray::{TrayMenuItem, TrayIconEvent}` + `App::set_tray_*`（已用） |
 | 国际化 | `i18n::I18nManager` |
-| 命令注册 / 快捷键 | `actions!` 声明动作 + `cx.bind_keys`（App 级 `KeyBinding`）+ 根元素 `.on_action(cx.listener(...))`；`commands::CommandRegistry`、`key_context` 备用 |
+| 命令注册 / 快捷键 | `actions!` 声明动作 + `cx.bind_keys`（App 级 `KeyBinding`）+ 根元素 `.on_action(cx.listener(...))`；`commands::CommandRegistry`、`key_context` 备用。局部覆盖用 `KeyBinding::new("tab", NoAction {}, Some("Terminal"))`：`Keymap::bindings_for_input` 按上下文深度降序解析，遇到 `NoAction` 即 `break`，可截掉框架在 `Root` 上下文里对同一按键的绑定（终端 Tab 补全即此法恢复） |
+| 标签栏配色 | 主题语义色 `tab_bar` / `tab_active` / `tab_active_foreground` / `tab_foreground`（明暗两套自带区分），活动标签再叠 `primary` 描边；不硬编码颜色 |
 | 布局约束范式 | `examples/showcase/src/bin/app_suite.rs`（flex_grow + min_h(0) 有界布局范式，状态栏布局修复即据此） |
 
 ---
@@ -239,21 +247,34 @@ RuLink 不自造 UI 轮子，优先复用 rgpui 现成子系统：
 > `shell: Option<...>` 为 `None` 时用系统默认 shell。SSH 侧只需继续用外接后端，两条路径共用 `TerminalView`。
 
 ### 1. Windows 本地 shell（首批）
-- `[ ]` **cmd.exe**：`cmd.exe`（默认回退 shell）。
-- `[ ]` **Windows PowerShell 5.x**：`powershell.exe`（系统自带，无需安装）。
-- `[ ]` **PowerShell 7**：`pwsh.exe`（用户自行安装；探测 PATH 与常见安装位置）。
+- `[x]` **cmd.exe**：`cmd.exe`（`$COMSPEC` 回退 shell）。
+- `[x]` **Windows PowerShell 5.x**：`powershell.exe`（PATH 找不到时按 `%SystemRoot%` 定位 `System32\WindowsPowerShell\v1.0\powershell.exe`）。
+- `[x]` **PowerShell 7**：`pwsh.exe`（一期只探测 PATH；常见安装位置扫描与「默认 shell」设置项留给 profile 分期）。
 - `[ ]` **Git Bash**：`bash.exe`（探测 `git\bin\bash.exe` / `git\usr\bin\bash.exe` 注册表与 PATH）。
 - `[ ]` **WSL**：`wsl.exe`（可带 `-d <发行版>` 列出已安装发行版供选择）。
-- `[ ]` Windows 控制台 PTY ConPTY 适配（`ConPTY` 作为 `portable-pty` 后端落地路径），确认 Ctrl+C / 尺寸变化 / ANSI 序列正常。
+- `[x]` Windows 控制台 PTY 已确认可用：rgpui-term 内置 ConPTY（`portable-pty`）后端，实测
+      ANSI 颜色 / 尺寸自适应 / Ctrl+C（`^C` 回显）/ Enter / 退格均正常，无需自行适配。
+      - 探测顺序 `pwsh` → `powershell` → `COMSPEC`（`which()` + `default_local_shell()`，`src/main.rs`），
+        取第一个存在的可执行文件，标签名用其 `file_stem`（实测显示 `pwsh`）。
 
 ### 2. 其他平台本地 shell（顺带，非 Windows 用户同样受益）
-- `[ ]` Linux/macOS：探测 `$SHELL`，回退 `bash` / `zsh` / `sh`。
+- `[x]` Linux/macOS：探测 `$SHELL`，回退 `/bin/bash`。
 
 ### 3. 会话形态与 UI
-- `[ ]` 侧边栏新增"本地终端"分区（与主机列表并列），或顶部"+ 新建会话"下拉选择目标类型（SSH / 本地 shell）。
-- `[ ]` 标签标题区分来源：本地会话显示 `shell 名 + 当前目录`，远程会话保持 `user@host`（现有 `SessionTab.addr` 语义扩展为"连接描述"）。
+- `[~]` 侧边栏新增"本地终端"分区（与主机列表并列），或顶部"+ 新建会话"下拉选择目标类型（SSH / 本地 shell）。
+      一期先走最小入口：标题栏「会话」菜单 →「本地终端…」（`Ctrl+Shift+T`）；并入主机列表见 §二.2。
+- `[x]` 标签标题区分来源：本地会话显示 shell 名（`pwsh` / `powershell` / `cmd`），状态栏条目为
+      `本地终端 <shell>` + `<shell> · <起始目录>`；远程会话保持 `user@host`（`SessionTab.addr`
+      语义扩展为"连接描述"，`auth` 改为 `Option<AuthMethod>`——本地会话没有认证概念）。
+- `[x]` 终端内容区加内边距（左右 12px / 上下 8px），底色取终端自身主题的 `background`，
+      四周不会在浅色主题下显成一圈白框（`terminal_bg()`，随配色预设切换）。
+- `[x]` **Tab 键送进 PTY**（修复 shell 补全失效）：rgpui 的 `Root` 把 `tab` / `shift-tab` 绑成
+      `focus_next` / `focus_prev`（context `Root`），而按键绑定分发早于 `on_key_down`，终端元素
+      永远收不到 `\x09`。在 `Terminal` 上下文用 `NoAction {}` 抢占——它比 `Root` 更深，
+      `Keymap::bindings_for_input` 解析到 `NoAction` 即 `break`，Root 的绑定不再入选，按键原样
+      落到 `TerminalView::on_key_down` → `try_keystroke` → PTY。实测 `rea` + Tab 补出 `.\README.md`。
 - `[ ]` 默认 shell 可设置（加密库 `settings` 表增 `default_local_shell` 项），启动时可记忆上次使用的 profile。
-- `[ ]` 每个本地会话可选起始工作目录（含"打开当前目录的终端"入口）。
+- `[ ]` 每个本地会话可选起始工作目录（一期固定为进程当前目录）。
 
 ### 4. Shell Profile（类 Windows Terminal 的 profile 概念）
 - `[ ]` `hosts` 表增本地条目类型（或新增 `profiles` 表）：名称、可执行路径、参数数组、起始目录、环境变量、图标/配色。
@@ -262,13 +283,18 @@ RuLink 不自造 UI 轮子，优先复用 rgpui 现成子系统：
 
 ### 5. 架构约束（避免做成 SSH 专用）
 - `[ ]` 抽出 `SessionBackend` 抽象（`External`（russh）/ `LocalPty`），UI 层只认 `TerminalView` + 会话生命周期，不再假设"有 target/host"。
-- `[ ]` 状态栏本地会话条目显示 shell 与运行时长，不显示地址/认证方式。
-- `[ ]` 基座已具备，一期只需调用：`TerminalBuilder::new(working_directory, shell, env, max_scroll_history_lines, window_id, cx) -> Task<Result<TerminalBuilder>>`（`shell` 为 `None` 时走 `default_shell_command()`），拿到 builder 后与 SSH 路径完全同构（`cx.new(|cx| builder.subscribe(cx))` + `TerminalView::new`）。
-- `[ ]` 保持 UI 线程零阻塞：本地 PTY 读写走 rgpui-term 内部线程，应用侧只持有句柄。
+- `[~]` 状态栏本地会话条目显示 shell（与起始目录），不显示认证方式（`SessionTab.auth: Option<AuthMethod>`，
+      `None` 时该条目整体不渲染）；运行时长待补。
+- `[x]` 基座已具备，一期只需调用：`TerminalBuilder::new(working_directory, shell, env, max_scroll_history_lines, window_id, cx) -> Task<Result<TerminalBuilder>>`（`shell` 为 `None` 时走 `default_shell_command()`），拿到 builder 后与 SSH 路径完全同构（`cx.new(|cx| builder.subscribe(cx))` + `TerminalView::new`）。
+      - 窗口 id 取法：`Window::window_id()` 对外不可用，用 `cx.active_window().map(|h| h.window_id().as_u64())`。
+- `[x]` 保持 UI 线程零阻塞：本地 PTY 读写走 rgpui-term 内部线程，应用侧只持有句柄；
+      进程拉起 / 通道握手在 `cx.spawn` 里 await，**成功才落标签**，失败只写状态栏不留空标签。
+      shell 退出（`exit` / Ctrl+D / 进程被杀）经 `TerminalEvent::CloseTerminal` 订阅自动收标签。
 
 ### 6. 分期落地（慢慢实现）
-- 一期：`TerminalBuilder::new` 直连默认 shell，单标签跑通 cmd + PowerShell 5。
-- 二期：profile 自动发现（pwsh7 / Git Bash / WSL）+ 侧边栏"本地终端"入口 + 新建会话选择器。
+- 一期：~~`TerminalBuilder::new` 直连默认 shell，单标签跑通 cmd + PowerShell 5~~（**已完成**，实测 pwsh 7.6.7：
+  输入回显、`dir` 彩色表格、Ctrl+C、Tab 补全、`exit` 自动收标签均正常）。
+- 二期：profile 自动发现（Git Bash / WSL）+ 本地终端并入主机列表分组树 + 新建会话选择器（§二.2）。
 - 三期：profile 持久化、起始目录、环境变量、默认 shell 设置，与 SSH 共用分屏/标签/搜索能力。
 
 ---
@@ -281,10 +307,11 @@ RuLink 不自造 UI 轮子，优先复用 rgpui 现成子系统：
 3. ~~凭据 SQLite + keyring（安全核心，尽早定型，越晚迁移成本越高）~~（已完成：toasty ORM 单文件加密库
    `rulink.db`（hosts/settings/known_hosts 三表）+ keyring 或 argon2 主密码双档解锁 + 便携/全局双模式
    + 旧文件一次性迁移，见 §四；余量：分组/备注、导入导出界面、备份恢复）。
-4. ~~自定义标题栏~~（已完成：自绘顶栏 + 多级菜单（快捷键徽标）+ 会话标签并入 + 窗口控件，见 §二.5）+ 分屏
-   （余量：`SplitPane` / `DockArea` 多会话分屏）。
+4. ~~自定义标题栏~~（已完成：自绘顶栏 + 多级菜单（快捷键徽标）+ 窗口控件，见 §二.5；会话标签经用户确认
+   保留在主区标签栏）+ 分屏（余量：`SplitPane` / `DockArea` 多会话分屏）。
 5. i18n（文案抽取宜在功能稳定后统一做，避免反复）。
-6. **本地终端**（§五：cmd / PowerShell / pwsh7 / Git Bash / WSL）——基座已在 rgpui-term，一期只是接本地 PTY，投入小、日常价值高，可与凭据存储并行推进。
+6. ~~**本地终端**一期~~（已完成：`TerminalBuilder::new` 直连本地 PTY，默认 shell 探测 + 标签 + 状态栏 +
+   退出收标签，见 §五）；余量：Git Bash / WSL 探测、profile 持久化、本地终端并入主机列表分组树。
 7. SFTP / 端口转发 / 跳板机（`rulink.txt` 第二阶段）。
 
 > 每完成一项，回到本文件把对应方框勾成 `[x]`，并在 §一快照表更新状态。

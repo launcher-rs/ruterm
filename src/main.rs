@@ -13,6 +13,7 @@ mod ssh;
 mod vault;
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use rgpui::components::Select;
@@ -24,12 +25,12 @@ use rgpui::title_bar::TITLE_BAR_HEIGHT;
 use rgpui::{
     AbsoluteLength, AnyElement, App, Bounds, Button, ButtonVariants, Checkbox, ClickEvent, Context,
     DropdownMenu, Entity, FocusHandle, Focusable, FontWeight, Hsla, Icon, IconName,
-    InteractiveElement, IntoElement, KeyBinding, MouseButton, ParentElement, Pixels, PopupMenu,
-    PopupMenuItem, Render, ScrollableElement, SharedString, StatefulInteractiveElement, Styled,
-    TrayMenuItem, Window, WindowBounds, WindowControlArea, WindowOptions, actions, div, h_flex, px,
-    size, v_flex,
+    InteractiveElement, IntoElement, KeyBinding, MouseButton, NoAction, ParentElement, Pixels,
+    PopupMenu, PopupMenuItem, Render, ScrollableElement, SharedString, StatefulInteractiveElement,
+    Styled, TrayMenuItem, Window, WindowBounds, WindowControlArea, WindowOptions, actions, div,
+    h_flex, px, size, v_flex,
 };
-use rgpui_term::{TerminalBuilder, TerminalView, TextStyle, ThemeManager};
+use rgpui_term::{Event as TerminalEvent, TerminalBuilder, TerminalView, TextStyle, ThemeManager};
 use serde::{Deserialize, Serialize};
 
 use crate::config::SshTarget;
@@ -41,7 +42,16 @@ use crate::vault::Vault;
 // 应用级动作：既绑到全局快捷键，也挂在标题栏菜单项上。rgpui 会按键绑定
 // 在菜单项右侧自动渲染按键（`PopupMenu::render_key_binding`），因此不再需要在
 // 「帮助」菜单里用纯文字罗列快捷键。
-actions!(rulink, [ToggleSidebar, ToggleTheme, NewHost, OpenSettings]);
+actions!(
+    rulink,
+    [
+        ToggleSidebar,
+        ToggleTheme,
+        NewHost,
+        NewLocalTerminal,
+        OpenSettings
+    ]
+);
 
 /// 认证方式的展示名。
 fn auth_label(method: AuthMethod) -> &'static str {
@@ -52,16 +62,71 @@ fn auth_label(method: AuthMethod) -> &'static str {
     }
 }
 
+/// 在 `PATH` 里查找可执行文件（Windows 下自动补 `.exe`）。
+fn which(program: &str) -> Option<PathBuf> {
+    let name = if cfg!(windows) {
+        format!("{program}.exe")
+    } else {
+        program.to_owned()
+    };
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path).find_map(|dir| {
+        let candidate = dir.join(&name);
+        candidate.is_file().then_some(candidate)
+    })
+}
+
+/// 本地终端默认拉起的 shell，返回（可执行文件路径, 标签名）。
+/// Windows 依次尝试 PowerShell 7 → Windows PowerShell（PATH 或 System32 里的确切路径）→ `%COMSPEC%`；
+/// 其他平台用 `$SHELL`，回退 `/bin/bash`。
+fn default_local_shell() -> Option<(String, String)> {
+    #[cfg(windows)]
+    {
+        let candidates: [Option<PathBuf>; 3] = [
+            which("pwsh"),
+            which("powershell").or_else(|| {
+                std::env::var_os("SystemRoot").map(|root| {
+                    PathBuf::from(root)
+                        .join("System32")
+                        .join("WindowsPowerShell")
+                        .join("v1.0")
+                        .join("powershell.exe")
+                })
+            }),
+            std::env::var_os("COMSPEC").map(PathBuf::from),
+        ];
+        candidates
+            .into_iter()
+            .flatten()
+            .find(|path| path.is_file())
+            .and_then(local_shell_label)
+    }
+    #[cfg(not(windows))]
+    {
+        let shell = std::env::var_os("SHELL")
+            .map(PathBuf::from)
+            .filter(|path| path.is_file())
+            .unwrap_or_else(|| PathBuf::from("/bin/bash"));
+        local_shell_label(shell)
+    }
+}
+
+/// 由可执行文件路径拼出（路径, 去扩展名的文件名）；拿不到文件名就放弃。
+fn local_shell_label(path: PathBuf) -> Option<(String, String)> {
+    let label = path.file_stem()?.to_string_lossy().into_owned();
+    Some((path.display().to_string(), label))
+}
+
 /// 一个已连接的会话标签（持有终端视图）。
 struct SessionTab {
     /// 稳定标签 id（会话结束或用户关闭时据此定位）。
     id: usize,
     /// 标签标题（主机名）。
     title: SharedString,
-    /// 连接位置（user@host:port），状态栏展示；将来远程指标也挂在这里。
+    /// 连接位置（user@host:port 或本地 shell 的路径），状态栏展示。
     addr: SharedString,
-    /// 认证方式，状态栏展示。
-    auth: AuthMethod,
+    /// 认证方式，状态栏展示；本地终端没有认证概念，为 None。
+    auth: Option<AuthMethod>,
     /// 远程服务器基本信息（连接后经 exec 探测异步填充，探测失败保持 None）。
     remote_info: Option<RemoteInfo>,
     /// 渲染用终端视图。
@@ -402,6 +467,14 @@ struct Palette {
     input_text: Hsla,
     /// 输入框边框色。
     input_border: Hsla,
+    /// 标签栏底色（与编辑区、非活动标签区分）。
+    tab_bar_bg: Hsla,
+    /// 活动标签底色。
+    tab_active_bg: Hsla,
+    /// 活动标签文字色。
+    tab_active_fg: Hsla,
+    /// 非活动标签文字色。
+    tab_fg: Hsla,
 }
 
 impl Palette {
@@ -423,6 +496,10 @@ impl Palette {
             input_bg: theme.input_background(),
             input_text: theme.foreground,
             input_border: theme.border,
+            tab_bar_bg: theme.tab_bar,
+            tab_active_bg: theme.tab_active,
+            tab_active_fg: theme.tab_active_foreground,
+            tab_fg: theme.tab_foreground,
         }
     }
 }
@@ -1670,7 +1747,7 @@ impl RuLinkApp {
             id,
             title: title.into(),
             addr: addr.clone().into(),
-            auth,
+            auth: Some(auth),
             remote_info: None,
             terminal_view,
         });
@@ -1849,6 +1926,99 @@ impl RuLinkApp {
     ) {
         self.open_settings(window, cx);
     }
+
+    /// Ctrl+Shift+T / 菜单项：新开一个本地终端标签。
+    fn new_local_terminal(&mut self, _: &NewLocalTerminal, _: &mut Window, cx: &mut Context<Self>) {
+        self.open_local_terminal(cx);
+    }
+
+    /// 打开本地终端（路线图 §五 一期）：交给 rgpui-term 的本地 PTY 后端拉起默认 shell。
+    /// 进程拉起与通道握手是异步的：建好才落标签，失败只写状态栏，不留空标签。
+    fn open_local_terminal(&mut self, cx: &mut Context<Self>) {
+        let Some((program, label)) = default_local_shell() else {
+            self.status = "未找到可用的本地 shell".into();
+            cx.notify();
+            return;
+        };
+        let working_directory = std::env::current_dir().ok();
+        let cwd = working_directory
+            .as_ref()
+            .map(|dir| dir.display().to_string())
+            .unwrap_or_default();
+        self.status = SharedString::from(format!("正在启动 {label}…"));
+        cx.notify();
+        let Some(window_id) = cx.active_window().map(|handle| handle.window_id().as_u64()) else {
+            self.status = SharedString::from(format!("启动本地终端失败：找不到当前窗口"));
+            cx.notify();
+            return;
+        };
+        let builder = TerminalBuilder::new(
+            working_directory,
+            Some(program),
+            HashMap::new(),
+            None,
+            window_id,
+            cx,
+        );
+        cx.spawn(async move |this, cx| {
+            let builder = builder.await;
+            let Some(entity) = this.upgrade() else {
+                return;
+            };
+            let entity_id = entity.entity_id();
+            let _ = cx.with_window(entity_id, move |window, cx| {
+                let _ = entity.update(cx, |this, cx| match builder {
+                    Ok(builder) => this.add_local_tab(builder, label, cwd, window, cx),
+                    Err(error) => {
+                        log::error!("启动本地终端失败: {error}");
+                        this.status = SharedString::from(format!("启动本地终端失败：{label}"));
+                        cx.notify();
+                    }
+                });
+            });
+        })
+        .detach();
+    }
+
+    /// 把建好的本地 PTY 终端落成标签；shell 进程退出即自动移除。
+    fn add_local_tab(
+        &mut self,
+        builder: TerminalBuilder,
+        label: String,
+        cwd: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let terminal = cx.new(|cx| builder.subscribe(cx));
+        let style = self.terminal_text_style(cx);
+        let terminal_view =
+            cx.new(|cx| TerminalView::new_with_style(terminal.clone(), style, window, cx));
+        let id = self.next_id;
+        self.next_id += 1;
+        let addr = if cwd.is_empty() {
+            label.clone().into()
+        } else {
+            format!("{label} · {cwd}").into()
+        };
+        self.tabs.push(SessionTab {
+            id,
+            title: label.clone().into(),
+            addr,
+            auth: None,
+            remote_info: None,
+            terminal_view,
+        });
+        self.active_tab = Some(id);
+        // 本地 shell 退出（exit / Ctrl+D / 进程被杀）与 SSH 会话结束一样直接收标签。
+        cx.subscribe(&terminal, move |this, _, event: &TerminalEvent, cx| {
+            if matches!(event, TerminalEvent::CloseTerminal) {
+                this.remove_tab(id, cx);
+            }
+        })
+        .detach();
+        self.status = SharedString::from(format!("本地终端 {label}"));
+        cx.notify();
+    }
 }
 
 impl Render for RuLinkApp {
@@ -1865,6 +2035,7 @@ impl Render for RuLinkApp {
             .on_action(cx.listener(Self::toggle_sidebar))
             .on_action(cx.listener(Self::toggle_theme_action))
             .on_action(cx.listener(Self::new_host))
+            .on_action(cx.listener(Self::new_local_terminal))
             .on_action(cx.listener(Self::open_settings_action))
             .child(self.render_title_bar(window, cx))
             .child(
@@ -1944,10 +2115,12 @@ impl RuLinkApp {
         };
         let entity = cx.entity();
 
-        // 会话菜单：新建主机、侧栏折叠、设置入口、托盘与退出。
-        // 前三项挂 action（而非 on_click）：rgpui 会按键绑定在项右侧自动显示 Ctrl+N / Ctrl+B / Ctrl+,。
+        // 会话菜单：新建主机、本地终端、侧栏折叠、设置入口、托盘与退出。
+        // 前四项挂 action（而非 on_click）：rgpui 会按键绑定在项右侧自动显示
+        // Ctrl+N / Ctrl+Shift+T / Ctrl+B / Ctrl+,。
         let session_menu = move |menu: PopupMenu, _: &mut Window, _: &mut Context<PopupMenu>| {
             menu.item(PopupMenuItem::new("新建主机…").action(Box::new(NewHost)))
+                .item(PopupMenuItem::new("本地终端…").action(Box::new(NewLocalTerminal)))
                 .item(PopupMenuItem::new("折叠 / 展开侧边栏").action(Box::new(ToggleSidebar)))
                 .item(PopupMenuItem::new("设置…").action(Box::new(OpenSettings)))
                 .separator()
@@ -2105,9 +2278,15 @@ impl RuLinkApp {
                     .child(menu_button("menu-appearance", "外观").dropdown_menu(appearance_menu))
                     .child(menu_button("menu-help", "帮助").dropdown_menu(help_menu)),
             )
-            // 会话标签条（WindTerm 式"标签即标题栏"）：有会话时占据菜单与右侧按钮之间，
-            // 无会话时整段仍是拖拽区。
-            .child(self.render_title_bar_tabs(&pal, cx))
+            // 可拖动段二：菜单与右侧按钮之间的空档（会话标签在下方标签栏，不占标题栏）。
+            .child(
+                div()
+                    .id("titlebar-gap")
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .window_control_area(WindowControlArea::Drag),
+            )
             .child(
                 h_flex()
                     .items_center()
@@ -2195,85 +2374,6 @@ impl RuLinkApp {
                 close_active_bg,
                 close_hover_fg,
             ))
-            .into_any_element()
-    }
-
-    /// 标题栏里的会话标签条（类 WindTerm 的"标签即标题栏"）。
-    /// 标签是交互控件，只能与拖拽段互为**兄弟**：Windows `WM_NCHITTEST` 取第一个命中的
-    /// 控制区，把标签嵌进 Drag 容器会让点击被判定成 caption（同自绘标题栏不采用 rgpui
-    /// `TitleBar` 的原因）。标签放不下时横向裁剪，末尾空档仍可拖动窗口。
-    fn render_title_bar_tabs(&self, pal: &Palette, cx: &mut Context<Self>) -> AnyElement {
-        let gap = || {
-            div()
-                .id("titlebar-gap")
-                .flex_1()
-                .min_w_0()
-                .h_full()
-                .window_control_area(WindowControlArea::Drag)
-        };
-
-        if self.tabs.is_empty() {
-            return gap().into_any_element();
-        }
-
-        h_flex()
-            .id("titlebar-tabs")
-            .h_full()
-            .flex_1()
-            .min_w_0()
-            .items_center()
-            .gap_1()
-            .overflow_x_hidden()
-            .children(self.tabs.iter().map(|tab| {
-                let id = tab.id;
-                let active = self.active_tab == Some(id);
-                let tab_id = SharedString::from(format!("titlebar-tab-{id}"));
-                let close_id = SharedString::from(format!("titlebar-tab-close-{id}"));
-                h_flex()
-                    .id(tab_id)
-                    .h_full()
-                    .min_w(px(96.0))
-                    .max_w(px(220.0))
-                    .flex_shrink_0()
-                    .px_3()
-                    .gap_2()
-                    .items_center()
-                    // 活动标签用编辑区底色 + 强调色下划线，与非活动标签只差这两项，
-                    // 高度恒定，切换时标题栏不会上下跳。
-                    .bg(if active {
-                        pal.window_bg
-                    } else {
-                        Hsla::transparent_black()
-                    })
-                    .border_b_2()
-                    .border_color(if active {
-                        pal.accent
-                    } else {
-                        Hsla::transparent_black()
-                    })
-                    .text_color(if active { pal.text } else { pal.muted })
-                    .cursor_pointer()
-                    .hover(|this| this.bg(pal.card_hover))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.active_tab = Some(id);
-                        cx.notify();
-                    }))
-                    .child(div().flex_1().min_w_0().truncate().child(tab.title.clone()))
-                    .child(
-                        div()
-                            .id(close_id)
-                            .text_base()
-                            .text_color(pal.danger)
-                            .child("×")
-                            .cursor_pointer()
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|_, _, _, cx| cx.stop_propagation()),
-                            )
-                            .on_click(cx.listener(move |this, _, _, cx| this.close_tab(id, cx))),
-                    )
-            }))
-            .child(gap())
             .into_any_element()
     }
 
@@ -3469,14 +3569,86 @@ impl RuLinkApp {
     /// 右侧主区：当前终端（会话标签已并入标题栏）。
     fn render_main(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let pal = self.palette(cx);
+        let tab_bar = if self.tabs.is_empty() {
+            div()
+        } else {
+            h_flex()
+                .h(px(44.0))
+                .flex_shrink_0()
+                .items_center()
+                .bg(pal.tab_bar_bg)
+                .border_b_1()
+                .border_color(pal.border)
+                .px_3()
+                .gap_2()
+                .overflow_hidden()
+                .children(self.tabs.iter().map(|tab| {
+                    let id = tab.id;
+                    let active = self.active_tab == Some(id);
+                    let tab_id = SharedString::from(format!("tab-{id}"));
+                    let close_id = SharedString::from(format!("tab-close-{id}"));
+                    h_flex()
+                        .id(tab_id)
+                        .h(px(32.0))
+                        .min_w(px(160.0))
+                        .flex_shrink_0()
+                        .px_4()
+                        .gap_2()
+                        .items_center()
+                        .justify_between()
+                        .rounded(px(6.0))
+                        // 活动/非活动只差底色与描边不足以分辨（浅色主题下 tab_bar 与
+                        // tab_active 仅隔一档灰），再给活动标签一圈强调色描边。
+                        .bg(if active {
+                            pal.tab_active_bg
+                        } else {
+                            Hsla::transparent_black()
+                        })
+                        .border_1()
+                        .border_color(if active { pal.accent } else { pal.border })
+                        .text_color(if active {
+                            pal.tab_active_fg
+                        } else {
+                            pal.tab_fg
+                        })
+                        .cursor_pointer()
+                        .hover(|this| this.bg(pal.card_hover))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.active_tab = Some(id);
+                            cx.notify();
+                        }))
+                        .child(div().flex_1().min_w_0().truncate().child(tab.title.clone()))
+                        .child(
+                            div()
+                                .id(close_id)
+                                .text_base()
+                                .text_color(pal.danger)
+                                .child("×")
+                                .cursor_pointer()
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                                )
+                                .on_click(
+                                    cx.listener(move |this, _, _, cx| this.close_tab(id, cx)),
+                                ),
+                        )
+                }))
+        };
 
+        let terminal_bg = self.terminal_bg(cx);
         let body = self
             .active_tab
             .and_then(|id| self.tabs.iter().find(|tab| tab.id == id))
             .map(|tab| {
+                // 内边距取终端自己的底色，四周才像终端的一部分而不是白框。
                 div()
                     .flex_1()
+                    .min_h_0()
                     .overflow_hidden()
+                    .bg(terminal_bg)
+                    .px_3()
+                    .py_2()
                     .child(tab.terminal_view.clone())
                     .into_any_element()
             })
@@ -3520,7 +3692,12 @@ impl RuLinkApp {
             div().into_any_element()
         };
 
-        v_flex().flex_1().h_full().child(expand_bar).child(body)
+        v_flex()
+            .flex_1()
+            .h_full()
+            .child(expand_bar)
+            .child(tab_bar)
+            .child(body)
     }
 
     /// 底部状态栏：左侧瞬态状态 + 活动会话信息（按用户勾选的显示项拼装），右侧会话计数。
@@ -3534,12 +3711,8 @@ impl RuLinkApp {
             if self.status_bar.addr {
                 left.push(StatusBarItem::new(tab.addr.clone()).id("addr"));
             }
-            if self.status_bar.auth {
-                left.push(
-                    StatusBarItem::new(auth_label(tab.auth))
-                        .id("auth")
-                        .muted(true),
-                );
+            if let (true, Some(auth)) = (self.status_bar.auth, tab.auth) {
+                left.push(StatusBarItem::new(auth_label(auth)).id("auth").muted(true));
             }
             // 远程基本信息由 SSH 建立后的 exec 探测任务异步写入 tab.remote_info。
             if let Some(info) = tab.remote_info.as_ref() {
@@ -3586,6 +3759,18 @@ impl RuLinkApp {
             }
         })
         .detach();
+    }
+
+    /// 终端底色：内边距要与终端内容同色，否则在浅色主题下会显成一圈白框。
+    fn terminal_bg(&self, cx: &App) -> Hsla {
+        let Some(manager) = cx.try_global::<ThemeManager>() else {
+            return self.palette(cx).window_bg;
+        };
+        manager
+            .get_theme(&self.terminal.theme)
+            .or_else(|| Some(manager.current_theme()))
+            .map(|theme| theme.background)
+            .unwrap_or_else(|| self.palette(cx).window_bg)
     }
 
     /// 由偏好组装终端渲染样式。配色取自 rgpui-term 的 `ThemeManager` 预设
@@ -3765,7 +3950,13 @@ fn main() {
             KeyBinding::new("ctrl-b", ToggleSidebar, None),
             KeyBinding::new("ctrl-t", ToggleTheme, None),
             KeyBinding::new("ctrl-n", NewHost, None),
+            KeyBinding::new("ctrl-shift-t", NewLocalTerminal, None),
             KeyBinding::new("ctrl-,", OpenSettings, None),
+            // Tab 在 rgpui 的 Root 上下文里被绑成焦点切换，而按键绑定分发早于 on_key_down，
+            // 终端元素因此永远收不到 \x09（shell 补全失效）。在 Terminal 上下文用 NoAction
+            // 抢占：它比 Root 更深，分发解析到它就停止，按键原样落到 on_key_down 转发给 PTY。
+            KeyBinding::new("tab", NoAction {}, Some("Terminal")),
+            KeyBinding::new("shift-tab", NoAction {}, Some("Terminal")),
         ]);
         let opened = cx.open_window(
             WindowOptions {
@@ -3839,8 +4030,23 @@ fn main() {
 mod tests {
     use super::{
         FONT_SIZE_MAX, FONT_SIZE_MIN, LINE_HEIGHT_MAX, LINE_HEIGHT_MIN, Metric, StatusBarPrefs,
-        TERMINAL_THEME_DEFAULT, TerminalPrefs,
+        TERMINAL_THEME_DEFAULT, TerminalPrefs, default_local_shell, which,
     };
+
+    #[test]
+    fn default_local_shell_resolves_an_existing_executable() {
+        let (program, label) = default_local_shell().expect("本机应至少有一个可用 shell");
+        assert!(std::path::Path::new(&program).is_file(), "{program} 不存在");
+        assert!(!label.is_empty());
+        assert!(!label.contains('.'), "标签名应去掉扩展名，实得 {label}");
+    }
+
+    #[test]
+    fn which_finds_known_programs_and_rejects_unknown_ones() {
+        assert!(which("this-program-should-not-exist-9f3a2b").is_none());
+        #[cfg(windows)]
+        assert!(which("cmd").is_some(), "cmd 应在 PATH 中可寻");
+    }
 
     #[test]
     fn status_bar_prefs_default_to_everything_shown() {
