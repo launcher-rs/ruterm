@@ -15,19 +15,20 @@ mod vault;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use rgpui::components::Select;
 use rgpui::components::split_pane::{CollapsiblePane, SplitPane, SplitPaneState};
 use rgpui::components::status_bar::{StatusBar, StatusBarItem};
 use rgpui::input_ui::{Input, InputContentType, InputEvent, InputState};
 use rgpui::prelude::*;
 use rgpui::title_bar::TITLE_BAR_HEIGHT;
 use rgpui::{
-    AnyElement, App, Bounds, Button, ButtonVariants, Checkbox, Context, DropdownMenu, Entity,
-    FocusHandle, Focusable, FontWeight, Hsla, Icon, IconName, InteractiveElement, IntoElement,
-    MouseButton, ParentElement, Pixels, PopupMenu, PopupMenuItem, Render, ScrollableElement,
-    SharedString, StatefulInteractiveElement, Styled, TrayMenuItem, Window, WindowBounds,
-    WindowControlArea, WindowOptions, div, h_flex, px, size, v_flex,
+    AbsoluteLength, AnyElement, App, Bounds, Button, ButtonVariants, Checkbox, ClickEvent, Context,
+    DropdownMenu, Entity, FocusHandle, Focusable, FontWeight, Hsla, Icon, IconName,
+    InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels, PopupMenu, PopupMenuItem,
+    Render, ScrollableElement, SharedString, StatefulInteractiveElement, Styled, TrayMenuItem,
+    Window, WindowBounds, WindowControlArea, WindowOptions, div, h_flex, px, size, v_flex,
 };
-use rgpui_term::{TerminalBuilder, TerminalView};
+use rgpui_term::{TerminalBuilder, TerminalView, TextStyle, ThemeManager};
 use serde::{Deserialize, Serialize};
 
 use crate::config::SshTarget;
@@ -149,6 +150,8 @@ const SETTINGS_TAB_VAULT: usize = 0;
 const SETTINGS_TAB_APPEARANCE: usize = 1;
 /// 设置弹窗分页：状态栏显示项。
 const SETTINGS_TAB_STATUS: usize = 2;
+/// 设置弹窗分页：终端外观（字号 / 行高 / 配色方案）。
+const SETTINGS_TAB_TERMINAL: usize = 3;
 
 /// 设置弹窗固定宽高：切分页不重排，弹窗不随内容忽大忽小。
 const SETTINGS_DIALOG_W: f32 = 640.0;
@@ -223,6 +226,98 @@ impl StatusBarPrefs {
     }
 }
 
+/// 终端字号范围与步进：下限保证可读，上限避免把窗口撑爆。
+const FONT_SIZE_MIN: f32 = 10.0;
+const FONT_SIZE_MAX: f32 = 32.0;
+const FONT_SIZE_STEP: f32 = 1.0;
+const FONT_SIZE_DEFAULT: f32 = 14.0;
+/// 行高倍数范围与步进（过密会糊字，过疏浪费竖向空间）。
+const LINE_HEIGHT_MIN: f32 = 1.0;
+const LINE_HEIGHT_MAX: f32 = 2.0;
+const LINE_HEIGHT_STEP: f32 = 0.1;
+const LINE_HEIGHT_DEFAULT: f32 = 1.2;
+/// 配色方案默认值，与 rgpui-term `ThemeManager` 的初始主题一致。
+const TERMINAL_THEME_DEFAULT: &str = "One Dark";
+
+/// 终端外观偏好：字号、行高与配色方案（方案名取 `ThemeManager` 预设）。
+///
+/// 只影响终端渲染，不动界面主题：终端有自己的一套 ANSI 配色，
+/// 与 rgpui 全局 `Theme` 无关（后者管窗口 chrome）。
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TerminalPrefs {
+    /// 终端字号（px）。
+    #[serde(default = "default_font_size")]
+    pub font_size: f32,
+    /// 行高倍数。
+    #[serde(default = "default_line_height")]
+    pub line_height: f32,
+    /// 配色方案名（`ThemeManager::available_themes()` 之一）。
+    #[serde(default = "default_terminal_theme")]
+    pub theme: String,
+}
+
+fn default_font_size() -> f32 {
+    FONT_SIZE_DEFAULT
+}
+
+fn default_line_height() -> f32 {
+    LINE_HEIGHT_DEFAULT
+}
+
+fn default_terminal_theme() -> String {
+    TERMINAL_THEME_DEFAULT.to_string()
+}
+
+impl Default for TerminalPrefs {
+    fn default() -> Self {
+        Self {
+            font_size: FONT_SIZE_DEFAULT,
+            line_height: LINE_HEIGHT_DEFAULT,
+            theme: TERMINAL_THEME_DEFAULT.to_string(),
+        }
+    }
+}
+
+impl TerminalPrefs {
+    /// 把数值夹回合法区间：库里存的是历史版本写下的值，坏数据不该让终端不可读。
+    fn clamp(&mut self) {
+        self.font_size = self.font_size.clamp(FONT_SIZE_MIN, FONT_SIZE_MAX).round();
+        self.line_height = self.line_height.clamp(LINE_HEIGHT_MIN, LINE_HEIGHT_MAX);
+        if self.theme.is_empty() {
+            self.theme = TERMINAL_THEME_DEFAULT.to_string();
+        }
+    }
+
+    /// 字号增减一档（`+1` / `-1`），结果仍夹在合法区间内。
+    fn nudge_font_size(&mut self, steps: i32) {
+        let next = self.font_size + FONT_SIZE_STEP * steps as f32;
+        self.font_size = next;
+        self.clamp();
+    }
+
+    /// 行高增减一档。
+    fn nudge_line_height(&mut self, steps: i32) {
+        let next = self.line_height + LINE_HEIGHT_STEP * steps as f32;
+        self.line_height = next;
+        self.clamp();
+    }
+
+    /// 序列化为入库/入文件的字符串。
+    fn to_json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
+    }
+
+    /// 解析库内 / settings.json 里的偏好；损坏或为空时回默认。
+    fn from_json(text: &str) -> Self {
+        if text.is_empty() {
+            return Self::default();
+        }
+        let mut prefs: Self = serde_json::from_str(text).unwrap_or_default();
+        prefs.clamp();
+        prefs
+    }
+}
+
 /// RuLink 主视图：左侧主机账号管理，右侧会话标签终端。
 struct RuLinkApp {
     /// 会话仓库（负责持久化）。
@@ -262,6 +357,8 @@ struct RuLinkApp {
     status: SharedString,
     /// 状态栏显示项偏好（勾选哪些条目），随加密库 / settings.json 持久化。
     status_bar: StatusBarPrefs,
+    /// 终端外观偏好（字号 / 行高 / 配色方案），同样双层持久化。
+    terminal: TerminalPrefs,
     /// 侧边栏 ↔ 主区 的分隔面板状态（拖拽调整宽度 + 折叠/展开）。
     split_state: Entity<SplitPaneState>,
     focus_handle: FocusHandle,
@@ -331,7 +428,13 @@ impl RuLinkApp {
         let store = SessionStore::new(&mode);
         let hosts = store.load();
         // 开库前先用旧 settings.json 里的状态栏偏好，库打开后再被库内值覆盖。
-        let status_bar = StatusBarPrefs::from_json(&store.load_settings().status_bar);
+        let settings = store.load_settings();
+        let status_bar = StatusBarPrefs::from_json(&settings.status_bar);
+        let terminal = TerminalPrefs::from_json(&settings.terminal);
+        // 终端配色预设管理器：全局一份，`TerminalView::set_theme` 与自建样式都从这里取。
+        if !cx.has_global::<ThemeManager>() {
+            cx.set_global(ThemeManager::new(None));
+        }
         // 侧边栏 ↔ 主区 分隔面板：初始侧边栏占比约 0.25。
         let split_state = cx.new(SplitPaneState::new);
         split_state.update(cx, |state, cx| {
@@ -362,6 +465,7 @@ impl RuLinkApp {
             next_id: 0,
             status: "就绪".into(),
             status_bar,
+            terminal,
             split_state,
             focus_handle: cx.focus_handle(),
         };
@@ -506,6 +610,16 @@ impl RuLinkApp {
                 let _ = this.update(cx, |this, cx| {
                     if this.status_bar != prefs {
                         this.status_bar = prefs;
+                        cx.notify();
+                    }
+                });
+            }
+            // 终端外观（字号 / 行高 / 配色）同样以库内为准，此时还没有会话，无需重绘。
+            if let Ok(Some(json)) = vault.setting("terminal").await {
+                let prefs = TerminalPrefs::from_json(&json);
+                let _ = this.update(cx, |this, cx| {
+                    if this.terminal != prefs {
+                        this.terminal = prefs;
                         cx.notify();
                     }
                 });
@@ -1527,7 +1641,8 @@ impl RuLinkApp {
             return;
         };
         let terminal = cx.new(|cx| builder.subscribe(cx));
-        let terminal_view = cx.new(|cx| TerminalView::new(terminal, window, cx));
+        let style = self.terminal_text_style(cx);
+        let terminal_view = cx.new(|cx| TerminalView::new_with_style(terminal, style, window, cx));
         // 状态栏展示用的连接位置与认证方式，须在 target 被 session::start 消费前取出。
         let addr = format!("{}@{}:{}", target.user, target.host, target.port);
         let auth = if target.password.is_some() {
@@ -1872,17 +1987,19 @@ impl RuLinkApp {
                 .item(PopupMenuItem::new(vault_state).disabled(true))
         };
 
-        // 外观菜单：明暗二选一（当前项打勾），外加设置面板的外观 / 状态栏分页。
+        // 外观菜单：明暗二选一（当前项打勾），外加设置面板的外观 / 状态栏 / 终端分页。
         let to_dark = entity.clone();
         let to_light = entity.clone();
         let appearance = entity.clone();
         let status = entity.clone();
+        let terminal = entity.clone();
         let appearance_menu =
             move |menu: PopupMenu, _: &mut Window, _: &mut Context<PopupMenu>| {
                 let to_dark = to_dark.clone();
                 let to_light = to_light.clone();
                 let appearance = appearance.clone();
                 let status = status.clone();
+                let terminal = terminal.clone();
                 menu.item(PopupMenuItem::new("暗色主题").checked(dark).on_click(
                     move |_, window, cx| {
                         to_dark.update(cx, |this, cx| this.apply_theme(true, window, cx));
@@ -1905,6 +2022,13 @@ impl RuLinkApp {
                     PopupMenuItem::new("状态栏显示项…").on_click(move |_, window, cx| {
                         status.update(cx, |this, cx| {
                             this.open_settings_at(SETTINGS_TAB_STATUS, window, cx);
+                        });
+                    }),
+                )
+                .item(
+                    PopupMenuItem::new("终端外观…").on_click(move |_, window, cx| {
+                        terminal.update(cx, |this, cx| {
+                            this.open_settings_at(SETTINGS_TAB_TERMINAL, window, cx);
                         });
                     }),
                 )
@@ -2195,7 +2319,7 @@ impl RuLinkApp {
             .into_any_element()
     }
 
-    /// 设置居中弹窗：左侧竖排分页导航（凭据库与主密码 / 外观 / 状态栏），右侧为当前分页内容。
+    /// 设置居中弹窗：左侧竖排分页导航（凭据库与主密码 / 外观 / 状态栏 / 终端），右侧为当前分页内容。
     fn render_settings_dialog(&self, cx: &Context<Self>) -> AnyElement {
         let pal = self.palette(cx);
         let Some(state) = self.settings.as_ref() else {
@@ -2208,6 +2332,7 @@ impl RuLinkApp {
         let body = match state.tab {
             SETTINGS_TAB_APPEARANCE => self.render_appearance_tab(&pal, dark, cx),
             SETTINGS_TAB_STATUS => self.render_status_tab(&pal, cx),
+            SETTINGS_TAB_TERMINAL => self.render_terminal_tab(&pal, cx),
             _ => self.render_vault_tab(&pal, state, passphrase_mode, unlocked, cx),
         };
         let entity = cx.entity();
@@ -2305,6 +2430,12 @@ impl RuLinkApp {
                                         "settings-tab-status",
                                         "状态栏",
                                         SETTINGS_TAB_STATUS,
+                                        entity.clone(),
+                                    ))
+                                    .child(tab_item(
+                                        "settings-tab-terminal",
+                                        "终端",
+                                        SETTINGS_TAB_TERMINAL,
                                         entity,
                                     )),
                             )
@@ -2584,6 +2715,102 @@ impl RuLinkApp {
                         ),
                     )
                     .children(metrics),
+            )
+            .into_any_element()
+    }
+
+    /// 「终端」分页：字号、行高与配色方案，改动即刻刷到所有已开终端并写入凭据库。
+    fn render_terminal_tab(&self, pal: &Palette, cx: &Context<Self>) -> AnyElement {
+        let entity = cx.entity();
+        let themes = Self::terminal_themes(cx);
+        let theme_index = themes
+            .iter()
+            .position(|name| *name == self.terminal.theme)
+            .unwrap_or(0);
+        // 步进按钮：− / + 各一档，值显示在中间，比数字框少一层提交路径。
+        let row = |label: &'static str, value: String, minus, plus| {
+            h_flex()
+                .gap_2()
+                .items_center()
+                .child(
+                    div()
+                        .w(px(72.0))
+                        .text_sm()
+                        .text_color(pal.muted)
+                        .child(label),
+                )
+                .child(minus)
+                .child(
+                    div()
+                        .w(px(64.0))
+                        .text_center()
+                        .text_sm()
+                        .flex_shrink_0()
+                        .child(value),
+                )
+                .child(plus)
+        };
+        v_flex()
+            .id("settings-tab-terminal")
+            .gap_3()
+            .child(div().text_sm().text_color(pal.muted).child(
+                "终端外观只影响会话终端（界面主题在「外观」分页里），改动立即生效并写入凭据库。",
+            ))
+            .child(row(
+                "字号",
+                format!("{} px", self.terminal.font_size as i32),
+                stepper(
+                    "terminal-font-minus",
+                    "−",
+                    cx.listener(|this, _, _, cx| this.nudge_font_size(-1, cx)),
+                ),
+                stepper(
+                    "terminal-font-plus",
+                    "+",
+                    cx.listener(|this, _, _, cx| this.nudge_font_size(1, cx)),
+                ),
+            ))
+            .child(row(
+                "行高",
+                format!("{:.1}", self.terminal.line_height),
+                stepper(
+                    "terminal-line-minus",
+                    "−",
+                    cx.listener(|this, _, _, cx| this.nudge_line_height(-1, cx)),
+                ),
+                stepper(
+                    "terminal-line-plus",
+                    "+",
+                    cx.listener(|this, _, _, cx| this.nudge_line_height(1, cx)),
+                ),
+            ))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        div()
+                            .w(px(72.0))
+                            .text_sm()
+                            .text_color(pal.muted)
+                            .child("配色方案"),
+                    )
+                    .child({
+                        let options = themes.clone();
+                        Select::new(themes)
+                            .id("terminal-theme")
+                            .selected(Some(theme_index))
+                            .w(px(200.0))
+                            .on_change(move |index, _name, _window, cx| {
+                                let Some(name) = options.get(index).cloned() else {
+                                    return;
+                                };
+                                let entity = entity.clone();
+                                entity.update(cx, |this, cx| {
+                                    this.set_terminal_theme(&name, cx);
+                                });
+                            })
+                    }),
             )
             .into_any_element()
     }
@@ -3334,6 +3561,113 @@ impl RuLinkApp {
         })
         .detach();
     }
+
+    /// 由偏好组装终端渲染样式。配色取自 rgpui-term 的 `ThemeManager` 预设
+    /// （方案名读不到时回落当前主题，避免解析不到颜色）；字体族沿用默认等宽字体。
+    fn terminal_text_style(&self, cx: &App) -> TextStyle {
+        let mut style = TextStyle::default();
+        style.font_size = AbsoluteLength::Pixels(px(self.terminal.font_size));
+        style.line_height_multiplier = self.terminal.line_height;
+        let theme = cx
+            .try_global::<ThemeManager>()
+            .and_then(|manager| manager.get_theme(&self.terminal.theme).cloned())
+            .or_else(|| {
+                cx.try_global::<ThemeManager>()
+                    .map(|manager| manager.current_theme().clone())
+            });
+        if let Some(theme) = theme {
+            style.foreground = theme.foreground;
+            style.background = theme.background;
+            style.theme = theme;
+        }
+        style
+    }
+
+    /// 把当前样式刷到所有已开终端：设置里改一项即刻见效，无需重连。
+    fn apply_terminal_style(&self, style: &TextStyle, cx: &mut App) {
+        for tab in &self.tabs {
+            let style = style.clone();
+            tab.terminal_view.update(cx, |view, cx| {
+                *view.text_style_mut() = style;
+                cx.notify();
+            });
+        }
+    }
+
+    /// 终端外观改动：记账 → 刷新所有终端 → 持久化（库内优先，降级时写 settings.json）。
+    fn set_terminal_prefs(&mut self, mut prefs: TerminalPrefs, cx: &mut Context<Self>) {
+        prefs.clamp();
+        if prefs == self.terminal {
+            return;
+        }
+        self.terminal = prefs;
+        let style = self.terminal_text_style(cx);
+        self.apply_terminal_style(&style, cx);
+        cx.notify();
+        self.persist_terminal(cx);
+    }
+
+    /// 字号增减一档（`steps` 为正负档数）。
+    fn nudge_font_size(&mut self, steps: i32, cx: &mut Context<Self>) {
+        let mut prefs = self.terminal.clone();
+        prefs.nudge_font_size(steps);
+        self.set_terminal_prefs(prefs, cx);
+    }
+
+    /// 行高增减一档。
+    fn nudge_line_height(&mut self, steps: i32, cx: &mut Context<Self>) {
+        let mut prefs = self.terminal.clone();
+        prefs.nudge_line_height(steps);
+        self.set_terminal_prefs(prefs, cx);
+    }
+
+    /// 切换终端配色方案。
+    fn set_terminal_theme(&mut self, name: &str, cx: &mut Context<Self>) {
+        let mut prefs = self.terminal.clone();
+        prefs.theme = name.to_string();
+        self.set_terminal_prefs(prefs, cx);
+    }
+
+    /// 可选的终端配色方案名（`ThemeManager` 预设，已按名排序）。
+    fn terminal_themes(cx: &App) -> Vec<SharedString> {
+        match cx.try_global::<ThemeManager>() {
+            Some(manager) => manager
+                .available_themes()
+                .into_iter()
+                .map(SharedString::from)
+                .collect(),
+            None => vec![TERMINAL_THEME_DEFAULT.into()],
+        }
+    }
+
+    /// 终端偏好落库；加密库不可用时退回旧 settings.json。
+    fn persist_terminal(&self, cx: &mut Context<Self>) {
+        let json = self.terminal.to_json();
+        let Some(vault) = self.vault.clone() else {
+            self.store.save_terminal(&json);
+            return;
+        };
+        cx.spawn(async move |_, _| {
+            if let Err(error) = vault.set_setting("terminal", &json).await {
+                log::warn!("写入库内终端偏好失败: {error}");
+            }
+        })
+        .detach();
+    }
+}
+
+/// 设置分页里的 −/＋ 步进按钮：中性描边小按钮，与「关闭」等按钮保持同一观感。
+fn stepper(
+    id: &'static str,
+    label: &'static str,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + Send + Sync + 'static,
+) -> Button {
+    Button::new(id)
+        .label(label)
+        .secondary()
+        .outline()
+        .compact()
+        .on_click(on_click)
 }
 
 /// 带标题的输入框行。
@@ -3470,7 +3804,10 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{Metric, StatusBarPrefs};
+    use super::{
+        FONT_SIZE_MAX, FONT_SIZE_MIN, LINE_HEIGHT_MAX, LINE_HEIGHT_MIN, Metric, StatusBarPrefs,
+        TERMINAL_THEME_DEFAULT, TerminalPrefs,
+    };
 
     #[test]
     fn status_bar_prefs_default_to_everything_shown() {
@@ -3499,6 +3836,75 @@ mod tests {
         assert_eq!(
             StatusBarPrefs::from_json("{ not json"),
             StatusBarPrefs::default()
+        );
+    }
+
+    #[test]
+    fn terminal_prefs_roundtrip_keeps_all_three_fields() {
+        let mut prefs = TerminalPrefs::default();
+        prefs.nudge_font_size(3);
+        prefs.nudge_line_height(2);
+        prefs.theme = "Dracula".into();
+        let restored = TerminalPrefs::from_json(&prefs.to_json());
+        assert_eq!(restored.font_size, prefs.font_size);
+        assert!((restored.line_height - prefs.line_height).abs() < 1e-3);
+        assert_eq!(restored.theme, "Dracula");
+    }
+
+    #[test]
+    fn terminal_prefs_steppers_stop_at_bounds() {
+        // 步进夹在合法区间内：连点 + 不会把终端字号撑到窗口放不下，连点 − 不会小到不可读。
+        let mut big = TerminalPrefs {
+            font_size: FONT_SIZE_MAX,
+            ..Default::default()
+        };
+        big.nudge_font_size(5);
+        assert_eq!(big.font_size, FONT_SIZE_MAX);
+
+        let mut small = TerminalPrefs {
+            font_size: FONT_SIZE_MIN,
+            ..Default::default()
+        };
+        small.nudge_font_size(-5);
+        assert_eq!(small.font_size, FONT_SIZE_MIN);
+
+        let mut dense = TerminalPrefs {
+            line_height: LINE_HEIGHT_MIN,
+            ..Default::default()
+        };
+        dense.nudge_line_height(-9);
+        assert!((dense.line_height - LINE_HEIGHT_MIN).abs() < 1e-3);
+
+        let mut loose = TerminalPrefs {
+            line_height: LINE_HEIGHT_MAX,
+            ..Default::default()
+        };
+        loose.nudge_line_height(9);
+        assert!((loose.line_height - LINE_HEIGHT_MAX).abs() < 1e-3);
+    }
+
+    #[test]
+    fn terminal_prefs_clamp_bad_data_back_into_range() {
+        // 库里存的历史/手工改过的越界值一律夹回区间，坏数据不该让终端不可读。
+        let huge = TerminalPrefs::from_json(r#"{"font_size":9999.0,"line_height":0.2}"#);
+        assert_eq!(huge.font_size, FONT_SIZE_MAX);
+        assert!((huge.line_height - LINE_HEIGHT_MIN).abs() < 1e-3);
+        assert_eq!(huge.theme, TERMINAL_THEME_DEFAULT);
+
+        let tiny = TerminalPrefs::from_json(r#"{"font_size":1.0,"line_height":99.0}"#);
+        assert_eq!(tiny.font_size, FONT_SIZE_MIN);
+        assert!((tiny.line_height - LINE_HEIGHT_MAX).abs() < 1e-3);
+
+        // 空方案名回落默认主题，其余内容仍保留。
+        let blank = TerminalPrefs::from_json(r#"{"font_size":18.0,"theme":""}"#);
+        assert_eq!(blank.font_size, 18.0);
+        assert_eq!(blank.theme, TERMINAL_THEME_DEFAULT);
+
+        // 空串与损坏 JSON 回默认（14px / 1.2 / One Dark）。
+        assert_eq!(TerminalPrefs::from_json(""), TerminalPrefs::default());
+        assert_eq!(
+            TerminalPrefs::from_json(r#"{"font_size":"大","line_height":[]}"#),
+            TerminalPrefs::default()
         );
     }
 }

@@ -19,7 +19,7 @@
 | 凭据持久化 | `[x]` | 主机配置、应用设置、known_hosts 三类数据合并入**单个加密文件** `rulink.db`（toasty 0.11 ORM + turso 0.7 AEGIS-256 页级加密，`hosts.password` 列再叠 **AES-256-GCM 字段加密**），全局模式位于 `~/.rulink/`、便携模式位于 exe 旁 `data/`；解锁两档并存：默认 keyring 随机 32 字节主密钥（零输入），或用户**主密码**（argon2id 派生，可带往他机解锁）。库不可用时降级旧 `sessions.json` 且禁用密码保存，见 §四 |
 | 便携 / 全局双模式 | `[x]` | 启动时只探测不创建：exe 同目录存在 `data/` → 便携模式（数据随 exe 走），否则全局模式 `~/.rulink`；主密码为可选项（设置 / 更换 / 取消均在设置里），见 §四 |
 | 自定义标题栏 | `[x]` | 应用自绘顶栏：品牌标识 + 「会话 / 凭据 / 外观 / 帮助」多级菜单 + ⚙/🔑/🔒/`«` 快捷按钮 + 系统窗口控件；拖拽与窗口控制走 `WindowControlArea` 命中区，交互控件排在 Drag 区之外 |
-| 设置界面 | `[x]` | ⚙ 打开设置弹窗（固定 640×470，切分页尺寸不变），**左侧竖排分页导航**（凭据库与主密码 / 外观 / 状态栏）+ 右侧定高滚动内容区，新设置项继续追加分页 |
+| 设置界面 | `[x]` | ⚙ 打开设置弹窗（固定 640×470，切分页尺寸不变），**左侧竖排分页导航**（凭据库与主密码 / 外观 / 状态栏 / 终端）+ 右侧定高滚动内容区，新设置项继续追加分页 |
 | 品牌图标 | `[x]` | 从展示板切分 6 图标变体 + logo + 多尺寸 `.ico`；`build.rs`+winresource 嵌入 exe（任务栏/标题栏） |
 | 系统托盘 | `[x]` | 品牌托盘图标 + 悬停提示 + 右键菜单（显示主界面 / 退出），`App::set_tray_*` + `on_tray_menu_action` |
 
@@ -68,8 +68,13 @@
 - `[x]` 明 / 暗主题切换（rgpui `Theme::change(ThemeMode)` + 配色统一走 `cx.theme()` 语义色），标题栏「外观」菜单（当前项打勾）+ `Ctrl+T`。
 - `[x]` 启动项记忆上次主题选择（持久化到加密库 `settings` 表的 `theme` 项，库打开/解锁完成后自动应用；
       库不可用时回退读写 `settings.json`）。
-- `[ ]` 终端配色方案（多套预设，可自定义前景/背景/16 色）。
-- `[ ]` 自定义字体与字号、行高（终端 + UI）。
+- `[~]` 终端配色方案：设置「终端」分页下拉切换 rgpui-term `ThemeManager` 的 **9 套内置预设**
+      （One Dark/Light、Solarized Dark/Light、Dracula、Nord、Gruvbox Dark/Light、GitHub Light），
+      改动即刻刷到所有已开终端并写入加密库 `settings` 表 `terminal` 键（降级时 `settings.json`）。
+      自定义前景 / 背景 / 16 色（`TerminalThemeConfig` → `ThemeManager::add_theme("Custom")`）待做。
+- `[~]` 终端字号（10–32 px）与行高（1.0–2.0）步进调节，与配色同分页、同持久化；
+      新建终端经 `TerminalView::new_with_style` 取当前偏好，已开的经 `text_style_mut()` 原地刷新。
+      终端字体族沿用默认等宽（`FiraCode Nerd Font` + 平台回退），UI 字号未开放。
 
 ### 4. 国际化（i18n）
 - `[ ]` 接入 rgpui `I18nManager`，抽取界面文案为 key。
@@ -87,7 +92,7 @@
       关闭仍经 `on_window_should_close` → 隐藏到托盘。
 - `[x]` **标题栏多级菜单**：「会话」（新建主机 / 折叠侧栏 / 隐藏到托盘 / 退出）·
       「凭据」（解锁 · 主密码与凭据库设置 · 锁定 · 末尾只读显示当前档位）·
-      「外观」（暗色 / 亮色打勾单选 + 外观设置 · 状态栏显示项分页入口）·「帮助」（版本与快捷键）。
+      「外观」（暗色 / 亮色打勾单选 + 外观设置 · 状态栏显示项 · 终端外观分页入口）·「帮助」（版本与快捷键）。
       菜单用 `Button::dropdown_menu` + `PopupMenu`，构建器是 `Fn`，实体句柄需在闭包内重新 `clone` 再交给各项 `on_click`。
 - `[x]` 设置入口收进标题栏：⚙ 打开**分页式**设置弹窗（凭据库与主密码 / 外观 / 状态栏），🔑 / 🔒 随锁定态切换，
       侧边栏头部品牌行与 ⚙/🔒 按钮移除。菜单项可**直达指定分页**（弹窗已开时只换分页，不重复创建）。
@@ -103,11 +108,13 @@
 - `[x]` 主机列表搜索：侧边栏顶部搜索框，按展示名 / `user@host:port` 子串实时过滤（无匹配显示"无匹配主机"）。
 - `[x]` 主机收藏：每行 ★/☆ 切换按钮（`stop_propagation` 不触发连接），收藏主机稳定排序置顶，`favorite` 字段持久化到加密库 `hosts` 表。
 - `[x]` **设置弹窗（左侧竖排分页）**（标题栏 ⚙ 或菜单进入）：「凭据库与主密码」分页显示数据目录与解锁方式、
-      设置 / 更换 / 取消主密码、锁定凭据库；「外观」分页放明暗主题；「状态栏」分页勾选底部条目。
+      设置 / 更换 / 取消主密码、锁定凭据库；「外观」分页放明暗主题；「状态栏」分页勾选底部条目；
+      「终端」分页调字号 / 行高与配色方案（见 §二.3）。
       弹窗为固定尺寸，切分页不再忽大忽小，内容超出时由分页自身滚动。
       新增设置项继续追加分页即可，主密码相关操作不再散落在侧边栏。已设主密码时标题栏额外出现
       🔒，点击即锁定库（丢弃句柄与内存密钥，需口令重新解锁）。
-- `[~]` 设置项扩展：状态栏显示项（已完成，见 §二.1）、字体字号、默认 shell 等，继续按分页追加。
+- `[~]` 设置项扩展：状态栏显示项（见 §二.1）、终端字号 / 行高 / 配色方案（见 §二.3）已完成，
+      默认 shell、UI 字体、终端自定义 16 色等继续按分页追加。
 - `[ ]` 主机分组、最近连接。
 - `[ ]` 断线提示 + 手动 / 自动重连、连接超时设置。
 - `[ ]` 命令片段库、快捷命令、多主机同时执行。
@@ -134,6 +141,7 @@ RuLink 不自造 UI 轮子，优先复用 rgpui 现成子系统：
 | 自定义标题栏 | `TitlebarOptions::appears_transparent` + `app_owns_titlebar_drag` + `WindowControlArea`（Drag/Min/Max/Close）；`title_bar::TitleBar` 因 Drag 命中区吞掉栏内按钮点击而未采用，改自绘一行 |
 | 标题栏菜单 / 设置分页 | `menu::{PopupMenu, PopupMenuItem, DropdownMenu}`（`Button::dropdown_menu`）；设置分页导航自绘（`h_flex` 行 + 选中项强调色竖条 + 粗体，不用 `tabs::TabBar`——它只有横向模式） |
 | 主题切换 | `theme::Theme::change` |
+| 终端配色 / 字号 | `rgpui-term`：`ThemeManager`（全局，9 套预设）+ `TextStyle`；新建走 `TerminalView::new_with_style`，已开终端经 `text_style_mut()` 原地刷新 |
 | 系统托盘 | `tray::{TrayMenuItem, TrayIconEvent}` + `App::set_tray_*`（已用） |
 | 国际化 | `i18n::I18nManager` |
 | 命令注册 / 快捷键 | `commands::CommandRegistry`、`key_context` |
@@ -202,7 +210,7 @@ RuLink 不自造 UI 轮子，优先复用 rgpui 现成子系统：
 ### 迁移策略
 - `[x]` 一次性迁移到单文件库（`migrate_legacy`）：旧手写 SQL 的 `vault.db`（keyring 密钥）
       读出 hosts → 写入 toasty 新库；`sessions.json` 非空且新库为空时按序导入并分配主键；
-      `settings.json` 的主题 / 状态栏偏好写入 `settings` 表；`known_hosts` 文本逐行解析入表。
+      `settings.json` 的主题 / 状态栏 / 终端偏好写入 `settings` 表；`known_hosts` 文本逐行解析入表。
       导入 / 改名间新增的主机也会补发 id 入库。**导入 / 导出 UI 为后续增量。**
 - `[x]` 迁移前不删除旧文件：**读取成功后**才逐个改名为 `.migrated`（`vault.db.migrated` /
       `sessions.json.migrated` / `settings.json.migrated` / `known_hosts.migrated`）保留现场；

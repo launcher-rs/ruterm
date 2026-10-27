@@ -74,6 +74,9 @@ pub struct Settings {
     /// 状态栏显示项偏好（序列化成 JSON 字符串；空串表示未设置）。
     #[serde(default)]
     pub status_bar: String,
+    /// 终端外观偏好（字号 / 行高 / 配色方案，序列化成 JSON 字符串）。
+    #[serde(default)]
+    pub terminal: String,
 }
 
 impl Settings {
@@ -139,6 +142,12 @@ impl SessionStore {
     pub fn save_status_bar(&self, json: &str) {
         let json = json.to_string();
         self.update_settings(|settings| settings.status_bar = json);
+    }
+
+    /// 降级模式（无加密库）下保存终端外观偏好。
+    pub fn save_terminal(&self, json: &str) {
+        let json = json.to_string();
+        self.update_settings(|settings| settings.terminal = json);
     }
 
     /// 迁移完成后把 sessions.json 改名为 sessions.json.migrated（保留现场，不删除）。
