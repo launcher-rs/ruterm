@@ -4503,38 +4503,7 @@ impl RuLinkApp {
                     .into_any_element()
             });
 
-        // 侧边栏折叠后，主区顶部补一条展开栏（分隔面板自带折叠按钮已关闭）。
-        let collapsed = self.split_state.read(cx).is_collapsed();
-        let expand_bar = if collapsed {
-            h_flex()
-                .h(px(44.0))
-                .flex_shrink_0()
-                .items_center()
-                .px_2()
-                .bg(pal.sidebar_bg)
-                .border_b_1()
-                .border_color(pal.border)
-                .child(
-                    Button::new("sidebar-expand")
-                        .label("»")
-                        .ghost()
-                        .tooltip("展开侧边栏 (Ctrl+B)")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.split_state.update(cx, |state, cx| state.expand(cx));
-                            cx.notify();
-                        })),
-                )
-                .into_any_element()
-        } else {
-            div().into_any_element()
-        };
-
-        v_flex()
-            .flex_1()
-            .h_full()
-            .child(expand_bar)
-            .child(tab_bar)
-            .child(body)
+        v_flex().flex_1().h_full().child(tab_bar).child(body)
     }
 
     /// 底部状态栏：左侧瞬态状态 + 活动会话信息（按用户勾选的显示项拼装），右侧会话计数。
