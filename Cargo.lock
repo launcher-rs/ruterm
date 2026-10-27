@@ -6189,6 +6189,7 @@ dependencies = [
  "getrandom 0.4.3",
  "keyring",
  "log",
+ "png",
  "rgpui",
  "rgpui-platform",
  "rgpui-term",
@@ -6200,6 +6201,7 @@ dependencies = [
  "toasty-driver-turso",
  "tokio",
  "turso",
+ "windows 0.62.2",
  "winresource",
 ]
 

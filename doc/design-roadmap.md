@@ -9,7 +9,7 @@
 | 能力 | 状态 | 说明 |
 |------|------|------|
 | SSH 连接与终端 | `[x]` | russh + rgpui-term（外部 IO 后端），交互式 PTY |
-| 本地终端（系统 Shell） | `[~]` | 一期已通：rgpui-term 本地 PTY 拉起默认 shell（pwsh7 → Windows PowerShell → `COMSPEC`），标签与 SSH 会话并存，进程退出自动收标签；Git Bash / WSL / profile 持久化见 §五 |
+| 本地终端（系统 Shell） | `[x]` | 侧边栏树顶「本地终端」是**可折叠分组**：子项为本机探测到的每个 shell（各取 exe 的系统默认图标），点一下即开对应终端标签；启动后台静默扫一次（含 WSL），「一键扫描」可在右键菜单 / 设置「终端」分页手动刷新；标签与 SSH 会话并存，进程退出自动收标签；profile 持久化、起始目录、环境变量见 §五 |
 | 认证方式 | `[x]` | 密码 / 私钥(IdentityFile，表单可填口令、`浏览…`选择密钥文件；加密私钥自动弹口令窗) / Agent；口令与密码同走"默认内存 + 勾选入加密库"两档 |
 | 主机指纹校验 | `[x]` | TOFU known_hosts **存入加密库**（`known_hosts` 表），不匹配 / 写入失败 / 查询失败一律拒绝（fail-closed，防 MITM） |
 | 会话标签页 | `[x]` | 多标签、关闭、激活切换；标签栏在主区顶部（44px 栏高、160px 最小标签宽），不放标题栏；活动标签用主题语义色 `tab_active` + 强调色描边，与 `tab_bar` 底色区分 |
@@ -75,9 +75,11 @@
     （降级时 `settings.json`）。加列要在加密库上做真实 ALTER，而分组只是展示层元数据，代价与风险都低得多。
   - 搜索态：空分组隐藏、折叠强制展开（否则命中的主机看不见）；无主机且未建组时用一行提示代替空壳「未分组」。
 - `[~]` 主机**跨分组拖拽**移动（当前用右键「移动到分组」，拖拽待做）。
-- `[x]` **本地终端并入主机列表**：树顶内置「本地终端」条目（`SquareTerminal` 图标 + 探测到的 shell 名 +
-      「本机」标记），点一下即开本地标签；它不入凭据库，故不参与分组/收藏/删除，搜索按「本地终端」与 shell 名匹配。
-      「会话」菜单 → 本地终端（`Ctrl+Shift+T`）与右键菜单入口并存。
+- `[x]` **本地终端并入主机列表**：树顶内置「本地终端」**可折叠分组**（折叠三角 + 终端图标 + 名称 + 数量），
+      子项是探测到的每个本机 shell（PowerShell 7 / Windows PowerShell / Git Bash / 命令提示符 / WSL），
+      每项左边是该 exe 的**系统默认图标**，点一下直接开对应终端标签。
+      它不入凭据库，故不参与分组/收藏/删除；搜索按「本地终端」与各 shell 名匹配，命中即展开只留有命中的子项。
+      右键菜单：一键扫描本机 shell… / 新建主机… / 新建分组…；「会话」菜单 → 本地终端（`Ctrl+Shift+T`）开列表第一项。
 - `[x]` **新建入口收敛**：侧边栏顶部常驻的「+ 新建主机」大按钮已去掉，顶部空间整块留给列表；
       新建走**主机行 / 分组行 / 列表空白处**右键菜单，或标题栏「会话」菜单「新建主机…」（`Ctrl+N`）。
 - `[x]` **主机行右键菜单改用框架 `PopupMenu`**：手搭的 `absolute` 浮层留在普通图层，会被后画的兄弟节点压住
@@ -180,6 +182,8 @@ RuLink 不自造 UI 轮子，优先复用 rgpui 现成子系统：
 | 标签栏配色 | 主题语义色 `tab_bar` / `tab_active` / `tab_active_foreground` / `tab_foreground`（明暗两套自带区分），活动标签再叠 `primary` 描边；不硬编码颜色 |
 | 主机行 / 分组行 / 空白处右键菜单 | `menu::context_menu::{ContextMenuExt::context_menu, PopupMenu, PopupMenuItem}`：包装器把元素转 `relative` 并在 `deferred(anchored().snap_to_window_with_margin(8px).with_priority(1))` 的**独立图层**渲染菜单。手搭 `absolute` 浮层不可行——它留在普通图层，被后画兄弟节点压住 hitbox，菜单项只吃得到 hover 吃不到 mouse-up。`context_menu` 要求元素同时是 `InteractiveElement + ParentElement + Styled`，ElementId 由内层 `.id()` 派生；包装器的 hitbox 注册在子节点**之后**，故两层菜单不能嵌套（一次右键弹两个），空白区菜单须作行的兄弟节点。`PopupMenuItem::on_click` 的闭包要求 `Send + Sync`，捕获 `Entity<T>` 后 `entity.update(cx, ..)` 即可拿到 `&mut RuLinkApp`（`Entity` 恒 `Send + Sync`，内部是 `PhantomData<fn(T)->T>`） |
 | 布局约束范式 | `examples/showcase/src/bin/app_suite.rs`（flex_grow + min_h(0) 有界布局范式，状态栏布局修复即据此） |
+| exe 的系统默认图标 | 无现成组件：`SHGetFileInfoW(SHGFI_ICON \| SHGFI_LARGEICON)` 取 `HICON` → `GetIconInfo` + `CreateDIBSection`（32bpp 顶向下）+ `DrawIconEx(DI_NORMAL)` → BGRA 转 RGBA（`alpha == 0` 的 RGB 归零）→ `png::Encoder` → `rgpui::Image::from_bytes(ImageFormat::Png, ..)`。`windows 0.62`（`Win32_UI_Shell` / `Win32_Storage_FileSystem` / `Win32_Graphics_Gdi` / `Win32_UI_WindowsAndMessaging`）+ `png 0.18`，无新增大件。另注：`extract_icon` 在 rsproxy 镜像上不可得，故手写 |
+| 后台阻塞任务（扫描 shell） | **不能用 `tokio::task::spawn_blocking`**：rgpui 的 `cx.spawn` 跑在它自己的执行器上，没有 tokio reactor，直接 panic「there is no reactor running」。正确写法是先 `let runtime = rgpui::tokio::Tokio::handle(cx);` 拿到 `tokio::runtime::Handle`，再 `runtime.spawn_blocking(f).await` |
 
 ---
 
@@ -265,21 +269,27 @@ RuLink 不自造 UI 轮子，优先复用 rgpui 现成子系统：
 ### 1. Windows 本地 shell（首批）
 - `[x]` **cmd.exe**：`cmd.exe`（`$COMSPEC` 回退 shell）。
 - `[x]` **Windows PowerShell 5.x**：`powershell.exe`（PATH 找不到时按 `%SystemRoot%` 定位 `System32\WindowsPowerShell\v1.0\powershell.exe`）。
-- `[x]` **PowerShell 7**：`pwsh.exe`（一期只探测 PATH；常见安装位置扫描与「默认 shell」设置项留给 profile 分期）。
-- `[ ]` **Git Bash**：`bash.exe`（探测 `git\bin\bash.exe` / `git\usr\bin\bash.exe` 注册表与 PATH）。
-- `[ ]` **WSL**：`wsl.exe`（可带 `-d <发行版>` 列出已安装发行版供选择）。
+- `[x]` **PowerShell 7**：`pwsh.exe`（PATH 探测；常见安装位置扫描与「默认 shell」概念**不做**，见 §五.3）。
+- `[x]` **Git Bash**：`git.exe` 同级的 `..\bin\bash.exe`，再兜 `%ProgramFiles%` / `%ProgramFiles(x86)%` /
+      `%LOCALAPPDATA%` 下的 `Git\bin\bash.exe`，最后 PATH 里的 `bash`（`git_bash()`，`src/local_shell.rs`）。
+- `[x]` **WSL**：`wsl.exe -l -q` 列出已安装发行版（UTF-16LE / UTF-8 两种输出都解，未安装时装的是本地化提示句，
+      需过滤），有发行版才出现条目，名称带数量：「WSL（2 个发行版）」。
+      - **限制**：`rgpui_term::TerminalBuilder::new` 内部写死 `tty::Shell::new(program, Vec::new())`（参数恒为空），
+        故只能起默认发行版，`wsl.exe -d <发行版>` 起不来；按发行版分条要等上游开放 shell 参数。
 - `[x]` Windows 控制台 PTY 已确认可用：rgpui-term 内置 ConPTY（`portable-pty`）后端，实测
       ANSI 颜色 / 尺寸自适应 / Ctrl+C（`^C` 回显）/ Enter / 退格均正常，无需自行适配。
-      - 探测顺序 `pwsh` → `powershell` → `COMSPEC`（`which()` + `default_local_shell()`，`src/main.rs`），
-        取第一个存在的可执行文件，标签名用其 `file_stem`（实测显示 `pwsh`）。
+      - 探测拆两档（`src/local_shell.rs`）：`detect()` 只查文件、启动时同步调用；
+        `scan()` = `detect()` + 起一次 `wsl.exe`，耗时且可能触发 WSL 服务启动，故放后台：
+        启动后**静默补扫一次**（不写状态栏），「一键扫描」按钮/菜单项再手动刷新。
+      - 去重保留先发现者（`pwsh` 优先于 `powershell`，Git Bash 不会因 PATH 里还有 `bash` 出现两条）。
 
 ### 2. 其他平台本地 shell（顺带，非 Windows 用户同样受益）
 - `[x]` Linux/macOS：探测 `$SHELL`，回退 `/bin/bash`。
 
 ### 3. 会话形态与 UI
-- `[x]` 侧边栏新增"本地终端"分区（与主机列表并列）→ 已升级为**主机列表树顶的内置条目**（见 §二.2）：
-      `SquareTerminal` 图标 + shell 名副标题 + 「本机」标记，点击即开本地标签，右键菜单同样可新建主机 / 新建分组；
-      标题栏「会话」菜单 →「本地终端…」（`Ctrl+Shift+T`）入口保留。它不入库，因此不受分组、收藏、删除影响。
+- `[x]` 侧边栏树顶的**可折叠「本地终端」分组**（见 §二.2）：子项即各本机 shell，带系统默认图标，
+      点一下开对应标签；右键菜单与设置「终端」分页都有「一键扫描」；标题栏「会话」菜单 →
+      「本地终端…」（`Ctrl+Shift+T`）入口保留。它不入库，因此不受分组、收藏、删除影响。
 - `[x]` 标签标题区分来源：本地会话显示 shell 名（`pwsh` / `powershell` / `cmd`），状态栏条目为
       `本地终端 <shell>` + `<shell> · <起始目录>`；远程会话保持 `user@host`（`SessionTab.addr`
       语义扩展为"连接描述"，`auth` 改为 `Option<AuthMethod>`——本地会话没有认证概念）。
@@ -290,13 +300,17 @@ RuLink 不自造 UI 轮子，优先复用 rgpui 现成子系统：
       永远收不到 `\x09`。在 `Terminal` 上下文用 `NoAction {}` 抢占——它比 `Root` 更深，
       `Keymap::bindings_for_input` 解析到 `NoAction` 即 `break`，Root 的绑定不再入选，按键原样
       落到 `TerminalView::on_key_down` → `try_keystroke` → PTY。实测 `rea` + Tab 补出 `.\README.md`。
-- `[ ]` 默认 shell 可设置（加密库 `settings` 表增 `default_local_shell` 项），启动时可记忆上次使用的 profile。
-- `[ ]` 每个本地会话可选起始工作目录（一期固定为进程当前目录）。
+- `[x]` ~~默认 shell 可设置~~ —— **明确不做**：入口就是列表本身，点哪个开哪个；
+      多一层"默认值"只会让"列表第一个"和"默认项"两套概念打架（用户决策：简单的一个本地终端列表就行）。
+      `Ctrl+Shift+T` / 菜单项无具体档案时开列表第一项（`detect()` 把 PowerShell 7 排最前）。
+- `[x]` 分组折叠态只存内存（`local_group_collapsed`）：它不是库里的分组，不值得占一个持久化键。
+- `[ ]` 每个本地会话可选起始工作目录（当前固定为进程当前目录）。
 
 ### 4. Shell Profile（类 Windows Terminal 的 profile 概念）
 - `[ ]` `hosts` 表增本地条目类型（或新增 `profiles` 表）：名称、可执行路径、参数数组、起始目录、环境变量、图标/配色。
 - `[ ]` 保留与收藏、搜索、置顶复用现有主机列表机制（★ 收藏 + 搜索过滤天然适用）。
-- `[ ]` 从系统自动发现 profile（注册表 / PATH / `wsl -l`），一键添加。
+- `[x]` 从系统自动发现（PATH / 安装目录 / `wsl -l`）：`src/local_shell.rs` 的 `detect()` / `scan()`，
+      结果直接作为侧边栏子项展示（尚未入表，也还不能自定义名称/参数/环境变量）。
 
 ### 5. 架构约束（避免做成 SSH 专用）
 - `[ ]` 抽出 `SessionBackend` 抽象（`External`（russh）/ `LocalPty`），UI 层只认 `TerminalView` + 会话生命周期，不再假设"有 target/host"。
@@ -311,9 +325,10 @@ RuLink 不自造 UI 轮子，优先复用 rgpui 现成子系统：
 ### 6. 分期落地（慢慢实现）
 - 一期：~~`TerminalBuilder::new` 直连默认 shell，单标签跑通 cmd + PowerShell 5~~（**已完成**，实测 pwsh 7.6.7：
   输入回显、`dir` 彩色表格、Ctrl+C、Tab 补全、`exit` 自动收标签均正常）。
-- 二期：~~本地终端并入主机列表分组树~~（**已完成**：树顶内置「本地终端」条目，见 §二.2 / §五.3）
-  + profile 自动发现（Git Bash / WSL）+ 新建会话选择器（§二.2）。
-- 三期：profile 持久化、起始目录、环境变量、默认 shell 设置，与 SSH 共用分屏/标签/搜索能力。
+- 二期：~~本地终端并入主机列表分组树~~（**已完成**：树顶「本地终端」分组列出各 shell，见 §二.2 / §五.3）
+  + ~~profile 自动发现（Git Bash / WSL）~~（**已完成**，`src/local_shell.rs`）+ 新建会话选择器（§二.2）。
+- 三期：profile 持久化（自定义名称/参数/起始目录/环境变量）、每会话起始目录、环境变量，
+  与 SSH 共用分屏/标签/搜索能力；按发行版分条 WSL 待 rgpui-term 开放 shell 参数。
 
 ---
 
@@ -328,8 +343,9 @@ RuLink 不自造 UI 轮子，优先复用 rgpui 现成子系统：
 4. ~~自定义标题栏~~（已完成：自绘顶栏 + 多级菜单（快捷键徽标）+ 窗口控件，见 §二.5；会话标签经用户确认
    保留在主区标签栏）+ 分屏（余量：`SplitPane` / `DockArea` 多会话分屏）。
 5. i18n（文案抽取宜在功能稳定后统一做，避免反复）。
-6. ~~**本地终端**一期~~（已完成：`TerminalBuilder::new` 直连本地 PTY，默认 shell 探测 + 标签 + 状态栏 +
-   退出收标签，见 §五）；余量：Git Bash / WSL 探测、profile 持久化、默认 shell 设置项。
+6. ~~**本地终端**一期~~（已完成：`TerminalBuilder::new` 直连本地 PTY，标签 + 状态栏 + 退出收标签；
+   Git Bash / WSL 探测、一键扫描、系统图标、侧边栏分组列表均已完成，见 §五）；
+   余量：profile 持久化（自定义名称/参数/起始目录/环境变量）、每会话起始目录。
 7. SFTP / 端口转发 / 跳板机（`rulink.txt` 第二阶段）。
 
 > 每完成一项，回到本文件把对应方框勾成 `[x]`，并在 §一快照表更新状态。

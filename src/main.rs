@@ -5,6 +5,7 @@
 //! 认证直接连接。仍兼容一次性命令行快速连接（带目标参数时首启动即连上该主机）。
 
 mod config;
+mod local_shell;
 mod paths;
 mod remote;
 mod session;
@@ -13,7 +14,6 @@ mod ssh;
 mod vault;
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use rgpui::components::Select;
@@ -25,15 +25,16 @@ use rgpui::title_bar::TITLE_BAR_HEIGHT;
 use rgpui::{
     AbsoluteLength, AnyElement, App, Bounds, Button, ButtonVariants, Checkbox, ClickEvent, Context,
     ContextMenuExt, Div, DropdownMenu, Entity, FocusHandle, Focusable, FontWeight, Hsla, Icon,
-    IconName, InteractiveElement, IntoElement, KeyBinding, MouseButton, NoAction, ParentElement,
-    Pixels, PopupMenu, PopupMenuItem, Render, ScrollableElement, SharedString, Stateful,
-    StatefulInteractiveElement, Styled, TrayMenuItem, Window, WindowBounds, WindowControlArea,
-    WindowOptions, actions, div, h_flex, px, size, v_flex,
+    IconName, Image, ImageFormat, InteractiveElement, IntoElement, KeyBinding, MouseButton,
+    NoAction, ParentElement, Pixels, PopupMenu, PopupMenuItem, Render, ScrollableElement,
+    SharedString, Stateful, StatefulInteractiveElement, Styled, TrayMenuItem, Window, WindowBounds,
+    WindowControlArea, WindowOptions, actions, div, h_flex, img, px, size, v_flex,
 };
 use rgpui_term::{Event as TerminalEvent, TerminalBuilder, TerminalView, TextStyle, ThemeManager};
 use serde::{Deserialize, Serialize};
 
 use crate::config::SshTarget;
+use crate::local_shell::ShellProfile;
 use crate::paths::StorageMode;
 use crate::remote::{Metric, RemoteInfo};
 use crate::sessions::{AuthMethod, HostConfig, SessionStore};
@@ -60,61 +61,6 @@ fn auth_label(method: AuthMethod) -> &'static str {
         AuthMethod::IdentityFile => "私钥",
         AuthMethod::Password => "密码",
     }
-}
-
-/// 在 `PATH` 里查找可执行文件（Windows 下自动补 `.exe`）。
-fn which(program: &str) -> Option<PathBuf> {
-    let name = if cfg!(windows) {
-        format!("{program}.exe")
-    } else {
-        program.to_owned()
-    };
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path).find_map(|dir| {
-        let candidate = dir.join(&name);
-        candidate.is_file().then_some(candidate)
-    })
-}
-
-/// 本地终端默认拉起的 shell，返回（可执行文件路径, 标签名）。
-/// Windows 依次尝试 PowerShell 7 → Windows PowerShell（PATH 或 System32 里的确切路径）→ `%COMSPEC%`；
-/// 其他平台用 `$SHELL`，回退 `/bin/bash`。
-fn default_local_shell() -> Option<(String, String)> {
-    #[cfg(windows)]
-    {
-        let candidates: [Option<PathBuf>; 3] = [
-            which("pwsh"),
-            which("powershell").or_else(|| {
-                std::env::var_os("SystemRoot").map(|root| {
-                    PathBuf::from(root)
-                        .join("System32")
-                        .join("WindowsPowerShell")
-                        .join("v1.0")
-                        .join("powershell.exe")
-                })
-            }),
-            std::env::var_os("COMSPEC").map(PathBuf::from),
-        ];
-        candidates
-            .into_iter()
-            .flatten()
-            .find(|path| path.is_file())
-            .and_then(local_shell_label)
-    }
-    #[cfg(not(windows))]
-    {
-        let shell = std::env::var_os("SHELL")
-            .map(PathBuf::from)
-            .filter(|path| path.is_file())
-            .unwrap_or_else(|| PathBuf::from("/bin/bash"));
-        local_shell_label(shell)
-    }
-}
-
-/// 由可执行文件路径拼出（路径, 去扩展名的文件名）；拿不到文件名就放弃。
-fn local_shell_label(path: PathBuf) -> Option<(String, String)> {
-    let label = path.file_stem()?.to_string_lossy().into_owned();
-    Some((path.display().to_string(), label))
 }
 
 /// 一个已连接的会话标签（持有终端视图）。
@@ -561,8 +507,14 @@ struct RuLinkApp {
     new_host: Option<NewHostForm>,
     /// 等待密码输入的连接。
     pending: Option<PendingConnect>,
-    /// 启动时探测一次的本机 shell（可执行路径, 标签名）；None 表示没找到可用 shell。
-    local_shell: Option<(String, String)>,
+    /// 本机 shell 档案列表：启动时 `detect()`（只查文件），点「一键扫描」后含 WSL。
+    local_shells: Vec<ShellProfile>,
+    /// 可执行文件路径 → 系统默认图标（PNG 解码后的 `Image`），扫描后填充。
+    shell_icons: HashMap<String, Arc<Image>>,
+    /// 扫描进行中：按钮禁用 + 状态栏提示，避免连点起多个 wsl.exe。
+    scanning_shells: bool,
+    /// 「本地终端」分组的折叠状态。只影响这次会话——它不是库里的分组，没必要占持久化键。
+    local_group_collapsed: bool,
     /// 侧边栏分组（文件夹）偏好，随加密库 / settings.json 双层持久化。
     sidebar: SidebarPrefs,
     /// 分组新建 / 重命名弹窗（`renaming` 为 None 表示新建）。
@@ -693,7 +645,10 @@ impl RuLinkApp {
             active_tab: None,
             new_host: None,
             pending: None,
-            local_shell: default_local_shell(),
+            local_shells: local_shell::detect(),
+            shell_icons: HashMap::new(),
+            scanning_shells: false,
+            local_group_collapsed: false,
             sidebar,
             group_prompt: None,
             confirm_delete: None,
@@ -709,6 +664,9 @@ impl RuLinkApp {
             focus_handle: cx.focus_handle(),
         };
         app.boot_vault(window, cx);
+        // 启动档 shell 只有几个，图标走 shell 缓存、毫秒级，直接在主线程取好再进列表。
+        app.refresh_shell_icons();
+        app.auto_scan_local_shells(cx);
         if let Some(target) = quick {
             let title = target.addr();
             app.connect(title, target, None, None, false, window, cx);
@@ -2188,19 +2146,96 @@ impl RuLinkApp {
         self.open_settings(window, cx);
     }
 
-    /// Ctrl+Shift+T / 菜单项：新开一个本地终端标签。
-    fn new_local_terminal(&mut self, _: &NewLocalTerminal, _: &mut Window, cx: &mut Context<Self>) {
-        self.open_local_terminal(cx);
+    /// 启动时静默补扫一次：`detect()` 只查文件，WSL 得跑 `wsl.exe -l`，
+    /// 不值得卡在启动路径上，但列表应当开箱即完整，所以后台补一次、不打扰状态栏。
+    fn auto_scan_local_shells(&mut self, cx: &mut Context<Self>) {
+        self.fetch_local_shells(true, cx);
     }
 
-    /// 打开本地终端（路线图 §五 一期）：交给 rgpui-term 的本地 PTY 后端拉起默认 shell。
+    /// 一键扫描本机 shell（含 WSL）：`wsl.exe -l` 是子进程，丢给阻塞线程池，UI 不卡。
+    fn scan_local_shells(&mut self, cx: &mut Context<Self>) {
+        self.fetch_local_shells(false, cx);
+    }
+
+    /// `quiet` 为真时不动状态栏（启动补扫用），扫到的列表与图标照常刷新。
+    fn fetch_local_shells(&mut self, quiet: bool, cx: &mut Context<Self>) {
+        if self.scanning_shells {
+            return;
+        }
+        self.scanning_shells = true;
+        if !quiet {
+            self.status = "正在扫描本机 shell…".into();
+        }
+        cx.notify();
+        let runtime = rgpui::tokio::Tokio::handle(cx);
+        cx.spawn(async move |this, cx| {
+            // rgpui 的 `cx.spawn` 跑在自己的执行器上，`tokio::task::spawn_blocking`
+            // 会因"没有 reactor"直接 panic；阻塞任务必须显式交给 tokio 运行时句柄。
+            let found = runtime.spawn_blocking(local_shell::scan).await;
+            let found = found.unwrap_or_default();
+            let _ = this.update(cx, |this, cx| {
+                this.scanning_shells = false;
+                let count = found.len();
+                this.local_shells = found;
+                this.refresh_shell_icons();
+                if !quiet {
+                    this.status = if count == 0 {
+                        "扫描完成：没找到可用的本机 shell".into()
+                    } else {
+                        format!(
+                            "扫描完成：找到 {count} 个本机 shell，在左侧「本地终端」里点一下即可打开"
+                        )
+                        .into()
+                    };
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 给列表里每个 shell 取一次系统图标（同一 exe 只取一次，如各 WSL 发行版共用 wsl.exe）。
+    fn refresh_shell_icons(&mut self) {
+        let programs: Vec<String> = self
+            .local_shells
+            .iter()
+            .map(|profile| profile.program.clone())
+            .collect();
+        for program in programs {
+            if self.shell_icons.contains_key(&program) {
+                continue;
+            }
+            let Some(bytes) = local_shell::icon_png(&program) else {
+                continue;
+            };
+            self.shell_icons.insert(
+                program,
+                Arc::new(Image::from_bytes(ImageFormat::Png, bytes)),
+            );
+        }
+    }
+
+    /// Ctrl+Shift+T / 菜单项：新开一个本地终端标签。
+    fn new_local_terminal(&mut self, _: &NewLocalTerminal, _: &mut Window, cx: &mut Context<Self>) {
+        self.open_local_terminal(None, cx);
+    }
+
+    /// 打开本地终端（路线图 §五 一期）：交给 rgpui-term 的本地 PTY 后端拉起选定 shell。
+    /// 不指定档案时取列表第一项（`detect()` 把 PowerShell 7 排最前）。
     /// 进程拉起与通道握手是异步的：建好才落标签，失败只写状态栏，不留空标签。
-    fn open_local_terminal(&mut self, cx: &mut Context<Self>) {
-        let Some((program, label)) = self.local_shell.clone() else {
+    fn open_local_terminal(&mut self, profile: Option<&ShellProfile>, cx: &mut Context<Self>) {
+        let chosen = profile
+            .cloned()
+            .or_else(|| self.local_shells.first().cloned());
+        let Some(program) = chosen.as_ref().map(|profile| profile.program.clone()) else {
             self.status = "未找到可用的本地 shell".into();
             cx.notify();
             return;
         };
+        let label = chosen
+            .as_ref()
+            .map(|profile| profile.name.clone())
+            .unwrap_or_default();
         let working_directory = std::env::current_dir().ok();
         let cwd = working_directory
             .as_ref()
@@ -3256,6 +3291,49 @@ impl RuLinkApp {
                             })
                     }),
             )
+            .child(self.render_local_shell_row(pal, cx))
+            .child(
+                div().text_xs().text_color(pal.muted).child(
+                    "「一键扫描」会实际调用 wsl.exe 列出 WSL 发行版，故放在按钮后面而不是启动时；"
+                        .to_string()
+                        + "扫描结果列在左侧「本地终端」分组里，点一下即开对应终端。",
+                ),
+            )
+            .into_any_element()
+    }
+
+    /// 设置「终端」分页里的本机 shell 一行：扫描结果计数 + 一键扫描按钮。
+    fn render_local_shell_row(&self, pal: &Palette, cx: &Context<Self>) -> AnyElement {
+        let count = self.local_shells.len();
+        let scanning = cx.entity();
+        h_flex()
+            .gap_2()
+            .items_center()
+            .child(
+                div()
+                    .w(px(72.0))
+                    .text_sm()
+                    .text_color(pal.muted)
+                    .child("本机 shell"),
+            )
+            .child(div().text_sm().child(if count == 0 {
+                "未扫描到".to_string()
+            } else {
+                format!("已扫到 {count} 个")
+            }))
+            .child(
+                Button::new("scan-local-shells")
+                    .label(if self.scanning_shells {
+                        "扫描中…"
+                    } else {
+                        "一键扫描"
+                    })
+                    .secondary()
+                    .outline()
+                    .on_click(move |_, _, cx| {
+                        scanning.update(cx, |this, cx| this.scan_local_shells(cx));
+                    }),
+            )
             .into_any_element()
     }
 
@@ -3408,7 +3486,7 @@ impl RuLinkApp {
                 false,
                 false,
                 |this, _, cx| {
-                    this.open_local_terminal(cx);
+                    this.open_local_terminal(None, cx);
                 },
             ))
             .item(Self::menu_item(
@@ -3540,59 +3618,134 @@ impl RuLinkApp {
             .cursor_pointer()
     }
 
-    /// 内置「本地终端」条目：点开本机 shell 标签。
+    /// 内置「本地终端」分组：父行折叠/展开，子行是扫描到的每个本机 shell，点一下直接开对应终端。
     /// 它不是凭据库里的主机，所以没有 ★ / 编辑 / 删除，也不参与分组与收藏排序；
-    /// 搜索时按「本地终端」与 shell 名（pwsh / powershell / cmd）匹配。
-    fn render_local_terminal_row(
+    /// 搜索时按「本地终端」与各 shell 名匹配，命中即展开。
+    /// 子行图标取该 exe 的系统默认图标（`SHGetFileInfoW`），取不到回退字形。
+    fn render_local_terminal_rows(
         &self,
         pal: &Palette,
         query: &str,
         cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let shell = self.local_shell.as_ref().map(|(_, label)| label.clone());
+    ) -> Vec<AnyElement> {
         let entity = cx.entity();
+        let searching = !query.is_empty();
         let hit = query.is_empty()
             || "本地终端".contains(query)
-            || shell
-                .as_deref()
-                .is_some_and(|label| label.to_lowercase().contains(query));
+            || local_shell::matches(&self.local_shells, query);
         if !hit {
-            return div().into_any_element();
+            return Vec::new();
         }
-        let (title, subtitle) = match shell {
-            Some(label) => ("本地终端", label),
-            None => (
-                "本地终端（未检测到 shell）",
-                "PATH 中没有 pwsh / powershell / cmd".to_string(),
-            ),
-        };
-        Self::row_base("local-terminal-row", pal, px(4.0))
-            .on_click(cx.listener(|this, _, _, cx| this.open_local_terminal(cx)))
+        let count = self.local_shells.len();
+        let collapsed = !searching && self.local_group_collapsed;
+        let parent = Self::row_base("local-terminal-row", pal, px(2.0))
+            .font_weight(rgpui::FontWeight(600.0))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.local_group_collapsed = !this.local_group_collapsed;
+                cx.notify();
+            }))
+            .child(
+                Icon::new(if collapsed {
+                    IconName::ChevronRight
+                } else {
+                    IconName::ChevronDown
+                })
+                .xsmall()
+                .text_color(pal.muted),
+            )
             .child(
                 Icon::new(IconName::SquareTerminal)
                     .small()
                     .text_color(pal.link),
             )
-            .child(
-                div().flex_1().min_w_0().text_ellipsis().child(title).child(
+            .child(div().flex_1().min_w_0().text_ellipsis().child("本地终端"))
+            .when(count > 0, |this| {
+                this.child(
                     div()
-                        .text_ellipsis()
+                        .flex_shrink_0()
                         .text_xs()
                         .text_color(pal.muted)
-                        .child(subtitle),
-                ),
-            )
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .text_xs()
-                    .text_color(pal.muted)
-                    .child("本机"),
-            )
-            .context_menu(move |menu, _, _| {
-                Self::context_menu(MenuTarget::Blank, vec![], None, entity.clone(), menu)
+                        .child(count.to_string()),
+                )
             })
-            .into_any_element()
+            .context_menu(move |menu, _, _| {
+                let scanning = entity.clone();
+                menu.item(
+                    PopupMenuItem::new("一键扫描本机 shell…").on_click(move |_, _, cx| {
+                        scanning.update(cx, |this, cx| this.scan_local_shells(cx));
+                    }),
+                )
+                .item(PopupMenuItem::new("新建主机…").on_click({
+                    let entity = entity.clone();
+                    move |_, window, cx| {
+                        entity.update(cx, |this, cx| this.open_form(window, cx));
+                    }
+                }))
+                .item(PopupMenuItem::new("新建分组…").on_click({
+                    let entity = entity.clone();
+                    move |_, window, cx| {
+                        entity.update(cx, |this, cx| this.open_group_prompt(None, window, cx));
+                    }
+                }))
+            })
+            .into_any_element();
+        if collapsed {
+            return vec![parent];
+        }
+        let rows: Vec<AnyElement> = self
+            .local_shells
+            .iter()
+            .filter(|profile| profile.matches(query))
+            .enumerate()
+            .map(|(index, profile)| self.render_shell_row(index, profile, pal, cx))
+            .collect();
+        std::iter::once(parent).chain(rows).collect()
+    }
+
+    /// 「本地终端」分组下的一台 shell：系统图标 + 展示名，点开即开该 shell 的终端标签。
+    fn render_shell_row(
+        &self,
+        index: usize,
+        profile: &ShellProfile,
+        pal: &Palette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let entity = cx.entity();
+        let name = profile.name.clone();
+        let icon: AnyElement = match self.shell_icons.get(&profile.program).cloned() {
+            Some(image) => img(image)
+                .size_4()
+                .flex_shrink_0()
+                .text_color(pal.text)
+                .into_any_element(),
+            None => Icon::new(IconName::SquareTerminal)
+                .small()
+                .text_color(pal.muted)
+                .into_any_element(),
+        };
+        Self::row_base(
+            SharedString::from(format!("local-shell-row-{index}")),
+            pal,
+            px(22.0),
+        )
+        .on_click(cx.listener(move |this, _, _, cx| {
+            let chosen = this.local_shells.get(index).cloned();
+            this.open_local_terminal(chosen.as_ref(), cx);
+        }))
+        .child(icon)
+        .child(div().flex_1().min_w_0().text_ellipsis().child(name.clone()))
+        .context_menu(move |menu, _, _| {
+            let opening = entity.clone();
+            menu.item(
+                PopupMenuItem::new(format!("打开 {name}")).on_click(move |_, _, cx| {
+                    opening.update(cx, |this, cx| {
+                        let chosen = this.local_shells.get(index).cloned();
+                        this.open_local_terminal(chosen.as_ref(), cx);
+                    });
+                }),
+            )
+        })
+        .into_any_element()
     }
 
     /// 分组（文件夹）行：折叠三角 + 文件夹图标 + 组名 + 数量；
@@ -3790,7 +3943,7 @@ impl RuLinkApp {
             }
         }
         // 内置「本地终端」条目恒在最前（不入库，故也不受删除/分组/收藏影响）。
-        let local_row = self.render_local_terminal_row(&pal, &query, cx);
+        let local_rows = self.render_local_terminal_rows(&pal, &query, cx);
         // 列表末尾的空白区：右键给出「仅新建」的菜单。它是行的兄弟节点而非祖先，
         // 否则一次右键会同时命中两层菜单，弹出两个重叠的浮层。
         let blank = {
@@ -3816,7 +3969,9 @@ impl RuLinkApp {
                 })
         };
         let searching = !query.is_empty();
-        let mut list = v_flex().gap_px().min_h_full().child(local_row);
+        // 搜索命中本机 shell 时，主机没有命中也不该再叠一句"无匹配主机"（看着像整体没结果）。
+        let local_hit = !local_rows.is_empty();
+        let mut list = v_flex().gap_px().min_h_full().children(local_rows);
         // 首启动（既没主机也没建过分组）：用一个提示代替空壳「未分组」文件夹。
         let bare = self.hosts.is_empty() && !searching && buckets.len() == 1;
         let mut shown = 0usize;
@@ -3838,7 +3993,7 @@ impl RuLinkApp {
                 );
             }
         }
-        if shown == 0 {
+        if shown == 0 && !(searching && local_hit) {
             let hint = if bare {
                 "暂无主机：在列表空白处点右键选「新建主机…」，或用「会话」菜单 / Ctrl+N。"
             } else {
@@ -4719,23 +4874,8 @@ fn main() {
 mod tests {
     use super::{
         FONT_SIZE_MAX, FONT_SIZE_MIN, LINE_HEIGHT_MAX, LINE_HEIGHT_MIN, Metric, SidebarPrefs,
-        StatusBarPrefs, TERMINAL_THEME_DEFAULT, TerminalPrefs, default_local_shell, which,
+        StatusBarPrefs, TERMINAL_THEME_DEFAULT, TerminalPrefs,
     };
-
-    #[test]
-    fn default_local_shell_resolves_an_existing_executable() {
-        let (program, label) = default_local_shell().expect("本机应至少有一个可用 shell");
-        assert!(std::path::Path::new(&program).is_file(), "{program} 不存在");
-        assert!(!label.is_empty());
-        assert!(!label.contains('.'), "标签名应去掉扩展名，实得 {label}");
-    }
-
-    #[test]
-    fn which_finds_known_programs_and_rejects_unknown_ones() {
-        assert!(which("this-program-should-not-exist-9f3a2b").is_none());
-        #[cfg(windows)]
-        assert!(which("cmd").is_some(), "cmd 应在 PATH 中可寻");
-    }
 
     #[test]
     fn status_bar_prefs_default_to_everything_shown() {

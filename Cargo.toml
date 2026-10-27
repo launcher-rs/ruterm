@@ -25,5 +25,16 @@ aes-gcm = { version = "0.11", default-features = false, features = ["aes", "allo
 sha2 = "0.11"
 base64 = "0.23"
 
+[target.'cfg(windows)'.dependencies]
+# 提取 shell 可执行文件的系统图标：Win32 取 HICON，png 编成 rgpui 能直接吃的字节。
+windows = { version = "0.62", default-features = false, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Storage_FileSystem",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+png = "0.18"
+
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
