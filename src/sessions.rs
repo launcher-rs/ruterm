@@ -77,6 +77,9 @@ pub struct Settings {
     /// 终端外观偏好（字号 / 行高 / 配色方案，序列化成 JSON 字符串）。
     #[serde(default)]
     pub terminal: String,
+    /// 侧边栏分组（文件夹）偏好（序列化成 JSON 字符串）。
+    #[serde(default)]
+    pub sidebar: String,
 }
 
 impl Settings {
@@ -148,6 +151,12 @@ impl SessionStore {
     pub fn save_terminal(&self, json: &str) {
         let json = json.to_string();
         self.update_settings(|settings| settings.terminal = json);
+    }
+
+    /// 降级模式（无加密库）下保存侧边栏分组偏好。
+    pub fn save_sidebar(&self, json: &str) {
+        let json = json.to_string();
+        self.update_settings(|settings| settings.sidebar = json);
     }
 
     /// 迁移完成后把 sessions.json 改名为 sessions.json.migrated（保留现场，不删除）。

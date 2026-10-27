@@ -24,11 +24,11 @@ use rgpui::prelude::*;
 use rgpui::title_bar::TITLE_BAR_HEIGHT;
 use rgpui::{
     AbsoluteLength, AnyElement, App, Bounds, Button, ButtonVariants, Checkbox, ClickEvent, Context,
-    DropdownMenu, Entity, FocusHandle, Focusable, FontWeight, Hsla, Icon, IconName,
-    InteractiveElement, IntoElement, KeyBinding, MouseButton, NoAction, ParentElement, Pixels,
-    PopupMenu, PopupMenuItem, Render, ScrollableElement, SharedString, StatefulInteractiveElement,
-    Styled, TrayMenuItem, Window, WindowBounds, WindowControlArea, WindowOptions, actions, div,
-    h_flex, px, size, v_flex,
+    ContextMenuExt, Div, DropdownMenu, Entity, FocusHandle, Focusable, FontWeight, Hsla, Icon,
+    IconName, InteractiveElement, IntoElement, KeyBinding, MouseButton, NoAction, ParentElement,
+    Pixels, PopupMenu, PopupMenuItem, Render, ScrollableElement, SharedString, Stateful,
+    StatefulInteractiveElement, Styled, TrayMenuItem, Window, WindowBounds, WindowControlArea,
+    WindowOptions, actions, div, h_flex, px, size, v_flex,
 };
 use rgpui_term::{Event as TerminalEvent, TerminalBuilder, TerminalView, TextStyle, ThemeManager};
 use serde::{Deserialize, Serialize};
@@ -149,11 +149,12 @@ struct NewHostForm {
     editing: Option<usize>,
 }
 
-/// 主机列表右键菜单（真实下标 + 弹出位置，窗口坐标）。
-struct HostContextMenu {
-    index: usize,
-    x: Pixels,
-    y: Pixels,
+/// 分组新建 / 重命名弹窗状态。
+#[derive(Clone)]
+struct GroupPrompt {
+    /// Some(原名)＝重命名既有分组；None＝新建。
+    renaming: Option<SharedString>,
+    name: Entity<InputState>,
 }
 
 /// 弹窗索取的秘密类型：登录密码或加密私钥的口令。
@@ -389,6 +390,154 @@ impl TerminalPrefs {
     }
 }
 
+/// 侧边栏分组（文件夹）偏好：组顺序 + 折叠态 + 主机归属。
+///
+/// 整体序列化成一个 JSON 串，存进加密库 `settings` 表的 `sidebar` 键（降级时进
+/// settings.json）。刻意不给 `hosts` 表加列：加列要在加密库上做真实 ALTER，
+/// 而分组只是展示层元数据，单独一个键即可，风险与迁移成本都低得多。
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SidebarPrefs {
+    /// 用户分组，按此顺序显示（未分组恒在末尾，不占位）。
+    #[serde(default)]
+    groups: Vec<GroupEntry>,
+    /// 主机 id → 组名。组被删除后残留的映射按未分组处理，不报错。
+    #[serde(default)]
+    assign: HashMap<i64, String>,
+    /// 「未分组」文件夹是否折叠。
+    #[serde(default)]
+    ungrouped_collapsed: bool,
+}
+
+/// 一个分组（文件夹）条目。
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GroupEntry {
+    pub name: String,
+    #[serde(default)]
+    pub collapsed: bool,
+}
+
+/// 未分组文件夹的名字（不作为 `groups` 条目存在）。
+const UNGROUPED: &str = "未分组";
+
+impl SidebarPrefs {
+    /// 组名列表（不含未分组）。
+    fn names(&self) -> impl Iterator<Item = &str> {
+        self.groups.iter().map(|group| group.name.as_str())
+    }
+
+    /// 该主机所属分组；未分组或组已删除时返回 None。
+    fn group_of(&self, id: i64) -> Option<&str> {
+        let name = self.assign.get(&id).map(String::as_str)?;
+        self.groups
+            .iter()
+            .any(|group| group.name == name)
+            .then_some(name)
+    }
+
+    /// 新建分组；名字为空或已存在时返回 false。
+    fn add(&mut self, name: &str) -> bool {
+        let name = name.trim();
+        !name.is_empty()
+            && name != UNGROUPED
+            && !self.groups.iter().any(|group| group.name == name)
+            && {
+                self.groups.push(GroupEntry {
+                    name: name.to_string(),
+                    collapsed: false,
+                });
+                true
+            }
+    }
+
+    /// 重命名分组，并把组内主机的归属一并改写；目标名非法或原名不存在返回 false。
+    fn rename(&mut self, from: &str, to: &str) -> bool {
+        let to = to.trim();
+        if to.is_empty()
+            || to == UNGROUPED
+            || (to != from && self.groups.iter().any(|g| g.name == to))
+        {
+            return false;
+        }
+        let Some(group) = self.groups.iter_mut().find(|group| group.name == from) else {
+            return false;
+        };
+        group.name = to.to_string();
+        for name in self.assign.values_mut() {
+            if name == from {
+                *name = to.to_string();
+            }
+        }
+        true
+    }
+
+    /// 删除分组：组内主机退回未分组（只删归属，不删主机）。
+    fn remove(&mut self, name: &str) {
+        self.groups.retain(|group| group.name != name);
+        self.assign.retain(|_, current| current != name);
+    }
+
+    /// 折叠 / 展开分组。
+    fn toggle(&mut self, name: &str) {
+        if name == UNGROUPED {
+            self.ungrouped_collapsed = !self.ungrouped_collapsed;
+            return;
+        }
+        if let Some(group) = self.groups.iter_mut().find(|group| group.name == name) {
+            group.collapsed = !group.collapsed;
+        }
+    }
+
+    fn collapsed(&self, name: &str) -> bool {
+        if name == UNGROUPED {
+            return self.ungrouped_collapsed;
+        }
+        self.groups
+            .iter()
+            .any(|group| group.name == name && group.collapsed)
+    }
+
+    /// 把主机移入某分组；`None` 表示未分组。
+    fn assign_to(&mut self, id: i64, group: Option<&str>) {
+        match group {
+            Some(name) => {
+                self.assign.insert(id, name.to_string());
+            }
+            None => {
+                self.assign.remove(&id);
+            }
+        }
+    }
+
+    /// 主机删除后清理残留归属。
+    fn forget(&mut self, id: i64) {
+        self.assign.remove(&id);
+    }
+
+    /// 序列化为入库/入文件的字符串。
+    fn to_json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
+    }
+
+    /// 解析库内 / settings.json 里的分组偏好；损坏或为空时回默认。
+    fn from_json(text: &str) -> Self {
+        if text.is_empty() {
+            return Self::default();
+        }
+        serde_json::from_str(text).unwrap_or_default()
+    }
+}
+
+/// 侧边栏右键菜单的目标。
+#[derive(Clone)]
+enum MenuTarget {
+    /// 列表空白处：只给新建类入口。
+    Blank,
+    /// 某个分组（文件夹）：附带重命名 / 删除。
+    Group(SharedString),
+    /// 某台主机行（真实下标）：附带编辑、移动分组、删除。
+    Host(usize),
+}
+
 /// RuLink 主视图：左侧主机账号管理，右侧会话标签终端。
 struct RuLinkApp {
     /// 会话仓库（负责持久化）。
@@ -412,8 +561,12 @@ struct RuLinkApp {
     new_host: Option<NewHostForm>,
     /// 等待密码输入的连接。
     pending: Option<PendingConnect>,
-    /// 主机行右键菜单（编辑/删除入口）。
-    context_menu: Option<HostContextMenu>,
+    /// 启动时探测一次的本机 shell（可执行路径, 标签名）；None 表示没找到可用 shell。
+    local_shell: Option<(String, String)>,
+    /// 侧边栏分组（文件夹）偏好，随加密库 / settings.json 双层持久化。
+    sidebar: SidebarPrefs,
+    /// 分组新建 / 重命名弹窗（`renaming` 为 None 表示新建）。
+    group_prompt: Option<GroupPrompt>,
     /// 删除二次确认（真实下标；浮层遮挡期间列表不会变）。
     confirm_delete: Option<usize>,
     /// 主密码解锁弹窗（便携模式 / 已设置主密码时启动弹出）。
@@ -514,6 +667,7 @@ impl RuLinkApp {
         let settings = store.load_settings();
         let status_bar = StatusBarPrefs::from_json(&settings.status_bar);
         let terminal = TerminalPrefs::from_json(&settings.terminal);
+        let sidebar = SidebarPrefs::from_json(&settings.sidebar);
         // 终端配色预设管理器：全局一份，`TerminalView::set_theme` 与自建样式都从这里取。
         if !cx.has_global::<ThemeManager>() {
             cx.set_global(ThemeManager::new(None));
@@ -539,7 +693,9 @@ impl RuLinkApp {
             active_tab: None,
             new_host: None,
             pending: None,
-            context_menu: None,
+            local_shell: default_local_shell(),
+            sidebar,
+            group_prompt: None,
             confirm_delete: None,
             unlock: None,
             settings: None,
@@ -703,6 +859,16 @@ impl RuLinkApp {
                 let _ = this.update(cx, |this, cx| {
                     if this.terminal != prefs {
                         this.terminal = prefs;
+                        cx.notify();
+                    }
+                });
+            }
+            // 侧边栏分组同样以库内为准。
+            if let Ok(Some(json)) = vault.setting("sidebar").await {
+                let prefs = SidebarPrefs::from_json(&json);
+                let _ = this.update(cx, |this, cx| {
+                    if this.sidebar != prefs {
+                        this.sidebar = prefs;
                         cx.notify();
                     }
                 });
@@ -1489,7 +1655,6 @@ impl RuLinkApp {
 
     /// 右键菜单"删除"：进入二次确认，不直接动手。
     fn ask_delete(&mut self, index: usize, cx: &mut Context<Self>) {
-        self.context_menu = None;
         if index < self.hosts.len() {
             self.confirm_delete = Some(index);
             cx.notify();
@@ -1526,9 +1691,105 @@ impl RuLinkApp {
             } else {
                 self.store.save(&self.hosts);
             }
+            self.sidebar.forget(removed.id);
+            self.persist_sidebar(cx);
             self.status = SharedString::from(format!("已删除主机 {label}"));
             cx.notify();
         }
+    }
+
+    /// 折叠 / 展开分组（文件夹）。
+    fn toggle_group(&mut self, name: &str, cx: &mut Context<Self>) {
+        self.sidebar.toggle(name);
+        cx.notify();
+        self.persist_sidebar(cx);
+    }
+
+    /// 打开分组新建 / 重命名弹窗；`Some(原名)` 表示重命名。
+    fn open_group_prompt(
+        &mut self,
+        renaming: Option<SharedString>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let initial = renaming.clone().unwrap_or_else(|| "".into());
+        let placeholder = if renaming.is_some() {
+            "分组名称"
+        } else {
+            "如：生产环境 / 家"
+        };
+        let name = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder));
+        if !initial.is_empty() {
+            name.update(cx, |state, cx| state.set_value(initial, window, cx));
+        }
+        // 回车即确认，与解锁弹窗一致。
+        cx.subscribe(&name, |this, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::PressEnter { shift: false, .. }) {
+                this.commit_group_prompt(cx);
+            }
+        })
+        .detach();
+        name.update(cx, |state, cx| state.focus(window, cx));
+        self.group_prompt = Some(GroupPrompt { renaming, name });
+        cx.notify();
+    }
+
+    /// 关闭分组弹窗，不写入。
+    fn cancel_group_prompt(&mut self, cx: &mut Context<Self>) {
+        self.group_prompt = None;
+        cx.notify();
+    }
+
+    /// 确认分组弹窗：新建或重命名。空名 / 重名只提示，不关窗，便于就地改。
+    fn commit_group_prompt(&mut self, cx: &mut Context<Self>) {
+        let Some(prompt) = self.group_prompt.clone() else {
+            return;
+        };
+        let name = prompt.name.read(cx).value().trim().to_string();
+        if name.is_empty() {
+            self.status = "分组名称不能为空".into();
+            cx.notify();
+            return;
+        }
+        let ok = match prompt.renaming.as_deref() {
+            Some(from) => self.sidebar.rename(from, &name),
+            None => self.sidebar.add(&name),
+        };
+        if !ok {
+            self.status = if prompt.renaming.is_some() {
+                "重命名失败：名称为空或已存在同名分组".into()
+            } else {
+                "已存在同名分组".into()
+            };
+            cx.notify();
+            return;
+        }
+        if let Some(from) = prompt.renaming.as_deref() {
+            self.status = SharedString::from(format!("分组 {from} 已改名为 {name}"));
+        } else {
+            self.status = SharedString::from(format!("已新建分组 {name}"));
+        }
+        self.group_prompt = None;
+        cx.notify();
+        self.persist_sidebar(cx);
+    }
+
+    /// 删除分组：只退回归属，主机本身保留。
+    fn delete_group(&mut self, name: &str, cx: &mut Context<Self>) {
+        self.sidebar.remove(name);
+        self.status = SharedString::from(format!("已删除分组 {name}（组内主机退回未分组）"));
+        cx.notify();
+        self.persist_sidebar(cx);
+    }
+
+    /// 把主机移入分组（`None` = 未分组）。
+    fn move_host(&mut self, index: usize, group: Option<SharedString>, cx: &mut Context<Self>) {
+        let Some(id) = self.hosts.get(index).map(|host| host.id) else {
+            return;
+        };
+        self.sidebar.assign_to(id, group.as_deref());
+        cx.notify();
+        self.persist_sidebar(cx);
     }
 
     /// 切换指定主机的收藏状态并持久化。
@@ -1935,7 +2196,7 @@ impl RuLinkApp {
     /// 打开本地终端（路线图 §五 一期）：交给 rgpui-term 的本地 PTY 后端拉起默认 shell。
     /// 进程拉起与通道握手是异步的：建好才落标签，失败只写状态栏，不留空标签。
     fn open_local_terminal(&mut self, cx: &mut Context<Self>) {
-        let Some((program, label)) = default_local_shell() else {
+        let Some((program, label)) = self.local_shell.clone() else {
             self.status = "未找到可用的本地 shell".into();
             cx.notify();
             return;
@@ -2048,7 +2309,7 @@ impl Render for RuLinkApp {
                     .overflow_hidden(),
             )
             .child(self.render_status_bar().flex_shrink_0().w_full())
-            .child(self.render_overlay(window, cx))
+            .child(self.render_overlay(cx))
     }
 }
 
@@ -2394,17 +2655,17 @@ impl RuLinkApp {
             .bg(pal.sidebar_bg)
             .p_3()
             .gap_2()
-            .child(
-                Button::new("new-host")
-                    .label("+ 新建主机")
-                    .primary()
-                    .w_full()
-                    .on_click(cx.listener(|this, _, window, cx| this.open_form(window, cx))),
-            )
             .when(list_mode, |this| {
                 this.child(styled_input(Input::new(&self.search), &pal))
             })
-            .child(div().flex_1().overflow_y_scrollbar().child(panel))
+            .child(
+                div()
+                    .id("sidebar-list")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scrollbar()
+                    .child(panel),
+            )
             .into_any_element()
     }
 
@@ -2998,8 +3259,9 @@ impl RuLinkApp {
             .into_any_element()
     }
 
-    /// 窗口级浮层：主机右键菜单与删除二次确认框（绝对定位渲染在最上层）。
-    fn render_overlay(&self, window: &mut Window, cx: &Context<Self>) -> AnyElement {
+    /// 窗口级浮层：删除二次确认、主机表单、分组新建/重命名等居中模态。
+    /// （主机右键菜单不在这里——它走框架的独立图层，见 `context_menu`。）
+    fn render_overlay(&self, cx: &Context<Self>) -> AnyElement {
         let pal = self.palette(cx);
         // 解锁 / 主密码弹窗优先于一切浮层（库未解锁时其余操作无意义）。
         if self.unlock.is_some() {
@@ -3090,86 +3352,405 @@ impl RuLinkApp {
         if self.new_host.is_some() {
             return self.render_form_dialog(cx);
         }
-        // 主机行右键菜单：编辑 / 删除（删除走二次确认）。
-        if let Some(menu) = self.context_menu.as_ref() {
-            let index = menu.index;
-            let bounds = window.bounds();
-            let x = menu.x.min(bounds.size.width - px(150.0)).max(px(0.0));
-            let y = menu.y.min(bounds.size.height - px(100.0)).max(px(0.0));
-            let close = cx.listener(|this, _, _, cx| {
-                this.context_menu = None;
-                cx.notify();
-            });
-            return div()
-                .id("menu-backdrop")
-                .absolute()
-                .top(px(0.0))
-                .left(px(0.0))
-                .size_full()
-                .on_mouse_down(MouseButton::Left, close)
-                .on_mouse_down(
-                    MouseButton::Right,
-                    cx.listener(|this, _, _, cx| {
-                        this.context_menu = None;
-                        cx.notify();
-                    }),
-                )
-                .child(
-                    v_flex()
-                        .id("host-context-menu")
-                        .absolute()
-                        .top(y)
-                        .left(x)
-                        .min_w(px(140.0))
-                        .py_1()
-                        .rounded(px(6.0))
-                        .bg(pal.card_bg)
-                        .border_1()
-                        .border_color(pal.border)
-                        .child(
-                            div()
-                                .id("ctx-edit-host")
-                                .px_3()
-                                .py_1()
-                                .text_sm()
-                                .cursor_pointer()
-                                .hover(|style| style.bg(pal.card_hover))
-                                .child("编辑")
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.context_menu = None;
-                                    this.open_form_at(Some(index), window, cx);
-                                })),
-                        )
-                        .child(
-                            div()
-                                .id("ctx-delete-host")
-                                .px_3()
-                                .py_1()
-                                .text_sm()
-                                .text_color(pal.danger)
-                                .cursor_pointer()
-                                .hover(|style| style.bg(pal.card_hover))
-                                .child("删除")
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.ask_delete(index, cx);
-                                })),
-                        ),
-                )
-                .into_any_element();
+        // 分组新建 / 重命名：同名模态，宽度固定，避免列表内联编辑误丢内容。
+        if self.group_prompt.is_some() {
+            return self.render_group_prompt(cx);
         }
         div().into_any_element()
     }
 
-    /// 主机账号列表；每行可点击连接、附删除按钮。
+    /// 侧边栏右键菜单内容，按目标（空白处 / 分组 / 主机行）给出不同条目。
+    /// 顶部常驻的「+ 新建主机」大按钮已取消，新建一律走这里或「会话」菜单。
+    ///
+    /// 走框架的 `PopupMenu`（`deferred + anchored` 独立图层）而不是手搭浮层：
+    /// 手搭的绝对定位浮层留在普通图层里，会被后画的兄弟节点压住 hitbox，
+    /// 菜单项收不到 mouse-up，点下去只关菜单不触发。
+    fn context_menu(
+        target: MenuTarget,
+        groups: Vec<SharedString>,
+        current_group: Option<SharedString>,
+        entity: Entity<RuLinkApp>,
+        menu: PopupMenu,
+    ) -> PopupMenu {
+        let menu = menu.min_w(px(168.0));
+        let menu = match &target {
+            MenuTarget::Host(index) => {
+                let index = *index;
+                menu.item(Self::menu_item(
+                    entity.clone(),
+                    "编辑",
+                    None,
+                    false,
+                    false,
+                    move |this, window, cx| {
+                        this.open_form_at(Some(index), window, cx);
+                    },
+                ))
+                .separator()
+            }
+            _ => menu,
+        };
+        let menu = menu
+            .item(Self::menu_item(
+                entity.clone(),
+                "新建主机…",
+                None,
+                false,
+                false,
+                |this, window, cx| {
+                    this.open_form(window, cx);
+                },
+            ))
+            .item(Self::menu_item(
+                entity.clone(),
+                "本地终端…",
+                Some(IconName::SquareTerminal),
+                false,
+                false,
+                |this, _, cx| {
+                    this.open_local_terminal(cx);
+                },
+            ))
+            .item(Self::menu_item(
+                entity.clone(),
+                "新建分组…",
+                Some(IconName::Folder),
+                false,
+                false,
+                |this, window, cx| {
+                    this.open_group_prompt(None, window, cx);
+                },
+            ));
+        let menu = match &target {
+            MenuTarget::Group(name) if name.as_str() != UNGROUPED => {
+                let renaming = name.clone();
+                let deleting = name.clone();
+                menu.separator()
+                    .item(Self::menu_item(
+                        entity.clone(),
+                        "重命名分组…",
+                        None,
+                        false,
+                        false,
+                        move |this, window, cx| {
+                            this.open_group_prompt(Some(renaming.clone()), window, cx);
+                        },
+                    ))
+                    .item(Self::menu_item(
+                        entity.clone(),
+                        "删除分组",
+                        None,
+                        true,
+                        false,
+                        move |this, _, cx| {
+                            this.delete_group(&deleting, cx);
+                        },
+                    ))
+            }
+            _ => menu,
+        };
+        let menu = match &target {
+            MenuTarget::Host(index) => {
+                let index = *index;
+                let current = current_group.clone();
+                let mut menu = menu.separator().label("移动到分组").item(Self::menu_item(
+                    entity.clone(),
+                    UNGROUPED,
+                    None,
+                    false,
+                    current.is_none(),
+                    move |this, _, cx| {
+                        this.move_host(index, None, cx);
+                    },
+                ));
+                for name in groups {
+                    let group = name.clone();
+                    let checked = current.as_ref() == Some(&name);
+                    menu = menu.item(Self::menu_item(
+                        entity.clone(),
+                        name,
+                        Some(IconName::Folder),
+                        false,
+                        checked,
+                        move |this, _, cx| {
+                            this.move_host(index, Some(group.clone()), cx);
+                        },
+                    ));
+                }
+                menu
+            }
+            _ => menu,
+        };
+        match target {
+            MenuTarget::Host(index) => menu.separator().item(Self::menu_item(
+                entity,
+                "删除",
+                Some(IconName::Delete),
+                true,
+                false,
+                move |this, _, cx| {
+                    this.ask_delete(index, cx);
+                },
+            )),
+            _ => menu,
+        }
+    }
+
+    /// 右键菜单的一项：回调要求 `Send + Sync`，故只捕获实体与标签，不捕获 `&self`。
+    fn menu_item(
+        entity: Entity<RuLinkApp>,
+        label: impl Into<SharedString>,
+        icon: Option<IconName>,
+        danger: bool,
+        checked: bool,
+        run: impl Fn(&mut RuLinkApp, &mut Window, &mut Context<RuLinkApp>) + Send + Sync + 'static,
+    ) -> PopupMenuItem {
+        let label = label.into();
+        let mut item = PopupMenuItem::new(label).danger(danger).checked(checked);
+        if let Some(icon) = icon {
+            item = item.icon(icon);
+        }
+        item.on_click(move |_, window, cx| {
+            let _ = entity.update(cx, |this, cx| run(this, window, cx));
+        })
+    }
+
+    /// 主机行图标：按认证方式区分，一眼看出连这台机器要什么凭据。
+    fn host_icon(auth: AuthMethod) -> IconName {
+        match auth {
+            AuthMethod::Agent => IconName::Network,
+            AuthMethod::IdentityFile => IconName::File,
+            AuthMethod::Password => IconName::CircleUser,
+        }
+    }
+
+    /// 列表行的通用外观：透明底 + 悬停高亮（树式，不再是每张卡片一块底），
+    /// 左侧留出的缩进由 `indent` 控制，分组下的主机比文件夹行多缩一档。
+    fn row_base(id: impl Into<SharedString>, pal: &Palette, indent: Pixels) -> Stateful<Div> {
+        h_flex()
+            .id(id.into())
+            .w_full()
+            .pl(indent)
+            .pr_2()
+            .py_1()
+            .gap_2()
+            .items_center()
+            .rounded(px(5.0))
+            .hover(|style| style.bg(pal.card_hover))
+            .cursor_pointer()
+    }
+
+    /// 内置「本地终端」条目：点开本机 shell 标签。
+    /// 它不是凭据库里的主机，所以没有 ★ / 编辑 / 删除，也不参与分组与收藏排序；
+    /// 搜索时按「本地终端」与 shell 名（pwsh / powershell / cmd）匹配。
+    fn render_local_terminal_row(
+        &self,
+        pal: &Palette,
+        query: &str,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let shell = self.local_shell.as_ref().map(|(_, label)| label.clone());
+        let entity = cx.entity();
+        let hit = query.is_empty()
+            || "本地终端".contains(query)
+            || shell
+                .as_deref()
+                .is_some_and(|label| label.to_lowercase().contains(query));
+        if !hit {
+            return div().into_any_element();
+        }
+        let (title, subtitle) = match shell {
+            Some(label) => ("本地终端", label),
+            None => (
+                "本地终端（未检测到 shell）",
+                "PATH 中没有 pwsh / powershell / cmd".to_string(),
+            ),
+        };
+        Self::row_base("local-terminal-row", pal, px(4.0))
+            .on_click(cx.listener(|this, _, _, cx| this.open_local_terminal(cx)))
+            .child(
+                Icon::new(IconName::SquareTerminal)
+                    .small()
+                    .text_color(pal.link),
+            )
+            .child(
+                div().flex_1().min_w_0().text_ellipsis().child(title).child(
+                    div()
+                        .text_ellipsis()
+                        .text_xs()
+                        .text_color(pal.muted)
+                        .child(subtitle),
+                ),
+            )
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .text_xs()
+                    .text_color(pal.muted)
+                    .child("本机"),
+            )
+            .context_menu(move |menu, _, _| {
+                Self::context_menu(MenuTarget::Blank, vec![], None, entity.clone(), menu)
+            })
+            .into_any_element()
+    }
+
+    /// 分组（文件夹）行：折叠三角 + 文件夹图标 + 组名 + 数量；
+    /// 点整行折叠/展开，右键给出该组的分组管理与新建入口。
+    fn render_group_row(
+        &self,
+        name: &str,
+        count: usize,
+        collapsed: bool,
+        pal: &Palette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let entity = cx.entity();
+        let groups: Vec<SharedString> = self
+            .sidebar
+            .names()
+            .map(|n| SharedString::from(n.to_string()))
+            .collect();
+        let toggle_name = SharedString::from(name.to_string());
+        let menu_name = toggle_name.clone();
+        Self::row_base(
+            SharedString::from(format!("group-row-{name}")),
+            pal,
+            px(2.0),
+        )
+        .font_weight(rgpui::FontWeight(600.0))
+        .on_click(cx.listener(move |this, _, _, cx| {
+            this.toggle_group(&toggle_name, cx);
+        }))
+        .child(
+            Icon::new(if collapsed {
+                IconName::ChevronRight
+            } else {
+                IconName::ChevronDown
+            })
+            .xsmall()
+            .text_color(pal.muted),
+        )
+        .child(
+            Icon::new(if collapsed {
+                IconName::FolderClosed
+            } else {
+                IconName::FolderOpen
+            })
+            .small()
+            .text_color(pal.link),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .text_ellipsis()
+                .child(name.to_string()),
+        )
+        .when(count > 0, |this| {
+            this.child(
+                div()
+                    .flex_shrink_0()
+                    .text_xs()
+                    .text_color(pal.muted)
+                    .child(count.to_string()),
+            )
+        })
+        .context_menu(move |menu, _, _| {
+            Self::context_menu(
+                MenuTarget::Group(menu_name.clone()),
+                groups.clone(),
+                None,
+                entity.clone(),
+                menu,
+            )
+        })
+        .into_any_element()
+    }
+
+    /// 一台主机：认证方式图标 + 展示名 + user@host:port + ★。
+    fn render_host_row(&self, index: usize, pal: &Palette, cx: &mut Context<Self>) -> AnyElement {
+        let host = &self.hosts[index];
+        let entity = cx.entity();
+        let groups: Vec<SharedString> = self
+            .sidebar
+            .names()
+            .map(|n| SharedString::from(n.to_string()))
+            .collect();
+        let current = self
+            .sidebar
+            .group_of(host.id)
+            .map(|name| SharedString::from(name.to_string()));
+        let fav_glyph: &'static str = if host.favorite { "★" } else { "☆" };
+        // 没填展示名时标题直接用地址，避免整行只剩一行灰字。
+        let title = if host.name.is_empty() {
+            host.addr()
+        } else {
+            host.name.clone()
+        };
+        Self::row_base(
+            SharedString::from(format!("host-row-{index}")),
+            pal,
+            px(22.0),
+        )
+        .on_click(cx.listener(move |this, _, window, cx| {
+            this.click_host(index, window, cx);
+        }))
+        .child(
+            Icon::new(Self::host_icon(host.auth))
+                .small()
+                .text_color(if host.favorite { pal.accent } else { pal.muted }),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .overflow_hidden()
+                .child(
+                    div()
+                        .text_ellipsis()
+                        .font_weight(rgpui::FontWeight(500.0))
+                        .child(title),
+                )
+                .child(
+                    div()
+                        .text_ellipsis()
+                        .text_xs()
+                        .text_color(pal.muted)
+                        .child(host.addr()),
+                ),
+        )
+        .child(
+            div()
+                .id(SharedString::from(format!("host-fav-{index}")))
+                .flex_shrink_0()
+                .text_sm()
+                .px_1()
+                .text_color(if host.favorite { pal.accent } else { pal.muted })
+                .child(fav_glyph)
+                .cursor_pointer()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| this.toggle_favorite(index, cx))),
+        )
+        .context_menu(move |menu, _, _| {
+            Self::context_menu(
+                MenuTarget::Host(index),
+                groups.clone(),
+                current.clone(),
+                entity.clone(),
+                menu,
+            )
+        })
+        .into_any_element()
+    }
+
+    /// 主机分组树：内置「本地终端」→ 各自定义分组 → 未分组 → 空白区。
+    /// 分组为空也照样显示（和参考客户端一致：先建组，再往里挪主机）。
     fn render_host_list(&self, cx: &mut Context<Self>) -> AnyElement {
         let pal = self.palette(cx);
-        if self.hosts.is_empty() {
-            return div()
-                .text_sm()
-                .text_color(pal.muted)
-                .child("暂无主机，点击上方“新建主机”添加。")
-                .into_any_element();
-        }
         let query = self.search.read(cx).value().trim().to_lowercase();
         // 按展示名 / user@host:port 子串过滤；保留真实下标供点击/删除定位。
         let mut matched: Vec<usize> = self
@@ -3185,96 +3766,94 @@ impl RuLinkApp {
             .collect();
         // 收藏主机置顶（稳定排序，同组内保持原插入顺序）。
         matched.sort_by_key(|&index| !self.hosts[index].favorite);
-        if matched.is_empty() {
-            return div()
-                .text_sm()
-                .text_color(pal.muted)
-                .child("无匹配主机")
-                .into_any_element();
+        // 分桶：先按偏好里的组顺序建桶，末尾恒有「未分组」。
+        let mut buckets: Vec<(String, Vec<usize>)> = self
+            .sidebar
+            .names()
+            .map(|name| (name.to_string(), Vec::new()))
+            .chain(std::iter::once((UNGROUPED.to_string(), Vec::new())))
+            .collect();
+        for index in matched {
+            let group = self
+                .sidebar
+                .group_of(self.hosts[index].id)
+                .unwrap_or(UNGROUPED)
+                .to_string();
+            match buckets.iter_mut().find(|(name, _)| *name == group) {
+                Some((_, rows)) => rows.push(index),
+                // 归属指向一个已被删掉的组：退回未分组（group_of 已过滤，这里兜底）。
+                None => {
+                    if let Some((_, rows)) = buckets.last_mut() {
+                        rows.push(index);
+                    }
+                }
+            }
         }
-        v_flex()
-            .gap_1()
-            .children(matched.into_iter().map(|index| {
-                let host = &self.hosts[index];
-                let host_id = SharedString::from(format!("host-row-{index}"));
-                let fav_id = SharedString::from(format!("host-fav-{index}"));
-                let fav_glyph: &'static str = if host.favorite { "★" } else { "☆" };
-                h_flex()
-                    .id(host_id)
-                    .w_full()
-                    .px_3()
-                    .py_2()
-                    .gap_2()
-                    .items_center()
-                    .justify_between()
-                    .rounded(px(6.0))
-                    .bg(pal.card_bg)
-                    .hover(|style| style.bg(pal.card_hover))
-                    .cursor_pointer()
-                    .on_click(
-                        cx.listener(move |this, _, window, cx| this.click_host(index, window, cx)),
+        // 内置「本地终端」条目恒在最前（不入库，故也不受删除/分组/收藏影响）。
+        let local_row = self.render_local_terminal_row(&pal, &query, cx);
+        // 列表末尾的空白区：右键给出「仅新建」的菜单。它是行的兄弟节点而非祖先，
+        // 否则一次右键会同时命中两层菜单，弹出两个重叠的浮层。
+        let blank = {
+            let entity = cx.entity();
+            let groups: Vec<SharedString> = self
+                .sidebar
+                .names()
+                .map(|n| SharedString::from(n.to_string()))
+                .collect();
+            div()
+                .id("sidebar-blank")
+                .w_full()
+                .min_h(px(80.0))
+                .flex_1()
+                .context_menu(move |menu, _, _| {
+                    Self::context_menu(
+                        MenuTarget::Blank,
+                        groups.clone(),
+                        None,
+                        entity.clone(),
+                        menu,
                     )
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(move |this, event: &rgpui::MouseDownEvent, _, cx| {
-                            cx.stop_propagation();
-                            this.context_menu = Some(HostContextMenu {
-                                index,
-                                x: event.position.x,
-                                y: event.position.y,
-                            });
-                            cx.notify();
-                        }),
-                    )
-                    .child(
-                        v_flex()
-                            .flex_1()
-                            .min_w_0()
-                            .overflow_hidden()
-                            .child(
-                                div()
-                                    .text_ellipsis()
-                                    .font_weight(rgpui::FontWeight(600.0))
-                                    .child(host.name.clone()),
-                            )
-                            .child(
-                                div()
-                                    .text_ellipsis()
-                                    .text_xs()
-                                    .text_color(pal.muted)
-                                    .child(host.addr()),
-                            ),
-                    )
-                    .child(
-                        h_flex()
-                            .flex_shrink_0()
-                            .gap_2()
-                            .items_center()
-                            .child(
-                                div()
-                                    .id(fav_id)
-                                    .text_sm()
-                                    .px_1()
-                                    .text_color(if host.favorite { pal.accent } else { pal.muted })
-                                    .child(fav_glyph)
-                                    .cursor_pointer()
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|_, _, _, cx| cx.stop_propagation()),
-                                    )
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.toggle_favorite(index, cx)
-                                    })),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(pal.link)
-                                    .child(auth_label(host.auth)),
-                            ),
-                    )
-            }))
-            .into_any_element()
+                })
+        };
+        let searching = !query.is_empty();
+        let mut list = v_flex().gap_px().min_h_full().child(local_row);
+        // 首启动（既没主机也没建过分组）：用一个提示代替空壳「未分组」文件夹。
+        let bare = self.hosts.is_empty() && !searching && buckets.len() == 1;
+        let mut shown = 0usize;
+        if !bare {
+            for (name, rows) in &buckets {
+                // 搜索时：空组不显示，折叠也照常展开；平时：空组仍显示，便于往里挪主机。
+                if searching && rows.is_empty() {
+                    continue;
+                }
+                let collapsed = !searching && self.sidebar.collapsed(name);
+                shown += 1;
+                list = list.child(self.render_group_row(name, rows.len(), collapsed, &pal, cx));
+                if collapsed {
+                    continue;
+                }
+                list = list.children(
+                    rows.iter()
+                        .map(|&index| self.render_host_row(index, &pal, cx)),
+                );
+            }
+        }
+        if shown == 0 {
+            let hint = if bare {
+                "暂无主机：在列表空白处点右键选「新建主机…」，或用「会话」菜单 / Ctrl+N。"
+            } else {
+                "无匹配主机"
+            };
+            list = list.child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .text_sm()
+                    .text_color(pal.muted)
+                    .child(hint),
+            );
+        }
+        list.child(blank).into_any_element()
     }
 
     /// 新建/编辑主机：居中模态弹窗。遮罩只挡交互、点击不关闭（防误丢已填内容），
@@ -3482,6 +4061,101 @@ impl RuLinkApp {
                                     .ghost()
                                     .on_click(cx.listener(|this, _, _, cx| this.cancel_form(cx))),
                             ),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// 分组新建 / 重命名弹窗：与主机表单同款居中模态。
+    /// 遮罩只挡交互不关闭（防止误丢已输入的名称），关闭走"取消"或标题栏 ×。
+    fn render_group_prompt(&self, cx: &Context<Self>) -> AnyElement {
+        let pal = self.palette(cx);
+        let Some(prompt) = self.group_prompt.as_ref() else {
+            return div().into_any_element();
+        };
+        let renaming = prompt.renaming.clone();
+        let title = match &renaming {
+            Some(old) => format!("重命名分组：{old}"),
+            None => "新建分组".to_string(),
+        };
+        v_flex()
+            .id("group-backdrop")
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .size_full()
+            .items_center()
+            .justify_center()
+            .bg(rgpui::hsla(0.0, 0.0, 0.0, 0.45))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_, _, _, cx| cx.stop_propagation()),
+            )
+            .child(
+                v_flex()
+                    .id("group-form")
+                    .w(px(360.0))
+                    .gap_3()
+                    .p_5()
+                    .rounded(px(8.0))
+                    .bg(pal.card_bg)
+                    .border_1()
+                    .border_color(pal.border)
+                    .shadow_md()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                    )
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_base()
+                                    .font_weight(rgpui::FontWeight(600.0))
+                                    .child(title),
+                            )
+                            .child(Button::new("close-group").label("×").ghost().on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    this.cancel_group_prompt(cx);
+                                }),
+                            )),
+                    )
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .child(div().text_sm().child("分组名称"))
+                            .child(styled_input(Input::new(&prompt.name), &pal)),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(pal.muted)
+                            .child("分组只影响列表的组织方式，不改动主机本身。"),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .justify_end()
+                            .child(
+                                Button::new("commit-group")
+                                    .label(if renaming.is_some() {
+                                        "重命名"
+                                    } else {
+                                        "创建"
+                                    })
+                                    .primary()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.commit_group_prompt(cx);
+                                    })),
+                            )
+                            .child(Button::new("cancel-group").label("取消").ghost().on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    this.cancel_group_prompt(cx);
+                                }),
+                            )),
                     ),
             )
             .into_any_element()
@@ -3865,6 +4539,21 @@ impl RuLinkApp {
         })
         .detach();
     }
+
+    /// 分组偏好落库；加密库不可用时退回旧 settings.json。
+    fn persist_sidebar(&self, cx: &mut Context<Self>) {
+        let json = self.sidebar.to_json();
+        let Some(vault) = self.vault.clone() else {
+            self.store.save_sidebar(&json);
+            return;
+        };
+        cx.spawn(async move |_, _| {
+            if let Err(error) = vault.set_setting("sidebar", &json).await {
+                log::warn!("写入库内分组偏好失败: {error}");
+            }
+        })
+        .detach();
+    }
 }
 
 /// 设置分页里的 −/＋ 步进按钮：中性描边小按钮，与「关闭」等按钮保持同一观感。
@@ -4029,8 +4718,8 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        FONT_SIZE_MAX, FONT_SIZE_MIN, LINE_HEIGHT_MAX, LINE_HEIGHT_MIN, Metric, StatusBarPrefs,
-        TERMINAL_THEME_DEFAULT, TerminalPrefs, default_local_shell, which,
+        FONT_SIZE_MAX, FONT_SIZE_MIN, LINE_HEIGHT_MAX, LINE_HEIGHT_MIN, Metric, SidebarPrefs,
+        StatusBarPrefs, TERMINAL_THEME_DEFAULT, TerminalPrefs, default_local_shell, which,
     };
 
     #[test]
@@ -4075,6 +4764,68 @@ mod tests {
         assert_eq!(
             StatusBarPrefs::from_json("{ not json"),
             StatusBarPrefs::default()
+        );
+    }
+
+    #[test]
+    fn sidebar_prefs_group_lifecycle_keeps_hosts_alive() {
+        let mut prefs = SidebarPrefs::default();
+        assert!(prefs.add("生产"));
+        assert!(prefs.add(" 家 "), "名称应自动去空白");
+        assert!(!prefs.add("生产"), "同名分组应被拒绝");
+        assert!(!prefs.add("未分组"), "未分组是保留名");
+        assert!(!prefs.add("   "), "空名应被拒绝");
+        assert_eq!(prefs.names().collect::<Vec<_>>(), vec!["生产", "家"]);
+
+        prefs.assign_to(7, Some("生产"));
+        prefs.assign_to(9, Some("生产"));
+        prefs.assign_to(11, Some("家"));
+        assert_eq!(prefs.group_of(7), Some("生产"));
+
+        // 改名要连带改写组内主机的归属，否则主机会静默掉回未分组。
+        assert!(prefs.rename("生产", "预发"));
+        assert_eq!(prefs.group_of(7), Some("预发"));
+        assert_eq!(prefs.group_of(9), Some("预发"));
+        assert!(prefs.group_of(11).is_some());
+        assert!(!prefs.rename("不存在", "X"));
+        assert!(!prefs.rename("预发", "家"), "改名不能撞已有分组");
+
+        // 删除分组只退回归属，主机本身保留。
+        prefs.remove("预发");
+        assert_eq!(prefs.group_of(7), None);
+        assert_eq!(prefs.group_of(11), Some("家"));
+
+        // 归属指向一个已不存在的组：group_of 视为未分组。
+        let mut orphan = SidebarPrefs::default();
+        orphan.assign_to(3, Some("被删掉的组"));
+        assert_eq!(orphan.group_of(3), None);
+
+        // 主机删除后清理残留归属，避免 JSON 越长越脏。
+        prefs.forget(11);
+        assert!(prefs.assign.is_empty());
+    }
+
+    #[test]
+    fn sidebar_prefs_collapse_is_per_group_and_survives_json() {
+        let mut prefs = SidebarPrefs::default();
+        prefs.add("生产");
+        assert!(!prefs.collapsed("生产"));
+        prefs.toggle("生产");
+        assert!(prefs.collapsed("生产"));
+        prefs.toggle("生产");
+        assert!(!prefs.collapsed("生产"));
+
+        // 未分组没有 GroupEntry，折叠态记在独立字段上。
+        prefs.toggle("未分组");
+        assert!(prefs.collapsed("未分组"));
+
+        let restored = SidebarPrefs::from_json(&prefs.to_json());
+        assert_eq!(restored, prefs);
+
+        assert_eq!(SidebarPrefs::from_json(""), SidebarPrefs::default());
+        assert_eq!(
+            SidebarPrefs::from_json("{ not json"),
+            SidebarPrefs::default()
         );
     }
 
