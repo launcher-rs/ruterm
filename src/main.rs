@@ -11,14 +11,17 @@ mod remote;
 mod session;
 mod sessions;
 mod ssh;
+mod ssh_config;
+mod transfer;
 mod vault;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rgpui::components::Select;
-use rgpui::components::split_pane::{CollapsiblePane, SplitPane, SplitPaneState};
+use rgpui::components::split_pane::{CollapsiblePane, SplitDirection, SplitPane, SplitPaneState};
 use rgpui::components::status_bar::{StatusBar, StatusBarItem};
 use rgpui::input_ui::{Input, InputContentType, InputEvent, InputState};
 use rgpui::prelude::*;
@@ -27,12 +30,15 @@ use rgpui::{
     AbsoluteLength, AnyElement, App, Bounds, Button, ButtonVariants, Checkbox, ClickEvent, Context,
     ContextMenuExt, Div, DropdownMenu, Entity, FocusHandle, Focusable, FontWeight, Hsla, Icon,
     IconName, Image, ImageFormat, InteractiveElement, IntoElement, KeyBinding, KeyDownEvent,
-    MouseButton, NoAction, ParentElement, Pixels, PopupMenu, PopupMenuItem, Render, ScrollHandle,
-    ScrollableElement, SharedString, Stateful, StatefulInteractiveElement, Styled, TrayMenuItem,
-    Window, WindowBounds, WindowControlArea, WindowOptions, actions, div, h_flex, img, px, size,
-    v_flex,
+    MouseButton, NoAction, ParentElement, Pixels, PopupMenu, PopupMenuItem, Render, Rgba,
+    ScrollHandle, ScrollableElement, SharedString, Stateful, StatefulInteractiveElement, Styled,
+    TrayMenuItem, Window, WindowBounds, WindowControlArea, WindowOptions, actions, div, h_flex,
+    img, px, size, v_flex,
 };
-use rgpui_term::{Event as TerminalEvent, TerminalBuilder, TerminalView, TextStyle, ThemeManager};
+use rgpui_term::{
+    Event as TerminalEvent, TerminalBuilder, TerminalThemeConfig, TerminalView, TextStyle,
+    ThemeDefinition, ThemeManager,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::config::SshTarget;
@@ -54,7 +60,12 @@ actions!(
         NewLocalTerminal,
         NextTab,
         PrevTab,
-        OpenSettings
+        OpenSettings,
+        OpenTransfer,
+        OpenForward,
+        SplitRight,
+        SplitDown,
+        CloseSplit
     ]
 );
 
@@ -101,12 +112,70 @@ struct SessionTab {
     resume: Option<Resume>,
     /// 主动断开当前 SSH 会话（关闭标签时发送；本地终端为 None）。
     disconnect: Option<tokio::sync::oneshot::Sender<()>>,
+    /// 会话指令通道（SFTP 传输 / 端口转发；本地终端为 None）。
+    commands: Option<tokio::sync::mpsc::UnboundedSender<session::SessionCommand>>,
+    /// 本标签当前生效的端口转发规则（随会话结束清空，不持久化）。
+    forwards: Vec<session::ForwardRule>,
     /// 本轮连续自动重连已尝试次数（0＝不在自动重连中，手动重连会清零）。
     auto_retry_attempt: u32,
     /// 已排定一次自动重连（横幅展示等待与取消入口）。
     auto_retry_pending: bool,
     /// 本次会话 shell 成功开启的时刻：稳定运行过一阵后再断线，自动重连次数重新计。
     connected_at: Option<Instant>,
+}
+
+/// 分屏视图：主区同时显示两个会话标签（左/上＝first，右/下＝second）。
+///
+/// 只把"哪两个标签并排"记成一个固定有序对：点哪一侧就切到哪个标签，
+/// 但两屏位置不互换；从标签栏切到第三个会话时自动退出分屏。
+struct SplitView {
+    first: usize,
+    second: usize,
+    direction: SplitDirection,
+    /// 可拖拽的分隔条状态（比例只存活在内存，每次分屏从 50% 开始）。
+    pane: Entity<SplitPaneState>,
+}
+
+/// 文件传输弹窗：本地路径 + 远端路径，上传与下载共用。
+struct TransferDialog {
+    /// 目标会话标签 id（传输指令发往该标签的 SSH 连接）。
+    tab_id: usize,
+    /// 弹窗标题里的会话名。
+    title: SharedString,
+    local: Entity<InputState>,
+    remote: Entity<InputState>,
+    /// SFTP 查询到的远端主目录；用于预填上传落点。
+    home: Option<String>,
+    /// 传输进行中：按钮禁用、进度可见。
+    busy: bool,
+    direction: Option<transfer::Direction>,
+    /// (已传输, 总量)
+    progress: Option<(u64, u64)>,
+    error: Option<SharedString>,
+    info: Option<SharedString>,
+}
+
+/// 端口转发弹窗：默认是规则列表，点「设置…」才展开新增 / 编辑表单。
+struct ForwardDialog {
+    /// 目标会话标签 id（转发指令发往该标签的 SSH 连接）。
+    tab_id: usize,
+    /// 弹窗标题里的会话名。
+    title: SharedString,
+    /// 该会话的连接键（user@host:port），保存规则时按它归档。
+    addr: SharedString,
+    /// 表单是否展开（列表与新增分开，避免列表被表单挤占）。
+    editing: bool,
+    /// 当前方向（-L / -R / -D），切换只换标签语义，不改输入内容。
+    kind: session::ForwardKind,
+    /// 新规则的备注名（可空）。
+    name: Entity<InputState>,
+    listen_port: Entity<InputState>,
+    target_host: Entity<InputState>,
+    target_port: Entity<InputState>,
+    /// 新规则保存时是否带「连接时自动开启」。
+    auto_start: bool,
+    error: Option<SharedString>,
+    info: Option<SharedString>,
 }
 
 /// 断线标签的重连参数快照。
@@ -140,6 +209,8 @@ struct NewHostForm {
     auth: AuthMethod,
     /// 保存到的分组；None＝未分组。从分组右键进入时预填该组，编辑时预填原归属。
     group: Option<SharedString>,
+    /// 跳板机（另一台已保存主机的 id）；None＝直连。
+    jump: Option<i64>,
     /// Some(index)＝编辑既有主机（保存时按该下标原位替换）。
     editing: Option<usize>,
 }
@@ -166,6 +237,15 @@ struct ShellPrompt {
 enum ShellPromptKind {
     Rename,
     WorkingDirectory,
+    Arguments,
+    Environment,
+}
+
+impl ShellPromptKind {
+    /// 环境变量是多行文本（每行一条），其余为单行。
+    fn multi_line(self) -> bool {
+        matches!(self, Self::Environment)
+    }
 }
 
 /// 弹窗索取的秘密类型：登录密码或加密私钥的口令。
@@ -237,6 +317,9 @@ const SETTINGS_TAB_STATUS: usize = 2;
 const SETTINGS_TAB_TERMINAL: usize = 3;
 /// 设置弹窗分页：会话行为（自动重连 / 连接超时）。
 const SETTINGS_TAB_SESSION: usize = 4;
+
+/// 「会话」菜单里最近连接最多保留几条；再多菜单就太长了。
+const RECENT_HOSTS_MAX: usize = 8;
 
 /// 设置弹窗固定宽高：切分页不重排，弹窗不随内容忽大忽小。
 const SETTINGS_DIALOG_W: f32 = 640.0;
@@ -323,8 +406,137 @@ const LINE_HEIGHT_STEP: f32 = 0.1;
 const LINE_HEIGHT_DEFAULT: f32 = 1.2;
 /// 配色方案默认值，与 rgpui-term `ThemeManager` 的初始主题一致。
 const TERMINAL_THEME_DEFAULT: &str = "One Dark";
+/// 自定义配色在 `ThemeManager` 里注册的名字，也是 `TerminalPrefs::theme` 的一个取值。
+const TERMINAL_THEME_CUSTOM: &str = "自定义";
+/// 自定义配色可编辑的字段数：前景、背景、8 个普通色、8 个明亮色。
+const CUSTOM_COLOR_FIELDS: usize = 18;
+/// 普通色在 `TerminalColors` 字段序列里的起点（前两个是前景 / 背景）。
+const CUSTOM_ANSI_BASE: usize = 2;
+/// 明亮色起点（紧跟 8 个普通色）。
+const CUSTOM_BRIGHT_BASE: usize = CUSTOM_ANSI_BASE + 8;
+/// ANSI 前 8 色的中文名，按「黑 红 绿 黄 蓝 洋红 青 白」排列。
+const ANSI_COLOR_NAMES: [&str; 8] = ["黑", "红", "绿", "黄", "蓝", "洋红", "青", "白"];
+/// 自定义配色的初始值：与默认方案 One Dark 一致，用户切到「自定义」时不会突然换色。
+const CUSTOM_DEFAULT_FOREGROUND: &str = "#ABB2BF";
+const CUSTOM_DEFAULT_BACKGROUND: &str = "#282C34";
+const CUSTOM_DEFAULT_ANSI: [&str; 8] = [
+    "#3F4451", "#E06C75", "#98C379", "#E5C07B", "#61AFEF", "#C678DD", "#56B6C2", "#ABB2BF",
+];
+const CUSTOM_DEFAULT_BRIGHT: [&str; 8] = [
+    "#5C6370", "#E06C75", "#98C379", "#E5C07B", "#61AFEF", "#C678DD", "#56B6C2", "#FFFFFF",
+];
 
-/// 终端外观偏好：字号、行高与配色方案（方案名取 `ThemeManager` 预设）。
+/// 自定义终端配色：前景 / 背景 + 16 色（普通 8 + 明亮 8），一律存 `#RRGGBB`。
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TerminalColors {
+    pub foreground: String,
+    pub background: String,
+    pub ansi: [String; 8],
+    pub bright: [String; 8],
+}
+
+impl Default for TerminalColors {
+    fn default() -> Self {
+        Self {
+            foreground: CUSTOM_DEFAULT_FOREGROUND.to_string(),
+            background: CUSTOM_DEFAULT_BACKGROUND.to_string(),
+            ansi: CUSTOM_DEFAULT_ANSI.map(str::to_string),
+            bright: CUSTOM_DEFAULT_BRIGHT.map(str::to_string),
+        }
+    }
+}
+
+impl TerminalColors {
+    /// 读取第 `index` 个可编辑字段（顺序见 `CUSTOM_*_BASE` 常量）。
+    fn hex_field(&self, index: usize) -> &str {
+        match index {
+            0 => &self.foreground,
+            1 => &self.background,
+            i if (CUSTOM_ANSI_BASE..CUSTOM_BRIGHT_BASE).contains(&i) => {
+                &self.ansi[i - CUSTOM_ANSI_BASE]
+            }
+            i if (CUSTOM_BRIGHT_BASE..CUSTOM_COLOR_FIELDS).contains(&i) => {
+                &self.bright[i - CUSTOM_BRIGHT_BASE]
+            }
+            _ => CUSTOM_DEFAULT_FOREGROUND,
+        }
+    }
+
+    /// 写入第 `index` 个字段；值须已通过 `normalize_hex`。
+    fn set_hex_field(&mut self, index: usize, value: String) {
+        match index {
+            0 => self.foreground = value,
+            1 => self.background = value,
+            i if (CUSTOM_ANSI_BASE..CUSTOM_BRIGHT_BASE).contains(&i) => {
+                self.ansi[i - CUSTOM_ANSI_BASE] = value;
+            }
+            i if (CUSTOM_BRIGHT_BASE..CUSTOM_COLOR_FIELDS).contains(&i) => {
+                self.bright[i - CUSTOM_BRIGHT_BASE] = value;
+            }
+            _ => {}
+        }
+    }
+
+    /// 坏数据（手改 JSON / 空串 / 非十六进制）回落到默认 One Dark，避免终端渲染出透明块。
+    fn clamp(&mut self) {
+        let defaults = Self::default();
+        for index in 0..CUSTOM_COLOR_FIELDS {
+            let value = self.hex_field(index).to_string();
+            let fixed =
+                normalize_hex(&value).unwrap_or_else(|| defaults.hex_field(index).to_string());
+            self.set_hex_field(index, fixed);
+        }
+    }
+
+    /// 转成 rgpui-term 的配置；光标跟随前景色，明亮白兼作 bright 前景。
+    fn to_config(&self) -> TerminalThemeConfig {
+        let mut config = TerminalThemeConfig::default();
+        config.foreground = self.foreground.clone();
+        config.background = self.background.clone();
+        config.cursor = self.foreground.clone();
+        config.ansi = self.ansi.clone();
+        config.bright = self.bright.clone();
+        config.bright_foreground = Some(self.bright[7].clone());
+        config.dim_foreground = Some(self.ansi[7].clone());
+        config
+    }
+}
+
+/// 把 `#RGB` / `#RRGGBB`（大小写、省略 `#` 均可）规范成 `#RRGGBB`；不合法返回 None。
+fn normalize_hex(text: &str) -> Option<String> {
+    let raw = text.trim().trim_start_matches('#');
+    let expanded = match raw.len() {
+        3 => raw.chars().flat_map(|ch| [ch, ch]).collect::<String>(),
+        6 => raw.to_string(),
+        _ => return None,
+    };
+    expanded
+        .chars()
+        .all(|ch| ch.is_ascii_hexdigit())
+        .then(|| format!("#{}", expanded.to_ascii_uppercase()))
+}
+
+/// `#RRGGBB` → HSLA（用于色块预览；不合法返回 None，预览退回边框色）。
+fn hex_to_hsla(hex: &str) -> Option<Hsla> {
+    let normalized = normalize_hex(hex)?;
+    let channel = |range: std::ops::Range<usize>| {
+        u8::from_str_radix(&normalized[range], 16)
+            .ok()
+            .map(|value| value as f32 / 255.0)
+    };
+    Some(
+        Rgba {
+            r: channel(1..3)?,
+            g: channel(3..5)?,
+            b: channel(5..7)?,
+            a: 1.0,
+        }
+        .into(),
+    )
+}
+
+/// 终端外观偏好：字号、行高与配色方案（方案名取 `ThemeManager` 预设，或「自定义」）。
 ///
 /// 只影响终端渲染，不动界面主题：终端有自己的一套 ANSI 配色，
 /// 与 rgpui 全局 `Theme` 无关（后者管窗口 chrome）。
@@ -336,9 +548,12 @@ pub struct TerminalPrefs {
     /// 行高倍数。
     #[serde(default = "default_line_height")]
     pub line_height: f32,
-    /// 配色方案名（`ThemeManager::available_themes()` 之一）。
+    /// 配色方案名（`ThemeManager::available_themes()` 之一，含「自定义」）。
     #[serde(default = "default_terminal_theme")]
     pub theme: String,
+    /// 自定义 16 色（选「自定义」时生效，始终随偏好一起持久化）。
+    #[serde(default)]
+    pub custom: TerminalColors,
 }
 
 fn default_font_size() -> f32 {
@@ -359,6 +574,7 @@ impl Default for TerminalPrefs {
             font_size: FONT_SIZE_DEFAULT,
             line_height: LINE_HEIGHT_DEFAULT,
             theme: TERMINAL_THEME_DEFAULT.to_string(),
+            custom: TerminalColors::default(),
         }
     }
 }
@@ -371,6 +587,7 @@ impl TerminalPrefs {
         if self.theme.is_empty() {
             self.theme = TERMINAL_THEME_DEFAULT.to_string();
         }
+        self.custom.clamp();
     }
 
     /// 字号增减一档（`+1` / `-1`），结果仍夹在合法区间内。
@@ -487,7 +704,175 @@ impl SessionPrefs {
     }
 }
 
-/// 本机 shell 的偏好：自定义展示名 + 起始工作目录（按 profile id = 路径 + 参数记账）。
+/// 一条保存下来的端口转发规则（WindTerm 式"先保存、再开关"）。
+///
+/// 只存规则本身，不存"当前是否在跑"——开关是会话内状态，重连后由
+/// [`SavedForward::auto_start`] 决定要不要自动打开。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedForward {
+    /// 备注名（可空，空时列表显示规则描述）。
+    #[serde(default)]
+    pub name: String,
+    pub kind: session::ForwardKind,
+    #[serde(default = "forward_listen_default")]
+    pub listen_port: u16,
+    #[serde(default = "forward_host_default")]
+    pub target_host: String,
+    #[serde(default = "forward_port_default")]
+    pub target_port: u16,
+    /// 连接建立后自动开启。
+    #[serde(default)]
+    pub auto_start: bool,
+}
+
+fn forward_listen_default() -> u16 {
+    8080
+}
+
+fn forward_host_default() -> String {
+    "127.0.0.1".to_string()
+}
+
+fn forward_port_default() -> u16 {
+    80
+}
+
+impl SavedForward {
+    /// 折算成会话层规则。
+    pub fn rule(&self) -> session::ForwardRule {
+        session::ForwardRule {
+            kind: self.kind,
+            listen_port: self.listen_port,
+            target_host: self.target_host.clone(),
+            target_port: self.target_port,
+        }
+    }
+
+    /// 列表主标题：有备注用备注，否则用规则描述。
+    fn title(&self) -> String {
+        let name = self.name.trim();
+        if name.is_empty() {
+            self.rule().label()
+        } else {
+            name.to_string()
+        }
+    }
+}
+
+/// 端口转发偏好：按连接（`user@host:port`）保存规则列表。
+///
+/// 与侧边栏分组一样整体序列化成一个 JSON 串，存加密库 `settings` 表的
+/// `forwards` 键（降级时进 settings.json），不动 `hosts` 表结构。
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForwardPrefs {
+    #[serde(default)]
+    rules: HashMap<String, Vec<SavedForward>>,
+}
+
+impl ForwardPrefs {
+    /// 某连接的规则列表（无记录时返回空切片）。
+    fn rules_for(&self, addr: &str) -> &[SavedForward] {
+        self.rules.get(addr).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// 保存一条规则：同方向同监听端口视为同一条，原位替换，避免重复行。
+    fn insert(&mut self, addr: &str, saved: SavedForward) {
+        let id = saved.rule().id();
+        let list = self.rules.entry(addr.to_string()).or_default();
+        match list.iter_mut().find(|item| item.rule().id() == id) {
+            // 覆盖已有规则时表单没填名字就沿用原名，避免"改个端口把备注弄丢"。
+            Some(existing) => {
+                let name = if saved.name.trim().is_empty() {
+                    existing.name.clone()
+                } else {
+                    saved.name.clone()
+                };
+                *existing = SavedForward { name, ..saved };
+            }
+            None => list.push(saved),
+        }
+    }
+
+    /// 删除某连接下的一条规则。
+    fn remove(&mut self, addr: &str, rule_id: &str) {
+        let Some(list) = self.rules.get_mut(addr) else {
+            return;
+        };
+        list.retain(|item| item.rule().id() != rule_id);
+        if list.is_empty() {
+            self.rules.remove(addr);
+        }
+    }
+
+    fn to_json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
+    }
+
+    fn from_json(text: &str) -> Self {
+        if text.is_empty() {
+            return Self::default();
+        }
+        serde_json::from_str(text).unwrap_or_default()
+    }
+}
+
+/// 主机 → 跳板机映射（host id → jump host id）。
+///
+/// 为什么不进 hosts 表：加密库的表由 toasty 建模，给已有库加列需要手工 ALTER
+/// 并处理旧库；和侧边栏分组一样放进 `settings` 表的一个 JSON 键即可，
+/// 启动后回填到 [`HostConfig::proxy_jump`]。降级模式直接随 sessions.json 落盘。
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JumpPrefs {
+    /// 键是字符串形式的 host id（JSON 对象的键只能是字符串）。
+    #[serde(default)]
+    jumps: BTreeMap<String, i64>,
+}
+
+impl JumpPrefs {
+    fn jump_of(&self, host_id: i64) -> Option<i64> {
+        self.jumps.get(&host_id.to_string()).copied()
+    }
+
+    fn set(&mut self, host_id: i64, jump_id: Option<i64>) {
+        let key = host_id.to_string();
+        match jump_id {
+            Some(id) => {
+                self.jumps.insert(key, id);
+            }
+            None => {
+                self.jumps.remove(&key);
+            }
+        }
+    }
+
+    /// 删除主机后清理引用：它作为目标、或作为别人的跳板机都要断掉。
+    /// 返回被清掉跳板机的宿主 id，调用方据此改内存里的主机。
+    fn forget(&mut self, host_id: i64) -> Vec<i64> {
+        self.jumps.remove(&host_id.to_string());
+        let affected: Vec<i64> = self
+            .jumps
+            .iter()
+            .filter(|(_, jump)| **jump == host_id)
+            .filter_map(|(host, _)| host.parse().ok())
+            .collect();
+        self.jumps.retain(|_, jump| *jump != host_id);
+        affected
+    }
+
+    fn to_json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
+    }
+
+    fn from_json(text: &str) -> Self {
+        if text.is_empty() {
+            return Self::default();
+        }
+        serde_json::from_str(text).unwrap_or_default()
+    }
+}
+
+/// 本机 shell 的偏好：自定义展示名 + 起始工作目录 + 启动参数 + 环境变量
+/// （按 profile id = 路径 + 参数记账）。
 ///
 /// 扫描结果每次重建，偏好单独存一份，重扫后仍生效；清空对应条目即恢复默认。
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -497,6 +882,12 @@ pub struct LocalShellPrefs {
     /// profile id → 起始工作目录（未设置则用进程当前目录）。
     #[serde(default)]
     cwd: HashMap<String, String>,
+    /// profile id → 自定义启动参数原文（空格分隔，可带双引号）。
+    #[serde(default)]
+    args: HashMap<String, String>,
+    /// profile id → 环境变量原文（每行 KEY=VALUE）。
+    #[serde(default)]
+    env: HashMap<String, String>,
 }
 
 impl LocalShellPrefs {
@@ -536,6 +927,44 @@ impl LocalShellPrefs {
         }
     }
 
+    /// 解析后的自定义启动参数（原始文本已在保存时校验并规范化）。
+    fn args_of(&self, id: &str) -> Vec<String> {
+        self.args
+            .get(id)
+            .map(|text| local_shell::split_args(text))
+            .unwrap_or_default()
+    }
+
+    /// 保存自定义启动参数原文；空串等于不加参数。
+    fn set_args(&mut self, id: &str, text: &str) {
+        let text = text.trim();
+        if text.is_empty() {
+            self.args.remove(id);
+        } else {
+            self.args.insert(id.to_string(), text.to_string());
+        }
+    }
+
+    /// 该 profile 的环境变量原文（未设置为空串）。
+    fn env_of(&self, id: &str) -> &str {
+        self.env.get(id).map(String::as_str).unwrap_or("")
+    }
+
+    /// 解析后的环境变量（保存时已校验，解析不会失败）。
+    fn env_map_of(&self, id: &str) -> HashMap<String, String> {
+        local_shell::parse_env(self.env_of(id)).unwrap_or_default()
+    }
+
+    /// 保存环境变量原文；空串等于不注入额外变量。
+    fn set_env(&mut self, id: &str, text: &str) {
+        let text = text.trim();
+        if text.is_empty() {
+            self.env.remove(id);
+        } else {
+            self.env.insert(id.to_string(), text.to_string());
+        }
+    }
+
     fn to_json(&self) -> String {
         serde_json::to_string(self).unwrap_or_default()
     }
@@ -564,6 +993,9 @@ pub struct SidebarPrefs {
     /// 「未分组」文件夹是否折叠。
     #[serde(default)]
     ungrouped_collapsed: bool,
+    /// 主机 id 的手动排序（跨组一条序列，渲染时只取组内相对次序）。
+    #[serde(default)]
+    order: Vec<i64>,
 }
 
 /// 一个分组（文件夹）条目。
@@ -680,6 +1112,39 @@ impl SidebarPrefs {
     /// 主机删除后清理残留归属。
     fn forget(&mut self, id: i64) {
         self.assign.remove(&id);
+        self.order.retain(|&item| item != id);
+    }
+
+    /// 主机在手动排序里的位置；未登记的主机排到已登记之后。
+    fn rank_of(&self, id: i64) -> usize {
+        self.order
+            .iter()
+            .position(|&item| item == id)
+            .unwrap_or(usize::MAX)
+    }
+
+    /// 用当前存活主机补齐排序表：删掉的清出去，新主机按给定顺序追加到尾部。
+    fn sync_order(&mut self, alive: &[i64]) {
+        self.order.retain(|id| alive.contains(id));
+        let mut seen = self.order.clone();
+        for &id in alive {
+            if !seen.contains(&id) {
+                seen.push(id);
+                self.order.push(id);
+            }
+        }
+    }
+
+    /// 把 `id` 移到 `anchor` 之前（锚点不存在时追加到尾部）。
+    fn move_before(&mut self, id: i64, anchor: i64) {
+        if id == anchor {
+            return;
+        }
+        self.order.retain(|&item| item != id);
+        match self.order.iter().position(|&item| item == anchor) {
+            Some(position) => self.order.insert(position, id),
+            None => self.order.push(id),
+        }
     }
 
     /// 序列化为入库/入文件的字符串。
@@ -707,6 +1172,14 @@ enum MenuTarget {
     Host(usize),
 }
 
+/// 组内手动排序动作（收藏 / 非收藏各自成桶，不互相穿插）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReorderAction {
+    Up,
+    Down,
+    Top,
+}
+
 /// RuLink 主视图：左侧主机账号管理，右侧会话标签终端。
 struct RuLinkApp {
     /// 会话仓库（负责持久化）。
@@ -720,6 +1193,8 @@ struct RuLinkApp {
     unlocked_key: Option<String>,
     /// 已保存的主机账号列表。
     hosts: Vec<HostConfig>,
+    /// 最近成功连接的加密库主机 id（新的在前），供「会话」菜单快速重连。
+    recent_hosts: Vec<i64>,
     /// 主机列表搜索框（按展示名 / user@host:port 子串过滤）。
     search: Entity<InputState>,
     /// 活动会话标签。
@@ -746,6 +1221,8 @@ struct RuLinkApp {
     tab_scroll: ScrollHandle,
     /// 侧边栏分组（文件夹）偏好，随加密库 / settings.json 双层持久化。
     sidebar: SidebarPrefs,
+    /// 主机 → 跳板机映射（host id → jump id），双层持久化。
+    jumps: JumpPrefs,
     /// 分组新建 / 重命名弹窗（`renaming` 为 None 表示新建）。
     group_prompt: Option<GroupPrompt>,
     /// 删除二次确认（真实下标；浮层遮挡期间列表不会变）。
@@ -754,6 +1231,10 @@ struct RuLinkApp {
     unlock: Option<UnlockState>,
     /// 设置弹窗（主密码管理、主题、锁定）。
     settings: Option<SettingsState>,
+    /// 文件传输弹窗（上传 / 下载）。
+    transfer: Option<TransferDialog>,
+    /// 端口转发弹窗。
+    forward: Option<ForwardDialog>,
     /// 本次运行内缓存的密码（按 user@host:port），避免重复弹窗；绝不落盘。
     password_cache: HashMap<String, String>,
     /// 内嵌私钥（host_id → PEM 明文）：开库时整体读入内存，连接时直接取用。
@@ -764,12 +1245,18 @@ struct RuLinkApp {
     status: SharedString,
     /// 状态栏显示项偏好（勾选哪些条目），随加密库 / settings.json 持久化。
     status_bar: StatusBarPrefs,
-    /// 终端外观偏好（字号 / 行高 / 配色方案），同样双层持久化。
+    /// 终端外观偏好（字号 / 行高 / 配色方案 / 自定义 16 色），同样双层持久化。
     terminal: TerminalPrefs,
+    /// 自定义配色的 18 个十六进制输入框（前景 / 背景 / 普通 8 色 / 明亮 8 色）。
+    custom_color_inputs: Vec<Entity<InputState>>,
     /// 会话行为偏好（自动重连 / 连接超时），同样双层持久化。
     session_prefs: SessionPrefs,
+    /// 端口转发规则（按连接保存，开关控制启停），同样双层持久化。
+    forward_prefs: ForwardPrefs,
     /// 侧边栏 ↔ 主区 的分隔面板状态（拖拽调整宽度 + 折叠/展开）。
     split_state: Entity<SplitPaneState>,
+    /// 主区分屏（两个标签并排）；None＝单屏显示活动标签。
+    view_split: Option<SplitView>,
     focus_handle: FocusHandle,
 }
 
@@ -855,10 +1342,29 @@ impl RuLinkApp {
         let session_prefs = SessionPrefs::from_json(&settings.session);
         let local_shell_prefs = LocalShellPrefs::from_json(&settings.local_shells);
         let sidebar = SidebarPrefs::from_json(&settings.sidebar);
+        let forward_prefs = ForwardPrefs::from_json(&settings.forwards);
+        let jumps = JumpPrefs::from_json(&settings.jumps);
         // 终端配色预设管理器：全局一份，`TerminalView::set_theme` 与自建样式都从这里取。
         if !cx.has_global::<ThemeManager>() {
             cx.set_global(ThemeManager::new(None));
         }
+        // 自定义 16 色作为一套叫「自定义」的方案注册进管理器，选择器与渲染共用同一份。
+        Self::register_custom_theme(&terminal.custom, cx);
+        // 18 个十六进制输入框常驻（设置弹窗反复打开也不用重建），
+        // 编辑时立即刷新色块与已开终端；程序化回填走 set_value，不会触发提交。
+        let custom_color_inputs = (0..CUSTOM_COLOR_FIELDS)
+            .map(|index| {
+                let value = terminal.custom.hex_field(index);
+                let input = cx.new(|cx| InputState::new(window, cx).default_value(value));
+                cx.subscribe(&input, move |this, _, event: &InputEvent, cx| {
+                    if matches!(event, InputEvent::Change) {
+                        this.commit_custom_color(index, cx);
+                    }
+                })
+                .detach();
+                input
+            })
+            .collect::<Vec<_>>();
         // 侧边栏 ↔ 主区 分隔面板：初始侧边栏占比约 0.25。
         let split_state = cx.new(SplitPaneState::new);
         split_state.update(cx, |state, cx| {
@@ -875,6 +1381,7 @@ impl RuLinkApp {
             mode,
             vault: None,
             hosts,
+            recent_hosts: Vec::new(),
             search,
             tabs: Vec::new(),
             active_tab: None,
@@ -888,10 +1395,13 @@ impl RuLinkApp {
             shell_prompt: None,
             tab_scroll: ScrollHandle::new(),
             sidebar,
+            jumps,
             group_prompt: None,
             confirm_delete: None,
             unlock: None,
             settings: None,
+            transfer: None,
+            forward: None,
             unlocked_key: None,
             password_cache: HashMap::new(),
             inline_keys: HashMap::new(),
@@ -899,8 +1409,11 @@ impl RuLinkApp {
             status: "就绪".into(),
             status_bar,
             terminal,
+            custom_color_inputs,
             session_prefs,
+            forward_prefs,
             split_state,
+            view_split: None,
             focus_handle: cx.focus_handle(),
         };
         app.boot_vault(window, cx);
@@ -1066,6 +1579,8 @@ impl RuLinkApp {
             if let Ok(Some(json)) = vault.setting("terminal").await {
                 let prefs = TerminalPrefs::from_json(&json);
                 let _ = this.update(cx, |this, cx| {
+                    // 自定义 16 色可能刚被库内值替换，重新注册后再按新配色渲染。
+                    Self::register_custom_theme(&prefs.custom, cx);
                     if this.terminal != prefs {
                         this.terminal = prefs;
                         cx.notify();
@@ -1092,12 +1607,46 @@ impl RuLinkApp {
                     }
                 });
             }
+            // 最近连接：只保留仍存在的主机，顺序即最近先后。
+            if let Ok(Some(json)) = vault.setting("recent").await
+                && let Ok(mut ids) = serde_json::from_str::<Vec<i64>>(&json)
+            {
+                let _ = this.update(cx, |this, cx| {
+                    ids.retain(|id| this.hosts.iter().any(|host| host.id == *id));
+                    ids.truncate(RECENT_HOSTS_MAX);
+                    if this.recent_hosts != ids {
+                        this.recent_hosts = ids;
+                        cx.notify();
+                    }
+                });
+            }
             // 本机 shell 自定义名同样以库内为准（扫描结果不变，只需重绘列表）。
             if let Ok(Some(json)) = vault.setting("local_shells").await {
                 let prefs = LocalShellPrefs::from_json(&json);
                 let _ = this.update(cx, |this, cx| {
                     if this.local_shell_prefs != prefs {
                         this.local_shell_prefs = prefs;
+                        cx.notify();
+                    }
+                });
+            }
+            // 保存的端口转发规则同样以库内为准。
+            if let Ok(Some(json)) = vault.setting("forwards").await {
+                let prefs = ForwardPrefs::from_json(&json);
+                let _ = this.update(cx, |this, cx| {
+                    if this.forward_prefs != prefs {
+                        this.forward_prefs = prefs;
+                        cx.notify();
+                    }
+                });
+            }
+            // 跳板机映射同样以库内为准：回填到已加载的主机上。
+            if let Ok(Some(json)) = vault.setting("jumps").await {
+                let prefs = JumpPrefs::from_json(&json);
+                let _ = this.update(cx, |this, cx| {
+                    if this.jumps != prefs {
+                        this.jumps = prefs;
+                        this.apply_jumps();
                         cx.notify();
                     }
                 });
@@ -1215,6 +1764,8 @@ impl RuLinkApp {
 
     /// 打开设置弹窗并直接停在指定分页（标题栏菜单按入口意图分页）。
     fn open_settings_at(&mut self, tab: usize, window: &mut Window, cx: &mut Context<Self>) {
+        // 库内终端偏好可能在上次打开之后才到达，先把自定义色回填到输入框。
+        self.sync_custom_color_inputs(window, cx);
         if let Some(state) = self.settings.as_mut() {
             // 已开着：只换分页（搬迁途中锁住分页，避免切走看不到结果）。
             if !state.busy {
@@ -1313,6 +1864,798 @@ impl RuLinkApp {
             return;
         }
         self.settings = None;
+        cx.notify();
+    }
+
+    /// Ctrl+Shift+U / 会话菜单：为当前标签打开文件传输弹窗。
+    fn open_transfer_action(
+        &mut self,
+        _: &OpenTransfer,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_transfer(window, cx);
+    }
+
+    /// 打开传输弹窗：借用当前 SSH 会话的 SFTP 子系统，不新开连接、不再认证。
+    fn open_transfer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.transfer.is_some() || self.overlay_open() {
+            return;
+        }
+        let Some(id) = self.active_tab else {
+            self.status = "没有可传输的会话，请先连接 SSH 主机".into();
+            cx.notify();
+            return;
+        };
+        let Some(tab) = self.tabs.iter().find(|tab| tab.id == id) else {
+            return;
+        };
+        if tab.ended {
+            self.status = "会话已断开，请先重新连接再传输文件".into();
+            cx.notify();
+            return;
+        }
+        let Some(sender) = tab.commands.clone() else {
+            self.status = "本地终端不支持文件传输，请连接 SSH 主机".into();
+            cx.notify();
+            return;
+        };
+        let title = tab.title.clone();
+        let local = cx.new(|cx| InputState::new(window, cx).placeholder("本地文件路径"));
+        let remote = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value("~")
+                .placeholder("远端路径，如 /var/tmp/app.log")
+        });
+        local.update(cx, |state, cx| state.focus(window, cx));
+        self.transfer = Some(TransferDialog {
+            tab_id: id,
+            title,
+            local: local.clone(),
+            remote,
+            home: None,
+            busy: false,
+            direction: None,
+            progress: None,
+            error: None,
+            info: None,
+        });
+        // 主目录只是预填用：查不到也让用户手动输入路径，不挡住弹窗。
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        if sender.send(session::SessionCommand::Home { reply }).is_ok() {
+            let entity = cx.entity();
+            let entity_id = entity.entity_id();
+            cx.spawn(async move |_, cx| {
+                let Ok(result) = rx.await else {
+                    return;
+                };
+                let _ = cx.with_window(entity_id, move |window, cx| {
+                    let _ = entity.update(cx, move |this, cx| {
+                        this.apply_transfer_home(local, result, window, cx);
+                    });
+                });
+            })
+            .detach();
+        }
+        self.status = "文件传输：选择本地文件上传，或输入远端文件下载".into();
+        cx.notify();
+    }
+
+    /// SFTP 主目录返回：预填远端路径（仅在用户尚未改写时），失败则提示手动输入。
+    fn apply_transfer_home(
+        &mut self,
+        identity: Entity<InputState>,
+        result: anyhow::Result<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(dialog) = self
+            .transfer
+            .as_mut()
+            .filter(|dialog| dialog.local == identity)
+        else {
+            return;
+        };
+        match result {
+            Ok(home) => {
+                dialog.home = Some(home.clone());
+                let remote = dialog.remote.clone();
+                let current = remote.read(cx).value();
+                let untouched = matches!(current.trim(), "" | "~" | "~/");
+                if untouched {
+                    remote.update(cx, |state, cx| state.set_value(home, window, cx));
+                }
+            }
+            Err(error) => {
+                dialog.info = Some(
+                    format!(
+                        "无法读取远端主目录（{}），请手动输入完整路径",
+                        session::error_summary(&error)
+                    )
+                    .into(),
+                );
+            }
+        }
+        cx.notify();
+    }
+
+    /// 关闭传输弹窗；进行中的任务继续跑完（结果仍写状态栏），只是不再展示进度。
+    fn close_transfer(&mut self, cx: &mut Context<Self>) {
+        self.transfer = None;
+        cx.notify();
+    }
+
+    /// 选择要上传的本地文件，并顺带把远端目标预填成「主目录/文件名」。
+    fn browse_transfer_local(&mut self, cx: &mut Context<Self>) {
+        let Some(dialog) = self.transfer.as_ref() else {
+            return;
+        };
+        let input = dialog.local.clone();
+        let entity = cx.entity();
+        let entity_id = entity.entity_id();
+        let rx = cx.prompt_for_paths(rgpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("选择要上传的文件".into()),
+        });
+        cx.spawn(async move |_, cx| {
+            let Ok(Ok(Some(paths))) = rx.await else {
+                return;
+            };
+            let Some(path) = paths.first().cloned() else {
+                return;
+            };
+            let value = path.to_string_lossy().into_owned();
+            let name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned());
+            let _ = cx.with_window(entity_id, move |window, cx| {
+                let _ = entity.update(cx, move |this, cx| {
+                    if this.transfer.as_ref().is_some_and(|d| d.local == input) {
+                        input.update(cx, |state, cx| state.set_value(value.clone(), window, cx));
+                    }
+                    let Some(dialog) = this.transfer.as_ref().filter(|d| d.local == input) else {
+                        return;
+                    };
+                    let current = dialog.remote.read(cx).value();
+                    let Some(home) = dialog.home.clone() else {
+                        cx.notify();
+                        return;
+                    };
+                    let Some(name) = name else {
+                        cx.notify();
+                        return;
+                    };
+                    // 用户没改过远端路径时，直接给出「主目录/文件名」，上传即可落地。
+                    if matches!(current.trim(), "" | "~" | "~/") {
+                        let target = format!("{}/{}", home.trim_end_matches('/'), name);
+                        dialog
+                            .remote
+                            .update(cx, |state, cx| state.set_value(target, window, cx));
+                    }
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
+    }
+
+    /// 上传：本地路径 + 远端目标（目标为目录时由 transfer 层补上文件名）。
+    fn upload_transfer(&mut self, cx: &mut Context<Self>) {
+        let Some(dialog) = self.transfer.as_ref() else {
+            return;
+        };
+        if dialog.busy {
+            return;
+        }
+        let local = dialog.local.read(cx).value().trim().to_string();
+        let remote = dialog.remote.read(cx).value().trim().to_string();
+        if local.is_empty() {
+            self.transfer_error("请先选择要上传的本地文件", cx);
+            return;
+        }
+        if remote.is_empty() {
+            self.transfer_error("请先输入远端目标路径", cx);
+            return;
+        }
+        self.start_transfer(
+            transfer::Direction::Upload,
+            PathBuf::from(local),
+            remote,
+            cx,
+        );
+    }
+
+    /// 下载：先让用户选保存位置，再按远端文件开始传输。
+    fn download_transfer(&mut self, cx: &mut Context<Self>) {
+        let Some(dialog) = self.transfer.as_ref() else {
+            return;
+        };
+        if dialog.busy {
+            return;
+        }
+        let remote = dialog.remote.read(cx).value().trim().to_string();
+        if remote.is_empty() {
+            self.transfer_error("请先输入要下载的远端文件路径", cx);
+            return;
+        }
+        let name = Path::new(&remote)
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "download".to_string());
+        let start = downloads_dir();
+        let input = dialog.local.clone();
+        let entity = cx.entity();
+        let entity_id = entity.entity_id();
+        let rx = cx.prompt_for_new_path(&start, Some(&name));
+        cx.spawn(async move |_, cx| {
+            let Ok(Ok(Some(path))) = rx.await else {
+                return;
+            };
+            let _ = cx.with_window(entity_id, move |window, cx| {
+                let _ = entity.update(cx, move |this, cx| {
+                    if !this.transfer.as_ref().is_some_and(|d| d.local == input) {
+                        return;
+                    }
+                    let value = path.to_string_lossy().into_owned();
+                    input.update(cx, |state, cx| state.set_value(value, window, cx));
+                    this.start_transfer(transfer::Direction::Download, path, remote, cx);
+                });
+            });
+        })
+        .detach();
+    }
+
+    /// 发起一次传输：弹窗置忙，后台任务把进度与最终结果写回 UI。
+    fn start_transfer(
+        &mut self,
+        direction: transfer::Direction,
+        local: PathBuf,
+        remote: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(dialog) = self.transfer.as_ref() else {
+            return;
+        };
+        if dialog.busy {
+            return;
+        }
+        let tab_id = dialog.tab_id;
+        let identity = dialog.local.clone();
+        let Some(sender) = self
+            .tabs
+            .iter()
+            .find(|tab| tab.id == tab_id)
+            .and_then(|tab| tab.commands.clone())
+        else {
+            self.transfer_error("会话已断开，无法传输文件", cx);
+            return;
+        };
+        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, u64)>();
+        let (reply_tx, mut reply_rx) = tokio::sync::oneshot::channel();
+        let command = session::SessionCommand::Transfer(transfer::Task {
+            direction,
+            local,
+            remote,
+            progress: progress_tx,
+            reply: reply_tx,
+        });
+        if sender.send(command).is_err() {
+            self.transfer_error("会话已断开，无法传输文件", cx);
+            return;
+        }
+        if let Some(dialog) = self.transfer.as_mut() {
+            dialog.busy = true;
+            dialog.direction = Some(direction);
+            dialog.progress = Some((0, 0));
+            dialog.error = None;
+            dialog.info = None;
+        }
+        self.status = SharedString::from(format!("正在{}文件…", direction.label()));
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let outcome = loop {
+                tokio::select! {
+                    result = &mut reply_rx => {
+                        break match result {
+                            Ok(Ok(summary)) => Ok(summary),
+                            Ok(Err(error)) => Err(session::error_summary(&error)),
+                            Err(_) => Err("传输任务已中断".to_string()),
+                        };
+                    }
+                    Some(progress) = progress_rx.recv() => {
+                        let _ = this.update(cx, |this, cx| {
+                            let Some(dialog) = this
+                                .transfer
+                                .as_mut()
+                                .filter(|dialog| dialog.local == identity)
+                            else {
+                                return;
+                            };
+                            if dialog.busy {
+                                dialog.progress = Some(progress);
+                                cx.notify();
+                            }
+                        });
+                    }
+                }
+            };
+            let _ = this.update(cx, |this, cx| {
+                this.finish_transfer(identity, direction, outcome, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// 传输收尾：按钮解禁、写入结果文案（弹窗已关闭时只更新状态栏）。
+    fn finish_transfer(
+        &mut self,
+        identity: Entity<InputState>,
+        direction: transfer::Direction,
+        outcome: Result<transfer::Summary, String>,
+        cx: &mut Context<Self>,
+    ) {
+        let active = self
+            .transfer
+            .as_ref()
+            .is_some_and(|dialog| dialog.local == identity);
+        match outcome {
+            Ok(summary) => {
+                let message = format!(
+                    "{}完成 · {} · {:.1} 秒",
+                    direction.label(),
+                    transfer::format_bytes(summary.bytes),
+                    summary.elapsed.as_secs_f64()
+                );
+                if active && let Some(dialog) = self.transfer.as_mut() {
+                    dialog.busy = false;
+                    dialog.info = Some(message.clone().into());
+                    dialog.error = None;
+                    dialog.progress = Some((summary.bytes, summary.bytes));
+                }
+                self.status = message.into();
+            }
+            Err(error) => {
+                if active && let Some(dialog) = self.transfer.as_mut() {
+                    dialog.busy = false;
+                    dialog.info = None;
+                    dialog.error = Some(error.clone().into());
+                }
+                self.status = format!("{}失败：{error}", direction.label()).into();
+            }
+        }
+        cx.notify();
+    }
+
+    /// 传输相关的即时错误：写进弹窗（若还开着）并同步状态栏。
+    fn transfer_error(&mut self, message: impl Into<SharedString>, cx: &mut Context<Self>) {
+        let message = message.into();
+        if let Some(dialog) = self.transfer.as_mut() {
+            dialog.error = Some(message.clone());
+            dialog.info = None;
+        }
+        self.status = message;
+        cx.notify();
+    }
+
+    /// Ctrl+Shift+F / 会话菜单：为当前标签打开端口转发弹窗。
+    fn open_forward_action(
+        &mut self,
+        _: &OpenForward,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_forward(window, cx);
+    }
+
+    /// 打开端口转发弹窗：规则绑定当前 SSH 会话，不新开连接。
+    fn open_forward(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.forward.is_some() || self.overlay_open() {
+            return;
+        }
+        let Some(id) = self.active_tab else {
+            self.status = "没有可转发的会话，请先连接 SSH 主机".into();
+            cx.notify();
+            return;
+        };
+        let Some(tab) = self.tabs.iter().find(|tab| tab.id == id) else {
+            return;
+        };
+        if tab.ended {
+            self.status = "会话已断开，请先重新连接再配置端口转发".into();
+            cx.notify();
+            return;
+        }
+        if tab.commands.is_none() {
+            self.status = "本地终端不支持端口转发，请连接 SSH 主机".into();
+            cx.notify();
+            return;
+        }
+        let title = tab.title.clone();
+        let addr = tab.addr.clone();
+        let name = cx.new(|cx| InputState::new(window, cx).placeholder("备注名（可选）"));
+        let listen_port = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value("8080")
+                .placeholder("监听端口")
+        });
+        let target_host = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value("127.0.0.1")
+                .placeholder("目标主机")
+        });
+        let target_port = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value("80")
+                .placeholder("目标端口")
+        });
+        listen_port.update(cx, |state, cx| state.focus(window, cx));
+        self.forward = Some(ForwardDialog {
+            tab_id: id,
+            title,
+            addr,
+            editing: false,
+            kind: session::ForwardKind::Local,
+            name,
+            listen_port,
+            target_host,
+            target_port,
+            auto_start: false,
+            error: None,
+            info: None,
+        });
+        self.status = "端口转发：保存规则后用开关启用，可设连接时自动开启".into();
+        cx.notify();
+    }
+
+    /// 切换转发方向：只改字段语义，不清空已填内容（本地/远程常用同样的 8080→80）。
+    fn set_forward_kind(&mut self, kind: session::ForwardKind, cx: &mut Context<Self>) {
+        let Some(dialog) = self.forward.as_mut() else {
+            return;
+        };
+        if dialog.kind == kind {
+            return;
+        }
+        dialog.kind = kind;
+        dialog.error = None;
+        dialog.info = None;
+        self.status = match kind {
+            session::ForwardKind::Local => {
+                "本地转发：监听本机回环端口，目标按服务器视角解析".into()
+            }
+            session::ForwardKind::Remote => {
+                "远程转发：服务器只监听其回环端口，目标按本机视角解析".into()
+            }
+            session::ForwardKind::Dynamic => {
+                "动态转发：本机回环端口提供 SOCKS5 代理，目标由客户端请求决定".into()
+            }
+        };
+        cx.notify();
+    }
+
+    /// 展开 / 收起新增规则表单；列表与添加分开，避免互相挤占。
+    fn set_forward_editing(&mut self, editing: bool, cx: &mut Context<Self>) {
+        if let Some(dialog) = self.forward.as_mut() {
+            dialog.editing = editing;
+            dialog.error = None;
+            if !editing {
+                dialog.info = None;
+            }
+        }
+        cx.notify();
+    }
+
+    /// 表单里的「连接时自动开启」勾选。
+    fn set_forward_auto_start(&mut self, on: bool, cx: &mut Context<Self>) {
+        if let Some(dialog) = self.forward.as_mut() {
+            dialog.auto_start = on;
+        }
+        cx.notify();
+    }
+
+    /// 关闭端口转发弹窗；已开启的转发继续在后台工作，可在再次打开时停止。
+    fn close_forward(&mut self, cx: &mut Context<Self>) {
+        self.forward = None;
+        cx.notify();
+    }
+
+    /// 校验表单字段，折算成规则（弹窗名称与自动开关一并返回）。
+    fn forward_form_rule(
+        &self,
+        dialog: &ForwardDialog,
+        cx: &Context<Self>,
+    ) -> Result<(session::ForwardRule, String, bool), String> {
+        let parse = |text: &str, label: &str| {
+            text.parse::<u16>()
+                .ok()
+                .filter(|port| *port > 0)
+                .ok_or_else(|| format!("{label}无效（应为 1–65535）"))
+        };
+        let listen_label = match dialog.kind {
+            session::ForwardKind::Local => "本地端口",
+            session::ForwardKind::Remote => "服务器监听端口",
+            session::ForwardKind::Dynamic => "SOCKS5 端口",
+        };
+        let listen_port = dialog.listen_port.read(cx).value().trim().to_string();
+        let listen_port = parse(&listen_port, listen_label)?;
+        let name = dialog.name.read(cx).value().trim().to_string();
+        if dialog.kind == session::ForwardKind::Dynamic {
+            // 动态转发的目标由 SOCKS5 客户端逐条给出，表单里不填目标。
+            return Ok((
+                session::ForwardRule {
+                    kind: dialog.kind,
+                    listen_port,
+                    target_host: String::new(),
+                    target_port: 0,
+                },
+                name,
+                dialog.auto_start,
+            ));
+        }
+        let (port_label, host_hint) = match dialog.kind {
+            session::ForwardKind::Local => ("远端端口", "请填写远端主机（服务器视角的地址）"),
+            _ => ("本地目标端口", "请填写本地目标主机（本机视角的地址）"),
+        };
+        let target_host = dialog.target_host.read(cx).value().trim().to_string();
+        let target_port = dialog.target_port.read(cx).value().trim().to_string();
+        let target_port = parse(&target_port, port_label)?;
+        if target_host.is_empty() {
+            return Err(host_hint.to_string());
+        }
+        Ok((
+            session::ForwardRule {
+                kind: dialog.kind,
+                listen_port,
+                target_host,
+                target_port,
+            },
+            name,
+            dialog.auto_start,
+        ))
+    }
+
+    /// 把表单里的规则保存到当前连接的规则列表（不动运行状态，开关另行控制）。
+    fn save_forward(&mut self, cx: &mut Context<Self>) {
+        let Some(dialog) = self.forward.as_ref() else {
+            return;
+        };
+        let (rule, name, auto_start) = match self.forward_form_rule(dialog, cx) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                self.forward_error(error, cx);
+                return;
+            }
+        };
+        let addr = dialog.addr.to_string();
+        let label = rule.label();
+        self.forward_prefs.insert(
+            &addr,
+            SavedForward {
+                name,
+                kind: rule.kind,
+                listen_port: rule.listen_port,
+                target_host: rule.target_host.clone(),
+                target_port: rule.target_port,
+                auto_start,
+            },
+        );
+        self.persist_forwards(cx);
+        if let Some(dialog) = self.forward.as_mut() {
+            // 保存后回到列表：新规则就在列表里，可以直接用开关启用。
+            dialog.editing = false;
+            dialog.error = None;
+            dialog.info = Some(
+                if auto_start {
+                    "已保存，连接建立时会自动开启；也可直接用开关立即启用"
+                } else {
+                    "已保存，打开列表里的开关即可启用"
+                }
+                .into(),
+            );
+        }
+        self.status = format!("已保存端口转发规则 {label}").into();
+        cx.notify();
+    }
+
+    /// 按已保存的规则发起转发（开关打开 / 自动开启共用）。
+    fn start_forward_rule(
+        &mut self,
+        tab_id: usize,
+        rule: session::ForwardRule,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(sender) = self
+            .tabs
+            .iter()
+            .find(|tab| tab.id == tab_id)
+            .and_then(|tab| tab.commands.clone())
+        else {
+            self.forward_error("会话已断开，无法开启端口转发", cx);
+            return;
+        };
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        if sender
+            .send(session::SessionCommand::ForwardStart {
+                rule: rule.clone(),
+                reply: reply_tx,
+            })
+            .is_err()
+        {
+            self.forward_error("会话已断开，无法开启端口转发", cx);
+            return;
+        }
+        self.status = format!("正在开启端口转发 {}…", rule.label()).into();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = match reply_rx.await {
+                Ok(result) => result.map_err(|error| session::error_summary(&error)),
+                Err(_) => Err("会话已断开，无法开启端口转发".to_string()),
+            };
+            let _ = this.update(cx, |this, cx| {
+                this.finish_forward_start(tab_id, result, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// 已保存规则的开关：开＝立即启动，关＝停止（规则本身保留）。
+    fn toggle_saved_forward(&mut self, saved: SavedForward, on: bool, cx: &mut Context<Self>) {
+        let Some(tab_id) = self.forward.as_ref().map(|dialog| dialog.tab_id) else {
+            return;
+        };
+        if on {
+            self.start_forward_rule(tab_id, saved.rule(), cx);
+        } else {
+            self.stop_forward(saved.rule(), cx);
+        }
+    }
+
+    /// 删除一条已保存规则；若正在转发先停掉，避免"删了还在跑"。
+    fn delete_saved_forward(&mut self, saved: SavedForward, cx: &mut Context<Self>) {
+        let Some(dialog) = self.forward.as_ref() else {
+            return;
+        };
+        let tab_id = dialog.tab_id;
+        let addr = dialog.addr.to_string();
+        let rule = saved.rule();
+        let active = self
+            .tabs
+            .iter()
+            .find(|tab| tab.id == tab_id)
+            .is_some_and(|tab| tab.forwards.iter().any(|item| item.id() == rule.id()));
+        if active {
+            self.stop_forward(rule.clone(), cx);
+        }
+        self.forward_prefs.remove(&addr, &rule.id());
+        self.persist_forwards(cx);
+        self.status = format!("已删除端口转发规则 {}", rule.label()).into();
+        cx.notify();
+    }
+
+    /// 会话就绪后自动开启勾选了「连接时自动开启」的规则。
+    fn auto_start_forwards(&mut self, tab_id: usize, cx: &mut Context<Self>) {
+        let Some(addr) = self
+            .tabs
+            .iter()
+            .find(|tab| tab.id == tab_id)
+            .map(|tab| tab.addr.to_string())
+        else {
+            return;
+        };
+        let rules: Vec<session::ForwardRule> = self
+            .forward_prefs
+            .rules_for(&addr)
+            .iter()
+            .filter(|saved| saved.auto_start)
+            .map(SavedForward::rule)
+            .collect();
+        for rule in rules {
+            self.start_forward_rule(tab_id, rule, cx);
+        }
+    }
+
+    /// 开启结果：成功则把生效规则记到标签上（弹窗关掉也不丢），失败写弹窗与状态栏。
+    fn finish_forward_start(
+        &mut self,
+        tab_id: usize,
+        result: Result<session::ForwardRule, String>,
+        cx: &mut Context<Self>,
+    ) {
+        match result {
+            Ok(effective) => {
+                if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id)
+                    && !tab.forwards.contains(&effective)
+                {
+                    tab.forwards.push(effective.clone());
+                }
+                let message = format!("端口转发已开启：{}", effective.label());
+                let shown = self
+                    .forward
+                    .as_ref()
+                    .is_some_and(|dialog| dialog.tab_id == tab_id);
+                if shown && let Some(dialog) = self.forward.as_mut() {
+                    dialog.error = None;
+                    dialog.info = Some(message.clone().into());
+                }
+                self.status = message.into();
+            }
+            Err(error) => {
+                if let Some(dialog) = self.forward.as_mut() {
+                    dialog.info = None;
+                    dialog.error = Some(error.clone().into());
+                }
+                self.status = format!("端口转发失败：{error}").into();
+            }
+        }
+        cx.notify();
+    }
+
+    /// 停止一条转发，并从标签的活动规则列表里移除。
+    fn stop_forward(&mut self, rule: session::ForwardRule, cx: &mut Context<Self>) {
+        let Some(dialog) = self.forward.as_ref() else {
+            return;
+        };
+        let tab_id = dialog.tab_id;
+        let Some(sender) = self
+            .tabs
+            .iter()
+            .find(|tab| tab.id == tab_id)
+            .and_then(|tab| tab.commands.clone())
+        else {
+            self.remove_forward_rule(tab_id, &rule);
+            self.forward_error("会话已断开，转发已随之停止", cx);
+            return;
+        };
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let label = rule.label();
+        if sender
+            .send(session::SessionCommand::ForwardStop {
+                rule: rule.clone(),
+                reply: reply_tx,
+            })
+            .is_err()
+        {
+            self.remove_forward_rule(tab_id, &rule);
+            self.forward_error("会话已断开，转发已随之停止", cx);
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let stopped = reply_rx.await.unwrap_or(false);
+            let _ = this.update(cx, |this, cx| {
+                this.remove_forward_rule(tab_id, &rule);
+                let message = if stopped {
+                    format!("已停止端口转发 {label}")
+                } else {
+                    format!("{label} 已不在转发中")
+                };
+                if let Some(dialog) = this.forward.as_mut() {
+                    dialog.error = None;
+                    dialog.info = Some(message.clone().into());
+                }
+                this.status = message.into();
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 从标签的活动规则列表里删掉一条（服务端已停止或已失效）。
+    fn remove_forward_rule(&mut self, tab_id: usize, rule: &session::ForwardRule) {
+        if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) {
+            let id = rule.id();
+            tab.forwards.retain(|existing| existing.id() != id);
+        }
+    }
+
+    /// 端口转发的即时错误：写进弹窗（若还开着）并同步状态栏。
+    fn forward_error(&mut self, message: impl Into<SharedString>, cx: &mut Context<Self>) {
+        let message = message.into();
+        if let Some(dialog) = self.forward.as_mut() {
+            dialog.error = Some(message.clone());
+            dialog.info = None;
+        }
+        self.status = message;
         cx.notify();
     }
 
@@ -1662,6 +3005,87 @@ impl RuLinkApp {
         }
     }
 
+    /// 从 `~/.ssh/config` 导入具体 Host 条目。
+    ///
+    /// 通配符 / `Match` 块跳过；按 user+host+port 或同名去重；
+    /// 私钥文件在本机不存在时改用 Agent（避免导入后在加载私钥这一步直接失败）。
+    fn import_ssh_config(&mut self, cx: &mut Context<Self>) {
+        let path = crate::ssh_config::config_path();
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) => {
+                self.status = SharedString::from(format!("读取 {} 失败：{error}", path.display()));
+                cx.notify();
+                return;
+            }
+        };
+        let entries = crate::ssh_config::parse(&text);
+        if entries.is_empty() {
+            self.status = SharedString::from(format!(
+                "{} 里没有可导入的具体主机（通配符与 Match 已跳过）",
+                path.display()
+            ));
+            cx.notify();
+            return;
+        }
+        let fallback_user = std::env::var("USER")
+            .or_else(|_| std::env::var("USERNAME"))
+            .unwrap_or_else(|_| "root".to_string());
+        let mut imported = 0usize;
+        let mut skipped = 0usize;
+        let mut missing_keys = 0usize;
+        for entry in entries {
+            let user = entry.user.unwrap_or_else(|| fallback_user.clone());
+            let duplicate = self.hosts.iter().any(|host| {
+                (host.user.eq_ignore_ascii_case(&user)
+                    && host.host.eq_ignore_ascii_case(&entry.host_name)
+                    && host.port == entry.port)
+                    || (!host.name.is_empty() && host.name.eq_ignore_ascii_case(&entry.alias))
+            });
+            if duplicate {
+                skipped += 1;
+                continue;
+            }
+            let (auth, key_path) = match entry.identity_file {
+                Some(path) if path.is_file() => {
+                    (AuthMethod::IdentityFile, path.display().to_string())
+                }
+                Some(_) => {
+                    missing_keys += 1;
+                    (AuthMethod::Agent, String::new())
+                }
+                None => (AuthMethod::Agent, String::new()),
+            };
+            let mut host = HostConfig {
+                id: 0,
+                name: entry.alias,
+                host: entry.host_name,
+                port: entry.port,
+                user,
+                auth,
+                key_path,
+                key_inline: false,
+                favorite: false,
+                proxy_jump: None,
+            };
+            if self.vault.is_some() {
+                host.id = self.hosts.iter().map(|item| item.id).max().unwrap_or(0) + 1;
+            }
+            self.hosts.push(host.clone());
+            self.persist_host(&host, cx);
+            imported += 1;
+        }
+        let mut status = format!("已从 {} 导入 {imported} 台主机", path.display());
+        if skipped > 0 {
+            status.push_str(&format!("，跳过 {skipped} 条重复"));
+        }
+        if missing_keys > 0 {
+            status.push_str(&format!("，{missing_keys} 条私钥不存在改用 Agent"));
+        }
+        self.status = SharedString::from(status);
+        cx.notify();
+    }
+
     /// 打开新建主机表单（未分组）。
     fn open_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.open_form_at(None, None, window, cx);
@@ -1752,6 +3176,7 @@ impl RuLinkApp {
             save_secret: false,
             auth,
             group,
+            jump: existing.as_ref().and_then(|host| host.proxy_jump),
             editing: edit_index,
         };
         self.new_host = Some(form);
@@ -1785,6 +3210,7 @@ impl RuLinkApp {
         let passphrase = form.passphrase.read(cx).value().trim().to_string();
         let save_secret = form.save_secret;
         let group = form.group.clone();
+        let jump = form.jump;
         let key_inline = form.key_inline;
         let key_data = form.key_data.clone();
         let host_raw = form.host.read(cx).value().trim().to_string();
@@ -1805,6 +3231,7 @@ impl RuLinkApp {
             key_path: if key_inline { String::new() } else { key_path },
             key_inline: auth == AuthMethod::IdentityFile && key_inline,
             favorite: false,
+            proxy_jump: jump,
         };
         if host.key_inline {
             if self.vault.is_none() {
@@ -1827,6 +3254,28 @@ impl RuLinkApp {
             cx.notify();
             return;
         }
+        // 跳板机引用必须是仍存在的另一台主机，且不能自己挂自己或形成两级以上链。
+        if let Some(jump_id) = host.proxy_jump {
+            let self_id = editing.and_then(|index| self.hosts.get(index)).map(|host| host.id);
+            match self.hosts.iter().find(|item| item.id == jump_id) {
+                None => {
+                    self.status = "所选跳板机已不存在，请重新选择".into();
+                    cx.notify();
+                    return;
+                }
+                Some(jump) if Some(jump.id) == self_id => {
+                    self.status = "不能把主机自己设为跳板机".into();
+                    cx.notify();
+                    return;
+                }
+                Some(jump) if jump.proxy_jump.is_some() => {
+                    self.status = "跳板机不能再挂跳板机，请先解除它的跳板机设置".into();
+                    cx.notify();
+                    return;
+                }
+                Some(_) => {}
+            }
+        }
         let label = if host.name.is_empty() {
             host.host.clone()
         } else {
@@ -1844,6 +3293,7 @@ impl RuLinkApp {
                 let was_inline = current.key_inline;
                 self.hosts[index] = host.clone();
                 self.persist_host(&host, cx);
+                self.note_jump(&host, cx);
                 let note = self.store_form_secret(&host, passphrase.clone(), save_secret, cx);
                 let key_note = self.store_form_key(&host, key_data, was_inline, cx);
                 self.apply_form_group(&host, group, cx);
@@ -1863,6 +3313,7 @@ impl RuLinkApp {
         }
         self.hosts.push(host.clone());
         self.persist_host(&host, cx);
+        self.note_jump(&host, cx);
         let note = self.store_form_secret(&host, passphrase, save_secret, cx);
         let key_note = self.store_form_key(&host, key_data, false, cx);
         self.apply_form_group(&host, group, cx);
@@ -2115,6 +3566,16 @@ impl RuLinkApp {
             }
             self.sidebar.forget(removed.id);
             self.persist_sidebar(cx);
+            // 跳板机引用一并断掉：删的是跳板机时，原本经由它的主机改回直连。
+            if self.vault.is_some() {
+                let orphaned = self.jumps.forget(removed.id);
+                for host in &mut self.hosts {
+                    if orphaned.contains(&host.id) {
+                        host.proxy_jump = None;
+                    }
+                }
+                self.persist_jumps(cx);
+            }
             self.status = SharedString::from(format!("已删除主机 {label}"));
             cx.notify();
         }
@@ -2238,8 +3699,9 @@ impl RuLinkApp {
         self.open_shell_input(
             id,
             ShellPromptKind::Rename,
-            default_text,
+            default_text.clone(),
             current,
+            default_text,
             window,
             cx,
         );
@@ -2260,8 +3722,49 @@ impl RuLinkApp {
         self.open_shell_input(
             id,
             ShellPromptKind::WorkingDirectory,
-            default_text,
+            default_text.clone(),
             current,
+            default_text,
+            window,
+            cx,
+        );
+    }
+
+    /// 打开「启动参数」弹窗（预填已保存的参数原文，留空＝不加参数）。
+    fn open_shell_args_prompt(
+        &mut self,
+        profile: &ShellProfile,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let id = profile.id();
+        let current = self.local_shell_prefs.args.get(&id).cloned().unwrap_or_default();
+        self.open_shell_input(
+            id,
+            ShellPromptKind::Arguments,
+            String::new(),
+            current,
+            "-NoLogo -NoProfile".into(),
+            window,
+            cx,
+        );
+    }
+
+    /// 打开「环境变量」弹窗（预填已保存的 KEY=VALUE 行，留空＝不注入）。
+    fn open_shell_env_prompt(
+        &mut self,
+        profile: &ShellProfile,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let id = profile.id();
+        let current = local_shell::env_text(&self.local_shell_prefs.env_map_of(&id));
+        self.open_shell_input(
+            id,
+            ShellPromptKind::Environment,
+            String::new(),
+            current,
+            "KEY=VALUE".into(),
             window,
             cx,
         );
@@ -2273,22 +3776,31 @@ impl RuLinkApp {
         kind: ShellPromptKind,
         default_text: String,
         current: String,
+        placeholder: String,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let placeholder = default_text.clone();
+        let multi_line = kind.multi_line();
         let input = cx.new(|cx| {
-            InputState::new(window, cx)
+            let state = InputState::new(window, cx)
                 .placeholder(placeholder)
-                .default_value(current)
-        });
-        // 回车即确认，与分组重命名一致。
-        cx.subscribe(&input, |this, _, event: &InputEvent, cx| {
-            if matches!(event, InputEvent::PressEnter { shift: false, .. }) {
-                this.commit_shell_prompt(cx);
+                .default_value(current);
+            if multi_line {
+                // 多行输入在无固定高度的容器里会塌成一行，用 auto_grow 撑到 6 行起。
+                state.auto_grow(6, 12)
+            } else {
+                state
             }
-        })
-        .detach();
+        });
+        // 单行弹窗回车即确认，与分组重命名一致；多行里回车是换行，点「保存」提交。
+        if !multi_line {
+            cx.subscribe(&input, |this, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::PressEnter { shift: false, .. }) {
+                    this.commit_shell_prompt(cx);
+                }
+            })
+            .detach();
+        }
         input.update(cx, |state, cx| state.focus(window, cx));
         self.shell_prompt = Some(ShellPrompt {
             id,
@@ -2332,6 +3844,37 @@ impl RuLinkApp {
                     self.status = SharedString::from(format!("起始目录已设为 {text}"));
                 }
             }
+            ShellPromptKind::Arguments => {
+                let args = local_shell::split_args(&text);
+                if args.is_empty() {
+                    self.local_shell_prefs.set_args(&prompt.id, "");
+                    self.status = "已清除自定义启动参数".into();
+                } else {
+                    // 规范化存储：引号按分词规则重排，回填时与解析结果一致。
+                    let normalized = local_shell::join_args(&args);
+                    self.local_shell_prefs.set_args(&prompt.id, &normalized);
+                    self.status = SharedString::from(format!("启动参数已设为 {normalized}"));
+                }
+            }
+            ShellPromptKind::Environment => match local_shell::parse_env(&text) {
+                Err(error) => {
+                    self.status = SharedString::from(error);
+                    self.shell_prompt = Some(prompt);
+                    cx.notify();
+                    return;
+                }
+                Ok(env) if env.is_empty() => {
+                    self.local_shell_prefs.set_env(&prompt.id, "");
+                    self.status = "已清除自定义环境变量".into();
+                }
+                Ok(env) => {
+                    let normalized = local_shell::env_text(&env);
+                    let count = env.len();
+                    self.local_shell_prefs.set_env(&prompt.id, &normalized);
+                    self.status =
+                        SharedString::from(format!("已设置 {count} 个环境变量"));
+                }
+            },
         }
         self.persist_local_shells(cx);
         cx.notify();
@@ -2390,6 +3933,22 @@ impl RuLinkApp {
         cx.notify();
     }
 
+    /// 右键「清除启动参数」。
+    fn reset_shell_args(&mut self, profile: &ShellProfile, cx: &mut Context<Self>) {
+        self.local_shell_prefs.set_args(&profile.id(), "");
+        self.status = SharedString::from(format!("已清除 {} 的启动参数", self.shell_name(profile)));
+        self.persist_local_shells(cx);
+        cx.notify();
+    }
+
+    /// 右键「清除环境变量」。
+    fn reset_shell_env(&mut self, profile: &ShellProfile, cx: &mut Context<Self>) {
+        self.local_shell_prefs.set_env(&profile.id(), "");
+        self.status = SharedString::from(format!("已清除 {} 的环境变量", self.shell_name(profile)));
+        self.persist_local_shells(cx);
+        cx.notify();
+    }
+
     /// 保存本机 shell 自定义名（库可用入库，否则退回 settings.json）。
     fn persist_local_shells(&mut self, cx: &mut Context<Self>) {
         let json = self.local_shell_prefs.to_json();
@@ -2415,6 +3974,61 @@ impl RuLinkApp {
         self.persist_sidebar(cx);
     }
 
+    /// 组内手动排序：收藏 / 非收藏各自成桶（收藏恒在桶上方，菜单只挪同桶邻居）。
+    fn reorder_host(&mut self, index: usize, action: ReorderAction, cx: &mut Context<Self>) {
+        let Some(host) = self.hosts.get(index) else {
+            return;
+        };
+        let (id, favorite) = (host.id, host.favorite);
+        let group = self
+            .sidebar
+            .group_of(id)
+            .map(str::to_string)
+            .unwrap_or_else(|| UNGROUPED.to_string());
+        let alive: Vec<i64> = self.hosts.iter().map(|host| host.id).collect();
+        self.sidebar.sync_order(&alive);
+        // 同组同桶的主机按当前展示顺序（手动序 → 插入序）排好。
+        let mut peers: Vec<i64> = self
+            .hosts
+            .iter()
+            .filter(|candidate| candidate.favorite == favorite)
+            .filter(|candidate| {
+                self.sidebar
+                    .group_of(candidate.id)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| UNGROUPED.to_string())
+                    == group
+            })
+            .map(|candidate| candidate.id)
+            .collect();
+        peers.sort_by_key(|&peer| self.sidebar.rank_of(peer));
+        let Some(position) = peers.iter().position(|&peer| peer == id) else {
+            return;
+        };
+        let anchor = match action {
+            ReorderAction::Up if position > 0 => Some(peers[position - 1]),
+            ReorderAction::Down if position + 1 < peers.len() => Some(peers[position + 1]),
+            ReorderAction::Top if position > 0 => Some(peers[0]),
+            _ => None,
+        };
+        let Some(anchor) = anchor else {
+            let boundary = match action {
+                ReorderAction::Down => "已在组内最后",
+                _ => "已在组内最前",
+            };
+            self.status = SharedString::from(boundary);
+            cx.notify();
+            return;
+        };
+        match action {
+            // 下移＝把下一个邻居挪到本机前面，等价于本机后移一位。
+            ReorderAction::Down => self.sidebar.move_before(anchor, id),
+            _ => self.sidebar.move_before(id, anchor),
+        }
+        self.persist_sidebar(cx);
+        cx.notify();
+    }
+
     /// 切换指定主机的收藏状态并持久化。
     fn toggle_favorite(&mut self, index: usize, cx: &mut Context<Self>) {
         if let Some(host) = self.hosts.get_mut(index) {
@@ -2432,14 +4046,17 @@ impl RuLinkApp {
         };
         match host.auth {
             AuthMethod::Agent => {
-                let Ok(target) = self.host_target(&host, None) else {
-                    self.status =
-                        "内嵌私钥不可用（加密库未解锁或数据损坏），请编辑该主机重新导入".into();
-                    cx.notify();
-                    return;
-                };
+                let target = match self.host_target(&host, None) {
+                        Ok(target) => target,
+                        Err(error) => {
+                            self.status = SharedString::from(error);
+                            cx.notify();
+                            return;
+                        }
+                    };
                 let title = host.name.clone();
-                self.connect(title, target, None, None, false, window, cx);
+                // 带上 host：Agent 主机也能进最近连接，且重连时按最新主机配置重建。
+                self.connect(title, target, None, Some(host), false, window, cx);
             }
             AuthMethod::Password | AuthMethod::IdentityFile => {
                 self.click_secret_host(host, window, cx);
@@ -2463,10 +4080,25 @@ impl RuLinkApp {
             let entity_id = entity.entity_id();
             cx.spawn(async move |_, cx| {
                 let saved = vault.password_of(host.id).await.ok().flatten();
+                // 跳板机的凭据也从库里取：目标主机点击时才需要输入密码，
+                // 跳板机不能每次都追问一遍（它只是连接路径的一部分）。
+                let saved_jump = match host.proxy_jump {
+                    Some(id) if id != host.id => vault.password_of(id).await.ok().flatten(),
+                    _ => None,
+                };
                 let _ = cx.with_window(entity_id, move |window, cx| {
                     let _ = entity.update(cx, move |this, cx| {
                         if this.pending.is_some() {
                             return;
+                        }
+                        if let Some(secret) = saved_jump
+                            && let Some(jump) = this
+                                .hosts
+                                .iter()
+                                .find(|item| Some(item.id) == host.proxy_jump)
+                        {
+                            let key = jump.addr();
+                            this.password_cache.insert(key, secret);
                         }
                         match (saved, host.auth) {
                             (Some(secret), _) => {
@@ -2507,7 +4139,61 @@ impl RuLinkApp {
         } else {
             None
         };
-        Ok(SshTarget::from_host(host, password).with_key_data(key_data))
+        let jump = self.jump_target(host)?;
+        Ok(SshTarget::from_host(host, password)
+            .with_key_data(key_data)
+            .with_jump(jump))
+    }
+
+    /// 把主机表单里选的跳板机构造成完整的连接目标（含它自己的认证材料）。
+    ///
+    /// 跳板机必须是另一台已保存主机；密码 / 口令只从本次运行的内存缓存里取
+    /// （先单独连一次该跳板机并勾选保存即可），绝不为了跳板机再弹一次窗
+    /// 或落明文。取不到时给出可操作的提示，而不是让连接失败得莫名其妙。
+    fn jump_target(&self, host: &HostConfig) -> Result<Option<SshTarget>, String> {
+        let Some(jump_id) = host.proxy_jump else {
+            return Ok(None);
+        };
+        let jump = self
+            .hosts
+            .iter()
+            .find(|item| item.id == jump_id)
+            .ok_or_else(|| "所选跳板机已不存在，请编辑该主机重新选择".to_string())?;
+        if jump.id == host.id {
+            return Err("不能把主机自己设为跳板机".to_string());
+        }
+        if jump.proxy_jump.is_some() {
+            return Err("跳板机不能再挂跳板机，请先解除它的跳板机设置".to_string());
+        }
+        let secret = self.password_cache.get(&jump.addr()).cloned();
+        let password = if jump.auth == AuthMethod::Password {
+            Some(secret.clone().ok_or_else(|| {
+                format!(
+                    "跳板机 {} 需要密码：请先单独连接它并勾选「保存密码」，或改用私钥 / Agent",
+                    jump.addr()
+                )
+            })?)
+        } else {
+            None
+        };
+        let key_data = if jump.auth == AuthMethod::IdentityFile && jump.key_inline {
+            Some(self.inline_keys.get(&jump.id).cloned().ok_or_else(|| {
+                format!("跳板机 {} 的内嵌私钥不可用（加密库未解锁或数据损坏）", jump.addr())
+            })?)
+        } else {
+            None
+        };
+        // 私钥口令走 `passphrase`；密码认证的 secret 已在上面作为 password 传了。
+        let passphrase = if jump.auth == AuthMethod::Password {
+            None
+        } else {
+            secret
+        };
+        Ok(Some(
+            SshTarget::from_host(jump, password)
+                .with_key_data(key_data)
+                .with_passphrase(passphrase),
+        ))
     }
 
     /// 用取到的秘密（缓存或加密库）建立连接目标并连接。
@@ -2526,11 +4212,14 @@ impl RuLinkApp {
                 .host_target(&host, None)
                 .map(|target| target.with_passphrase(Some(secret))),
         };
-        let Ok(target) = target else {
-            self.status = "内嵌私钥不可用（加密库未解锁或数据损坏），请编辑该主机重新导入".into();
-            cx.notify();
-            return;
-        };
+        let target = match target {
+                Ok(target) => target,
+                Err(error) => {
+                    self.status = SharedString::from(error);
+                    cx.notify();
+                    return;
+                }
+            };
         let title = host.name.clone();
         self.connect(title, target, Some(key), Some(host), from_vault, window, cx);
     }
@@ -2542,10 +4231,13 @@ impl RuLinkApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Ok(target) = self.host_target(&host, None) else {
-            self.status = "内嵌私钥不可用（加密库未解锁或数据损坏），请编辑该主机重新导入".into();
-            cx.notify();
-            return;
+        let target = match self.host_target(&host, None) {
+            Ok(target) => target,
+            Err(error) => {
+                self.status = SharedString::from(error);
+                cx.notify();
+                return;
+            }
         };
         let title = host.name.clone();
         self.connect(title, target, None, Some(host), false, window, cx);
@@ -2607,11 +4299,14 @@ impl RuLinkApp {
                 .host_target(&host, None)
                 .map(|target| target.with_passphrase(Some(secret))),
         };
-        let Ok(target) = target else {
-            self.status = "内嵌私钥不可用（加密库未解锁或数据损坏），请编辑该主机重新导入".into();
-            cx.notify();
-            return;
-        };
+        let target = match target {
+                Ok(target) => target,
+                Err(error) => {
+                    self.status = SharedString::from(error);
+                    cx.notify();
+                    return;
+                }
+            };
         self.connect(
             host.name.clone(),
             target,
@@ -2641,6 +4336,8 @@ impl RuLinkApp {
     ) {
         let id = self.next_id;
         self.next_id += 1;
+        // 新会话成为活动标签，分屏里没有它，回到单屏。
+        self.view_split = None;
         self.active_tab = Some(id);
         self.start_ssh(
             id,
@@ -2706,6 +4403,7 @@ impl RuLinkApp {
             started,
             ready,
             disconnect,
+            commands,
         } = session::start(
             target,
             handles,
@@ -2735,6 +4433,8 @@ impl RuLinkApp {
             failed: false,
             resume: Some(resume),
             disconnect: Some(disconnect),
+            commands: Some(commands),
+            forwards: Vec::new(),
             auto_retry_attempt: retry_attempt,
             auto_retry_pending: false,
             connected_at: None,
@@ -2748,20 +4448,27 @@ impl RuLinkApp {
         self.activate_tab(id, window, cx);
         // shell 真正开起来才算"连接可用"：记录时刻供断线后判断会话是否稳定过。
         let ready_view = terminal_view.clone();
+        let recent_host_id = host.as_ref().map(|host| host.id).filter(|id| *id != 0);
         cx.spawn(async move |this, cx| {
             if ready.await.is_err() {
                 return;
             }
             let _ = this.update(cx, |this, cx| {
-                if let Some(tab) = this
+                let current = this
                     .tabs
                     .iter_mut()
-                    .find(|tab| tab.id == id && tab.terminal_view == ready_view)
-                {
+                    .find(|tab| tab.id == id && tab.terminal_view == ready_view);
+                if let Some(tab) = current {
                     tab.connected_at = Some(Instant::now());
                     tab.auto_retry_pending = false;
-                    cx.notify();
+                } else {
+                    return;
                 }
+                if let Some(host_id) = recent_host_id {
+                    this.record_recent_host(host_id, cx);
+                }
+                cx.notify();
+                this.auto_start_forwards(id, cx);
             });
         })
         .detach();
@@ -2870,10 +4577,19 @@ impl RuLinkApp {
             return;
         }
         tab.ended = true;
+        let had_forwards = !tab.forwards.is_empty();
+        // 端口转发随会话进程一起停：本地监听端口已释放，列表不能继续展示"生效中"。
+        tab.forwards.clear();
         let (title, failed, active) = (tab.title.clone(), tab.failed, self.active_tab == Some(id));
         if active && !failed {
             self.status =
                 SharedString::from(format!("会话已断开 {title}，按回车或点击「重新连接」恢复"));
+        }
+        if had_forwards
+            && let Some(dialog) = self.forward.as_mut().filter(|dialog| dialog.tab_id == id)
+        {
+            dialog.info = None;
+            dialog.error = Some("会话已断开，端口转发已全部停止".into());
         }
         cx.notify();
     }
@@ -2890,11 +4606,15 @@ impl RuLinkApp {
         cx: &mut Context<Self>,
     ) {
         let mut schedule = None;
+        let mut had_forwards = false;
         let auto_enabled = self.session_prefs.auto_reconnect;
         if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) {
             tab.failed = true;
             // 失败也按"已结束"落标签：终端事件可能迟到，横幅与重连入口要立刻可用。
             tab.ended = true;
+            had_forwards = !tab.forwards.is_empty();
+            // 连接没了，本地监听端口随会话任务一起释放。
+            tab.forwards.clear();
             // 稳定跑过一阵的会话：这是新一轮断线，重试次数清零。
             if tab
                 .connected_at
@@ -2919,6 +4639,12 @@ impl RuLinkApp {
                 schedule = Some((attempt, delay, tab.terminal_view.clone()));
             }
             cx.notify();
+        }
+        if had_forwards
+            && let Some(dialog) = self.forward.as_mut().filter(|dialog| dialog.tab_id == id)
+        {
+            dialog.info = None;
+            dialog.error = Some("连接已断开，端口转发已全部停止".into());
         }
         if let Some((attempt, delay, view)) = schedule {
             if self.active_tab == Some(id) {
@@ -3063,6 +4789,29 @@ impl RuLinkApp {
         if self.tabs.len() == before {
             return;
         }
+        // 分屏里的任一侧没了（关标签 / 本地 shell 退出）就回到单屏。
+        if self
+            .view_split
+            .as_ref()
+            .is_some_and(|view| view.first == id || view.second == id)
+        {
+            self.view_split = None;
+        }
+        // 传输/转发弹窗绑定的是这条连接：标签没了就一起关掉，避免对着死会话操作。
+        if self
+            .transfer
+            .as_ref()
+            .is_some_and(|dialog| dialog.tab_id == id)
+        {
+            self.transfer = None;
+        }
+        if self
+            .forward
+            .as_ref()
+            .is_some_and(|dialog| dialog.tab_id == id)
+        {
+            self.forward = None;
+        }
         if let Some(title) = title {
             self.status = SharedString::from(format!("已断开 {title}"));
         }
@@ -3072,6 +4821,7 @@ impl RuLinkApp {
                 self.reveal_tab(active);
             }
         }
+        self.sync_tray(cx);
         cx.notify();
     }
 
@@ -3120,12 +4870,163 @@ impl RuLinkApp {
 
     /// 切到指定标签：选中、滚进可见范围（标签多到溢出时），并把焦点交给它的终端。
     fn activate_tab(&mut self, id: usize, window: &mut Window, cx: &mut Context<Self>) {
+        // 分屏只描述"哪两个标签并排"：从标签栏 / 快捷键切到第三个会话时退出分屏，
+        // 点两个分屏面板之一则保持在分屏里（两屏位置不互换）。
+        if let Some(view) = self.view_split.as_ref()
+            && view.first != id
+            && view.second != id
+        {
+            self.view_split = None;
+            self.status = "已退出分屏".into();
+        }
         self.active_tab = Some(id);
         if let Some(ix) = self.tabs.iter().position(|tab| tab.id == id) {
             self.tab_scroll.scroll_to_item(ix);
             let focus = self.tabs[ix].terminal_view.read(cx).focus_handle(cx);
             focus.focus(window, cx);
         }
+        self.sync_tray(cx);
+    }
+
+    /// Ctrl+Shift+D / 菜单项：左右分屏；已在左右分屏时再按一次即取消。
+    fn split_right(&mut self, _: &SplitRight, window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_split(SplitDirection::Horizontal, window, cx);
+    }
+
+    /// Ctrl+Shift+E / 菜单项：上下分屏；已在上下分屏时再按一次即取消。
+    fn split_down(&mut self, _: &SplitDown, window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_split(SplitDirection::Vertical, window, cx);
+    }
+
+    fn close_split_action(&mut self, _: &CloseSplit, _: &mut Window, cx: &mut Context<Self>) {
+        self.close_split("已取消分屏", cx);
+    }
+
+    fn close_split(&mut self, status: &str, cx: &mut Context<Self>) {
+        if self.view_split.take().is_some() {
+            self.status = SharedString::from(status.to_string());
+            cx.notify();
+        }
+    }
+
+    /// 分屏开关：同方向＝取消；换方向＝原地换排布；未分屏时把活动标签与下一个标签并排。
+    fn toggle_split(
+        &mut self,
+        direction: SplitDirection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(view) = self.view_split.as_mut() {
+            if view.direction == direction {
+                self.close_split("已取消分屏", cx);
+                return;
+            }
+            view.direction = direction;
+            let pane = view.pane.clone();
+            pane.update(cx, |state, cx| state.set_direction(direction, cx));
+            self.status = SharedString::from(if direction == SplitDirection::Horizontal {
+                "已切换为左右分屏"
+            } else {
+                "已切换为上下分屏"
+            });
+            cx.notify();
+            return;
+        }
+        let Some(active) = self
+            .active_tab
+            .filter(|id| self.tabs.iter().any(|tab| tab.id == *id))
+            .or_else(|| self.tabs.last().map(|tab| tab.id))
+        else {
+            self.status = "没有可分屏的会话".into();
+            cx.notify();
+            return;
+        };
+        // 伙伴取活动标签的下一个（末尾则取上一个）；只有一个标签时没法分屏。
+        let Some(second) = self
+            .tabs
+            .iter()
+            .position(|tab| tab.id == active)
+            .and_then(|ix| {
+                let next = self.tabs.get(ix + 1).map(|tab| tab.id);
+                next.or_else(|| ix.checked_sub(1).map(|prev| self.tabs[prev].id))
+            })
+        else {
+            self.status = "分屏需要两个标签：先再开一个会话".into();
+            cx.notify();
+            return;
+        };
+        let pane = cx.new(|cx| {
+            let mut state = SplitPaneState::new(cx);
+            state.set_direction(direction, cx);
+            // 两边都留出能看几行的宽度，拖到极小意义不大。
+            state.set_min_first(240.0, cx);
+            state.set_min_second(240.0, cx);
+            state
+        });
+        // 左/上取标签顺序靠前的那个，两屏位置与标签栏顺序一致。
+        let active_ix = self
+            .tabs
+            .iter()
+            .position(|tab| tab.id == active)
+            .unwrap_or(0);
+        let second_ix = self
+            .tabs
+            .iter()
+            .position(|tab| tab.id == second)
+            .unwrap_or(0);
+        let (first, second) = if active_ix < second_ix {
+            (active, second)
+        } else {
+            (second, active)
+        };
+        self.view_split = Some(SplitView {
+            first,
+            second,
+            direction,
+            pane,
+        });
+        self.activate_tab(active, window, cx);
+        self.status = SharedString::from(if direction == SplitDirection::Horizontal {
+            "已左右分屏（拖中间分隔条调宽度）"
+        } else {
+            "已上下分屏（拖中间分隔条调高度）"
+        });
+        cx.notify();
+    }
+
+    /// 把当前会话列表刷到托盘菜单与悬停提示（隐藏到托盘后也能直接跳回某个标签）。
+    fn sync_tray(&self, cx: &mut Context<Self>) {
+        let mut menu = Vec::with_capacity(self.tabs.len() + 4);
+        for tab in &self.tabs {
+            let marker = if Some(tab.id) == self.active_tab {
+                "●"
+            } else {
+                "○"
+            };
+            menu.push(TrayMenuItem::Action {
+                label: format!("{marker} {}", tab.title).into(),
+                id: format!("tab:{}", tab.id).into(),
+            });
+        }
+        if !menu.is_empty() {
+            menu.push(TrayMenuItem::Separator);
+        }
+        menu.push(TrayMenuItem::Action {
+            label: "显示主界面".into(),
+            id: "show".into(),
+        });
+        menu.push(TrayMenuItem::Separator);
+        menu.push(TrayMenuItem::Action {
+            label: "退出".into(),
+            id: "quit".into(),
+        });
+        cx.set_tray_menu(menu);
+        let tooltip = if self.tabs.is_empty() {
+            "RuLink 拾连".to_string()
+        } else {
+            format!("RuLink 拾连 · {} 个会话", self.tabs.len())
+        };
+        cx.set_tray_tooltip(&tooltip);
     }
 
     /// 让标签栏滚到能看见指定标签（不改变选中态）。
@@ -3187,6 +5088,8 @@ impl RuLinkApp {
     fn overlay_open(&self) -> bool {
         self.unlock.is_some()
             || self.settings.is_some()
+            || self.transfer.is_some()
+            || self.forward.is_some()
             || self.confirm_delete.is_some()
             || self.new_host.is_some()
             || self.group_prompt.is_some()
@@ -3313,11 +5216,14 @@ impl RuLinkApp {
             return;
         };
         // WSL 等带参数的档案要拼成整条命令行；后端只收一个 shell 字符串。
-        let program = local_shell::command_line(&chosen);
+        let profile_id = chosen.id();
+        let extra_args = self.local_shell_prefs.args_of(&profile_id);
+        let program = local_shell::command_line_with(&chosen, &extra_args);
+        let env = self.local_shell_prefs.env_map_of(&profile_id);
         let label = self.shell_name(&chosen).to_string();
         let working_directory = self
             .local_shell_prefs
-            .cwd_of(&chosen.id())
+            .cwd_of(&profile_id)
             .map(std::path::PathBuf::from)
             // 目录事后被删/改名时静默回落，不阻断开会话。
             .filter(|dir| dir.is_dir())
@@ -3336,7 +5242,7 @@ impl RuLinkApp {
         let builder = TerminalBuilder::new(
             working_directory,
             Some(program),
-            HashMap::new(),
+            env,
             None,
             window_id,
             cx,
@@ -3392,12 +5298,16 @@ impl RuLinkApp {
             failed: false,
             resume: None,
             disconnect: None,
+            commands: None,
+            forwards: Vec::new(),
             auto_retry_attempt: 0,
             auto_retry_pending: false,
             connected_at: None,
         });
+        self.view_split = None;
         self.active_tab = Some(id);
         self.reveal_tab(id);
+        self.sync_tray(cx);
         // 本地 shell 退出（exit / Ctrl+D / 进程被杀）与 SSH 会话结束一样直接收标签。
         cx.subscribe(&terminal, move |this, _, event: &TerminalEvent, cx| {
             if matches!(event, TerminalEvent::CloseTerminal) {
@@ -3428,6 +5338,11 @@ impl Render for RuLinkApp {
             .on_action(cx.listener(Self::next_tab))
             .on_action(cx.listener(Self::prev_tab))
             .on_action(cx.listener(Self::open_settings_action))
+            .on_action(cx.listener(Self::open_transfer_action))
+            .on_action(cx.listener(Self::open_forward_action))
+            .on_action(cx.listener(Self::split_right))
+            .on_action(cx.listener(Self::split_down))
+            .on_action(cx.listener(Self::close_split_action))
             // 捕获阶段先看到回车：断开的终端已写不到远端，回车要用来重连而不是被它吞掉。
             .capture_key_down(cx.listener(Self::capture_session_key))
             .child(self.render_title_bar(window, cx))
@@ -3507,15 +5422,66 @@ impl RuLinkApp {
             "主密码档 · 已解锁"
         };
         let entity = cx.entity();
-        let sidebar_collapsed = self.split_state.read(cx).is_collapsed();
+        // 转发跑在后台：弹窗关了也要能从标题栏看出"还有几条在生效"。
+        let active_forwards = self
+            .active_tab
+            .and_then(|id| self.tabs.iter().find(|tab| tab.id == id))
+            .map_or(0, |tab| tab.forwards.len());
 
         // 会话菜单：新建主机、本地终端、标签切换、侧栏折叠、设置入口、托盘与退出。
         // 前六项挂 action（而非 on_click）：rgpui 会按键绑定在项右侧自动显示
         // Ctrl+N / Ctrl+Shift+T / Ctrl+Tab / Ctrl+,。
+        let split_open = self.view_split.is_some();
+        // 菜单打开时把最近连接的 id 解析成当前列表里的条目（主机可能已删除或重排）。
+        let recent_items: Vec<(usize, SharedString)> = self
+            .recent_hosts
+            .iter()
+            .filter_map(|id| {
+                let index = self.hosts.iter().position(|host| host.id == *id)?;
+                let host = &self.hosts[index];
+                Some((
+                    index,
+                    SharedString::from(format!("{}（{}）", host.name, host.addr())),
+                ))
+            })
+            .collect();
+        let menu_entity = entity.clone();
         let session_menu = move |menu: PopupMenu, _: &mut Window, _: &mut Context<PopupMenu>| {
-            menu.item(PopupMenuItem::new("新建主机…").action(Box::new(NewHost)))
+            let importing = menu_entity.clone();
+            let mut menu = menu
+                .item(PopupMenuItem::new("新建主机…").action(Box::new(NewHost)))
+                .item(
+                    PopupMenuItem::new("导入 ~/.ssh/config…").on_click(move |_, _, cx| {
+                        importing.update(cx, |this, cx| this.import_ssh_config(cx));
+                    }),
+                );
+            if !recent_items.is_empty() {
+                menu = menu
+                    .separator()
+                    .item(PopupMenuItem::new("最近连接").disabled(true));
+                for (index, label) in recent_items.iter() {
+                    let entity = menu_entity.clone();
+                    let index = *index;
+                    let label = label.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(label).on_click(move |_, window, cx| {
+                            entity.update(cx, |this, cx| this.click_host(index, window, cx));
+                        }),
+                    );
+                }
+            }
+            let menu = menu
                 .item(PopupMenuItem::new("本地终端…").action(Box::new(NewLocalTerminal)))
-                .item(PopupMenuItem::new("下一个标签").action(Box::new(NextTab)))
+                .item(PopupMenuItem::new("上传 / 下载文件…").action(Box::new(OpenTransfer)))
+                .item(PopupMenuItem::new("端口转发…").action(Box::new(OpenForward)))
+                .item(PopupMenuItem::new("左右分屏").action(Box::new(SplitRight)))
+                .item(PopupMenuItem::new("上下分屏").action(Box::new(SplitDown)));
+            let menu = if split_open {
+                menu.item(PopupMenuItem::new("取消分屏").action(Box::new(CloseSplit)))
+            } else {
+                menu
+            };
+            menu.item(PopupMenuItem::new("下一个标签").action(Box::new(NextTab)))
                 .item(PopupMenuItem::new("上一个标签").action(Box::new(PrevTab)))
                 .item(PopupMenuItem::new("折叠 / 展开侧边栏").action(Box::new(ToggleSidebar)))
                 .item(PopupMenuItem::new("设置…").action(Box::new(OpenSettings)))
@@ -3683,9 +5649,9 @@ impl RuLinkApp {
                     .h_full()
                     .window_control_area(WindowControlArea::Drag),
             )
-            // 右侧：内容级操作（侧栏折叠 / 设置 / 锁定）+ 细分隔线 + 系统窗口按钮。
-            // 窗口按钮贴右缘、整高整宽，是系统语义；内容按钮缩成 28px 圆角块并留出间距，
-            // 否则"设置"和"最小化"一样大、挤成一排，看着像多出来的一个窗口按钮。
+            // 右侧：传输 / 转发 + 锁定入口 + 细分隔线 + 系统窗口按钮。
+            // 传输与转发绑定当前会话，放在标题栏常驻比塞进标签栏更稳定：
+            // 标签一多时标签栏会横向滚动，右端按钮容易被挤出视野。
             .child(
                 h_flex()
                     .items_center()
@@ -3693,32 +5659,29 @@ impl RuLinkApp {
                     .flex_shrink_0()
                     .pr_3()
                     .child(
-                        Button::new("sidebar-collapse")
-                            .icon(if sidebar_collapsed {
-                                IconName::PanelLeftOpen
+                        Button::new("title-transfer")
+                            .label("⇅ 传输")
+                            .compact()
+                            .ghost()
+                            .text_color(fg)
+                            .tooltip("上传 / 下载文件 (Ctrl+Shift+U)")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_transfer(window, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("title-forward")
+                            .label(if active_forwards == 0 {
+                                "⇆ 转发".to_string()
                             } else {
-                                IconName::PanelLeftClose
+                                format!("⇆ 转发 {active_forwards}")
                             })
                             .compact()
                             .ghost()
                             .text_color(fg)
-                            .tooltip("折叠 / 展开侧边栏 (Ctrl+B)")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.split_state.update(cx, |state, cx| {
-                                    state.toggle_collapse(CollapsiblePane::First, cx);
-                                });
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        Button::new("open-settings")
-                            .icon(IconName::Settings)
-                            .compact()
-                            .ghost()
-                            .text_color(fg)
-                            .tooltip("设置 (Ctrl+,)")
+                            .tooltip("端口转发 (Ctrl+Shift+F)")
                             .on_click(cx.listener(|this, _, window, cx| {
-                                this.open_settings(window, cx);
+                                this.open_forward(window, cx);
                             })),
                     )
                     // 口令档且未解锁：只留重新解锁入口（其余操作都需要库）。
@@ -4063,6 +6026,541 @@ impl RuLinkApp {
                                 })),
                         ),
                     ),
+            )
+            .into_any_element()
+    }
+
+    /// 文件传输弹窗：本地文件 + 远端路径，上传 / 下载共用，传输中显示进度。
+    fn render_transfer_dialog(&self, cx: &Context<Self>) -> AnyElement {
+        let pal = self.palette(cx);
+        let Some(dialog) = self.transfer.as_ref() else {
+            return div().into_any_element();
+        };
+        let busy = dialog.busy;
+        let direction = dialog.direction;
+        let (done, total) = dialog.progress.unwrap_or((0, 0));
+        let fraction = if total > 0 {
+            (done as f32 / total as f32).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let progress_text = match direction {
+            Some(direction) if busy => format!(
+                "{}中 · {} / {}（{:.0}%）",
+                direction.label(),
+                transfer::format_bytes(done),
+                transfer::format_bytes(total),
+                fraction * 100.0
+            ),
+            Some(direction) => format!(
+                "上次{} · {}",
+                direction.label(),
+                transfer::format_bytes(done)
+            ),
+            None => String::new(),
+        };
+        v_flex()
+            .id("transfer-backdrop")
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .size_full()
+            .items_center()
+            .justify_center()
+            .bg(rgpui::hsla(0.0, 0.0, 0.0, 0.45))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    if !this.transfer.as_ref().is_some_and(|dialog| dialog.busy) {
+                        this.close_transfer(cx);
+                    }
+                }),
+            )
+            .child(
+                v_flex()
+                    .id("transfer-dialog")
+                    .w(px(540.0))
+                    .gap_3()
+                    .p_5()
+                    .rounded(px(8.0))
+                    .bg(pal.card_bg)
+                    .border_1()
+                    .border_color(pal.border)
+                    .shadow_md()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                    )
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_base()
+                                    .font_weight(FontWeight(600.0))
+                                    .child(format!("文件传输 · {}", dialog.title)),
+                            )
+                            .child(
+                                Button::new("close-transfer").label("×").ghost().on_click(
+                                    cx.listener(|this, _, _, cx| this.close_transfer(cx)),
+                                ),
+                            ),
+                    )
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .child(div().text_sm().child("本地路径"))
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .child(styled_input(Input::new(&dialog.local), &pal).flex_1())
+                                    .child(
+                                        Button::new("transfer-browse")
+                                            .label("浏览…")
+                                            .secondary()
+                                            .outline()
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.browse_transfer_local(cx);
+                                            })),
+                                    ),
+                            )
+                            .child(
+                                div().text_xs().text_color(pal.muted).child(
+                                    "选择本地文件用于上传；下载时点「下载到…」另选保存位置。",
+                                ),
+                            ),
+                    )
+                    .child(labeled_field("远端路径", &dialog.remote, &pal))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(pal.muted)
+                            .child("支持 ~ 展开；上传到目录（如主目录）时自动沿用本地文件名。"),
+                    )
+                    .when(!progress_text.is_empty(), |this| {
+                        this.child(
+                            v_flex()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(if busy { pal.text } else { pal.muted })
+                                        .child(progress_text),
+                                )
+                                .child(
+                                    div()
+                                        .h(px(6.0))
+                                        .w_full()
+                                        .rounded(px(3.0))
+                                        .bg(pal.border)
+                                        .overflow_hidden()
+                                        .child(
+                                            div()
+                                                .h_full()
+                                                .w(rgpui::relative(fraction))
+                                                .rounded(px(3.0))
+                                                .bg(pal.accent),
+                                        ),
+                                ),
+                        )
+                    })
+                    .when_some(dialog.error.clone(), |this, error| {
+                        this.child(div().text_sm().text_color(pal.danger).child(error))
+                    })
+                    .when_some(dialog.info.clone(), |this, info| {
+                        this.child(div().text_xs().text_color(pal.muted).child(info))
+                    })
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .justify_end()
+                            .child(
+                                Button::new("transfer-close")
+                                    .label("关闭")
+                                    .ghost()
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.close_transfer(cx)),
+                                    ),
+                            )
+                            .child(
+                                Button::new("transfer-download")
+                                    .label("下载到…")
+                                    .secondary()
+                                    .outline()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.download_transfer(cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("transfer-upload")
+                                    .label("上传")
+                                    .primary()
+                                    .loading(busy && direction == Some(transfer::Direction::Upload))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.upload_transfer(cx);
+                                    })),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// 端口转发弹窗：已保存规则的开关列表 + 新建规则表单。
+    fn render_forward_dialog(&self, cx: &Context<Self>) -> AnyElement {
+        let pal = self.palette(cx);
+        let Some(dialog) = self.forward.as_ref() else {
+            return div().into_any_element();
+        };
+        let active = self
+            .tabs
+            .iter()
+            .find(|tab| tab.id == dialog.tab_id)
+            .map(|tab| tab.forwards.clone())
+            .unwrap_or_default();
+        let saved_rules = self.forward_prefs.rules_for(&dialog.addr).to_vec();
+        let auto_start = dialog.auto_start;
+        let editing = dialog.editing;
+        let entity = cx.entity();
+        let kind = dialog.kind;
+        let (listen_label, host_label, port_label, hint) = match kind {
+            session::ForwardKind::Local => (
+                "本地端口",
+                "远端主机",
+                "远端端口",
+                "监听只绑本机 127.0.0.1，不对局域网开放；目标地址按服务器视角解析。",
+            ),
+            session::ForwardKind::Remote => (
+                "服务器监听端口",
+                "本地目标主机",
+                "本地目标端口",
+                "服务器只监听其 127.0.0.1，不对公网开放；目标地址按本机视角解析。",
+            ),
+            session::ForwardKind::Dynamic => (
+                "SOCKS5 端口",
+                "",
+                "",
+                "在本机 127.0.0.1 上提供 SOCKS5 代理（无认证），目标地址由客户端请求给出、经服务器解析。",
+            ),
+        };
+        let is_dynamic = kind == session::ForwardKind::Dynamic;
+        let local_button = if kind == session::ForwardKind::Local {
+            Button::new("forward-kind-local")
+                .label("本地 -L")
+                .primary()
+        } else {
+            Button::new("forward-kind-local")
+                .label("本地 -L")
+                .ghost()
+        }
+        .on_click(cx.listener(|this, _, _, cx| {
+            this.set_forward_kind(session::ForwardKind::Local, cx);
+        }));
+        let remote_button = if kind == session::ForwardKind::Remote {
+            Button::new("forward-kind-remote")
+                .label("远程 -R")
+                .primary()
+        } else {
+            Button::new("forward-kind-remote")
+                .label("远程 -R")
+                .ghost()
+        }
+        .on_click(cx.listener(|this, _, _, cx| {
+            this.set_forward_kind(session::ForwardKind::Remote, cx);
+        }));
+        let dynamic_button = if is_dynamic {
+            Button::new("forward-kind-dynamic")
+                .label("动态 -D")
+                .primary()
+        } else {
+            Button::new("forward-kind-dynamic")
+                .label("动态 -D")
+                .ghost()
+        }
+        .on_click(cx.listener(|this, _, _, cx| {
+            this.set_forward_kind(session::ForwardKind::Dynamic, cx);
+        }));
+        v_flex()
+            .id("forward-backdrop")
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .size_full()
+            .items_center()
+            .justify_center()
+            .bg(rgpui::hsla(0.0, 0.0, 0.0, 0.45))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.close_forward(cx)),
+            )
+            .child(
+                v_flex()
+                    .id("forward-dialog")
+                    .w(px(680.0))
+                    .max_h(px(560.0))
+                    .gap_3()
+                    .p_5()
+                    .rounded(px(8.0))
+                    .bg(pal.card_bg)
+                    .border_1()
+                    .border_color(pal.border)
+                    .shadow_md()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                    )
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_base()
+                                    .font_weight(FontWeight(600.0))
+                                    .child(format!("端口转发 · {}", dialog.title)),
+                            )
+                            .child(
+                                Button::new("close-forward")
+                                    .label("×")
+                                    .ghost()
+                                    .on_click(cx.listener(|this, _, _, cx| this.close_forward(cx))),
+                            ),
+                    )
+                    .child(
+                        v_flex()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(pal.muted)
+                                    .child("已保存的转发（开关即时生效）"),
+                            )
+                            .child(
+                                v_flex()
+                                    .id("forward-saved-list")
+                                    .gap_1()
+                                    .max_h(if editing { px(150.0) } else { px(260.0) })
+                                    .overflow_y_scrollbar()
+                                    .when(saved_rules.is_empty(), |this| {
+                                        this.child(
+                                            div().text_sm().text_color(pal.muted).child(
+                                                "暂无保存的规则，点下方「设置…」添加一条。",
+                                            ),
+                                        )
+                                    })
+                                    .children(saved_rules.iter().cloned().map(|saved| {
+                                        let rule = saved.rule();
+                                        let on = active.iter().any(|item| item.id() == rule.id());
+                                        let switch_saved = saved.clone();
+                                        let delete_saved = saved.clone();
+                                        let row_entity = entity.clone();
+                                        h_flex()
+                                            .id(SharedString::from(format!(
+                                                "forward-row-{}",
+                                                rule.id()
+                                            )))
+                                            .justify_between()
+                                            .items_center()
+                                            .gap_3()
+                                            .py_1()
+                                            .child(
+                                                h_flex()
+                                                    .flex_1()
+                                                    .items_center()
+                                                    .gap_3()
+                                                    .child(forward_switch(
+                                                        format!("forward-toggle-{}", rule.id()),
+                                                        on,
+                                                        &pal,
+                                                        move |_, _, cx| {
+                                                            let on = !on;
+                                                            row_entity.update(cx, |this, cx| {
+                                                                this.toggle_saved_forward(
+                                                                    switch_saved.clone(),
+                                                                    on,
+                                                                    cx,
+                                                                );
+                                                            });
+                                                        },
+                                                    ))
+                                                    .child(
+                                                        v_flex()
+                                                            .gap_0p5()
+                                                            .child(
+                                                                div()
+                                                                    .text_sm()
+                                                                    .font_weight(FontWeight(600.0))
+                                                                    .child(saved.title()),
+                                                            )
+                                                            // 没备注时标题本身就是规则描述，不再重复一行。
+                                                            .when(
+                                                                !saved.name.trim().is_empty(),
+                                                                |this| {
+                                                                    this.child(
+                                                                        div()
+                                                                            .text_xs()
+                                                                            .text_color(pal.muted)
+                                                                            .child(rule.label()),
+                                                                    )
+                                                                },
+                                                            ),
+                                                    ),
+                                            )
+                                            .child(
+                                                Button::new(SharedString::from(format!(
+                                                    "forward-delete-{}",
+                                                    rule.id()
+                                                )))
+                                                .label("删除")
+                                                .compact()
+                                                .ghost()
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.delete_saved_forward(
+                                                        delete_saved.clone(),
+                                                        cx,
+                                                    );
+                                                })),
+                                            )
+                                    })),
+                            ),
+                    )
+                    .when(editing, |this| {
+                        this.child(
+                            h_flex()
+                                .gap_2()
+                                .items_end()
+                                .child(local_button)
+                                .child(remote_button)
+                                .child(dynamic_button)
+                                .child(
+                                    v_flex()
+                                        .flex_1()
+                                        .gap_1()
+                                        .child(div().text_sm().child("名称"))
+                                        .child(styled_input(Input::new(&dialog.name), &pal)),
+                                ),
+                        )
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .child(
+                                    v_flex()
+                                        .w(px(130.0))
+                                        .gap_1()
+                                        .child(div().text_sm().child(listen_label))
+                                        .child(styled_input(
+                                            Input::new(&dialog.listen_port),
+                                            &pal,
+                                        )),
+                                )
+                                .when(!is_dynamic, |this| {
+                                    this.child(
+                                        v_flex()
+                                            .flex_1()
+                                            .gap_1()
+                                            .child(div().text_sm().child(host_label))
+                                            .child(styled_input(
+                                                Input::new(&dialog.target_host),
+                                                &pal,
+                                            )),
+                                    )
+                                    .child(
+                                        v_flex()
+                                            .w(px(130.0))
+                                            .gap_1()
+                                            .child(div().text_sm().child(port_label))
+                                            .child(styled_input(
+                                                Input::new(&dialog.target_port),
+                                                &pal,
+                                            )),
+                                    )
+                                }),
+                        )
+                        .child(div().text_xs().text_color(pal.muted).child(hint))
+                        .when_some(dialog.error.clone(), |this, error| {
+                            this.child(div().text_sm().text_color(pal.danger).child(error))
+                        })
+                        .child(
+                            h_flex()
+                                .gap_3()
+                                .items_center()
+                                .child(
+                                    h_flex()
+                                        .gap_2()
+                                        .items_center()
+                                        .child(forward_switch(
+                                            "forward-auto-start".to_string(),
+                                            auto_start,
+                                            &pal,
+                                            {
+                                                let entity = entity.clone();
+                                                move |_, _, cx| {
+                                                    let on = !auto_start;
+                                                    entity.update(cx, |this, cx| {
+                                                        this.set_forward_auto_start(on, cx);
+                                                    });
+                                                }
+                                            },
+                                        ))
+                                        .child(div().text_sm().child("连接时自动开启")),
+                                )
+                                .child(div().flex_1())
+                                .child(
+                                    Button::new("forward-cancel")
+                                        .label("取消")
+                                        .ghost()
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.set_forward_editing(false, cx);
+                                        })),
+                                )
+                                .child(
+                                    Button::new("forward-save")
+                                        .label("保存规则")
+                                        .primary()
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.save_forward(cx);
+                                        })),
+                                ),
+                        )
+                    })
+                    .when(!editing, |this| {
+                        this.when_some(dialog.error.clone(), |this, error| {
+                            this.child(div().text_sm().text_color(pal.danger).child(error))
+                        })
+                        .when_some(dialog.info.clone(), |this, info| {
+                            this.child(div().text_xs().text_color(pal.muted).child(info))
+                        })
+                        .child(
+                            h_flex()
+                                .gap_3()
+                                .items_center()
+                                .child(
+                                    Button::new("forward-settings")
+                                        .label("设置…")
+                                        .secondary()
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.set_forward_editing(true, cx);
+                                        })),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(pal.muted)
+                                        .child("添加或修改转发规则"),
+                                )
+                                .child(div().flex_1())
+                                .child(
+                                    Button::new("forward-close")
+                                        .label("关闭")
+                                        .ghost()
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.close_forward(cx)
+                                        })),
+                                ),
+                        )
+                    }),
             )
             .into_any_element()
     }
@@ -4412,6 +6910,9 @@ impl RuLinkApp {
                             })
                     }),
             )
+            .when(self.terminal.theme == TERMINAL_THEME_CUSTOM, |this| {
+                this.child(self.render_custom_colors(pal, cx))
+            })
             .child(self.render_local_shell_row(pal, cx))
             .child(
                 div().text_xs().text_color(pal.muted).child(
@@ -4419,6 +6920,91 @@ impl RuLinkApp {
                         .to_string()
                         + "扫描结果列在左侧「本地终端」分组里，点一下即开对应终端。",
                 ),
+            )
+            .into_any_element()
+    }
+
+    /// 自定义 16 色编辑器：前景 / 背景两行，下面 8 行「普通 | 明亮」同色成对。
+    /// 输入框只认 `#RGB` / `#RRGGBB`，非法内容不提交，色块保持上一个有效颜色。
+    fn render_custom_colors(&self, pal: &Palette, cx: &Context<Self>) -> AnyElement {
+        let colors = &self.terminal.custom;
+        // 单个色块 + 输入框；下标按 `TerminalColors` 字段序列取。
+        let cell = |index: usize| {
+            h_flex()
+                .gap_1()
+                .items_center()
+                .child(
+                    div()
+                        .size(px(14.0))
+                        .flex_shrink_0()
+                        .rounded(px(3.0))
+                        .border_1()
+                        .border_color(pal.border)
+                        .bg(hex_to_hsla(colors.hex_field(index)).unwrap_or(pal.border)),
+                )
+                .child(styled_input(Input::new(&self.custom_color_inputs[index]), pal).w(px(90.0)))
+        };
+        let labeled = |label: &'static str, index: usize| {
+            h_flex()
+                .w(px(150.0))
+                .gap_1()
+                .items_center()
+                .child(
+                    div()
+                        .w(px(32.0))
+                        .text_sm()
+                        .text_color(pal.muted)
+                        .child(label),
+                )
+                .child(cell(index))
+        };
+        let mut grid = v_flex().gap_1().child(
+            h_flex()
+                .gap_3()
+                .child(labeled("前景", 0))
+                .child(labeled("背景", 1)),
+        );
+        for i in 0..8 {
+            grid = grid.child(
+                h_flex()
+                    .gap_3()
+                    .child(labeled(ANSI_COLOR_NAMES[i], CUSTOM_ANSI_BASE + i))
+                    .child(labeled(ANSI_COLOR_NAMES[i], CUSTOM_BRIGHT_BASE + i)),
+            );
+        }
+        v_flex()
+            .gap_2()
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(pal.border)
+            .p_3()
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(pal.text)
+                            .child("自定义 16 色（左列普通 · 右列明亮）"),
+                    )
+                    .child(
+                        Button::new("terminal-custom-reset")
+                            .label("恢复 One Dark")
+                            .secondary()
+                            .outline()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.reset_custom_colors(window, cx);
+                            })),
+                    ),
+            )
+            .child(grid)
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(pal.muted)
+                    .child("输入 #RGB 或 #RRGGBB，回车前即生效；格式不合法时保持上一个有效颜色。"),
             )
             .into_any_element()
     }
@@ -4526,6 +7112,12 @@ impl RuLinkApp {
         }
         if self.settings.is_some() {
             return self.render_settings_dialog(cx);
+        }
+        if self.transfer.is_some() {
+            return self.render_transfer_dialog(cx);
+        }
+        if self.forward.is_some() {
+            return self.render_forward_dialog(cx);
         }
         // 删除二次确认：半透明遮罩 + 居中卡片，点遮罩或"取消"关闭。
         if let Some(index) = self.confirm_delete {
@@ -4654,6 +7246,31 @@ impl RuLinkApp {
                     },
                 ))
                 .separator()
+                .item(Self::menu_item(
+                    entity.clone(),
+                    "上移一位",
+                    None,
+                    false,
+                    false,
+                    move |this, _, cx| this.reorder_host(index, ReorderAction::Up, cx),
+                ))
+                .item(Self::menu_item(
+                    entity.clone(),
+                    "下移一位",
+                    None,
+                    false,
+                    false,
+                    move |this, _, cx| this.reorder_host(index, ReorderAction::Down, cx),
+                ))
+                .item(Self::menu_item(
+                    entity.clone(),
+                    "移到组内最前",
+                    None,
+                    false,
+                    false,
+                    move |this, _, cx| this.reorder_host(index, ReorderAction::Top, cx),
+                ))
+                .separator()
             }
             _ => menu,
         };
@@ -4746,6 +7363,18 @@ impl RuLinkApp {
                 }
                 menu
             }
+            _ => menu,
+        };
+        // 空白处额外给一个批量入口（主机行菜单已经够长，不重复放）。
+        let menu = match &target {
+            MenuTarget::Blank => menu.separator().item(Self::menu_item(
+                entity.clone(),
+                "导入 ~/.ssh/config…",
+                None,
+                false,
+                false,
+                |this, _, cx| this.import_ssh_config(cx),
+            )),
             _ => menu,
         };
         match target {
@@ -4906,8 +7535,11 @@ impl RuLinkApp {
     ) -> AnyElement {
         let entity = cx.entity();
         let name = self.shell_name(profile);
-        let renamed = self.local_shell_prefs.name_of(&profile.id()).is_some();
-        let custom_cwd = self.local_shell_prefs.cwd_of(&profile.id()).is_some();
+        let profile_id = profile.id();
+        let renamed = self.local_shell_prefs.name_of(&profile_id).is_some();
+        let custom_cwd = self.local_shell_prefs.cwd_of(&profile_id).is_some();
+        let custom_args = !self.local_shell_prefs.args_of(&profile_id).is_empty();
+        let custom_env = !self.local_shell_prefs.env_of(&profile_id).is_empty();
         let system_name = profile.name.clone();
         let icon: AnyElement = match self.shell_icons.get(&profile.program).cloned() {
             Some(image) => img(image)
@@ -4963,6 +7595,28 @@ impl RuLinkApp {
                     });
                 }),
             );
+            let editing_args = entity.clone();
+            let menu = menu.item(
+                PopupMenuItem::new("启动参数…").on_click(move |_, window, cx| {
+                    editing_args.update(cx, |this, cx| {
+                        let Some(profile) = this.local_shells.get(index).cloned() else {
+                            return;
+                        };
+                        this.open_shell_args_prompt(&profile, window, cx);
+                    });
+                }),
+            );
+            let editing_env = entity.clone();
+            let menu = menu.item(
+                PopupMenuItem::new("环境变量…").on_click(move |_, window, cx| {
+                    editing_env.update(cx, |this, cx| {
+                        let Some(profile) = this.local_shells.get(index).cloned() else {
+                            return;
+                        };
+                        this.open_shell_env_prompt(&profile, window, cx);
+                    });
+                }),
+            );
             let menu = if custom_cwd {
                 let resetting = entity.clone();
                 menu.item(
@@ -4972,6 +7626,36 @@ impl RuLinkApp {
                                 return;
                             };
                             this.reset_shell_cwd(&profile, cx);
+                        });
+                    }),
+                )
+            } else {
+                menu
+            };
+            let menu = if custom_args {
+                let resetting = entity.clone();
+                menu.item(
+                    PopupMenuItem::new("清除启动参数").on_click(move |_, _, cx| {
+                        resetting.update(cx, |this, cx| {
+                            let Some(profile) = this.local_shells.get(index).cloned() else {
+                                return;
+                            };
+                            this.reset_shell_args(&profile, cx);
+                        });
+                    }),
+                )
+            } else {
+                menu
+            };
+            let menu = if custom_env {
+                let resetting = entity.clone();
+                menu.item(
+                    PopupMenuItem::new("清除环境变量").on_click(move |_, _, cx| {
+                        resetting.update(cx, |this, cx| {
+                            let Some(profile) = this.local_shells.get(index).cloned() else {
+                                return;
+                            };
+                            this.reset_shell_env(&profile, cx);
                         });
                     }),
                 )
@@ -5168,8 +7852,11 @@ impl RuLinkApp {
             })
             .map(|(index, _)| index)
             .collect();
-        // 收藏主机置顶（稳定排序，同组内保持原插入顺序）。
-        matched.sort_by_key(|&index| !self.hosts[index].favorite);
+        // 收藏主机置顶；同桶内按手动排序，未登记的新主机稳定留在后面。
+        matched.sort_by_key(|&index| {
+            let host = &self.hosts[index];
+            (!host.favorite, self.sidebar.rank_of(host.id))
+        });
         // 分桶：先按偏好里的组顺序建桶，末尾恒有「未分组」。
         let mut buckets: Vec<(String, Vec<usize>)> = self
             .sidebar
@@ -5371,6 +8058,58 @@ impl RuLinkApp {
                                     });
                                 }),
                         )
+                    })
+                    .child({
+                        // 跳板机选择：只列出可作为跳板的主机（排除自己与已挂跳板机的主机，
+                        // 避免自环与多级链）。降级模式没有稳定的主机 id，只给「直连」。
+                        let self_id = form
+                            .editing
+                            .and_then(|index| self.hosts.get(index))
+                            .map(|host| host.id);
+                        let mut options: Vec<SharedString> =
+                            vec![SharedString::from("直连（无跳板机）")];
+                        let mut ids: Vec<Option<i64>> = vec![None];
+                        if self.vault.is_some() {
+                            for host in &self.hosts {
+                                if Some(host.id) == self_id || host.proxy_jump.is_some() {
+                                    continue;
+                                }
+                                let label = if host.name.trim().is_empty() {
+                                    host.addr()
+                                } else {
+                                    host.name.clone()
+                                };
+                                ids.push(Some(host.id));
+                                options.push(SharedString::from(format!(
+                                    "{label}（{}）",
+                                    host.addr()
+                                )));
+                            }
+                        }
+                        let selected = form
+                            .jump
+                            .and_then(|id| ids.iter().position(|item| *item == Some(id)))
+                            .or(Some(0));
+                        let change_ids = ids.clone();
+                        let entity = cx.entity();
+                        v_flex()
+                            .gap_1()
+                            .child(div().text_sm().child("跳板机"))
+                            .child(
+                                Select::new(options)
+                                    .id("host-jump")
+                                    .selected(selected)
+                                    .w_full()
+                                    .on_change(move |index, _name, _window, cx| {
+                                        let jump = change_ids.get(index).copied().flatten();
+                                        entity.update(cx, |this, cx| {
+                                            if let Some(form) = this.new_host.as_mut() {
+                                                form.jump = jump;
+                                                cx.notify();
+                                            }
+                                        });
+                                    }),
+                            )
                     })
                     .child(
                         v_flex()
@@ -5710,7 +8449,22 @@ impl RuLinkApp {
                      目录不存在时不会保存。"
                 ),
             ),
+            ShellPromptKind::Arguments => (
+                "启动参数",
+                "参数",
+                "附加在 shell 可执行文件后的参数，空格分隔，含空格的路径用双引号包住；\
+                 留空＝不加参数。WSL 的 -d 发行版由应用自动拼接，不必重复填写。"
+                    .to_string(),
+            ),
+            ShellPromptKind::Environment => (
+                "环境变量",
+                "变量（每行一个 KEY=VALUE）",
+                "空行与 # 开头的注释忽略；值里可以有 =。留空＝不注入额外变量。\
+                 回车换行，点「保存」提交。"
+                    .to_string(),
+            ),
         };
+        let width = if prompt.kind.multi_line() { 460.0 } else { 380.0 };
         let input_row = h_flex()
             .w_full()
             .gap_2()
@@ -5747,7 +8501,7 @@ impl RuLinkApp {
             .child(
                 v_flex()
                     .id("shell-form")
-                    .w(px(380.0))
+                    .w(px(width))
                     .gap_3()
                     .p_5()
                     .rounded(px(8.0))
@@ -5991,40 +8745,102 @@ impl RuLinkApp {
         };
 
         let terminal_bg = self.terminal_bg(cx);
-        let body = self
-            .active_tab
-            .and_then(|id| self.tabs.iter().find(|tab| tab.id == id))
-            .map(|tab| {
-                // 内边距取终端自己的底色，四周才像终端的一部分而不是白框。
-                div()
-                    .relative()
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_hidden()
-                    .bg(terminal_bg)
-                    .px_3()
-                    .py_2()
-                    .child(tab.terminal_view.clone())
-                    .when(tab.ended, |this| {
-                        this.child(self.render_ended_banner(tab, cx))
-                    })
-                    .into_any_element()
-            })
-            .unwrap_or_else(|| {
-                v_flex()
-                    .flex_1()
-                    .items_center()
-                    .justify_center()
-                    .child(
-                        div()
-                            .text_base()
-                            .text_color(pal.muted)
-                            .child("从左侧点击主机账号开始连接"),
-                    )
-                    .into_any_element()
-            });
+        // 分屏：两个面板并排/上下，可拖中间分隔条；点哪侧就切到哪个标签。
+        let split_pair = self.view_split.as_ref().and_then(|view| {
+            let first = self.tabs.iter().find(|tab| tab.id == view.first)?;
+            let second = self.tabs.iter().find(|tab| tab.id == view.second)?;
+            Some((view, first, second))
+        });
+        let body = if let Some((view, first, second)) = split_pair {
+            let first_active = self.active_tab == Some(first.id);
+            // SplitPane 给每个面板的容器是 block 布局：面板本身用 flex_1 在 block 父级里
+            // 拿不到高度，会塌成只剩内边距。外面再套一层定高的 v_flex 让终端铺满。
+            let first_pane = v_flex().size_full().child(self.render_tab_pane(
+                first,
+                first_active,
+                true,
+                terminal_bg,
+                cx,
+            ));
+            let second_pane = v_flex().size_full().child(self.render_tab_pane(
+                second,
+                !first_active,
+                true,
+                terminal_bg,
+                cx,
+            ));
+            div()
+                .flex_1()
+                .min_h_0()
+                .child(
+                    SplitPane::new(view.pane.clone())
+                        .direction(view.direction)
+                        .first(first_pane)
+                        .second(second_pane),
+                )
+                .into_any_element()
+        } else {
+            self.active_tab
+                .and_then(|id| self.tabs.iter().find(|tab| tab.id == id))
+                .map(|tab| self.render_tab_pane(tab, true, false, terminal_bg, cx))
+                .unwrap_or_else(|| {
+                    v_flex()
+                        .flex_1()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            div()
+                                .text_base()
+                                .text_color(pal.muted)
+                                .child("从左侧点击主机账号开始连接"),
+                        )
+                        .into_any_element()
+                })
+        };
 
         v_flex().flex_1().h_full().child(tab_bar).child(body)
+    }
+
+    /// 主区里的一个会话面板：终端内容 + 内边距 + 断开横幅。
+    ///
+    /// `highlight` 只在分屏时给活动一侧加一圈强调色边框——单屏不需要。
+    fn render_tab_pane(
+        &self,
+        tab: &SessionTab,
+        active: bool,
+        highlight: bool,
+        terminal_bg: Hsla,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let pal = self.palette(cx);
+        let id = tab.id;
+        div()
+            .relative()
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .overflow_hidden()
+            .bg(terminal_bg)
+            .px_3()
+            .py_2()
+            .when(highlight && active, |this| {
+                this.border_1().border_color(pal.accent)
+            })
+            // 分屏时点一下另一侧即把焦点/状态栏切过去；点击落在终端上也会冒泡到这里。
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, window, cx| {
+                    if this.active_tab != Some(id) {
+                        this.activate_tab(id, window, cx);
+                        cx.notify();
+                    }
+                }),
+            )
+            .child(tab.terminal_view.clone())
+            .when(tab.ended, |this| {
+                this.child(self.render_ended_banner(tab, cx))
+            })
+            .into_any_element()
     }
 
     /// 会话断开横幅：浮在终端顶部，说明连接已结束并提供重连入口。
@@ -6232,6 +9048,8 @@ impl RuLinkApp {
             return;
         }
         self.terminal = prefs;
+        // 自定义色改了就重新注册，之后 `terminal_text_style` 才取得到新配色。
+        Self::register_custom_theme(&self.terminal.custom, cx);
         let style = self.terminal_text_style(cx);
         self.apply_terminal_style(&style, cx);
         cx.notify();
@@ -6257,6 +9075,54 @@ impl RuLinkApp {
         let mut prefs = self.terminal.clone();
         prefs.theme = name.to_string();
         self.set_terminal_prefs(prefs, cx);
+    }
+
+    /// 把「自定义」配色注册进全局 `ThemeManager`（重复调用即覆盖）。
+    fn register_custom_theme(colors: &TerminalColors, cx: &mut App) {
+        if !cx.has_global::<ThemeManager>() {
+            return;
+        }
+        ThemeManager::global_mut(cx).add_theme(ThemeDefinition {
+            name: TERMINAL_THEME_CUSTOM.to_string(),
+            theme: colors.to_config().to_theme(),
+        });
+    }
+
+    /// 某个自定义色输入框内容变化：合法十六进制才提交，非法输入保留上一个有效色。
+    fn commit_custom_color(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(input) = self.custom_color_inputs.get(index) else {
+            return;
+        };
+        let text = input.read(cx).value().to_string();
+        let Some(normalized) = normalize_hex(&text) else {
+            return;
+        };
+        if self.terminal.custom.hex_field(index) == normalized {
+            return;
+        }
+        let mut prefs = self.terminal.clone();
+        prefs.custom.set_hex_field(index, normalized);
+        self.set_terminal_prefs(prefs, cx);
+    }
+
+    /// 恢复自定义配色的默认值（One Dark），并同步输入框显示。
+    fn reset_custom_colors(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let mut prefs = self.terminal.clone();
+        prefs.custom = TerminalColors::default();
+        self.set_terminal_prefs(prefs, cx);
+        self.sync_custom_color_inputs(window, cx);
+    }
+
+    /// 把偏好里的颜色回填到输入框（打开设置弹窗时调用，库内值可能晚于启动到达）。
+    fn sync_custom_color_inputs(&self, window: &mut Window, cx: &mut App) {
+        for (index, input) in self.custom_color_inputs.iter().enumerate() {
+            let value = self.terminal.custom.hex_field(index);
+            input.update(cx, |state, cx| {
+                if state.value().as_ref() != value {
+                    state.set_value(value, window, cx);
+                }
+            });
+        }
     }
 
     /// 可选的终端配色方案名（`ThemeManager` 预设，已按名排序）。
@@ -6327,6 +9193,46 @@ impl RuLinkApp {
     }
 
     /// 分组偏好落库；加密库不可用时退回旧 settings.json。
+    /// 把跳板机映射回填到主机列表。
+    ///
+    /// 只对加密库模式生效：降级模式下 `proxy_jump` 直接序列化在 sessions.json 里，
+    /// 这里再按（可能全为 0 的）id 覆盖反而会把它抹掉。
+    fn apply_jumps(&mut self) {
+        if self.vault.is_none() {
+            return;
+        }
+        for host in &mut self.hosts {
+            host.proxy_jump = self.jumps.jump_of(host.id);
+        }
+    }
+
+    /// 记录主机与跳板机的绑定关系。
+    ///
+    /// 加密库模式写 `settings` 的 `jumps` 键；降级模式跳板机字段直接随
+    /// sessions.json 落盘，这里不动（否则会按 id=0 覆盖成空）。
+    fn note_jump(&mut self, host: &HostConfig, cx: &mut Context<Self>) {
+        if self.vault.is_none() || self.jumps.jump_of(host.id) == host.proxy_jump {
+            return;
+        }
+        self.jumps.set(host.id, host.proxy_jump);
+        self.persist_jumps(cx);
+    }
+
+    /// 跳板机映射落库；加密库不可用时退回旧 settings.json。
+    fn persist_jumps(&self, cx: &mut Context<Self>) {
+        let json = self.jumps.to_json();
+        let Some(vault) = self.vault.clone() else {
+            self.store.save_jumps(&json);
+            return;
+        };
+        cx.spawn(async move |_, _| {
+            if let Err(error) = vault.set_setting("jumps", &json).await {
+                log::warn!("写入库内跳板机映射失败: {error}");
+            }
+        })
+        .detach();
+    }
+
     fn persist_sidebar(&self, cx: &mut Context<Self>) {
         let json = self.sidebar.to_json();
         let Some(vault) = self.vault.clone() else {
@@ -6340,6 +9246,78 @@ impl RuLinkApp {
         })
         .detach();
     }
+
+    /// 连接成功（shell 已开）后记一笔最近连接：去重后置顶，超出上限截断。
+    /// 降级模式（无加密库）主机 id 不可靠，只保留内存值，不落盘。
+    fn record_recent_host(&mut self, host_id: i64, cx: &mut Context<Self>) {
+        if host_id == 0 || !self.hosts.iter().any(|host| host.id == host_id) {
+            return;
+        }
+        self.recent_hosts.retain(|id| *id != host_id);
+        self.recent_hosts.insert(0, host_id);
+        self.recent_hosts.truncate(RECENT_HOSTS_MAX);
+        self.persist_recent_hosts(cx);
+    }
+
+    fn persist_recent_hosts(&self, cx: &mut Context<Self>) {
+        let Some(vault) = self.vault.clone() else {
+            return;
+        };
+        let ids = self.recent_hosts.clone();
+        cx.spawn(async move |_, _| {
+            let Ok(json) = serde_json::to_string(&ids) else {
+                return;
+            };
+            if let Err(error) = vault.set_setting("recent", &json).await {
+                log::warn!("写入库内最近连接失败: {error}");
+            }
+        })
+        .detach();
+    }
+
+    /// 端口转发规则落库；加密库不可用时退回旧 settings.json。
+    fn persist_forwards(&self, cx: &mut Context<Self>) {        let json = self.forward_prefs.to_json();
+        let Some(vault) = self.vault.clone() else {
+            self.store.save_forwards(&json);
+            return;
+        };
+        cx.spawn(async move |_, _| {
+            if let Err(error) = vault.set_setting("forwards", &json).await {
+                log::warn!("写入库内转发规则失败: {error}");
+            }
+        })
+        .detach();
+    }
+}
+
+/// 端口转发列表的开关：轨道 + 滑块，点击整块切换。
+fn forward_switch(
+    id: String,
+    on: bool,
+    pal: &Palette,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    div()
+        .id(SharedString::from(id))
+        .w(px(34.0))
+        .h(px(18.0))
+        .p(px(2.0))
+        .flex()
+        .items_center()
+        .when(on, |el| el.justify_end())
+        .when(!on, |el| el.justify_start())
+        .rounded(px(9.0))
+        .bg(if on { pal.accent } else { pal.segment_bg })
+        .border_1()
+        .border_color(if on { pal.accent } else { pal.border })
+        .cursor_pointer()
+        .on_click(on_click)
+        .child(
+            div()
+                .size(px(14.0))
+                .rounded(px(7.0))
+                .bg(if on { pal.card_bg } else { pal.muted }),
+        )
 }
 
 /// 设置分页里的 −/＋ 步进按钮：中性描边小按钮，与「关闭」等按钮保持同一观感。
@@ -6375,6 +9353,17 @@ fn styled_input(input: Input, pal: &Palette) -> Input {
         .text_color(pal.input_text)
         .border_1()
         .border_color(pal.input_border)
+}
+
+/// 下载保存对话框的起始目录：优先系统下载目录，缺失则退回当前目录。
+fn downloads_dir() -> PathBuf {
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from);
+    home.map(|home| home.join("Downloads"))
+        .filter(|dir| dir.is_dir())
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 impl Focusable for RuLinkApp {
@@ -6432,6 +9421,13 @@ fn main() {
             KeyBinding::new("ctrl-pagedown", NextTab, None),
             KeyBinding::new("ctrl-pageup", PrevTab, None),
             KeyBinding::new("ctrl-,", OpenSettings, None),
+            // 文件传输：给当前活动会话开 SFTP 上传 / 下载弹窗。
+            KeyBinding::new("ctrl-shift-u", OpenTransfer, None),
+            // 端口转发：给当前活动会话配置本地监听 → 远端目标。
+            KeyBinding::new("ctrl-shift-f", OpenForward, None),
+            // 分屏：左右 / 上下；同方向再按一次收起，换方向原地换排布。
+            KeyBinding::new("ctrl-shift-d", SplitRight, None),
+            KeyBinding::new("ctrl-shift-e", SplitDown, None),
             // Tab 在 rgpui 的 Root 上下文里被绑成焦点切换，而按键绑定分发早于 on_key_down，
             // 终端元素因此永远收不到 \x09（shell 补全失效）。在 Terminal 上下文用 NoAction
             // 抢占：它比 Root 更深，分发解析到它就停止，按键原样落到 on_key_down 转发给 PTY。
@@ -6477,31 +9473,32 @@ fn main() {
         };
         cx.activate(true);
 
-        // 系统托盘：品牌图标 + 悬停提示 + 右键菜单（显示主界面 / 退出）。
+        // 系统托盘：品牌图标 + 悬停提示 + 右键菜单（活动会话 / 显示主界面 / 退出）。
         // 图标以 32px PNG 内嵌，Windows 走 image 解码路径最稳；不依赖运行时文件路径。
         const TRAY_ICON: &[u8] = include_bytes!("../assets/icons/tray-32.png");
         cx.set_tray_icon(Some(TRAY_ICON));
-        cx.set_tray_tooltip("RuLink 拾连");
-        cx.set_tray_menu(vec![
-            TrayMenuItem::Action {
-                label: "显示主界面".into(),
-                id: "show".into(),
-            },
-            TrayMenuItem::Separator,
-            TrayMenuItem::Action {
-                label: "退出".into(),
-                id: "quit".into(),
-            },
-        ]);
-        cx.on_tray_menu_action(move |id: SharedString, cx: &mut App| match id.as_ref() {
-            "quit" => cx.quit(),
-            "show" => {
-                // 从托盘恢复：把隐藏的主窗口重新带到前台。
-                window_handle
-                    .update(cx, |_, window, _| window.activate_window())
-                    .ok();
+        // 菜单与提示由应用按会话列表同步（隐藏到托盘后也能直接跳回某个标签）。
+        let _ = window_handle.update(cx, |app, _, cx| app.sync_tray(cx));
+        cx.on_tray_menu_action(move |id: SharedString, cx: &mut App| {
+            if let Some(rest) = id.strip_prefix("tab:") {
+                if let Ok(tab_id) = rest.parse::<usize>() {
+                    let _ = window_handle.update(cx, |app, window, cx| {
+                        window.activate_window();
+                        app.activate_tab(tab_id, window, cx);
+                    });
+                }
+                return;
             }
-            _ => {}
+            match id.as_ref() {
+                "quit" => cx.quit(),
+                "show" => {
+                    // 从托盘恢复：把隐藏的主窗口重新带到前台。
+                    window_handle
+                        .update(cx, |_, window, _| window.activate_window())
+                        .ok();
+                }
+                _ => {}
+            }
         });
     });
 }
@@ -6510,30 +9507,130 @@ fn main() {
 mod tests {
     use super::{
         AUTO_RECONNECT_MAX, CONNECT_TIMEOUT_DEFAULT, CONNECT_TIMEOUT_MAX, CONNECT_TIMEOUT_MIN,
-        FONT_SIZE_MAX, FONT_SIZE_MIN, LINE_HEIGHT_MAX, LINE_HEIGHT_MIN, LocalShellPrefs, Metric,
-        SessionPrefs, SidebarPrefs, StatusBarPrefs, TERMINAL_THEME_DEFAULT, TerminalPrefs,
-        auto_reconnect_delay,
+        CUSTOM_ANSI_BASE, CUSTOM_BRIGHT_BASE, CUSTOM_DEFAULT_ANSI, CUSTOM_DEFAULT_BRIGHT,
+        FONT_SIZE_MAX, FONT_SIZE_MIN, ForwardPrefs, JumpPrefs, LINE_HEIGHT_MAX, LINE_HEIGHT_MIN,
+        LocalShellPrefs, Metric, SavedForward, SessionPrefs, SidebarPrefs, StatusBarPrefs,
+        TERMINAL_THEME_DEFAULT, TerminalColors, TerminalPrefs, auto_reconnect_delay, hex_to_hsla,
+        normalize_hex,
     };
+    use crate::session::ForwardKind;
+
+    fn saved(name: &str, kind: ForwardKind, listen: u16) -> SavedForward {
+        SavedForward {
+            name: name.to_string(),
+            kind,
+            listen_port: listen,
+            target_host: "127.0.0.1".to_string(),
+            target_port: 80,
+            auto_start: false,
+        }
+    }
+
+    #[test]
+    fn saved_forward_defaults_and_title() {
+        // 旧数据可能只有方向与端口，其余字段回落到默认值。
+        let parsed: SavedForward = serde_json::from_str(r#"{"kind":"remote","listen_port":9000}"#)
+            .expect("应能解析缺省字段");
+        assert_eq!(parsed.target_host, "127.0.0.1");
+        assert_eq!(parsed.target_port, 80);
+        assert!(!parsed.auto_start);
+        assert_eq!(parsed.rule().kind, ForwardKind::Remote);
+        assert_eq!(parsed.title(), "R 服务器:9000 → 本机 127.0.0.1:80");
+
+        let named = SavedForward {
+            name: "内网 Web".to_string(),
+            ..parsed
+        };
+        assert_eq!(named.title(), "内网 Web");
+    }
+
+    #[test]
+    fn forward_prefs_insert_replace_and_remove() {
+        let mut prefs = ForwardPrefs::default();
+        prefs.insert("tester@127.0.0.1:22", saved("", ForwardKind::Local, 8080));
+        prefs.insert("tester@127.0.0.1:22", saved("", ForwardKind::Remote, 8080));
+        // 同方向同端口视为同一条：原位替换而不是追加。
+        prefs.insert("tester@127.0.0.1:22", saved("web", ForwardKind::Local, 8080));
+        let list = prefs.rules_for("tester@127.0.0.1:22");
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].name, "web");
+
+        // 表单名字留空再保存同一条规则时沿用旧备注，不被清空。
+        prefs.insert("tester@127.0.0.1:22", saved("", ForwardKind::Local, 8080));
+        assert_eq!(prefs.rules_for("tester@127.0.0.1:22")[0].name, "web");
+
+        // 不同连接互不影响。
+        assert!(prefs.rules_for("other@host:22").is_empty());
+
+        let roundtrip = ForwardPrefs::from_json(&prefs.to_json());
+        assert_eq!(roundtrip, prefs);
+
+        let local = saved("", ForwardKind::Local, 8080).rule();
+        prefs.remove("tester@127.0.0.1:22", &local.id());
+        assert_eq!(prefs.rules_for("tester@127.0.0.1:22").len(), 1);
+        let remote = saved("", ForwardKind::Remote, 8080).rule();
+        prefs.remove("tester@127.0.0.1:22", &remote.id());
+        // 最后一条删除后不留空连接键。
+        assert!(prefs.rules_for("tester@127.0.0.1:22").is_empty());
+        assert_eq!(ForwardPrefs::from_json("{}"), ForwardPrefs::default());
+        assert_eq!(ForwardPrefs::from_json("{ not json"), ForwardPrefs::default());
+    }
+
+    #[test]
+    fn jump_prefs_roundtrip_and_forget() {
+        let mut prefs = JumpPrefs::default();
+        prefs.set(5, Some(2));
+        prefs.set(6, Some(2));
+        prefs.set(7, Some(3));
+        assert_eq!(prefs.jump_of(5), Some(2));
+        assert_eq!(JumpPrefs::from_json(&prefs.to_json()), prefs);
+
+        // 删掉 2：它作为跳板机的引用断掉，别的绑定不受影响。
+        let orphaned = prefs.forget(2);
+        assert_eq!(orphaned.len(), 2);
+        assert!(orphaned.contains(&5) && orphaned.contains(&6));
+        assert_eq!(prefs.jump_of(5), None);
+        assert_eq!(prefs.jump_of(7), Some(3));
+
+        // 改成直连 = 删条目；空串 / 坏 JSON 回落默认值。
+        prefs.set(7, None);
+        assert_eq!(prefs.jump_of(7), None);
+        assert_eq!(JumpPrefs::from_json(""), JumpPrefs::default());
+        assert_eq!(JumpPrefs::from_json("{ not json"), JumpPrefs::default());
+    }
 
     #[test]
     fn local_shell_prefs_name_and_cwd_roundtrip() {
         let mut prefs = LocalShellPrefs::default();
         prefs.rename("pwsh", "主终端");
         prefs.set_cwd("pwsh", r"D:\code");
+        prefs.set_args("pwsh", "-NoLogo -NoProfile");
+        prefs.set_env("pwsh", "FOO=1\nBAR=two words");
         assert_eq!(prefs.name_of("pwsh"), Some("主终端"));
         assert_eq!(prefs.cwd_of("pwsh"), Some(r"D:\code"));
+        assert_eq!(prefs.args_of("pwsh"), ["-NoLogo", "-NoProfile"]);
+        assert_eq!(
+            prefs.env_map_of("pwsh").get("BAR").map(String::as_str),
+            Some("two words")
+        );
         assert_eq!(LocalShellPrefs::from_json(&prefs.to_json()), prefs);
 
         // 空串/空白 = 恢复默认（删条目，不留空壳）。
         prefs.rename("pwsh", "  ");
         prefs.set_cwd("pwsh", " ");
+        prefs.set_args("pwsh", " ");
+        prefs.set_env("pwsh", "");
         assert_eq!(prefs.name_of("pwsh"), None);
         assert_eq!(prefs.cwd_of("pwsh"), None);
+        assert!(prefs.args_of("pwsh").is_empty());
+        assert!(prefs.env_map_of("pwsh").is_empty());
 
-        // 旧版 JSON 只有 names：cwd 缺省不影响读取。
+        // 旧版 JSON 只有 names：cwd / args / env 缺省不影响读取。
         let legacy = LocalShellPrefs::from_json(r#"{"names":{"cmd":"CMD"}}"#);
         assert_eq!(legacy.name_of("cmd"), Some("CMD"));
         assert_eq!(legacy.cwd_of("cmd"), None);
+        assert!(legacy.args_of("cmd").is_empty());
+        assert!(legacy.env_of("cmd").is_empty());
     }
 
     #[test]
@@ -6602,6 +9699,34 @@ mod tests {
         // 主机删除后清理残留归属，避免 JSON 越长越脏。
         prefs.forget(11);
         assert!(prefs.assign.is_empty());
+    }
+
+    #[test]
+    fn sidebar_prefs_manual_order_moves_and_forgets() {
+        let mut prefs = SidebarPrefs::default();
+        prefs.sync_order(&[1, 2, 3]);
+        assert_eq!(prefs.rank_of(1), 0);
+        assert_eq!(prefs.rank_of(2), 1);
+
+        // 上移 / 移到最前都走 move_before（把本机插到锚点前）。
+        prefs.move_before(3, 1);
+        assert_eq!(prefs.order, vec![3, 1, 2]);
+        // 下移＝把下一个邻居挪到本机前。
+        prefs.move_before(2, 1);
+        assert_eq!(prefs.order, vec![3, 2, 1]);
+
+        // 新主机追加到尾部；未登记 id 的 rank 视为最后。
+        prefs.sync_order(&[1, 2, 3, 9]);
+        assert_eq!(prefs.rank_of(9), 3);
+        assert_eq!(prefs.rank_of(42), usize::MAX);
+        // 已删除的主机在 sync 时清出去。
+        prefs.sync_order(&[1, 3, 9]);
+        assert_eq!(prefs.order, vec![3, 1, 9]);
+
+        // 删除主机同时清排序位，不留孤儿 id。
+        prefs.forget(2);
+        assert_eq!(prefs.order, vec![3, 1, 9]);
+        assert_eq!(SidebarPrefs::from_json(&prefs.to_json()), prefs);
     }
 
     #[test]
@@ -6694,10 +9819,52 @@ mod tests {
         prefs.nudge_font_size(3);
         prefs.nudge_line_height(2);
         prefs.theme = "Dracula".into();
+        prefs
+            .custom
+            .set_hex_field(CUSTOM_BRIGHT_BASE + 3, "#123456".into());
         let restored = TerminalPrefs::from_json(&prefs.to_json());
         assert_eq!(restored.font_size, prefs.font_size);
         assert!((restored.line_height - prefs.line_height).abs() < 1e-3);
         assert_eq!(restored.theme, "Dracula");
+        assert_eq!(restored.custom, prefs.custom);
+        // 旧版 JSON 没有 custom：按 One Dark 初始值补齐，不影响其余字段。
+        let legacy = TerminalPrefs::from_json(r#"{"font_size":16.0}"#);
+        assert_eq!(legacy.custom, TerminalColors::default());
+    }
+
+    #[test]
+    fn custom_colors_normalize_and_repair_bad_values() {
+        // 大小写、省略 #、三位缩写都规范化成 #RRGGBB。
+        assert_eq!(normalize_hex(" #abc "), Some("#AABBCC".to_string()));
+        assert_eq!(normalize_hex("a1b2c3"), Some("#A1B2C3".to_string()));
+        // 长度不对或含非十六进制字符一律拒绝，输入框保留上一个有效色。
+        assert_eq!(normalize_hex("#12345"), None);
+        assert_eq!(normalize_hex("#GGGGGG"), None);
+        assert!(hex_to_hsla("#FF0000").is_some());
+        assert!(hex_to_hsla("炸").is_none());
+
+        let mut colors = TerminalColors::default();
+        colors.set_hex_field(CUSTOM_ANSI_BASE + 1, "#XYZ".into());
+        colors.set_hex_field(CUSTOM_BRIGHT_BASE + 2, "ff0000".into());
+        colors.clamp();
+        assert_eq!(
+            colors.hex_field(CUSTOM_ANSI_BASE + 1),
+            CUSTOM_DEFAULT_ANSI[1]
+        );
+        assert_eq!(colors.hex_field(CUSTOM_BRIGHT_BASE + 2), "#FF0000");
+
+        // 转成 rgpui-term 配置时前景 / 背景 / 16 色一一对应。
+        let config = colors.to_config();
+        assert_eq!(config.foreground, colors.foreground);
+        assert_eq!(config.background, colors.background);
+        assert_eq!(config.ansi, colors.ansi);
+        assert_eq!(config.bright, colors.bright);
+        // 光标跟随前景，明亮白兼作 bright 前景、普通白作为 dim 前景。
+        assert_eq!(config.cursor, colors.foreground);
+        assert_eq!(
+            config.bright_foreground.as_deref(),
+            Some(CUSTOM_DEFAULT_BRIGHT[7])
+        );
     }
 
     #[test]

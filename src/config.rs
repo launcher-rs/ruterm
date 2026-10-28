@@ -21,6 +21,11 @@ pub struct SshTarget {
     pub password: Option<String>,
     /// 加密私钥的口令（仅私钥认证且密钥有口令时使用；绝不入命令行）
     pub passphrase: Option<String>,
+    /// 跳板机链（最内层在这里，向内嵌套）；None 表示直连。
+    ///
+    /// 每一跳只额外建立一条 `direct-tcpip` 通道，SSH 跑在通道之上：
+    /// 跳板机本身不需要端口转发规则，但它的 sshd 必须允许 TCP 转发。
+    pub jump: Option<Box<SshTarget>>,
 }
 
 impl SshTarget {
@@ -90,6 +95,7 @@ impl SshTarget {
             key_path,
             key_data: None,
             passphrase: None,
+            jump: None,
             password: std::env::var("RULINK_PASSWORD")
                 .ok()
                 .filter(|s| !s.is_empty()),
@@ -120,7 +126,28 @@ impl SshTarget {
             key_data: None,
             password,
             passphrase: None,
+            jump: None,
         }
+    }
+
+    /// 挂上跳板机链（参数是**最内层**跳板机，它自己可以再带 `jump`）。
+    pub fn with_jump(mut self, jump: Option<SshTarget>) -> Self {
+        self.jump = jump.map(Box::new);
+        self
+    }
+
+    /// 跳板链，从最外层到最内层（按"先连谁"排序），不含最终目标。
+    ///
+    /// `target.jump` 是最近一跳，`jump.jump` 是它的跳板机，因此收集后需要反转。
+    pub fn jump_chain(&self) -> Vec<SshTarget> {
+        let mut chain = Vec::new();
+        let mut cursor = self.jump.as_deref();
+        while let Some(jump) = cursor {
+            chain.push(jump.clone());
+            cursor = jump.jump.as_deref();
+        }
+        chain.reverse();
+        chain
     }
 
     /// 补充内嵌私钥（PEM 文本，仅内存传递）。
@@ -151,6 +178,7 @@ mod tests {
             key_path: key_path.into(),
             key_inline,
             favorite: false,
+            proxy_jump: None,
         }
     }
 
@@ -173,5 +201,26 @@ mod tests {
             .with_passphrase(Some("pp".into()));
         assert_eq!(target.key_data.as_deref(), Some("PEM"));
         assert_eq!(target.passphrase.as_deref(), Some("pp"));
+    }
+
+    fn plain(name: &str) -> SshTarget {
+        let mut config = host(AuthMethod::Agent, "", false);
+        config.host = name.into();
+        config.user = "u".into();
+        SshTarget::from_host(&config, None)
+    }
+
+    /// 链从最外层开始：目标挂 jump1、jump1 挂 jump2，就先连 jump2。
+    #[test]
+    fn jump_chain_orders_outermost_first() {
+        let target = plain("target").with_jump(Some(plain("jump1").with_jump(Some(plain("jump2")))));
+        let chain: Vec<String> = target
+            .jump_chain()
+            .iter()
+            .map(|node| node.host.clone())
+            .collect();
+        assert_eq!(chain, ["jump2", "jump1"]);
+        // 直连没有跳板链。
+        assert!(plain("solo").jump_chain().is_empty());
     }
 }

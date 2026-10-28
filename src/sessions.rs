@@ -42,6 +42,12 @@ pub struct HostConfig {
     /// 是否收藏（收藏主机在列表置顶，★ 标记）
     #[serde(default)]
     pub favorite: bool,
+    /// 跳板机（指向另一台已保存主机的 id）；None 表示直连。
+    ///
+    /// 加密库模式下不存在 hosts 表里（避免 ALTER 迁移），而是随 `settings`
+    /// 表的 `jumps` 键持久化，启动后回填到这里。
+    #[serde(default)]
+    pub proxy_jump: Option<i64>,
 }
 
 impl HostConfig {
@@ -92,6 +98,12 @@ pub struct Settings {
     /// 本机 shell 自定义展示名（序列化成 JSON 字符串）。
     #[serde(default)]
     pub local_shells: String,
+    /// 端口转发规则（按连接保存，序列化成 JSON 字符串）。
+    #[serde(default)]
+    pub forwards: String,
+    /// 主机 → 跳板机映射（序列化成 JSON 字符串，键是主机 id）。
+    #[serde(default)]
+    pub jumps: String,
 }
 
 impl Settings {
@@ -181,6 +193,18 @@ impl SessionStore {
     pub fn save_local_shells(&self, json: &str) {
         let json = json.to_string();
         self.update_settings(|settings| settings.local_shells = json);
+    }
+
+    /// 降级模式（无加密库）下保存端口转发规则。
+    pub fn save_forwards(&self, json: &str) {
+        let json = json.to_string();
+        self.update_settings(|settings| settings.forwards = json);
+    }
+
+    /// 降级模式（无加密库）下保存跳板机映射。
+    pub fn save_jumps(&self, json: &str) {
+        let json = json.to_string();
+        self.update_settings(|settings| settings.jumps = json);
     }
 
     /// 迁移完成后把 sessions.json 改名为 sessions.json.migrated（保留现场，不删除）。

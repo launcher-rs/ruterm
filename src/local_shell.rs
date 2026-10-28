@@ -61,14 +61,17 @@ impl ShellProfile {
 /// Windows 后端把 `shell` 原样拼进 `CreateProcessW` 的命令行（`escape_args=false`），
 /// 所以带启动参数（如 `wsl.exe -d Debian`）时必须自己拼一条完整命令行；
 /// 没有参数时仍是纯路径，与旧行为一致。
-pub fn command_line(profile: &ShellProfile) -> String {
-    if profile.args.is_empty() {
+///
+/// 档案自带参数在前，用户自定义参数（`extra`）在后。
+/// 非 Windows 后端不解析命令行，参数无法传递，只返回可执行文件路径。
+pub fn command_line_with(profile: &ShellProfile, extra: &[String]) -> String {
+    if profile.args.is_empty() && extra.is_empty() {
         return profile.program.clone();
     }
     #[cfg(windows)]
     {
         let mut line = quote_arg(&profile.program);
-        for arg in &profile.args {
+        for arg in profile.args.iter().chain(extra) {
             line.push(' ');
             line.push_str(&quote_arg(arg));
         }
@@ -76,13 +79,86 @@ pub fn command_line(profile: &ShellProfile) -> String {
     }
     #[cfg(not(windows))]
     {
-        // 非 Windows 后端不解析命令行，参数无法传递（当前也没有带参数的档案）。
+        let _ = extra;
         profile.program.clone()
     }
 }
 
+/// 启动参数文本 → 参数数组：按空白切分，双引号内保留空白，引号本身丢弃。
+///
+/// 未闭合的引号按"一直到结尾"处理，不报错——用户写到一半不该弹错误。
+pub fn split_args(text: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    // 空引号 `""` 是一个合法空参数，故额外记一个"本段有内容"标记。
+    let mut started = false;
+    for ch in text.chars() {
+        match ch {
+            '"' => {
+                quoted = !quoted;
+                started = true;
+            }
+            ch if ch.is_whitespace() && !quoted => {
+                if started {
+                    args.push(std::mem::take(&mut current));
+                    started = false;
+                }
+            }
+            ch => {
+                current.push(ch);
+                started = true;
+            }
+        }
+    }
+    if started {
+        args.push(current);
+    }
+    args
+}
+
+/// 参数数组 → 文本（含空白或为空时加双引号），用于回填设置框与规范化存储。
+pub fn join_args(args: &[String]) -> String {
+    args.iter()
+        .map(|arg| quote_arg(arg))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// 环境变量文本 → 表：每行 `KEY=VALUE`，空行与 `#` 开头的注释忽略。
+///
+/// 键名不合规（含空白或以 `=` 开头）时返回带行号的错误，让弹窗拒绝保存。
+pub fn parse_env(text: &str) -> Result<std::collections::HashMap<String, String>, String> {
+    let mut env = std::collections::HashMap::new();
+    for (index, raw) in text.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            return Err(format!("第 {} 行缺少 =：{line}", index + 1));
+        };
+        let key = key.trim();
+        if key.is_empty() || key.contains(char::is_whitespace) {
+            return Err(format!("第 {} 行的变量名不合法：{line}", index + 1));
+        }
+        env.insert(key.to_string(), value.trim().to_string());
+    }
+    Ok(env)
+}
+
+/// 环境变量表 → 文本（按键排序，便于回填与比对）。
+pub fn env_text(env: &std::collections::HashMap<String, String>) -> String {
+    let mut entries: Vec<_> = env.iter().collect();
+    entries.sort_by(|left, right| left.0.cmp(right.0));
+    entries
+        .into_iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// 含空白或为空时加双引号（Windows 命令行分词规则）。
-#[cfg(windows)]
 fn quote_arg(arg: &str) -> String {
     if arg.is_empty() || arg.contains([' ', '\t']) {
         format!("\"{arg}\"")
@@ -243,7 +319,7 @@ fn posix_shell() -> Option<ShellProfile> {
 /// WSL。`wsl.exe` 在部分 Windows 版本里不在 PATH 上，故也探 System32。
 ///
 /// 每个发行版单独成条（`WSL · Debian`），启动参数 `-d <发行版>`；参数经
-/// [`command_line`] 拼进整条命令行，绕开 `TerminalBuilder` 只收单一路径的限制。
+/// [`command_line_with`] 拼进整条命令行，绕开 `TerminalBuilder` 只收单一路径的限制。
 /// 枚举失败（`wsl.exe` 存在但调用出错）时退回一条「默认发行版」，无发行版则不出现条目。
 #[cfg(windows)]
 fn wsl_distros() -> Vec<ShellProfile> {
@@ -590,6 +666,64 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn split_args_handles_quotes_and_empty_segments() {
+        assert!(split_args("   ").is_empty());
+        assert_eq!(split_args("  -NoLogo   -NoProfile "), ["-NoLogo", "-NoProfile"]);
+        assert_eq!(
+            split_args(r#"-Command "echo hi""#),
+            ["-Command", "echo hi"]
+        );
+        assert_eq!(
+            split_args(r#""C:\Program Files\Git\bin\bash.exe" -i -l"#),
+            [r"C:\Program Files\Git\bin\bash.exe", "-i", "-l"]
+        );
+        // 空引号是一个合法空参数；未闭合的引号按到结尾处理。
+        assert_eq!(split_args(r#""" tail"#), ["", "tail"]);
+        assert_eq!(split_args(r#"head "open"#), ["head", "open"]);
+    }
+
+    #[test]
+    fn join_args_round_trips_through_split() {
+        let args = vec![
+            "-Command".to_string(),
+            "echo hi".to_string(),
+            String::new(),
+        ];
+        assert_eq!(split_args(&join_args(&args)), args);
+    }
+
+    #[test]
+    fn parse_env_reads_pairs_and_skips_comments() {
+        let env = parse_env("FOO=1\n\n# 注释\nBAR = two words \nBAZ=\n").unwrap();
+        assert_eq!(env.get("FOO").map(String::as_str), Some("1"));
+        assert_eq!(env.get("BAR").map(String::as_str), Some("two words"));
+        assert_eq!(env.get("BAZ").map(String::as_str), Some(""));
+        assert!(parse_env("").unwrap().is_empty());
+        // 值里允许再出现 =。
+        assert_eq!(
+            parse_env("URL=a=b").unwrap().get("URL").map(String::as_str),
+            Some("a=b")
+        );
+    }
+
+    #[test]
+    fn parse_env_rejects_bad_lines() {
+        assert!(parse_env("NOVALUE").unwrap_err().contains("第 1 行"));
+        assert!(parse_env("OK=1\nBAD KEY=2").unwrap_err().contains("第 2 行"));
+        assert!(parse_env("=1").is_err());
+    }
+
+    #[test]
+    fn env_text_sorts_keys_and_round_trips() {
+        let mut env = std::collections::HashMap::new();
+        env.insert("B".to_string(), "2".to_string());
+        env.insert("A".to_string(), "1".to_string());
+        assert_eq!(env_text(&env), "A=1\nB=2");
+        assert_eq!(parse_env(&env_text(&env)).unwrap(), env);
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn command_line_appends_and_quotes_args() {
         let mut profile = ShellProfile {
             name: "WSL · Debian".into(),
@@ -597,17 +731,24 @@ mod tests {
             args: vec![],
             kind: ShellKind::Wsl,
         };
-        assert_eq!(command_line(&profile), r"C:\Windows\System32\wsl.exe");
+        assert_eq!(
+            command_line_with(&profile, &[]),
+            r"C:\Windows\System32\wsl.exe"
+        );
         profile.args = vec!["-d".into(), "Debian".into()];
         assert_eq!(
-            command_line(&profile),
+            command_line_with(&profile, &[]),
             r"C:\Windows\System32\wsl.exe -d Debian"
         );
         profile.program = r"C:\Program Files\Git\bin\bash.exe".into();
         profile.args = vec!["-i".into(), "-l".into()];
         assert_eq!(
-            command_line(&profile),
+            command_line_with(&profile, &[]),
             r#""C:\Program Files\Git\bin\bash.exe" -i -l"#
+        );
+        assert_eq!(
+            command_line_with(&profile, &["-NoLogo".into(), "a b".into()]),
+            r#""C:\Program Files\Git\bin\bash.exe" -i -l -NoLogo "a b""#
         );
     }
 

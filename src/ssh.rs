@@ -12,8 +12,9 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use rgpui_term::FeedHandle;
+use russh::Channel;
 use russh::ChannelId;
-use russh::client::{self, Session};
+use russh::client::{self, ChannelOpenHandle, Msg, Session};
 use russh::keys::{HashAlg, PublicKey, PublicKeyOrCertificate};
 
 use crate::paths::StorageMode;
@@ -62,6 +63,18 @@ fn fingerprint_hex(key: &PublicKey) -> String {
         .collect()
 }
 
+/// 服务器为**远程转发**打开的通道：会话任务据此接上本机目标。
+///
+/// 通道由服务器发起，`connected_address/port` 是服务器上正在监听的地址与端口，
+/// 用它匹配本地登记的转发规则；`originator_*` 是连到服务器的对端，仅用于日志。
+pub struct ForwardedTcpip {
+    pub channel: Channel<Msg>,
+    pub connected_address: String,
+    pub connected_port: u32,
+    pub originator_address: String,
+    pub originator_port: u32,
+}
+
 /// russh 会话的事件处理器：实现 `client::Handler`。
 pub struct SshTerminalHandler {
     feed: FeedHandle,
@@ -73,6 +86,8 @@ pub struct SshTerminalHandler {
     vault: Option<Arc<Vault>>,
     /// 交互通道结束信号：让会话任务退出 `handle.await`，释放底层连接。
     ended: tokio::sync::mpsc::UnboundedSender<()>,
+    /// 远程转发通道交给会话任务统一接本地目标（Handler 里不放业务状态）。
+    forwarded: tokio::sync::mpsc::UnboundedSender<ForwardedTcpip>,
 }
 
 impl SshTerminalHandler {
@@ -84,6 +99,7 @@ impl SshTerminalHandler {
         side: SideChannels,
         vault: Option<Arc<Vault>>,
         ended: tokio::sync::mpsc::UnboundedSender<()>,
+        forwarded: tokio::sync::mpsc::UnboundedSender<ForwardedTcpip>,
     ) -> Self {
         Self {
             feed,
@@ -92,6 +108,7 @@ impl SshTerminalHandler {
             side,
             vault,
             ended,
+            forwarded,
         }
     }
 
@@ -224,6 +241,32 @@ impl client::Handler for SshTerminalHandler {
     ) -> Result<(), Self::Error> {
         self.feed
             .feed(format!("\r\n[rulink] {banner}\r\n").into_bytes());
+        Ok(())
+    }
+
+    /// 远程转发：服务器接受监听后，每来一个外部连接就会开一条 forwarded-tcpip 通道。
+    ///
+    /// 必须先登记旁路再交出去：通道里的字节由会话任务搬给本地目标，
+    /// 同时不能让 `Handler::data` 把流量灌进终端。
+    async fn server_channel_open_forwarded_tcpip(
+        &mut self,
+        channel: Channel<Msg>,
+        connected_address: &str,
+        connected_port: u32,
+        originator_address: &str,
+        originator_port: u32,
+        reply: ChannelOpenHandle,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        reply.accept().await;
+        self.side.add(channel.id());
+        let _ = self.forwarded.send(ForwardedTcpip {
+            channel,
+            connected_address: connected_address.to_string(),
+            connected_port,
+            originator_address: originator_address.to_string(),
+            originator_port,
+        });
         Ok(())
     }
 

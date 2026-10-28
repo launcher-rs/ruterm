@@ -79,6 +79,8 @@ mod schema {
                 key_path: self.key_path.clone(),
                 key_inline: false,
                 favorite: self.favorite,
+                // 跳板机映射存在 settings 表，加载后由 UI 层回填。
+                proxy_jump: None,
             }
         }
     }
@@ -926,6 +928,7 @@ async fn read_legacy_vault(
                 key_path: text_of(&row, 6),
                 key_inline: false,
                 favorite: matches!(row.get_value(7), Ok(Value::Integer(v)) if v != 0),
+                proxy_jump: None,
             },
             password,
         ));
@@ -1221,7 +1224,8 @@ mod tests {
             auth: AuthMethod::IdentityFile,
             key_path: "C:/keys/id_ed25519".into(),
             key_inline: false,
-            favorite: true,
+             favorite: true,
+            proxy_jump: None,
         };
         vault.upsert(&host).await.unwrap();
         vault.set_password(3, Some("s3cret")).await.unwrap();
@@ -1300,7 +1304,8 @@ mod tests {
             auth: AuthMethod::Password,
             key_path: String::new(),
             key_inline: false,
-            favorite: false,
+             favorite: false,
+            proxy_jump: None,
         };
         vault.upsert(&host).await.unwrap();
         vault.set_password(7, Some("pw-7")).await.unwrap();
@@ -1426,7 +1431,8 @@ mod tests {
             auth: AuthMethod::Password,
             key_path: String::new(),
             key_inline: false,
-            favorite: false,
+             favorite: false,
+            proxy_jump: None,
         };
         std::thread::scope(|scope| {
             scope.spawn(move || {
@@ -1641,7 +1647,8 @@ mod tests {
             auth: AuthMethod::Password,
             key_path: String::new(),
             key_inline: false,
-            favorite: false,
+             favorite: false,
+            proxy_jump: None,
         };
         vault.upsert(&host).await.unwrap();
         vault.set_password(5, Some("明文口令")).await.unwrap();
@@ -1695,7 +1702,8 @@ mod tests {
             auth: AuthMethod::IdentityFile,
             key_path: String::new(),
             key_inline: false,
-            favorite: false,
+             favorite: false,
+            proxy_jump: None,
         };
         vault.upsert(&host).await.unwrap();
 
