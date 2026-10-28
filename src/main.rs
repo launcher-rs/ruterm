@@ -5356,7 +5356,7 @@ impl Render for RuLinkApp {
                     .overflow_hidden(),
             )
             .child(self.render_status_bar().flex_shrink_0().w_full())
-            .child(self.render_overlay(cx))
+            .child(self.render_overlay(window, cx))
     }
 }
 
@@ -7104,7 +7104,7 @@ impl RuLinkApp {
 
     /// 窗口级浮层：删除二次确认、主机表单、分组新建/重命名等居中模态。
     /// （主机右键菜单不在这里——它走框架的独立图层，见 `context_menu`。）
-    fn render_overlay(&self, cx: &Context<Self>) -> AnyElement {
+    fn render_overlay(&self, window: &Window, cx: &Context<Self>) -> AnyElement {
         let pal = self.palette(cx);
         // 解锁 / 主密码弹窗优先于一切浮层（库未解锁时其余操作无意义）。
         if self.unlock.is_some() {
@@ -7199,7 +7199,7 @@ impl RuLinkApp {
         }
         // 新建/编辑主机：居中模态弹窗（不再挤占侧边栏窄面板）。
         if self.new_host.is_some() {
-            return self.render_form_dialog(cx);
+            return self.render_form_dialog(window, cx);
         }
         // 分组新建 / 重命名：同名模态，宽度固定，避免列表内联编辑误丢内容。
         if self.group_prompt.is_some() {
@@ -7944,11 +7944,15 @@ impl RuLinkApp {
 
     /// 新建/编辑主机：居中模态弹窗。遮罩只挡交互、点击不关闭（防误丢已填内容），
     /// 关闭仅走"取消"按钮或标题栏 ×。
-    fn render_form_dialog(&self, cx: &Context<Self>) -> AnyElement {
+    fn render_form_dialog(&self, window: &Window, cx: &Context<Self>) -> AnyElement {
         let pal = self.palette(cx);
         let Some(form) = self.new_host.as_ref() else {
             return div().into_any_element();
         };
+        // 默认窗口只有 720 高，字段一多表单就会顶出可视区。整卡最大高度跟着窗口走，
+        // 字段区自己滚动，标题与底部按钮永远留在窗口内。
+        let max_height = (window.viewport_size().height - px(48.0)).max(px(360.0));
+        let fields_max_height = (max_height - px(160.0)).max(px(200.0));
         let methods = [
             AuthMethod::Agent,
             AuthMethod::IdentityFile,
@@ -7974,6 +7978,7 @@ impl RuLinkApp {
                 v_flex()
                     .id("host-form")
                     .w(px(440.0))
+                    .max_h(max_height)
                     .gap_3()
                     .p_5()
                     .rounded(px(8.0))
@@ -8007,8 +8012,14 @@ impl RuLinkApp {
                                     .on_click(cx.listener(|this, _, _, cx| this.cancel_form(cx))),
                             ),
                     )
-                    .child(labeled_field("展示名", &form.name, &pal))
-                    .child(labeled_field("主机地址", &form.host, &pal))
+                    .child(
+                        v_flex()
+                            .id("host-form-fields")
+                            .gap_2()
+                            .max_h(fields_max_height)
+                            .overflow_y_scrollbar()
+                            .child(labeled_field("展示名", &form.name, &pal))
+                            .child(labeled_field("主机地址", &form.host, &pal))
                     .child(
                         h_flex()
                             .gap_3()
@@ -8023,94 +8034,104 @@ impl RuLinkApp {
                                     .child(labeled_field("用户名", &form.user, &pal)),
                             ),
                     )
-                    .child({
-                        // 分组选择：新建时默认未分组（从分组右键进入则预选该组），
-                        // 编辑时预填原归属；保存即落到这里选中的组。
-                        let mut options: Vec<SharedString> = vec![SharedString::from(UNGROUPED)];
-                        options.extend(
-                            self.sidebar
-                                .names()
-                                .map(|name| SharedString::from(name.to_string())),
-                        );
-                        let selected = form
-                            .group
-                            .as_ref()
-                            .and_then(|group| options.iter().position(|option| option == group))
-                            .or(Some(0));
-                        let change_options = options.clone();
-                        let entity = cx.entity();
-                        v_flex().gap_1().child(div().text_sm().child("分组")).child(
-                            Select::new(options)
-                                .id("host-group")
-                                .selected(selected)
-                                .w_full()
-                                .on_change(move |index, _name, _window, cx| {
-                                    let group = if index == 0 {
-                                        None
-                                    } else {
-                                        change_options.get(index).cloned()
-                                    };
-                                    entity.update(cx, |this, cx| {
-                                        if let Some(form) = this.new_host.as_mut() {
-                                            form.group = group;
-                                            cx.notify();
+                    // 分组 / 跳板机并排一行：两项都是可选的下拉，各占一半宽度，
+                    // 省下的竖向空间留给私钥字段。
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child({
+                                // 分组选择：新建时默认未分组（从分组右键进入则预选该组），
+                                // 编辑时预填原归属；保存即落到这里选中的组。
+                                let mut options: Vec<SharedString> =
+                                    vec![SharedString::from(UNGROUPED)];
+                                options.extend(
+                                    self.sidebar
+                                        .names()
+                                        .map(|name| SharedString::from(name.to_string())),
+                                );
+                                let selected = form
+                                    .group
+                                    .as_ref()
+                                    .and_then(|group| {
+                                        options.iter().position(|option| option == group)
+                                    })
+                                    .or(Some(0));
+                                let change_options = options.clone();
+                                let entity = cx.entity();
+                                div().flex_1().child(
+                                    v_flex().gap_1().child(div().text_sm().child("分组")).child(
+                                        Select::new(options)
+                                            .id("host-group")
+                                            .selected(selected)
+                                            .w_full()
+                                            .on_change(move |index, _name, _window, cx| {
+                                                let group = if index == 0 {
+                                                    None
+                                                } else {
+                                                    change_options.get(index).cloned()
+                                                };
+                                                entity.update(cx, |this, cx| {
+                                                    if let Some(form) = this.new_host.as_mut() {
+                                                        form.group = group;
+                                                        cx.notify();
+                                                    }
+                                                });
+                                            }),
+                                    ),
+                                )
+                            })
+                            .child({
+                                // 跳板机选择：只列出可作为跳板的主机（排除自己与已挂跳板机的主机，
+                                // 避免自环与多级链）。降级模式没有稳定的主机 id，只给「直连」。
+                                let self_id = form
+                                    .editing
+                                    .and_then(|index| self.hosts.get(index))
+                                    .map(|host| host.id);
+                                let mut options: Vec<SharedString> =
+                                    vec![SharedString::from("直连（无跳板机）")];
+                                let mut ids: Vec<Option<i64>> = vec![None];
+                                if self.vault.is_some() {
+                                    for host in &self.hosts {
+                                        if Some(host.id) == self_id || host.proxy_jump.is_some() {
+                                            continue;
                                         }
-                                    });
-                                }),
-                        )
-                    })
-                    .child({
-                        // 跳板机选择：只列出可作为跳板的主机（排除自己与已挂跳板机的主机，
-                        // 避免自环与多级链）。降级模式没有稳定的主机 id，只给「直连」。
-                        let self_id = form
-                            .editing
-                            .and_then(|index| self.hosts.get(index))
-                            .map(|host| host.id);
-                        let mut options: Vec<SharedString> =
-                            vec![SharedString::from("直连（无跳板机）")];
-                        let mut ids: Vec<Option<i64>> = vec![None];
-                        if self.vault.is_some() {
-                            for host in &self.hosts {
-                                if Some(host.id) == self_id || host.proxy_jump.is_some() {
-                                    continue;
+                                        let label = if host.name.trim().is_empty() {
+                                            host.addr()
+                                        } else {
+                                            host.name.clone()
+                                        };
+                                        ids.push(Some(host.id));
+                                        options.push(SharedString::from(format!(
+                                            "{label}（{}）",
+                                            host.addr()
+                                        )));
+                                    }
                                 }
-                                let label = if host.name.trim().is_empty() {
-                                    host.addr()
-                                } else {
-                                    host.name.clone()
-                                };
-                                ids.push(Some(host.id));
-                                options.push(SharedString::from(format!(
-                                    "{label}（{}）",
-                                    host.addr()
-                                )));
-                            }
-                        }
-                        let selected = form
-                            .jump
-                            .and_then(|id| ids.iter().position(|item| *item == Some(id)))
-                            .or(Some(0));
-                        let change_ids = ids.clone();
-                        let entity = cx.entity();
-                        v_flex()
-                            .gap_1()
-                            .child(div().text_sm().child("跳板机"))
-                            .child(
-                                Select::new(options)
-                                    .id("host-jump")
-                                    .selected(selected)
-                                    .w_full()
-                                    .on_change(move |index, _name, _window, cx| {
-                                        let jump = change_ids.get(index).copied().flatten();
-                                        entity.update(cx, |this, cx| {
-                                            if let Some(form) = this.new_host.as_mut() {
-                                                form.jump = jump;
-                                                cx.notify();
-                                            }
-                                        });
-                                    }),
-                            )
-                    })
+                                let selected = form
+                                    .jump
+                                    .and_then(|id| ids.iter().position(|item| *item == Some(id)))
+                                    .or(Some(0));
+                                let change_ids = ids.clone();
+                                let entity = cx.entity();
+                                div().flex_1().child(
+                                    v_flex().gap_1().child(div().text_sm().child("跳板机")).child(
+                                        Select::new(options)
+                                            .id("host-jump")
+                                            .selected(selected)
+                                            .w_full()
+                                            .on_change(move |index, _name, _window, cx| {
+                                                let jump = change_ids.get(index).copied().flatten();
+                                                entity.update(cx, |this, cx| {
+                                                    if let Some(form) = this.new_host.as_mut() {
+                                                        form.jump = jump;
+                                                        cx.notify();
+                                                    }
+                                                });
+                                            }),
+                                    ),
+                                )
+                            }),
+                    )
                     .child(
                         v_flex()
                             .gap_1()
@@ -8148,14 +8169,12 @@ impl RuLinkApp {
                                     }))
                             }))),
                     )
-                    // 私钥区块常驻布局：非私钥时用 invisible 保留占位（隐藏绘制与事件），
-                    // 切换认证方式弹窗高度不跳变。
-                    .child(
-                        v_flex()
-                            .gap_3()
-                            .when(selected != AuthMethod::IdentityFile, |this| {
-                                this.invisible()
-                            })
+                    // 私钥区块只在「私钥」认证下渲染：常驻占位会白撑两百多像素，
+                    // 默认窗口装不下。窗口更矮时由字段区自身滚动兜底。
+                    .when(selected == AuthMethod::IdentityFile, |this| {
+                        this.child(
+                            v_flex()
+                                .gap_2()
                             // 私钥来源：本地文件 / 内嵌加密库。两段切换不改变弹窗高度
                             // （下方行数一致：路径行 ↔ 导入行）。
                             .child({
@@ -8269,46 +8288,61 @@ impl RuLinkApp {
                             .child(
                                 v_flex()
                                     .gap_1()
-                                    .child(div().text_sm().child("私钥口令"))
+                                    .child(
+                                        // 「保存口令」勾选与标签同排，省下一整行高度；
+                                        // 库不可用时只留"仅本次内存持有"的灰字提示。
+                                        h_flex()
+                                            .w_full()
+                                            .items_center()
+                                            .justify_between()
+                                            .child(div().text_sm().child("私钥口令"))
+                                            .child(
+                                                h_flex()
+                                                    .id("save-passphrase")
+                                                    .gap_2()
+                                                    .items_center()
+                                                    .when(self.vault.is_some(), |this| {
+                                                        this.cursor_pointer().on_click(
+                                                            cx.listener(|this, _, _, cx| {
+                                                                if let Some(form) =
+                                                                    this.new_host.as_mut()
+                                                                {
+                                                                    form.save_secret =
+                                                                        !form.save_secret;
+                                                                    cx.notify();
+                                                                }
+                                                            }),
+                                                        )
+                                                    })
+                                                    .child(div().text_xs().text_color(
+                                                        if self.vault.is_none() {
+                                                            pal.muted
+                                                        } else if save_checked {
+                                                            pal.text
+                                                        } else {
+                                                            pal.muted
+                                                        },
+                                                    ).child(
+                                                        if self.vault.is_some() {
+                                                            if save_checked {
+                                                                "☑ 保存口令到加密库"
+                                                            } else {
+                                                                "☐ 保存口令到加密库"
+                                                            }
+                                                        } else {
+                                                            "口令仅本次内存持有"
+                                                        },
+                                                    )),
+                                            ),
+                                    )
                                     .child(styled_input(
                                         Input::new(&form.passphrase)
                                             .content_type(InputContentType::Password),
                                         &pal,
                                     )),
-                            )
-                            .child(
-                                h_flex()
-                                    .id("save-passphrase")
-                                    .gap_2()
-                                    .items_center()
-                                    .when(self.vault.is_some(), |this| {
-                                        this.cursor_pointer().on_click(cx.listener(
-                                            |this, _, _, cx| {
-                                                if let Some(form) = this.new_host.as_mut() {
-                                                    form.save_secret = !form.save_secret;
-                                                    cx.notify();
-                                                }
-                                            },
-                                        ))
-                                    })
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .text_color(if save_checked {
-                                                pal.text
-                                            } else {
-                                                pal.muted
-                                            })
-                                            .child(if save_checked { "☑" } else { "☐" }),
-                                    )
-                                    .child(div().text_sm().text_color(pal.muted).child(
-                                        if self.vault.is_some() {
-                                            "保存口令（加密存入本地凭据库，默认仅本次内存持有）"
-                                        } else {
-                                            "加密库不可用，口令仅本次内存持有"
-                                        },
-                                    )),
                             ),
+                        )
+                    })
                     )
                     .child(
                         h_flex()
