@@ -25,12 +25,13 @@ use rgpui::components::split_pane::{CollapsiblePane, SplitDirection, SplitPane, 
 use rgpui::components::status_bar::{StatusBar, StatusBarItem};
 use rgpui::input_ui::{Input, InputContentType, InputEvent, InputState};
 use rgpui::prelude::*;
+use rgpui::tabs::tab_drag::TabDragData;
 use rgpui::title_bar::TITLE_BAR_HEIGHT;
 use rgpui::{
     AbsoluteLength, AnyElement, App, Bounds, Button, ButtonVariants, Checkbox, ClickEvent, Context,
     ContextMenuExt, Div, DropdownMenu, Entity, FocusHandle, Focusable, FontWeight, Hsla, Icon,
     IconName, Image, ImageFormat, InteractiveElement, IntoElement, KeyBinding, KeyDownEvent,
-    MouseButton, NoAction, ParentElement, Pixels, PopupMenu, PopupMenuItem, Render, Rgba,
+    MouseButton, NoAction, ParentElement, Pixels, Point, PopupMenu, PopupMenuItem, Render, Rgba,
     ScrollHandle, ScrollableElement, SharedString, Stateful, StatefulInteractiveElement, Styled,
     TrayMenuItem, Window, WindowBounds, WindowControlArea, WindowOptions, actions, div, h_flex,
     img, px, size, v_flex,
@@ -1263,6 +1264,7 @@ struct RuLinkApp {
 /// 主题调色板：从 rgpui 全局 `Theme` 的语义色映射而来（不硬编码颜色）。
 /// 切换明暗只调 `Theme::change`，本结构随之重取，界面整体换色，且与按钮 / 状态栏等
 /// 组件共用同一份主题（避免手工配色与框架主题脱节）。
+#[derive(Clone, Copy)]
 struct Palette {
     /// 窗口/编辑区底色。
     window_bg: Hsla,
@@ -5036,6 +5038,24 @@ impl RuLinkApp {
         }
     }
 
+    /// 拖拽排序标签：把第 `from` 个标签移到第 `to` 个标签的位置。
+    /// 先取出再插入，`from < to` 时目标下标会左移一位，这里用移出后的下标插入，
+    /// 视觉上落点标签让位、被拖标签占住它的位置（与 rgpui 自带 TabBar 同规则）。
+    fn reorder_tab(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
+        let len = self.tabs.len();
+        if from >= len {
+            return;
+        }
+        let to = to.min(len.saturating_sub(1));
+        if from == to {
+            return;
+        }
+        let tab = self.tabs.remove(from);
+        let insert_at = to.min(self.tabs.len());
+        self.tabs.insert(insert_at, tab);
+        cx.notify();
+    }
+
     /// Ctrl+Tab / Ctrl+Shift+Tab：按标签顺序循环切换（末尾回到开头）。
     fn cycle_tab(&mut self, step: isize, window: &mut Window, cx: &mut Context<Self>) {
         if self.tabs.is_empty() {
@@ -8700,7 +8720,7 @@ impl RuLinkApp {
                         .overflow_x_scroll()
                         .restrict_scroll_to_axis()
                         .track_scroll(&self.tab_scroll)
-                        .children(self.tabs.iter().map(|tab| {
+                        .children(self.tabs.iter().enumerate().map(|(index, tab)| {
                             let id = tab.id;
                             let active = self.active_tab == Some(id);
                             let tab_id = SharedString::from(format!("tab-{id}"));
@@ -8727,6 +8747,31 @@ impl RuLinkApp {
                                 })
                                 .when(!active, |this| this.hover(|this| this.bg(pal.card_hover)))
                                 .cursor_pointer()
+                                // 拖拽排序：拖动超过阈值后出现跟随光标的缩略标签，
+                                // 松手落到哪个标签上就占它的位置（空白处＝移到最末）。
+                                .on_drag(
+                                    TabDragData {
+                                        index,
+                                        title: tab.title.to_string(),
+                                        position: Point::default(),
+                                    },
+                                    |drag: &TabDragData, position, _window, cx| {
+                                        cx.new(|_| TabDragData {
+                                            index: drag.index,
+                                            title: drag.title.clone(),
+                                            position,
+                                        })
+                                    },
+                                )
+                                .drag_over::<TabDragData>(move |style, _, _, _| {
+                                    style
+                                        .bg(pal.card_hover)
+                                        .border_l(px(2.0))
+                                        .border_color(pal.accent)
+                                })
+                                .on_drop(cx.listener(move |this, drag: &TabDragData, _, cx| {
+                                    this.reorder_tab(drag.index, index, cx);
+                                }))
                                 .on_click(cx.listener(move |this, _, window, cx| {
                                     this.activate_tab(id, window, cx);
                                     cx.notify();
@@ -8773,6 +8818,11 @@ impl RuLinkApp {
                                             })),
                                     )
                                 })
+                        }))
+                        // 拖到标签栏空白处＝挪到最末，避免只能落到某个标签上。
+                        .on_drop(cx.listener(|this, drag: &TabDragData, _, cx| {
+                            let last = this.tabs.len().saturating_sub(1);
+                            this.reorder_tab(drag.index, last, cx);
                         })),
                 )
                 .into_any_element()
