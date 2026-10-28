@@ -36,6 +36,9 @@ pub struct HostConfig {
     /// 私钥路径（仅 IdentityFile 使用）
     #[serde(default)]
     pub key_path: String,
+    /// 私钥是否内嵌在加密库（不落 JSON；读取时按库内是否存在私钥回填）。
+    #[serde(skip)]
+    pub key_inline: bool,
     /// 是否收藏（收藏主机在列表置顶，★ 标记）
     #[serde(default)]
     pub favorite: bool,
@@ -58,8 +61,11 @@ impl HostConfig {
         if self.port == 0 {
             return Some("端口无效".to_string());
         }
-        if self.auth == AuthMethod::IdentityFile && self.key_path.trim().is_empty() {
-            return Some("请填写私钥路径".to_string());
+        if self.auth == AuthMethod::IdentityFile
+            && !self.key_inline
+            && self.key_path.trim().is_empty()
+        {
+            return Some("请填写私钥路径，或改为内嵌私钥".to_string());
         }
         None
     }
@@ -83,6 +89,9 @@ pub struct Settings {
     /// 侧边栏分组（文件夹）偏好（序列化成 JSON 字符串）。
     #[serde(default)]
     pub sidebar: String,
+    /// 本机 shell 自定义展示名（序列化成 JSON 字符串）。
+    #[serde(default)]
+    pub local_shells: String,
 }
 
 impl Settings {
@@ -166,6 +175,12 @@ impl SessionStore {
     pub fn save_sidebar(&self, json: &str) {
         let json = json.to_string();
         self.update_settings(|settings| settings.sidebar = json);
+    }
+
+    /// 降级模式（无加密库）下保存本机 shell 自定义名。
+    pub fn save_local_shells(&self, json: &str) {
+        let json = json.to_string();
+        self.update_settings(|settings| settings.local_shells = json);
     }
 
     /// 迁移完成后把 sessions.json 改名为 sessions.json.migrated（保留现场，不删除）。

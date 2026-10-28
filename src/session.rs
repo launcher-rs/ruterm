@@ -312,7 +312,7 @@ async fn forward_uplink(
     }
 }
 
-/// 按 密码 → 私钥 → SSH Agent 的优先级完成认证。
+/// 按 密码 → 内嵌私钥 → 私钥文件 → SSH Agent 的优先级完成认证。
 async fn authenticate(handle: &mut Handle<SshTerminalHandler>, target: &SshTarget) -> Result<()> {
     if let Some(password) = &target.password {
         let ok = handle
@@ -323,6 +323,28 @@ async fn authenticate(handle: &mut Handle<SshTerminalHandler>, target: &SshTarge
             return Err(anyhow::anyhow!("密码认证失败").context(SecretRejected));
         }
         return Ok(());
+    }
+
+    if let Some(data) = &target.key_data {
+        let secret = match russh::keys::decode_secret_key(data, target.passphrase.as_deref()) {
+            Ok(secret) => secret,
+            Err(russh::keys::Error::KeyIsEncrypted) if target.passphrase.is_none() => {
+                return Err(PassphraseRequired.into());
+            }
+            Err(error) => {
+                let context = if target.passphrase.is_some() {
+                    "内嵌私钥口令解密失败（口令可能不正确）"
+                } else {
+                    "内嵌私钥无法解析（内容可能已损坏）"
+                };
+                let mut error = anyhow::Error::new(error).context(context);
+                if target.passphrase.is_some() {
+                    error = error.context(SecretRejected);
+                }
+                return Err(error);
+            }
+        };
+        return authenticate_key(handle, target, secret, "内嵌私钥").await;
     }
 
     if let Some(path) = &target.key_path {
@@ -346,20 +368,7 @@ async fn authenticate(handle: &mut Handle<SshTerminalHandler>, target: &SshTarge
                 return Err(error);
             }
         };
-        let hash_alg = handle.best_supported_rsa_hash().await?.flatten();
-        let key = PrivateKeyWithHashAlg::new(Arc::new(secret), hash_alg);
-        let ok = handle
-            .authenticate_publickey(target.user.clone(), key)
-            .await?
-            .success();
-        if !ok {
-            return Err(anyhow::anyhow!(
-                "公钥认证被服务器拒绝：{}（请确认此私钥与服务器上授权的公钥匹配；若服务器只允许密码，请把该主机的认证方式改为密码）",
-                path.display()
-            )
-            .context(SecretRejected));
-        }
-        return Ok(());
+        return authenticate_key(handle, target, secret, &path.display().to_string()).await;
     }
 
     // SSH Agent：逐个尝试 agent 中登记的密钥（Unix 走 SSH_AUTH_SOCK，
@@ -389,4 +398,26 @@ async fn authenticate(handle: &mut Handle<SshTerminalHandler>, target: &SshTarge
         }
     }
     return Err(anyhow::anyhow!("SSH Agent 中的密钥均被服务器拒绝").context(SecretRejected));
+}
+
+/// 用已加载的私钥完成公钥认证（文件私钥与内嵌私钥共用）。
+async fn authenticate_key(
+    handle: &mut Handle<SshTerminalHandler>,
+    target: &SshTarget,
+    secret: russh::keys::PrivateKey,
+    label: &str,
+) -> Result<()> {
+    let hash_alg = handle.best_supported_rsa_hash().await?.flatten();
+    let key = PrivateKeyWithHashAlg::new(Arc::new(secret), hash_alg);
+    let ok = handle
+        .authenticate_publickey(target.user.clone(), key)
+        .await?
+        .success();
+    if !ok {
+        return Err(anyhow::anyhow!(
+            "公钥认证被服务器拒绝：{label}（请确认此私钥与服务器上授权的公钥匹配；若服务器只允许密码，请把该主机的认证方式改为密码）"
+        )
+        .context(SecretRejected));
+    }
+    Ok(())
 }

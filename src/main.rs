@@ -27,7 +27,7 @@ use rgpui::{
     AbsoluteLength, AnyElement, App, Bounds, Button, ButtonVariants, Checkbox, ClickEvent, Context,
     ContextMenuExt, Div, DropdownMenu, Entity, FocusHandle, Focusable, FontWeight, Hsla, Icon,
     IconName, Image, ImageFormat, InteractiveElement, IntoElement, KeyBinding, KeyDownEvent,
-    MouseButton, NoAction, ParentElement, Pixels, PopupMenu, PopupMenuItem, Render,
+    MouseButton, NoAction, ParentElement, Pixels, PopupMenu, PopupMenuItem, Render, ScrollHandle,
     ScrollableElement, SharedString, Stateful, StatefulInteractiveElement, Styled, TrayMenuItem,
     Window, WindowBounds, WindowControlArea, WindowOptions, actions, div, h_flex, img, px, size,
     v_flex,
@@ -52,6 +52,8 @@ actions!(
         ToggleTheme,
         NewHost,
         NewLocalTerminal,
+        NextTab,
+        PrevTab,
         OpenSettings
     ]
 );
@@ -63,6 +65,18 @@ fn auth_label(method: AuthMethod) -> &'static str {
         AuthMethod::IdentityFile => "私钥",
         AuthMethod::Password => "密码",
     }
+}
+
+/// 合并两条状态附注（保存成功时的括注）。
+fn join_notes(first: Option<String>, second: Option<String>) -> String {
+    let mut joined = String::new();
+    if let Some(first) = first {
+        joined.push_str(&first);
+    }
+    if let Some(second) = second {
+        joined.push_str(&second);
+    }
+    joined
 }
 
 /// 一个已连接的会话标签（持有终端视图）。
@@ -113,6 +127,12 @@ struct NewHostForm {
     port: Entity<InputState>,
     user: Entity<InputState>,
     key_path: Entity<InputState>,
+    /// 私钥来源：true＝内嵌到加密库（PEM 存库），false＝本地文件路径。
+    key_inline: bool,
+    /// 本次表单里新导入的私钥 PEM（仅内存；保存时才写入加密库）。
+    key_data: Option<String>,
+    /// 导入的私钥文件名，仅用于界面提示（绝不展示内容）。
+    key_label: Option<String>,
     /// 加密私钥口令（可选）。保存时勾选入库则写加密库，否则仅本次内存缓存；绝不落明文。
     passphrase: Entity<InputState>,
     /// 表单层"保存口令到加密库"开关（默认否＝仅本次内存持有）。
@@ -130,6 +150,22 @@ struct GroupPrompt {
     /// Some(原名)＝重命名既有分组；None＝新建。
     renaming: Option<SharedString>,
     name: Entity<InputState>,
+}
+
+/// 本地 shell 弹窗（重命名 / 设置起始目录）状态。
+struct ShellPrompt {
+    /// profile id（路径 + 参数）；扫描重建列表后仍能定位。
+    id: String,
+    kind: ShellPromptKind,
+    /// 系统默认名或默认目录文本，用于「留空恢复默认」提示。
+    default_text: String,
+    input: Entity<InputState>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ShellPromptKind {
+    Rename,
+    WorkingDirectory,
 }
 
 /// 弹窗索取的秘密类型：登录密码或加密私钥的口令。
@@ -377,6 +413,9 @@ const AUTO_RECONNECT_MAX: u32 = 5;
 /// 会话稳定存活超过这个时长后再次断线，重新计算自动重连次数（避免历史断线把额度吃光）。
 const AUTO_RECONNECT_HEALTHY: Duration = Duration::from_secs(30);
 
+/// 内嵌私钥文件大小上限：正常私钥几 KB，超过这个数多半是选错了文件。
+const MAX_INLINE_KEY_BYTES: usize = 64 * 1024;
+
 /// 第 n 次自动重连前的等待：退避避免对刚恢复的网络连打。
 fn auto_reconnect_delay(attempt: u32) -> Duration {
     Duration::from_secs(match attempt {
@@ -445,6 +484,67 @@ impl SessionPrefs {
         let mut prefs: Self = serde_json::from_str(text).unwrap_or_default();
         prefs.clamp();
         prefs
+    }
+}
+
+/// 本机 shell 的偏好：自定义展示名 + 起始工作目录（按 profile id = 路径 + 参数记账）。
+///
+/// 扫描结果每次重建，偏好单独存一份，重扫后仍生效；清空对应条目即恢复默认。
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalShellPrefs {
+    #[serde(default)]
+    names: HashMap<String, String>,
+    /// profile id → 起始工作目录（未设置则用进程当前目录）。
+    #[serde(default)]
+    cwd: HashMap<String, String>,
+}
+
+impl LocalShellPrefs {
+    /// 该 profile 的自定义名（空串视为未设置）。
+    fn name_of(&self, id: &str) -> Option<&str> {
+        self.names
+            .get(id)
+            .map(String::as_str)
+            .filter(|name| !name.is_empty())
+    }
+
+    /// 设置别名；空名等于恢复默认（删除别名）。
+    fn rename(&mut self, id: &str, name: &str) {
+        let name = name.trim();
+        if name.is_empty() {
+            self.names.remove(id);
+        } else {
+            self.names.insert(id.to_string(), name.to_string());
+        }
+    }
+
+    /// 该 profile 的起始目录（未设置或空串视为默认）。
+    fn cwd_of(&self, id: &str) -> Option<&str> {
+        self.cwd
+            .get(id)
+            .map(String::as_str)
+            .filter(|dir| !dir.is_empty())
+    }
+
+    /// 设置起始目录；空串等于恢复默认（删除该条）。
+    fn set_cwd(&mut self, id: &str, dir: &str) {
+        let dir = dir.trim();
+        if dir.is_empty() {
+            self.cwd.remove(id);
+        } else {
+            self.cwd.insert(id.to_string(), dir.to_string());
+        }
+    }
+
+    fn to_json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
+    }
+
+    fn from_json(text: &str) -> Self {
+        if text.is_empty() {
+            return Self::default();
+        }
+        serde_json::from_str(text).unwrap_or_default()
     }
 }
 
@@ -638,6 +738,12 @@ struct RuLinkApp {
     scanning_shells: bool,
     /// 「本地终端」分组的折叠状态。只影响这次会话——它不是库里的分组，没必要占持久化键。
     local_group_collapsed: bool,
+    /// 本机 shell 的自定义展示名，随加密库 / settings.json 双层持久化。
+    local_shell_prefs: LocalShellPrefs,
+    /// 本地 shell 重命名弹窗。
+    shell_prompt: Option<ShellPrompt>,
+    /// 标签栏横向滚动句柄：新建 / 切到标签时把它滚进可视区。
+    tab_scroll: ScrollHandle,
     /// 侧边栏分组（文件夹）偏好，随加密库 / settings.json 双层持久化。
     sidebar: SidebarPrefs,
     /// 分组新建 / 重命名弹窗（`renaming` 为 None 表示新建）。
@@ -650,6 +756,8 @@ struct RuLinkApp {
     settings: Option<SettingsState>,
     /// 本次运行内缓存的密码（按 user@host:port），避免重复弹窗；绝不落盘。
     password_cache: HashMap<String, String>,
+    /// 内嵌私钥（host_id → PEM 明文）：开库时整体读入内存，连接时直接取用。
+    inline_keys: HashMap<i64, String>,
     /// 标签自增 id。
     next_id: usize,
     /// 状态栏左侧的瞬态消息（连接/保存/删除/断开等节点更新）。
@@ -745,6 +853,7 @@ impl RuLinkApp {
         let status_bar = StatusBarPrefs::from_json(&settings.status_bar);
         let terminal = TerminalPrefs::from_json(&settings.terminal);
         let session_prefs = SessionPrefs::from_json(&settings.session);
+        let local_shell_prefs = LocalShellPrefs::from_json(&settings.local_shells);
         let sidebar = SidebarPrefs::from_json(&settings.sidebar);
         // 终端配色预设管理器：全局一份，`TerminalView::set_theme` 与自建样式都从这里取。
         if !cx.has_global::<ThemeManager>() {
@@ -775,6 +884,9 @@ impl RuLinkApp {
             shell_icons: HashMap::new(),
             scanning_shells: false,
             local_group_collapsed: false,
+            local_shell_prefs,
+            shell_prompt: None,
+            tab_scroll: ScrollHandle::new(),
             sidebar,
             group_prompt: None,
             confirm_delete: None,
@@ -782,6 +894,7 @@ impl RuLinkApp {
             settings: None,
             unlocked_key: None,
             password_cache: HashMap::new(),
+            inline_keys: HashMap::new(),
             next_id: 0,
             status: "就绪".into(),
             status_bar,
@@ -911,6 +1024,17 @@ impl RuLinkApp {
         self.vault = Some(vault.clone());
         self.unlocked_key = key;
         cx.notify();
+        // 内嵌私钥整体读入内存：连接与断线重连都走这份缓存，不再访问库。
+        let keys_vault = vault.clone();
+        cx.spawn(async move |this, cx| {
+            if let Ok(keys) = keys_vault.load_host_keys().await {
+                let _ = this.update(cx, |this, cx| {
+                    this.inline_keys = keys.into_iter().collect();
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
         // 库内主题优先于启动时的旧 JSON/默认值。
         cx.spawn(async move |this, cx| {
             if let Ok(Some(theme)) = vault.setting("theme").await {
@@ -964,6 +1088,16 @@ impl RuLinkApp {
                 let _ = this.update(cx, |this, cx| {
                     if this.sidebar != prefs {
                         this.sidebar = prefs;
+                        cx.notify();
+                    }
+                });
+            }
+            // 本机 shell 自定义名同样以库内为准（扫描结果不变，只需重绘列表）。
+            if let Ok(Some(json)) = vault.setting("local_shells").await {
+                let prefs = LocalShellPrefs::from_json(&json);
+                let _ = this.update(cx, |this, cx| {
+                    if this.local_shell_prefs != prefs {
+                        this.local_shell_prefs = prefs;
                         cx.notify();
                     }
                 });
@@ -1612,6 +1746,9 @@ impl RuLinkApp {
             passphrase: cx.new(|cx| {
                 InputState::new(window, cx).placeholder("私钥口令（可选，留空则连接时按需询问）")
             }),
+            key_inline: existing.as_ref().is_some_and(|host| host.key_inline),
+            key_data: None,
+            key_label: None,
             save_secret: false,
             auth,
             group,
@@ -1648,7 +1785,10 @@ impl RuLinkApp {
         let passphrase = form.passphrase.read(cx).value().trim().to_string();
         let save_secret = form.save_secret;
         let group = form.group.clone();
+        let key_inline = form.key_inline;
+        let key_data = form.key_data.clone();
         let host_raw = form.host.read(cx).value().trim().to_string();
+        let key_path = form.key_path.read(cx).value().trim().to_string();
         let mut host = HostConfig {
             id: 0,
             name: form.name.read(cx).value().trim().to_string(),
@@ -1662,9 +1802,25 @@ impl RuLinkApp {
                 .unwrap_or(22),
             user: form.user.read(cx).value().trim().to_string(),
             auth,
-            key_path: form.key_path.read(cx).value().trim().to_string(),
+            key_path: if key_inline { String::new() } else { key_path },
+            key_inline: auth == AuthMethod::IdentityFile && key_inline,
             favorite: false,
         };
+        if host.key_inline {
+            if self.vault.is_none() {
+                self.status = "内嵌私钥需要加密凭据库（当前不可用），请改用本地私钥文件".into();
+                cx.notify();
+                return;
+            }
+            let existing = editing
+                .and_then(|index| self.hosts.get(index))
+                .is_some_and(|current| current.key_inline);
+            if key_data.is_none() && !existing {
+                self.status = "请先导入私钥文件（选择「内嵌到加密库」后点「导入私钥…」）".into();
+                cx.notify();
+                return;
+            }
+        }
         if let Some(error) = host.validate() {
             log::warn!("保存主机失败: {error}");
             self.status = SharedString::from(format!("保存失败：{error}"));
@@ -1685,14 +1841,16 @@ impl RuLinkApp {
             if let Some(current) = self.hosts.get(index).cloned() {
                 host.id = current.id;
                 host.favorite = current.favorite;
+                let was_inline = current.key_inline;
                 self.hosts[index] = host.clone();
                 self.persist_host(&host, cx);
                 let note = self.store_form_secret(&host, passphrase.clone(), save_secret, cx);
+                let key_note = self.store_form_key(&host, key_data, was_inline, cx);
                 self.apply_form_group(&host, group, cx);
                 self.new_host = None;
                 self.status = SharedString::from(format!(
                     "已更新主机 {label}{}{group_note}",
-                    note.as_deref().unwrap_or("")
+                    join_notes(note, key_note)
                 ));
                 cx.notify();
                 return;
@@ -1706,11 +1864,12 @@ impl RuLinkApp {
         self.hosts.push(host.clone());
         self.persist_host(&host, cx);
         let note = self.store_form_secret(&host, passphrase, save_secret, cx);
+        let key_note = self.store_form_key(&host, key_data, false, cx);
         self.apply_form_group(&host, group, cx);
         self.new_host = None;
         self.status = SharedString::from(format!(
             "已保存主机 {label}{}{group_note}",
-            note.as_deref().unwrap_or("")
+            join_notes(note, key_note)
         ));
         cx.notify();
     }
@@ -1761,6 +1920,129 @@ impl RuLinkApp {
         }
         self.password_cache.insert(host.addr(), passphrase);
         Some("（口令仅本次内存持有）".to_string())
+    }
+
+    /// 内嵌私钥的落点：新导入的写入加密库，取消内嵌则清除库内旧条目。
+    ///
+    /// 编辑时没重新导入（key_data 为空）且原本就是内嵌的，视为"保持原样"；
+    /// 删除永远不会降级为明文——加密库不可用时内嵌选项根本不可选。
+    fn store_form_key(
+        &mut self,
+        host: &HostConfig,
+        key_data: Option<String>,
+        was_inline: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<String> {
+        if host.key_inline {
+            let pem = key_data?;
+            if let (Some(vault), true) = (self.vault.clone(), host.id != 0) {
+                let id = host.id;
+                self.inline_keys.insert(id, pem.clone());
+                cx.spawn(async move |_, _| {
+                    if let Err(error) = vault.set_host_key(id, Some(&pem)).await {
+                        log::warn!("保存内嵌私钥失败: {error}");
+                    }
+                })
+                .detach();
+            }
+            return Some("（私钥已加密入库）".to_string());
+        }
+        if was_inline {
+            let id = host.id;
+            self.inline_keys.remove(&id);
+            if let (Some(vault), true) = (self.vault.clone(), id != 0) {
+                cx.spawn(async move |_, _| {
+                    if let Err(error) = vault.set_host_key(id, None).await {
+                        log::warn!("清除内嵌私钥失败: {error}");
+                    }
+                })
+                .detach();
+            }
+            return Some("（已移除内嵌私钥）".to_string());
+        }
+        None
+    }
+
+    /// 选择私钥文件并读入表单（只在保存时写入加密库，读取后原文仅存内存）。
+    ///
+    /// 导入即做一次格式校验：能解析或"是加密私钥"才收下，避免把随便一个文本
+    /// 存进库、等到连接时才失败。
+    fn import_inline_key(&mut self, cx: &mut Context<Self>) {
+        if self.vault.is_none() {
+            self.status = "内嵌私钥需要加密凭据库（当前不可用）".into();
+            cx.notify();
+            return;
+        }
+        if self.new_host.is_none() {
+            return;
+        }
+        let entity = cx.entity();
+        let entity_id = entity.entity_id();
+        let rx = cx.prompt_for_paths(rgpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("选择私钥文件".into()),
+        });
+        cx.spawn(async move |_, cx| {
+            let Ok(Ok(Some(paths))) = rx.await else {
+                return;
+            };
+            let Some(path) = paths.first().cloned() else {
+                return;
+            };
+            let label = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string());
+            let read = std::fs::read_to_string(&path);
+            let _ = cx.with_window(entity_id, move |_, cx| {
+                let _ = entity.update(cx, move |this, cx| {
+                    this.apply_imported_key(label, read, cx);
+                });
+            });
+        })
+        .detach();
+    }
+
+    /// 校验并暂存导入的私钥（UI 线程侧）。
+    fn apply_imported_key(
+        &mut self,
+        label: String,
+        read: std::io::Result<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let text = match read {
+            Ok(text) if text.len() > MAX_INLINE_KEY_BYTES => {
+                self.status = "私钥文件过大（超过 64 KB），已拒绝导入".into();
+                cx.notify();
+                return;
+            }
+            Ok(text) => text,
+            Err(error) => {
+                log::warn!("读取私钥 {label} 失败: {error}");
+                self.status = format!("读取私钥文件 {label} 失败").into();
+                cx.notify();
+                return;
+            }
+        };
+        // 能解析、或是"加密私钥"才收下；其余内容当误选文件处理。
+        if let Err(error) = russh::keys::decode_secret_key(&text, None)
+            && !matches!(error, russh::keys::Error::KeyIsEncrypted)
+        {
+            log::warn!("导入私钥失败（{label}）: {error}");
+            self.status = format!("无法识别私钥文件 {label}").into();
+            cx.notify();
+            return;
+        }
+        let Some(form) = self.new_host.as_mut() else {
+            return;
+        };
+        form.key_data = Some(text);
+        form.key_label = Some(label);
+        form.key_inline = true;
+        self.status = "私钥已读入，保存主机时写入加密凭据库".into();
+        cx.notify();
     }
 
     /// 打开系统文件对话框选择私钥文件，回填表单"私钥路径"。
@@ -1819,6 +2101,7 @@ impl RuLinkApp {
         if index < self.hosts.len() {
             let removed = self.hosts.remove(index);
             let label = removed.name.clone();
+            self.inline_keys.remove(&removed.id);
             if let Some(vault) = self.vault.clone() {
                 let id = removed.id;
                 cx.spawn(async move |_, _| {
@@ -1921,6 +2204,207 @@ impl RuLinkApp {
         self.persist_sidebar(cx);
     }
 
+    /// 本地 shell 的展示名：用户改过用别名，否则用扫描出的系统名。
+    fn shell_name(&self, profile: &ShellProfile) -> SharedString {
+        match self.local_shell_prefs.name_of(&profile.id()) {
+            Some(alias) => SharedString::from(alias.to_string()),
+            None => SharedString::from(profile.name.clone()),
+        }
+    }
+
+    /// 搜索是否命中该 shell（自定义名、系统名或可执行文件名）。
+    fn shell_matches(&self, profile: &ShellProfile, query: &str) -> bool {
+        if query.is_empty() {
+            return true;
+        }
+        let query = query.to_lowercase();
+        let alias_hit = self
+            .local_shell_prefs
+            .name_of(&profile.id())
+            .is_some_and(|alias| alias.to_lowercase().contains(&query));
+        alias_hit || profile.matches(&query)
+    }
+
+    /// 打开本地 shell 重命名弹窗（预填当前展示名）。
+    fn open_shell_prompt(
+        &mut self,
+        profile: &ShellProfile,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let id = profile.id();
+        let default_text = profile.name.clone();
+        let current = self.shell_name(profile).to_string();
+        self.open_shell_input(
+            id,
+            ShellPromptKind::Rename,
+            default_text,
+            current,
+            window,
+            cx,
+        );
+    }
+
+    /// 打开「起始目录」弹窗（预填已设置的目录，留空＝进程当前目录）。
+    fn open_shell_cwd_prompt(
+        &mut self,
+        profile: &ShellProfile,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let id = profile.id();
+        let default_text = std::env::current_dir()
+            .map(|dir| dir.display().to_string())
+            .unwrap_or_default();
+        let current = self.local_shell_prefs.cwd_of(&id).unwrap_or("").to_string();
+        self.open_shell_input(
+            id,
+            ShellPromptKind::WorkingDirectory,
+            default_text,
+            current,
+            window,
+            cx,
+        );
+    }
+
+    fn open_shell_input(
+        &mut self,
+        id: String,
+        kind: ShellPromptKind,
+        default_text: String,
+        current: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let placeholder = default_text.clone();
+        let input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(placeholder)
+                .default_value(current)
+        });
+        // 回车即确认，与分组重命名一致。
+        cx.subscribe(&input, |this, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::PressEnter { shift: false, .. }) {
+                this.commit_shell_prompt(cx);
+            }
+        })
+        .detach();
+        input.update(cx, |state, cx| state.focus(window, cx));
+        self.shell_prompt = Some(ShellPrompt {
+            id,
+            kind,
+            default_text,
+            input,
+        });
+        cx.notify();
+    }
+
+    /// 确认弹窗：重命名留空/同名即恢复默认；起始目录留空即用进程当前目录。
+    fn commit_shell_prompt(&mut self, cx: &mut Context<Self>) {
+        let Some(prompt) = self.shell_prompt.take() else {
+            return;
+        };
+        let text = prompt.input.read(cx).value().trim().to_string();
+        match prompt.kind {
+            ShellPromptKind::Rename => {
+                if text.is_empty() || text == prompt.default_text {
+                    self.local_shell_prefs.rename(&prompt.id, "");
+                    self.status =
+                        SharedString::from(format!("已恢复默认名称 {}", prompt.default_text));
+                } else {
+                    self.local_shell_prefs.rename(&prompt.id, &text);
+                    self.status = SharedString::from(format!("已重命名为 {text}"));
+                }
+            }
+            ShellPromptKind::WorkingDirectory => {
+                if text.is_empty() || text == prompt.default_text {
+                    self.local_shell_prefs.set_cwd(&prompt.id, "");
+                    self.status = "已恢复默认起始目录（进程当前目录）".into();
+                } else if !std::path::Path::new(&text).is_dir() {
+                    // 目录不存在就不写：否则每次开会话都会静默回落到默认目录，
+                    // 用户以为设置生效了。
+                    self.status = SharedString::from(format!("目录不存在：{text}"));
+                    self.shell_prompt = Some(prompt);
+                    cx.notify();
+                    return;
+                } else {
+                    self.local_shell_prefs.set_cwd(&prompt.id, &text);
+                    self.status = SharedString::from(format!("起始目录已设为 {text}"));
+                }
+            }
+        }
+        self.persist_local_shells(cx);
+        cx.notify();
+    }
+
+    /// 「浏览…」选起始目录（系统目录选择对话框），回填弹窗输入框。
+    fn browse_shell_cwd(&mut self, cx: &mut Context<Self>) {
+        let Some(prompt) = self.shell_prompt.as_ref() else {
+            return;
+        };
+        let input = prompt.input.clone();
+        let entity_id = cx.entity_id();
+        let rx = cx.prompt_for_paths(rgpui::PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("选择起始目录".into()),
+        });
+        cx.spawn(async move |_, cx| {
+            if let Ok(Ok(Some(paths))) = rx.await {
+                if let Some(path) = paths.first() {
+                    let value = path.to_string_lossy().into_owned();
+                    let _ = cx.with_window(entity_id, move |window, cx| {
+                        let _ = input.update(cx, |state, cx| {
+                            state.set_value(value, window, cx);
+                        });
+                    });
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// 关闭重命名弹窗，不写入。
+    fn cancel_shell_prompt(&mut self, cx: &mut Context<Self>) {
+        self.shell_prompt = None;
+        cx.notify();
+    }
+
+    /// 右键「恢复默认名称」：直接清掉别名，不弹窗。
+    fn reset_shell_name(&mut self, profile: &ShellProfile, cx: &mut Context<Self>) {
+        self.local_shell_prefs.rename(&profile.id(), "");
+        self.status = SharedString::from(format!("已恢复默认名称 {}", profile.name));
+        self.persist_local_shells(cx);
+        cx.notify();
+    }
+
+    /// 右键「恢复默认起始目录」：清掉该 profile 的目录设置。
+    fn reset_shell_cwd(&mut self, profile: &ShellProfile, cx: &mut Context<Self>) {
+        self.local_shell_prefs.set_cwd(&profile.id(), "");
+        self.status = SharedString::from(format!(
+            "{} 的起始目录已恢复为进程当前目录",
+            self.shell_name(profile)
+        ));
+        self.persist_local_shells(cx);
+        cx.notify();
+    }
+
+    /// 保存本机 shell 自定义名（库可用入库，否则退回 settings.json）。
+    fn persist_local_shells(&mut self, cx: &mut Context<Self>) {
+        let json = self.local_shell_prefs.to_json();
+        if let Some(vault) = self.vault.clone() {
+            cx.spawn(async move |_, _| {
+                if let Err(error) = vault.set_setting("local_shells", &json).await {
+                    log::warn!("保存本机 shell 名称失败: {error}");
+                }
+            })
+            .detach();
+        } else {
+            self.store.save_local_shells(&json);
+        }
+    }
+
     /// 把主机移入分组（`None` = 未分组）。
     fn move_host(&mut self, index: usize, group: Option<SharedString>, cx: &mut Context<Self>) {
         let Some(id) = self.hosts.get(index).map(|host| host.id) else {
@@ -1948,7 +2432,12 @@ impl RuLinkApp {
         };
         match host.auth {
             AuthMethod::Agent => {
-                let target = SshTarget::from_host(&host, None);
+                let Ok(target) = self.host_target(&host, None) else {
+                    self.status =
+                        "内嵌私钥不可用（加密库未解锁或数据损坏），请编辑该主机重新导入".into();
+                    cx.notify();
+                    return;
+                };
                 let title = host.name.clone();
                 self.connect(title, target, None, None, false, window, cx);
             }
@@ -2002,6 +2491,25 @@ impl RuLinkApp {
         }
     }
 
+    /// 由主机配置 + 本次秘密构造连接目标，并带上加密库里的内嵌私钥。
+    ///
+    /// 标记为内嵌却取不到私钥时返回 Err：宁可明确报错，也不静默退回 SSH Agent
+    /// 让用户以为在用另一把钥匙。
+    fn host_target(
+        &self,
+        host: &HostConfig,
+        password: Option<String>,
+    ) -> Result<SshTarget, String> {
+        let key_data = if host.auth == AuthMethod::IdentityFile && host.key_inline {
+            Some(self.inline_keys.get(&host.id).cloned().ok_or_else(|| {
+                "内嵌私钥不可用（加密库未解锁或数据损坏），请编辑该主机重新导入".to_string()
+            })?)
+        } else {
+            None
+        };
+        Ok(SshTarget::from_host(host, password).with_key_data(key_data))
+    }
+
     /// 用取到的秘密（缓存或加密库）建立连接目标并连接。
     fn connect_with_secret(
         &mut self,
@@ -2013,8 +2521,15 @@ impl RuLinkApp {
         cx: &mut Context<Self>,
     ) {
         let target = match host.auth {
-            AuthMethod::Password => SshTarget::from_host(&host, Some(secret)),
-            _ => SshTarget::from_host(&host, None).with_passphrase(Some(secret)),
+            AuthMethod::Password => self.host_target(&host, Some(secret)),
+            _ => self
+                .host_target(&host, None)
+                .map(|target| target.with_passphrase(Some(secret))),
+        };
+        let Ok(target) = target else {
+            self.status = "内嵌私钥不可用（加密库未解锁或数据损坏），请编辑该主机重新导入".into();
+            cx.notify();
+            return;
         };
         let title = host.name.clone();
         self.connect(title, target, Some(key), Some(host), from_vault, window, cx);
@@ -2027,7 +2542,11 @@ impl RuLinkApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let target = SshTarget::from_host(&host, None);
+        let Ok(target) = self.host_target(&host, None) else {
+            self.status = "内嵌私钥不可用（加密库未解锁或数据损坏），请编辑该主机重新导入".into();
+            cx.notify();
+            return;
+        };
         let title = host.name.clone();
         self.connect(title, target, None, Some(host), false, window, cx);
     }
@@ -2083,10 +2602,15 @@ impl RuLinkApp {
             .detach();
         }
         let target = match kind {
-            PromptKind::Password => SshTarget::from_host(&host, Some(secret)),
-            PromptKind::Passphrase => {
-                SshTarget::from_host(&host, None).with_passphrase(Some(secret))
-            }
+            PromptKind::Password => self.host_target(&host, Some(secret)),
+            PromptKind::Passphrase => self
+                .host_target(&host, None)
+                .map(|target| target.with_passphrase(Some(secret))),
+        };
+        let Ok(target) = target else {
+            self.status = "内嵌私钥不可用（加密库未解锁或数据损坏），请编辑该主机重新导入".into();
+            cx.notify();
+            return;
         };
         self.connect(
             host.name.clone(),
@@ -2166,7 +2690,7 @@ impl RuLinkApp {
         let addr = format!("{}@{}:{}", target.user, target.host, target.port);
         let auth = if target.password.is_some() {
             AuthMethod::Password
-        } else if target.key_path.is_some() {
+        } else if target.key_path.is_some() || target.key_data.is_some() {
             AuthMethod::IdentityFile
         } else {
             AuthMethod::Agent
@@ -2220,10 +2744,8 @@ impl RuLinkApp {
             Some(_) => log::warn!("标签 id {id} 已存在，忽略重复落标签"),
             None => self.tabs.push(tab),
         }
-        self.active_tab = Some(id);
-        // 重连后把焦点交回新终端，键入住处即可继续敲命令。
-        let focus = terminal_view.read(cx).focus_handle(cx);
-        focus.focus(window, cx);
+        // 新标签/重连后把焦点交回终端，键入住处即可继续敲命令。
+        self.activate_tab(id, window, cx);
         // shell 真正开起来才算"连接可用"：记录时刻供断线后判断会话是否稳定过。
         let ready_view = terminal_view.clone();
         cx.spawn(async move |this, cx| {
@@ -2492,7 +3014,11 @@ impl RuLinkApp {
                 let password = (host.auth == AuthMethod::Password)
                     .then(|| resume.target.password.clone())
                     .flatten();
-                let mut target = SshTarget::from_host(host, password);
+                let Ok(mut target) = self.host_target(host, password) else {
+                    self.status = "内嵌私钥不可用（加密库未解锁或数据损坏），无法重连".into();
+                    cx.notify();
+                    return;
+                };
                 if host.auth == AuthMethod::IdentityFile {
                     target.passphrase = resume.target.passphrase.clone();
                 }
@@ -2542,6 +3068,9 @@ impl RuLinkApp {
         }
         if self.active_tab == Some(id) {
             self.active_tab = self.tabs.last().map(|tab| tab.id);
+            if let Some(active) = self.active_tab {
+                self.reveal_tab(active);
+            }
         }
         cx.notify();
     }
@@ -2589,6 +3118,46 @@ impl RuLinkApp {
         cx.notify();
     }
 
+    /// 切到指定标签：选中、滚进可见范围（标签多到溢出时），并把焦点交给它的终端。
+    fn activate_tab(&mut self, id: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.active_tab = Some(id);
+        if let Some(ix) = self.tabs.iter().position(|tab| tab.id == id) {
+            self.tab_scroll.scroll_to_item(ix);
+            let focus = self.tabs[ix].terminal_view.read(cx).focus_handle(cx);
+            focus.focus(window, cx);
+        }
+    }
+
+    /// 让标签栏滚到能看见指定标签（不改变选中态）。
+    fn reveal_tab(&self, id: usize) {
+        if let Some(ix) = self.tabs.iter().position(|tab| tab.id == id) {
+            self.tab_scroll.scroll_to_item(ix);
+        }
+    }
+
+    /// Ctrl+Tab / Ctrl+Shift+Tab：按标签顺序循环切换（末尾回到开头）。
+    fn cycle_tab(&mut self, step: isize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tabs.is_empty() {
+            return;
+        }
+        let current = self
+            .active_tab
+            .and_then(|id| self.tabs.iter().position(|tab| tab.id == id))
+            .unwrap_or(0);
+        let next = (current as isize + step).rem_euclid(self.tabs.len() as isize) as usize;
+        let id = self.tabs[next].id;
+        self.activate_tab(id, window, cx);
+        cx.notify();
+    }
+
+    fn next_tab(&mut self, _: &NextTab, window: &mut Window, cx: &mut Context<Self>) {
+        self.cycle_tab(1, window, cx);
+    }
+
+    fn prev_tab(&mut self, _: &PrevTab, window: &mut Window, cx: &mut Context<Self>) {
+        self.cycle_tab(-1, window, cx);
+    }
+
     /// Ctrl+T / 菜单项：切换明暗主题。
     fn toggle_theme_action(
         &mut self,
@@ -2621,6 +3190,7 @@ impl RuLinkApp {
             || self.confirm_delete.is_some()
             || self.new_host.is_some()
             || self.group_prompt.is_some()
+            || self.shell_prompt.is_some()
             || self.pending.is_some()
     }
 
@@ -2737,16 +3307,21 @@ impl RuLinkApp {
         let chosen = profile
             .cloned()
             .or_else(|| self.local_shells.first().cloned());
-        let Some(program) = chosen.as_ref().map(|profile| profile.program.clone()) else {
+        let Some(chosen) = chosen else {
             self.status = "未找到可用的本地 shell".into();
             cx.notify();
             return;
         };
-        let label = chosen
-            .as_ref()
-            .map(|profile| profile.name.clone())
-            .unwrap_or_default();
-        let working_directory = std::env::current_dir().ok();
+        // WSL 等带参数的档案要拼成整条命令行；后端只收一个 shell 字符串。
+        let program = local_shell::command_line(&chosen);
+        let label = self.shell_name(&chosen).to_string();
+        let working_directory = self
+            .local_shell_prefs
+            .cwd_of(&chosen.id())
+            .map(std::path::PathBuf::from)
+            // 目录事后被删/改名时静默回落，不阻断开会话。
+            .filter(|dir| dir.is_dir())
+            .or_else(|| std::env::current_dir().ok());
         let cwd = working_directory
             .as_ref()
             .map(|dir| dir.display().to_string())
@@ -2822,6 +3397,7 @@ impl RuLinkApp {
             connected_at: None,
         });
         self.active_tab = Some(id);
+        self.reveal_tab(id);
         // 本地 shell 退出（exit / Ctrl+D / 进程被杀）与 SSH 会话结束一样直接收标签。
         cx.subscribe(&terminal, move |this, _, event: &TerminalEvent, cx| {
             if matches!(event, TerminalEvent::CloseTerminal) {
@@ -2849,6 +3425,8 @@ impl Render for RuLinkApp {
             .on_action(cx.listener(Self::toggle_theme_action))
             .on_action(cx.listener(Self::new_host))
             .on_action(cx.listener(Self::new_local_terminal))
+            .on_action(cx.listener(Self::next_tab))
+            .on_action(cx.listener(Self::prev_tab))
             .on_action(cx.listener(Self::open_settings_action))
             // 捕获阶段先看到回车：断开的终端已写不到远端，回车要用来重连而不是被它吞掉。
             .capture_key_down(cx.listener(Self::capture_session_key))
@@ -2931,12 +3509,14 @@ impl RuLinkApp {
         let entity = cx.entity();
         let sidebar_collapsed = self.split_state.read(cx).is_collapsed();
 
-        // 会话菜单：新建主机、本地终端、侧栏折叠、设置入口、托盘与退出。
-        // 前四项挂 action（而非 on_click）：rgpui 会按键绑定在项右侧自动显示
-        // Ctrl+N / Ctrl+Shift+T / Ctrl+B / Ctrl+,。
+        // 会话菜单：新建主机、本地终端、标签切换、侧栏折叠、设置入口、托盘与退出。
+        // 前六项挂 action（而非 on_click）：rgpui 会按键绑定在项右侧自动显示
+        // Ctrl+N / Ctrl+Shift+T / Ctrl+Tab / Ctrl+,。
         let session_menu = move |menu: PopupMenu, _: &mut Window, _: &mut Context<PopupMenu>| {
             menu.item(PopupMenuItem::new("新建主机…").action(Box::new(NewHost)))
                 .item(PopupMenuItem::new("本地终端…").action(Box::new(NewLocalTerminal)))
+                .item(PopupMenuItem::new("下一个标签").action(Box::new(NextTab)))
+                .item(PopupMenuItem::new("上一个标签").action(Box::new(PrevTab)))
                 .item(PopupMenuItem::new("折叠 / 展开侧边栏").action(Box::new(ToggleSidebar)))
                 .item(PopupMenuItem::new("设置…").action(Box::new(OpenSettings)))
                 .separator()
@@ -4033,6 +4613,9 @@ impl RuLinkApp {
         if self.group_prompt.is_some() {
             return self.render_group_prompt(cx);
         }
+        if self.shell_prompt.is_some() {
+            return self.render_shell_prompt(cx);
+        }
         div().into_any_element()
     }
 
@@ -4238,7 +4821,10 @@ impl RuLinkApp {
         let searching = !query.is_empty();
         let hit = query.is_empty()
             || "本地终端".contains(query)
-            || local_shell::matches(&self.local_shells, query);
+            || self
+                .local_shells
+                .iter()
+                .any(|profile| self.shell_matches(profile, query));
         if !hit {
             return Vec::new();
         }
@@ -4298,11 +4884,13 @@ impl RuLinkApp {
         if collapsed {
             return vec![parent];
         }
+        // 下标必须是 `local_shells` 里的真实下标：先 enumerate 再过滤，
+        // 否则搜索态下点行会按过滤后的序号打开另一台 shell。
         let rows: Vec<AnyElement> = self
             .local_shells
             .iter()
-            .filter(|profile| profile.matches(query))
             .enumerate()
+            .filter(|(_, profile)| self.shell_matches(profile, query))
             .map(|(index, profile)| self.render_shell_row(index, profile, pal, cx))
             .collect();
         std::iter::once(parent).chain(rows).collect()
@@ -4317,7 +4905,10 @@ impl RuLinkApp {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let entity = cx.entity();
-        let name = profile.name.clone();
+        let name = self.shell_name(profile);
+        let renamed = self.local_shell_prefs.name_of(&profile.id()).is_some();
+        let custom_cwd = self.local_shell_prefs.cwd_of(&profile.id()).is_some();
+        let system_name = profile.name.clone();
         let icon: AnyElement = match self.shell_icons.get(&profile.program).cloned() {
             Some(image) => img(image)
                 .size_4()
@@ -4342,14 +4933,68 @@ impl RuLinkApp {
         .child(div().flex_1().min_w_0().text_ellipsis().child(name.clone()))
         .context_menu(move |menu, _, _| {
             let opening = entity.clone();
-            menu.item(
-                PopupMenuItem::new(format!("打开 {name}")).on_click(move |_, _, cx| {
+            let menu = menu.item(PopupMenuItem::new(format!("打开 {name}")).on_click(
+                move |_, _, cx| {
                     opening.update(cx, |this, cx| {
                         let chosen = this.local_shells.get(index).cloned();
                         this.open_local_terminal(chosen.as_ref(), cx);
                     });
+                },
+            ));
+            let renaming = entity.clone();
+            let menu = menu.item(
+                PopupMenuItem::new("重命名…").on_click(move |_, window, cx| {
+                    renaming.update(cx, |this, cx| {
+                        let Some(profile) = this.local_shells.get(index).cloned() else {
+                            return;
+                        };
+                        this.open_shell_prompt(&profile, window, cx);
+                    });
                 }),
-            )
+            );
+            let choosing_cwd = entity.clone();
+            let menu = menu.item(
+                PopupMenuItem::new("起始目录…").on_click(move |_, window, cx| {
+                    choosing_cwd.update(cx, |this, cx| {
+                        let Some(profile) = this.local_shells.get(index).cloned() else {
+                            return;
+                        };
+                        this.open_shell_cwd_prompt(&profile, window, cx);
+                    });
+                }),
+            );
+            let menu = if custom_cwd {
+                let resetting = entity.clone();
+                menu.item(
+                    PopupMenuItem::new("恢复默认起始目录").on_click(move |_, _, cx| {
+                        resetting.update(cx, |this, cx| {
+                            let Some(profile) = this.local_shells.get(index).cloned() else {
+                                return;
+                            };
+                            this.reset_shell_cwd(&profile, cx);
+                        });
+                    }),
+                )
+            } else {
+                menu
+            };
+            if renamed {
+                let resetting = entity.clone();
+                menu.item(
+                    PopupMenuItem::new(format!("恢复默认名称（{system_name}）")).on_click(
+                        move |_, _, cx| {
+                            resetting.update(cx, |this, cx| {
+                                let Some(profile) = this.local_shells.get(index).cloned() else {
+                                    return;
+                                };
+                                this.reset_shell_name(&profile, cx);
+                            });
+                        },
+                    ),
+                )
+            } else {
+                menu
+            }
         })
         .into_any_element()
     }
@@ -4772,25 +5417,116 @@ impl RuLinkApp {
                             .when(selected != AuthMethod::IdentityFile, |this| {
                                 this.invisible()
                             })
-                            .child(
-                                h_flex()
-                                    .gap_2()
-                                    .items_end()
-                                    .child(div().flex_1().child(labeled_field(
-                                        "私钥路径",
-                                        &form.key_path,
-                                        &pal,
-                                    )))
+                            // 私钥来源：本地文件 / 内嵌加密库。两段切换不改变弹窗高度
+                            // （下方行数一致：路径行 ↔ 导入行）。
+                            .child({
+                                let inline_available = self.vault.is_some();
+                                let source_id =
+                                    |label: &str| SharedString::from(format!("key-source-{label}"));
+                                let seg = |label: &'static str, inline: bool| {
+                                    let is_selected = form.key_inline == inline;
+                                    let enabled = !inline || inline_available;
+                                    div()
+                                        .id(source_id(label))
+                                        .px_3()
+                                        .py_1()
+                                        .rounded(px(5.0))
+                                        .text_sm()
+                                        .cursor_pointer()
+                                        .bg(if is_selected {
+                                            pal.accent
+                                        } else {
+                                            pal.segment_bg
+                                        })
+                                        .text_color(if is_selected {
+                                            cx.theme().primary_foreground
+                                        } else if enabled {
+                                            pal.text
+                                        } else {
+                                            pal.muted
+                                        })
+                                        .when(is_selected, |this| {
+                                            this.font_weight(FontWeight::BOLD)
+                                        })
+                                        .child(label)
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            if inline && this.vault.is_none() {
+                                                this.status =
+                                                    "内嵌私钥需要加密凭据库（当前不可用）".into();
+                                                cx.notify();
+                                                return;
+                                            }
+                                            if let Some(form) = this.new_host.as_mut() {
+                                                form.key_inline = inline;
+                                            }
+                                            cx.notify();
+                                        }))
+                                };
+                                v_flex()
+                                    .gap_1()
+                                    .child(div().text_sm().child("私钥来源"))
                                     .child(
-                                        Button::new("browse-key")
-                                            .label("浏览…")
-                                            .ghost()
-                                            .flex_shrink_0()
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.browse_key_path(cx);
-                                            })),
-                                    ),
-                            )
+                                        h_flex()
+                                            .gap_2()
+                                            .child(seg("本地文件", false))
+                                            .child(seg("内嵌到加密库", true)),
+                                    )
+                            })
+                            .when(!form.key_inline, |this| {
+                                this.child(
+                                    h_flex()
+                                        .gap_2()
+                                        .items_end()
+                                        .child(div().flex_1().child(labeled_field(
+                                            "私钥路径",
+                                            &form.key_path,
+                                            &pal,
+                                        )))
+                                        .child(
+                                            Button::new("browse-key")
+                                                .label("浏览…")
+                                                .ghost()
+                                                .flex_shrink_0()
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.browse_key_path(cx);
+                                                })),
+                                        ),
+                                )
+                            })
+                            .when(form.key_inline, |this| {
+                                // 已导入的私钥只显示文件名与字节数，界面里绝不出现内容。
+                                let note = match (&form.key_label, &form.key_data) {
+                                    (Some(name), Some(pem)) => {
+                                        format!("待保存：{name}（{} 字节）", pem.len())
+                                    }
+                                    _ if form.editing.is_some() => {
+                                        "已内嵌在加密库（重新导入可替换）".to_string()
+                                    }
+                                    _ => "尚未导入私钥".to_string(),
+                                };
+                                this.child(
+                                    h_flex()
+                                        .gap_2()
+                                        .items_center()
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .text_sm()
+                                                .text_color(pal.muted)
+                                                .truncate()
+                                                .child(note),
+                                        )
+                                        .child(
+                                            Button::new("import-key")
+                                                .label("导入私钥…")
+                                                .ghost()
+                                                .flex_shrink_0()
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.import_inline_key(cx);
+                                                })),
+                                        ),
+                                )
+                            })
                             .child(
                                 v_flex()
                                     .gap_1()
@@ -4951,6 +5687,124 @@ impl RuLinkApp {
             .into_any_element()
     }
 
+    /// 本地 shell 重命名弹窗：与分组重命名同款居中模态。
+    fn render_shell_prompt(&self, cx: &Context<Self>) -> AnyElement {
+        let pal = self.palette(cx);
+        let Some(prompt) = self.shell_prompt.as_ref() else {
+            return div().into_any_element();
+        };
+        let default_text = prompt.default_text.clone();
+        let (title, field_label, hint) = match prompt.kind {
+            ShellPromptKind::Rename => (
+                "重命名本地终端",
+                "显示名称",
+                format!(
+                    "只改侧边栏与标签上的叫法，不影响启动的 shell 本身；留空恢复默认（{default_text}）。"
+                ),
+            ),
+            ShellPromptKind::WorkingDirectory => (
+                "起始目录",
+                "工作目录",
+                format!(
+                    "新会话在此目录下启动；留空或保持默认（{default_text}）时用进程当前目录。\
+                     目录不存在时不会保存。"
+                ),
+            ),
+        };
+        let input_row = h_flex()
+            .w_full()
+            .gap_2()
+            .items_center()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .child(styled_input(Input::new(&prompt.input), &pal)),
+            )
+            .when(prompt.kind == ShellPromptKind::WorkingDirectory, |row| {
+                row.child(
+                    Button::new("browse-shell-cwd")
+                        .label("浏览…")
+                        .ghost()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.browse_shell_cwd(cx);
+                        })),
+                )
+            });
+        v_flex()
+            .id("shell-backdrop")
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .size_full()
+            .items_center()
+            .justify_center()
+            .bg(rgpui::hsla(0.0, 0.0, 0.0, 0.45))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_, _, _, cx| cx.stop_propagation()),
+            )
+            .child(
+                v_flex()
+                    .id("shell-form")
+                    .w(px(380.0))
+                    .gap_3()
+                    .p_5()
+                    .rounded(px(8.0))
+                    .bg(pal.card_bg)
+                    .border_1()
+                    .border_color(pal.border)
+                    .shadow_md()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                    )
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_base()
+                                    .font_weight(rgpui::FontWeight(600.0))
+                                    .child(title),
+                            )
+                            .child(Button::new("close-shell").label("×").ghost().on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    this.cancel_shell_prompt(cx);
+                                }),
+                            )),
+                    )
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .child(div().text_sm().child(field_label))
+                            .child(input_row),
+                    )
+                    .child(div().text_xs().text_color(pal.muted).child(hint))
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .justify_end()
+                            .child(
+                                Button::new("commit-shell")
+                                    .label("保存")
+                                    .primary()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.commit_shell_prompt(cx);
+                                    })),
+                            )
+                            .child(Button::new("cancel-shell").label("取消").ghost().on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    this.cancel_shell_prompt(cx);
+                                }),
+                            )),
+                    ),
+            )
+            .into_any_element()
+    }
+
     /// 密码输入面板。
     fn render_pending_panel(&self, cx: &mut Context<Self>) -> AnyElement {
         let pal = self.palette(cx);
@@ -4962,7 +5816,9 @@ impl RuLinkApp {
             PromptKind::Password => format!("连接 {host} 需要密码"),
             PromptKind::Passphrase => format!(
                 "连接 {host} 的私钥已加密，需要口令（{}）",
-                if pending.host.key_path.is_empty() {
+                if pending.host.key_inline {
+                    "内嵌私钥"
+                } else if pending.host.key_path.is_empty() {
                     "未填路径"
                 } else {
                     &pending.host.key_path
@@ -5034,91 +5890,104 @@ impl RuLinkApp {
     fn render_main(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let pal = self.palette(cx);
         let tab_bar = if self.tabs.is_empty() {
-            div()
+            div().into_any_element()
         } else {
             h_flex()
                 .h(px(44.0))
                 .flex_shrink_0()
-                .items_center()
                 .bg(pal.tab_bar_bg)
                 .border_b_1()
                 .border_color(pal.border)
-                .pl_2()
-                .overflow_hidden()
-                .children(self.tabs.iter().map(|tab| {
-                    let id = tab.id;
-                    let active = self.active_tab == Some(id);
-                    let tab_id = SharedString::from(format!("tab-{id}"));
-                    let close_id = SharedString::from(format!("tab-close-{id}"));
+                // 外层裁切、内层横向滚动：标签一多就溢出可见区，滚动而非挤压
+                // （与 rgpui 自带的 TabBar 同一套做法）。滚轮在横向滚动容器上
+                // 直接映射为水平滚动，不需要另加滚动条。
+                .child(
                     h_flex()
-                        .id(tab_id)
-                        // 平铺式标签：不描边、标签间不留缝，活动项靠底色 + 顶部强调线区分。
-                        .relative()
+                        .id("tabs-strip")
+                        .flex_1()
+                        .min_w_0()
                         .h_full()
-                        .min_w(px(160.0))
-                        .flex_shrink_0()
-                        .px_3()
-                        .gap_2()
                         .items_center()
-                        .bg(if active {
-                            pal.tab_active_bg
-                        } else {
-                            Hsla::transparent_black()
-                        })
-                        .text_color(if active {
-                            pal.tab_active_fg
-                        } else {
-                            pal.tab_fg
-                        })
-                        .when(!active, |this| this.hover(|this| this.bg(pal.card_hover)))
-                        .cursor_pointer()
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.active_tab = Some(id);
-                            cx.notify();
-                        }))
-                        .when(active, |this| {
-                            this.child(
-                                div()
-                                    .absolute()
-                                    .top_0()
-                                    .left_0()
-                                    .right_0()
-                                    .h(px(2.0))
-                                    .bg(pal.accent),
-                            )
-                        })
-                        // 结束的会话在后台也要一眼看见：标题前加一个危险色圆点。
-                        .when(tab.ended, |this| {
-                            this.child(
-                                div()
-                                    .w(px(6.0))
-                                    .h(px(6.0))
-                                    .flex_shrink_0()
-                                    .rounded(px(3.0))
-                                    .bg(pal.danger),
-                            )
-                        })
-                        .child(div().flex_1().min_w_0().truncate().child(tab.title.clone()))
-                        // 只有活动标签常驻 ×：非活动项的 × 更挡标题，切换过去再关即可。
-                        .when(active, |this| {
-                            this.child(
-                                div()
-                                    .id(close_id)
-                                    .text_base()
-                                    .text_color(pal.muted)
-                                    .child("×")
-                                    .cursor_pointer()
-                                    .hover(|this| this.text_color(pal.danger))
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                        .pl_2()
+                        .overflow_x_scroll()
+                        .restrict_scroll_to_axis()
+                        .track_scroll(&self.tab_scroll)
+                        .children(self.tabs.iter().map(|tab| {
+                            let id = tab.id;
+                            let active = self.active_tab == Some(id);
+                            let tab_id = SharedString::from(format!("tab-{id}"));
+                            let close_id = SharedString::from(format!("tab-close-{id}"));
+                            h_flex()
+                                .id(tab_id)
+                                // 平铺式标签：不描边、标签间不留缝，活动项靠底色 + 顶部强调线区分。
+                                .relative()
+                                .h_full()
+                                .min_w(px(160.0))
+                                .flex_shrink_0()
+                                .px_3()
+                                .gap_2()
+                                .items_center()
+                                .bg(if active {
+                                    pal.tab_active_bg
+                                } else {
+                                    Hsla::transparent_black()
+                                })
+                                .text_color(if active {
+                                    pal.tab_active_fg
+                                } else {
+                                    pal.tab_fg
+                                })
+                                .when(!active, |this| this.hover(|this| this.bg(pal.card_hover)))
+                                .cursor_pointer()
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.activate_tab(id, window, cx);
+                                    cx.notify();
+                                }))
+                                .when(active, |this| {
+                                    this.child(
+                                        div()
+                                            .absolute()
+                                            .top_0()
+                                            .left_0()
+                                            .right_0()
+                                            .h(px(2.0))
+                                            .bg(pal.accent),
                                     )
-                                    .on_click(
-                                        cx.listener(move |this, _, _, cx| this.close_tab(id, cx)),
-                                    ),
-                            )
-                        })
-                }))
+                                })
+                                // 结束的会话在后台也要一眼看见：标题前加一个危险色圆点。
+                                .when(tab.ended, |this| {
+                                    this.child(
+                                        div()
+                                            .w(px(6.0))
+                                            .h(px(6.0))
+                                            .flex_shrink_0()
+                                            .rounded(px(3.0))
+                                            .bg(pal.danger),
+                                    )
+                                })
+                                .child(div().flex_1().min_w_0().truncate().child(tab.title.clone()))
+                                // 只有活动标签常驻 ×：非活动项的 × 更挡标题，切换过去再关即可。
+                                .when(active, |this| {
+                                    this.child(
+                                        div()
+                                            .id(close_id)
+                                            .text_base()
+                                            .text_color(pal.muted)
+                                            .child("×")
+                                            .cursor_pointer()
+                                            .hover(|this| this.text_color(pal.danger))
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                                            )
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.close_tab(id, cx);
+                                            })),
+                                    )
+                                })
+                        })),
+                )
+                .into_any_element()
         };
 
         let terminal_bg = self.terminal_bg(cx);
@@ -5557,6 +6426,11 @@ fn main() {
             KeyBinding::new("ctrl-t", ToggleTheme, None),
             KeyBinding::new("ctrl-n", NewHost, None),
             KeyBinding::new("ctrl-shift-t", NewLocalTerminal, None),
+            // 标签多到溢出后光靠鼠标滚动不够快，配上循环切换。
+            KeyBinding::new("ctrl-tab", NextTab, None),
+            KeyBinding::new("ctrl-shift-tab", PrevTab, None),
+            KeyBinding::new("ctrl-pagedown", NextTab, None),
+            KeyBinding::new("ctrl-pageup", PrevTab, None),
             KeyBinding::new("ctrl-,", OpenSettings, None),
             // Tab 在 rgpui 的 Root 上下文里被绑成焦点切换，而按键绑定分发早于 on_key_down，
             // 终端元素因此永远收不到 \x09（shell 补全失效）。在 Terminal 上下文用 NoAction
@@ -5636,9 +6510,31 @@ fn main() {
 mod tests {
     use super::{
         AUTO_RECONNECT_MAX, CONNECT_TIMEOUT_DEFAULT, CONNECT_TIMEOUT_MAX, CONNECT_TIMEOUT_MIN,
-        FONT_SIZE_MAX, FONT_SIZE_MIN, LINE_HEIGHT_MAX, LINE_HEIGHT_MIN, Metric, SessionPrefs,
-        SidebarPrefs, StatusBarPrefs, TERMINAL_THEME_DEFAULT, TerminalPrefs, auto_reconnect_delay,
+        FONT_SIZE_MAX, FONT_SIZE_MIN, LINE_HEIGHT_MAX, LINE_HEIGHT_MIN, LocalShellPrefs, Metric,
+        SessionPrefs, SidebarPrefs, StatusBarPrefs, TERMINAL_THEME_DEFAULT, TerminalPrefs,
+        auto_reconnect_delay,
     };
+
+    #[test]
+    fn local_shell_prefs_name_and_cwd_roundtrip() {
+        let mut prefs = LocalShellPrefs::default();
+        prefs.rename("pwsh", "主终端");
+        prefs.set_cwd("pwsh", r"D:\code");
+        assert_eq!(prefs.name_of("pwsh"), Some("主终端"));
+        assert_eq!(prefs.cwd_of("pwsh"), Some(r"D:\code"));
+        assert_eq!(LocalShellPrefs::from_json(&prefs.to_json()), prefs);
+
+        // 空串/空白 = 恢复默认（删条目，不留空壳）。
+        prefs.rename("pwsh", "  ");
+        prefs.set_cwd("pwsh", " ");
+        assert_eq!(prefs.name_of("pwsh"), None);
+        assert_eq!(prefs.cwd_of("pwsh"), None);
+
+        // 旧版 JSON 只有 names：cwd 缺省不影响读取。
+        let legacy = LocalShellPrefs::from_json(r#"{"names":{"cmd":"CMD"}}"#);
+        assert_eq!(legacy.name_of("cmd"), Some("CMD"));
+        assert_eq!(legacy.cwd_of("cmd"), None);
+    }
 
     #[test]
     fn status_bar_prefs_default_to_everything_shown() {

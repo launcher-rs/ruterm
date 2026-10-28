@@ -15,6 +15,8 @@ pub struct SshTarget {
     pub port: u16,
     /// 私钥文件（可选；与密码二选一，都没有则尝试 SSH Agent）
     pub key_path: Option<PathBuf>,
+    /// 内嵌私钥的 PEM 文本（取自加密库，仅内存持有；优先于 `key_path`）
+    pub key_data: Option<String>,
     /// 密码（来自环境变量 RULINK_PASSWORD 或 GUI 临时输入/加密库）
     pub password: Option<String>,
     /// 加密私钥的口令（仅私钥认证且密钥有口令时使用；绝不入命令行）
@@ -86,6 +88,7 @@ impl SshTarget {
             host,
             port,
             key_path,
+            key_data: None,
             passphrase: None,
             password: std::env::var("RULINK_PASSWORD")
                 .ok()
@@ -101,25 +104,74 @@ impl SshTarget {
     /// 由主机账号 + 连接时临时输入的密码构造连接目标。
     ///
     /// 密码仅在内存中传递；加密库只存勾选"保存"后的密文；`key_path` 仅私钥认证时使用。
-    /// 私钥口令经 `with_passphrase` 补充。
+    /// 内嵌私钥由 [`with_key_data`](Self::with_key_data) 补充；私钥口令经
+    /// [`with_passphrase`](Self::with_passphrase) 补充。
     pub fn from_host(host: &HostConfig, password: Option<String>) -> Self {
+        let key_path = host.key_path.trim();
         Self {
             user: host.user.clone(),
             host: host.host.clone(),
             port: host.port,
-            key_path: if host.auth == AuthMethod::IdentityFile {
-                Some(PathBuf::from(host.key_path.as_str()))
+            key_path: if host.auth == AuthMethod::IdentityFile && !key_path.is_empty() {
+                Some(PathBuf::from(key_path))
             } else {
                 None
             },
+            key_data: None,
             password,
             passphrase: None,
         }
+    }
+
+    /// 补充内嵌私钥（PEM 文本，仅内存传递）。
+    pub fn with_key_data(mut self, data: Option<String>) -> Self {
+        self.key_data = data;
+        self
     }
 
     /// 补充加密私钥的口令（仅内存传递）。
     pub fn with_passphrase(mut self, passphrase: Option<String>) -> Self {
         self.passphrase = passphrase;
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn host(auth: AuthMethod, key_path: &str, key_inline: bool) -> HostConfig {
+        HostConfig {
+            id: 1,
+            name: "测试机".into(),
+            host: "example.com".into(),
+            port: 22,
+            user: "dev".into(),
+            auth,
+            key_path: key_path.into(),
+            key_inline,
+            favorite: false,
+        }
+    }
+
+    /// 内嵌私钥的主机没有路径：不能构造出一个空路径去让加载器报错。
+    #[test]
+    fn inline_key_host_has_no_key_path() {
+        let target = SshTarget::from_host(&host(AuthMethod::IdentityFile, "", true), None);
+        assert!(target.key_path.is_none());
+        // 非私钥认证时即便残留路径也不启用。
+        let target = SshTarget::from_host(&host(AuthMethod::Password, "C:/k", false), None);
+        assert!(target.key_path.is_none());
+        let target = SshTarget::from_host(&host(AuthMethod::IdentityFile, "C:/k ", false), None);
+        assert_eq!(target.key_path, Some(PathBuf::from("C:/k")));
+    }
+
+    #[test]
+    fn key_data_travels_with_the_target() {
+        let target = SshTarget::from_host(&host(AuthMethod::IdentityFile, "", true), None)
+            .with_key_data(Some("PEM".into()))
+            .with_passphrase(Some("pp".into()));
+        assert_eq!(target.key_data.as_deref(), Some("PEM"));
+        assert_eq!(target.passphrase.as_deref(), Some("pp"));
     }
 }

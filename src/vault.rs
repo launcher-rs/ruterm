@@ -19,6 +19,7 @@
 //! 改名保留 `.migrated`、绝不删除。turso 无 rekey 能力，更换主密钥走
 //! "新建加密库 + 全量搬迁 + 旧库改名备份 + 替换"路径。
 
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -36,6 +37,12 @@ use turso::{Builder, Value};
 /// 凭据管理器中的服务名与账户名（keyring 档主密钥条目）。
 const KEYRING_SERVICE: &str = "rulink";
 const KEYRING_ACCOUNT: &str = "vault-key";
+
+/// 内嵌私钥的存储位：settings 表里的一行 JSON（host_id → 字段加密的 PEM）。
+///
+/// 不另开表：toasty 的建表语句不支持 `IF NOT EXISTS`，给已有库加表需要手工迁移；
+/// 私钥本身按字段加密（与密码列同一套 AES-GCM），放在设置行里不降低保护强度。
+pub const HOST_KEYS_SETTING: &str = "host_keys";
 
 /// 新版单文件库：三张表全部由 toasty 建模，启动时 `push_schema` 幂等建表。
 mod schema {
@@ -70,6 +77,7 @@ mod schema {
                 user: self.user.clone(),
                 auth: crate::vault::auth_from_tag(&self.auth),
                 key_path: self.key_path.clone(),
+                key_inline: false,
                 favorite: self.favorite,
             }
         }
@@ -407,7 +415,7 @@ impl Vault {
         Ok(self.load_hosts().await?.len() as i64)
     }
 
-    /// 读取全部主机（不含密码列）。
+    /// 读取全部主机（不含密码列；内嵌私钥只回填 `key_inline` 标记）。
     pub async fn load_hosts(&self) -> Result<Vec<HostConfig>> {
         self.job(|cell| async move {
             let mut db = cell.lock().await;
@@ -415,7 +423,56 @@ impl Vault {
                 .exec(&mut *db as &mut dyn toasty::Executor)
                 .await
                 .context("读取凭据库失败")?;
-            Ok(rows.iter().map(|row| row.to_host_config()).collect())
+            let stored = stored_host_keys(&mut db).await?;
+            Ok(rows
+                .iter()
+                .map(|row| {
+                    let mut host = row.to_host_config();
+                    host.key_inline = host.id != 0 && stored.contains_key(&host.id);
+                    host
+                })
+                .collect())
+        })
+        .await
+    }
+
+    /// 读取全部内嵌私钥（PEM 明文，仅进程内存）。
+    ///
+    /// 单条解密失败只跳过该条（记日志）：一把坏钥匙不该让整个列表打不开。
+    pub async fn load_host_keys(&self) -> Result<BTreeMap<i64, String>> {
+        let field_key = self.field_key;
+        self.job(move |cell| async move {
+            let mut db = cell.lock().await;
+            let stored = stored_host_keys(&mut db).await?;
+            let mut keys = BTreeMap::new();
+            for (id, sealed) in stored {
+                match field::decrypt(&field_key, &sealed) {
+                    Ok(pem) => {
+                        keys.insert(id, pem);
+                    }
+                    Err(error) => log::warn!("内嵌私钥 {id} 解密失败，已跳过: {error}"),
+                }
+            }
+            Ok(keys)
+        })
+        .await
+    }
+
+    /// 写入或清除某主机的内嵌私钥（None 表示清除）。
+    pub async fn set_host_key(&self, id: i64, pem: Option<&str>) -> Result<()> {
+        let (pem, field_key) = (pem.map(str::to_string), self.field_key);
+        self.job(move |cell| async move {
+            let mut db = cell.lock().await;
+            let mut stored = stored_host_keys(&mut db).await?;
+            match pem {
+                Some(pem) => {
+                    stored.insert(id, field::encrypt(&field_key, &pem)?);
+                }
+                None => {
+                    stored.remove(&id);
+                }
+            }
+            put_host_keys(&mut db, &stored).await
         })
         .await
     }
@@ -466,7 +523,7 @@ impl Vault {
         .await
     }
 
-    /// 删除主机（连带其密码行）。
+    /// 删除主机（连带其密码行与内嵌私钥）。
     pub async fn remove(&self, id: i64) -> Result<()> {
         self.job(move |cell| async move {
             let mut db = cell.lock().await;
@@ -476,6 +533,10 @@ impl Vault {
                 .exec(&mut *db as &mut dyn toasty::Executor)
                 .await
                 .context("删除凭据库记录失败")?;
+            let mut stored = stored_host_keys(&mut db).await?;
+            if stored.remove(&id).is_some() {
+                put_host_keys(&mut db, &stored).await?;
+            }
             Ok(())
         })
         .await
@@ -486,13 +547,7 @@ impl Vault {
         let name = name.to_string();
         self.job(move |cell| async move {
             let mut db = cell.lock().await;
-            let row = Query::<List<SettingRow>>::all()
-                .filter(SettingRow::fields().name().eq(name))
-                .first()
-                .exec(&mut *db as &mut dyn toasty::Executor)
-                .await
-                .context("读取设置失败")?;
-            Ok(row.map(|row| row.value))
+            raw_setting(&mut db, &name).await
         })
         .await
     }
@@ -576,14 +631,24 @@ impl Vault {
                 .exec(&mut *db as &mut dyn toasty::Executor)
                 .await
                 .context("导出设置失败")?;
+            let stored = stored_host_keys(&mut db).await?;
+            let mut host_keys = Vec::with_capacity(stored.len());
+            for (id, sealed) in stored {
+                let pem = field::decrypt(&field_key, &sealed)
+                    .with_context(|| format!("导出主机 {id} 的内嵌私钥失败"))?;
+                host_keys.push((id, pem));
+            }
             let known = Query::<List<KnownHostRow>>::all()
                 .exec(&mut *db as &mut dyn toasty::Executor)
                 .await
                 .context("导出 known_hosts 失败")?;
             Ok(VaultDump {
                 hosts: dumped,
+                host_keys,
+                // 内嵌私钥表另存为明文形态（上面已解密），原始密文行不随设置搬迁。
                 settings: settings
                     .iter()
+                    .filter(|s| s.name != HOST_KEYS_SETTING)
                     .map(|s| (s.name.clone(), s.value.clone()))
                     .collect(),
                 known_hosts: known
@@ -603,8 +668,9 @@ impl Vault {
 
     /// 导入另一库导出的全部数据（换主密钥后写入新库）。
     pub async fn import_dump(&self, dump: &VaultDump) -> Result<()> {
-        let (hosts, settings, known_hosts, field_key) = (
+        let (hosts, host_keys, settings, known_hosts, field_key) = (
             dump.hosts.clone(),
+            dump.host_keys.clone(),
             dump.settings.clone(),
             dump.known_hosts.clone(),
             self.field_key,
@@ -613,6 +679,14 @@ impl Vault {
             let mut db = cell.lock().await;
             for (host, password) in &hosts {
                 put_host(&mut db, host, password.as_deref(), &field_key).await?;
+            }
+            if !host_keys.is_empty() {
+                // 换库必然换字段密钥：旧库里的密文搬过来解不开，必须用新密钥重加密。
+                let mut stored = BTreeMap::new();
+                for (id, pem) in &host_keys {
+                    stored.insert(*id, field::encrypt(&field_key, pem)?);
+                }
+                put_host_keys(&mut db, &stored).await?;
             }
             for (name, value) in &settings {
                 put_setting(&mut db, name, value).await?;
@@ -741,6 +815,42 @@ async fn put_setting(db: &mut toasty::Db, name: &str, value: &str) -> Result<()>
     Ok(())
 }
 
+/// 设置行原始值（缺失为 None；不做任何解密）。
+async fn raw_setting(db: &mut toasty::Db, name: &str) -> Result<Option<String>> {
+    let row = Query::<List<SettingRow>>::all()
+        .filter(SettingRow::fields().name().eq(name))
+        .first()
+        .exec(db as &mut dyn toasty::Executor)
+        .await
+        .context("读取设置失败")?;
+    Ok(row.map(|row| row.value))
+}
+
+/// 内嵌私钥表（host_id → 字段密文）。
+///
+/// 表损坏时记日志并按空表处理：私钥解不出来应表现为"这台主机没有内嵌私钥"，
+/// 而不是让整个主机列表/删除操作一起失败。
+async fn stored_host_keys(db: &mut toasty::Db) -> Result<BTreeMap<i64, String>> {
+    let Some(raw) = raw_setting(db, HOST_KEYS_SETTING).await? else {
+        return Ok(BTreeMap::new());
+    };
+    if raw.trim().is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    match serde_json::from_str(&raw) {
+        Ok(map) => Ok(map),
+        Err(error) => {
+            log::warn!("内嵌私钥表解析失败（{error}），本次按空表处理");
+            Ok(BTreeMap::new())
+        }
+    }
+}
+
+async fn put_host_keys(db: &mut toasty::Db, keys: &BTreeMap<i64, String>) -> Result<()> {
+    let text = serde_json::to_string(keys).context("序列化内嵌私钥表失败")?;
+    put_setting(db, HOST_KEYS_SETTING, &text).await
+}
+
 async fn put_known_host(
     db: &mut toasty::Db,
     host_port: &str,
@@ -756,10 +866,12 @@ async fn put_known_host(
     Ok(())
 }
 
-/// 两库之间搬迁用的全量快照（仅存在于进程内存，含口令明文——字段解密后的
-/// 原生形态；绝不写日志、绝不落盘）。
+/// 两库之间搬迁用的全量快照（仅存在于进程内存，含口令与内嵌私钥明文——字段
+/// 解密后的原生形态；绝不写日志、绝不落盘）。
 pub struct VaultDump {
     pub hosts: Vec<(HostConfig, Option<String>)>,
+    /// 内嵌私钥（host_id → PEM 明文）。
+    pub host_keys: Vec<(i64, String)>,
     pub settings: Vec<(String, String)>,
     pub known_hosts: Vec<(String, String, String)>,
 }
@@ -812,6 +924,7 @@ async fn read_legacy_vault(
                 user: text_of(&row, 4),
                 auth: auth_from_tag(&text_of(&row, 5)),
                 key_path: text_of(&row, 6),
+                key_inline: false,
                 favorite: matches!(row.get_value(7), Ok(Value::Integer(v)) if v != 0),
             },
             password,
@@ -899,6 +1012,7 @@ pub async fn migrate_legacy(
                 ("status_bar", &settings.status_bar),
                 ("terminal", &settings.terminal),
                 ("session", &settings.session),
+                ("local_shells", &settings.local_shells),
             ] {
                 if !value.is_empty() {
                     vault.set_setting(key, value).await?;
@@ -1106,6 +1220,7 @@ mod tests {
             user: "dev".into(),
             auth: AuthMethod::IdentityFile,
             key_path: "C:/keys/id_ed25519".into(),
+            key_inline: false,
             favorite: true,
         };
         vault.upsert(&host).await.unwrap();
@@ -1184,10 +1299,12 @@ mod tests {
             user: "ops".into(),
             auth: AuthMethod::Password,
             key_path: String::new(),
+            key_inline: false,
             favorite: false,
         };
         vault.upsert(&host).await.unwrap();
         vault.set_password(7, Some("pw-7")).await.unwrap();
+        vault.set_host_key(7, Some("INLINE-PEM-7")).await.unwrap();
         vault.set_setting("theme", "dark").await.unwrap();
         assert_eq!(
             vault
@@ -1228,6 +1345,17 @@ mod tests {
             Some("pw-7"),
             "搬迁后密码丢失"
         );
+        assert_eq!(
+            reopened
+                .load_host_keys()
+                .await
+                .unwrap()
+                .get(&7)
+                .map(String::as_str),
+            Some("INLINE-PEM-7"),
+            "搬迁后内嵌私钥丢失（换库必须用新字段密钥重加密）"
+        );
+        assert!(hosts[0].key_inline, "搬迁后内嵌私钥标记丢失");
         assert_eq!(
             reopened.setting("theme").await.unwrap().as_deref(),
             Some("dark")
@@ -1297,6 +1425,7 @@ mod tests {
             user: "u".into(),
             auth: AuthMethod::Password,
             key_path: String::new(),
+            key_inline: false,
             favorite: false,
         };
         std::thread::scope(|scope| {
@@ -1511,6 +1640,7 @@ mod tests {
             user: "u".into(),
             auth: AuthMethod::Password,
             key_path: String::new(),
+            key_inline: false,
             favorite: false,
         };
         vault.upsert(&host).await.unwrap();
@@ -1543,6 +1673,64 @@ mod tests {
             Some("明文口令")
         );
         drop(fresh);
+        drop(vault);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 内嵌私钥：读写往返、库里只有密文、标记随库回填、删除主机连带清除。
+    #[tokio::test]
+    async fn inline_key_roundtrip_never_plaintext() {
+        let dir = temp_dir("rulink-inline-key-test");
+        let mode = StorageMode::Global(dir.clone());
+        let rt = tokio::runtime::Handle::current();
+        let vault = Vault::open(&mode, "0b".repeat(32), rt.clone())
+            .await
+            .expect("打开库失败");
+        let host = HostConfig {
+            id: 9,
+            name: "内嵌私钥机".into(),
+            host: "9.example".into(),
+            port: 22,
+            user: "u".into(),
+            auth: AuthMethod::IdentityFile,
+            key_path: String::new(),
+            key_inline: false,
+            favorite: false,
+        };
+        vault.upsert(&host).await.unwrap();
+
+        let pem = "-----BEGIN OPENSSH PRIVATE KEY-----\nMARKER-INLINE-KEY-9\n-----END OPENSSH PRIVATE KEY-----";
+        vault.set_host_key(9, Some(pem)).await.unwrap();
+        assert_eq!(
+            vault
+                .load_host_keys()
+                .await
+                .unwrap()
+                .get(&9)
+                .map(String::as_str),
+            Some(pem)
+        );
+        assert!(
+            vault.load_hosts().await.unwrap()[0].key_inline,
+            "有内嵌私钥的主机应标记 key_inline"
+        );
+        // 设置行里存的必须是字段密文。
+        let raw = vault
+            .setting(HOST_KEYS_SETTING)
+            .await
+            .unwrap()
+            .expect("应有 host_keys 行");
+        assert!(!raw.contains("MARKER-INLINE-KEY-9"));
+
+        // 清除后标记跟着回落。
+        vault.set_host_key(9, None).await.unwrap();
+        assert!(vault.load_host_keys().await.unwrap().is_empty());
+        assert!(!vault.load_hosts().await.unwrap()[0].key_inline);
+
+        // 删除主机时内嵌私钥一并清掉，不留孤儿密文。
+        vault.set_host_key(9, Some(pem)).await.unwrap();
+        vault.remove(9).await.unwrap();
+        assert!(vault.load_host_keys().await.unwrap().is_empty());
         drop(vault);
         let _ = std::fs::remove_dir_all(&dir);
     }

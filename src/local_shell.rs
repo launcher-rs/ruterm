@@ -56,9 +56,39 @@ impl ShellProfile {
     }
 }
 
-/// 搜索框是否命中任一 shell。
-pub fn matches(list: &[ShellProfile], query: &str) -> bool {
-    list.iter().any(|profile| profile.matches(query))
+/// 交给 PTY 后端的 shell 字符串。
+///
+/// Windows 后端把 `shell` 原样拼进 `CreateProcessW` 的命令行（`escape_args=false`），
+/// 所以带启动参数（如 `wsl.exe -d Debian`）时必须自己拼一条完整命令行；
+/// 没有参数时仍是纯路径，与旧行为一致。
+pub fn command_line(profile: &ShellProfile) -> String {
+    if profile.args.is_empty() {
+        return profile.program.clone();
+    }
+    #[cfg(windows)]
+    {
+        let mut line = quote_arg(&profile.program);
+        for arg in &profile.args {
+            line.push(' ');
+            line.push_str(&quote_arg(arg));
+        }
+        line
+    }
+    #[cfg(not(windows))]
+    {
+        // 非 Windows 后端不解析命令行，参数无法传递（当前也没有带参数的档案）。
+        profile.program.clone()
+    }
+}
+
+/// 含空白或为空时加双引号（Windows 命令行分词规则）。
+#[cfg(windows)]
+fn quote_arg(arg: &str) -> String {
+    if arg.is_empty() || arg.contains([' ', '\t']) {
+        format!("\"{arg}\"")
+    } else {
+        arg.to_string()
+    }
 }
 
 /// 在 `PATH` 里查找可执行文件（Windows 下自动补 `.exe`）。
@@ -212,25 +242,38 @@ fn posix_shell() -> Option<ShellProfile> {
 
 /// WSL。`wsl.exe` 在部分 Windows 版本里不在 PATH 上，故也探 System32。
 ///
-/// 只给「默认发行版」一项：rgpui-term 的 `TerminalBuilder::new` 把 `Shell` 的参数写死成
-/// 空 `Vec`，`wsl.exe -d <distro>` 递不进去，故按发行版开标签要等上游暴露启动参数
-/// （路线图 §五.1 已记此限制）。发行版数量仍报给状态栏，扫描结果对用户不算黑盒。
+/// 每个发行版单独成条（`WSL · Debian`），启动参数 `-d <发行版>`；参数经
+/// [`command_line`] 拼进整条命令行，绕开 `TerminalBuilder` 只收单一路径的限制。
+/// 枚举失败（`wsl.exe` 存在但调用出错）时退回一条「默认发行版」，无发行版则不出现条目。
 #[cfg(windows)]
 fn wsl_distros() -> Vec<ShellProfile> {
     let Some(wsl) = wsl_launcher() else {
         return Vec::new();
     };
-    let count = wsl_distro_names().len();
-    vec![ShellProfile {
-        name: if count <= 1 {
-            "WSL".to_string()
-        } else {
-            format!("WSL（{count} 个发行版）")
-        },
-        program: wsl.display().to_string(),
-        args: Vec::new(),
-        kind: ShellKind::Wsl,
-    }]
+    wsl_profiles(&wsl.display().to_string(), wsl_distro_names())
+}
+
+/// 由 `wsl -l -q` 的结果造档案；`None` 表示枚举本身失败（不是"没装发行版"）。
+#[cfg(windows)]
+fn wsl_profiles(program: &str, names: Option<Vec<String>>) -> Vec<ShellProfile> {
+    match names {
+        Some(names) if names.is_empty() => Vec::new(),
+        Some(names) => names
+            .into_iter()
+            .map(|name| ShellProfile {
+                name: format!("WSL · {name}"),
+                program: program.to_string(),
+                args: vec!["-d".to_string(), name],
+                kind: ShellKind::Wsl,
+            })
+            .collect(),
+        None => vec![ShellProfile {
+            name: "WSL（默认发行版）".to_string(),
+            program: program.to_string(),
+            args: Vec::new(),
+            kind: ShellKind::Wsl,
+        }],
+    }
 }
 
 /// WSL 的可执行入口（不存在则 None）。
@@ -241,22 +284,21 @@ fn wsl_launcher() -> Option<PathBuf> {
         .filter(|path| path.is_file())
 }
 
-/// 已安装的 WSL 发行版名（`wsl -l -q`）；没装或调用失败时为空。
+/// 已安装的 WSL 发行版名（`wsl -l -q`）。`None`＝调用失败，`Some(空)`＝确实没装。
 #[cfg(windows)]
-fn wsl_distro_names() -> Vec<String> {
-    let Some(wsl) = wsl_launcher() else {
-        return Vec::new();
-    };
-    let Ok(output) = std::process::Command::new(&wsl)
+fn wsl_distro_names() -> Option<Vec<String>> {
+    let wsl = wsl_launcher()?;
+    let output = std::process::Command::new(&wsl)
         .args(["-l", "-q"])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .creation_flags(NO_WINDOW)
         .output()
-    else {
-        return Vec::new();
-    };
-    decode_wsl_list(&output.stdout)
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| decode_wsl_list(&output.stdout))
 }
 
 #[cfg(not(windows))]
@@ -524,6 +566,49 @@ mod tests {
         );
         assert!(decode_wsl_list("尚未安装任何 Linux 发行版。\r\n".as_bytes()).is_empty());
         assert!(decode_wsl_list(b"").is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn wsl_profiles_split_per_distro_and_keep_args() {
+        let profiles = wsl_profiles(
+            r"C:\Windows\System32\wsl.exe",
+            Some(vec!["Debian".into(), "docker-desktop".into()]),
+        );
+        assert_eq!(profiles.len(), 2);
+        assert_eq!(profiles[0].name, "WSL · Debian");
+        assert_eq!(profiles[0].args, vec!["-d".to_string(), "Debian".into()]);
+        assert_eq!(profiles[1].name, "WSL · docker-desktop");
+        // 两个发行版靠参数区分 id，去重不会把它们并成一条。
+        assert_ne!(profiles[0].id(), profiles[1].id());
+        // 确实没装发行版：不出现条目；枚举失败：退回默认发行版一条。
+        assert!(wsl_profiles(r"C:\Windows\System32\wsl.exe", Some(Vec::new())).is_empty());
+        let fallback = wsl_profiles(r"C:\Windows\System32\wsl.exe", None);
+        assert_eq!(fallback.len(), 1);
+        assert!(fallback[0].args.is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn command_line_appends_and_quotes_args() {
+        let mut profile = ShellProfile {
+            name: "WSL · Debian".into(),
+            program: r"C:\Windows\System32\wsl.exe".into(),
+            args: vec![],
+            kind: ShellKind::Wsl,
+        };
+        assert_eq!(command_line(&profile), r"C:\Windows\System32\wsl.exe");
+        profile.args = vec!["-d".into(), "Debian".into()];
+        assert_eq!(
+            command_line(&profile),
+            r"C:\Windows\System32\wsl.exe -d Debian"
+        );
+        profile.program = r"C:\Program Files\Git\bin\bash.exe".into();
+        profile.args = vec!["-i".into(), "-l".into()];
+        assert_eq!(
+            command_line(&profile),
+            r#""C:\Program Files\Git\bin\bash.exe" -i -l"#
+        );
     }
 
     #[cfg(windows)]
