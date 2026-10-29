@@ -13,7 +13,7 @@
 
 | 能力 | RustTerm-Egui | RuTerm | 结论 |
 |---|---|---|---|
-| 终端内查找 | Ctrl+F 高亮 + 上/下跳转 | 无 | 补 |
+| 终端内查找 | Ctrl+F 高亮 + 上/下跳转 | Ctrl+F 查找条（字面量 / 正则） | **已补** |
 | 多终端联动 | 批量执行 + 同步输入 | 无 | 补 |
 | Telnet / Ping | 原始 TCP + 最小 IAC；PTY 跑 ping | 无 | 补（Telnet）/缓（Ping） |
 | 中英文界面 | i18n 静态词典 + 语言切换 | 仅中文 | 补 |
@@ -35,7 +35,7 @@
 | # | 借鉴点 | 原型做法 | 我们的现状 | 排期与做法 |
 |---|---|---|---|---|
 | ① | 空状态当首页 | 品牌大字 + 三颗主按钮 + 搜索框 + 「最近会话」卡片 | 空工作区只有一行灰字「从左侧点击主机账号开始连接」 | `P0·S`：搜索 + 最近连接（复用 `recent_hosts`）+ 新建主机 |
-| ② | 查找条 | 终端上方内联一条：输入框、Enter / Shift+Enter、↑↓ 按钮（无匹配置灰）、Esc 关闭并清除 | 无（rgpui-term 已有搜索 API） | 并入 P0 查找；取值边界见下 |
+| ② | 查找条 | 终端上方内联一条：输入框、Enter / Shift+Enter、↑↓ 按钮（无匹配置灰）、Esc 关闭并清除 | 已按此实现（P0 查找） | 已完成；取值边界见下 |
 | ③ | 状态栏补终端状态 | 尺寸 `167×33`、光标行列、`↑ 回滚: N`、`选区: N 行` | 只有连接状态 / 地址 / 认证 / 远端指标 / 会话数 | `P1·S`：`TerminalContent` 已给 `terminal_bounds`、`display_offset`、`selection`、`cursor` |
 | ④ | 标签跟着终端走 | OSC 0/2 改标签名；双击就地重命名；中键关闭；Ctrl+W 关闭 | 标签名固定为主机名；无重命名；无中键 / Ctrl+W；只能点活动项的 × | `P1·S`：订阅 `Event::TitleChanged` 读 `Terminal::breadcrumb_text`，双击换 Input，补中键与 `ctrl-w` |
 | ⑤ | 拖拽落点说清楚 | 文件悬停面板时浮层写「松开即上传到 /path」 | 目标行有强调色边框，但没有文字说明 | `P1·S`：浮层写目标目录 |
@@ -72,12 +72,11 @@
 
 ## P0 · 近期（低成本、直接补短板）
 
-- [ ] **终端内查找（Ctrl+F）** — `S`
-  rgpui-term 1.6 已自带查找：`SearchSet { direction, regex }` / `SearchNext` / `SearchPrevious` / `ClearSearch`
-  actions，以及 `Terminal::search_status()` 与 `Event::SearchUpdated(SearchStatus)`。
-  工作只在 `src/main.rs`：绑 `ctrl-f` → 聚焦搜索 Input，`enter` / `shift-enter` 触发上/下跳转，
-  Esc 关闭并 `ClearSearch`；搜索条复用文件面板路径栏的 Input 样式即可。
-  交互与取值边界见「界面与交互」②（不显示总匹配数，用状态文案 + 可选正则开关）。
+- [x] **终端内查找（Ctrl+F）** — `S` — 已完成
+  活动终端顶部内联查找条：输入即高亮（含回滚历史），回车 / Shift+回车上下跳转，
+  `Aa` 切换字面量 / 正则，Esc 收起并清高亮。状态文案只区分「未找到 / 正则无效」，
+  不显示总匹配数（rgpui-term 不给计数）。实现走 `TerminalView::search` / `search_literal`
+  排队下发，`Event::SearchUpdated` 回来后再重绘查找条。
 - [ ] **同步输入 / 命令广播** — `M`
   活动终端按键镜像到其它终端，以及「命令发到所有会话」。需要把 `TerminalView` 的输入出口
   （`SessionCommand::Input` / rgpui-term 的 write 通道）抽成可按 tab 列表广播；

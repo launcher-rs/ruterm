@@ -43,8 +43,8 @@ use rgpui::{
     actions, canvas, div, h_flex, icon_named, img, px, relative, size, v_flex, IconNamed,
 };
 use rgpui_term::{
-    Event as TerminalEvent, TerminalBuilder, TerminalThemeConfig, TerminalView, TextStyle,
-    ThemeDefinition, ThemeManager,
+    Event as TerminalEvent, SearchStatus, TerminalBuilder, TerminalThemeConfig, TerminalView,
+    TextStyle, ThemeDefinition, ThemeManager,
 };
 use serde::{Deserialize, Serialize};
 
@@ -82,7 +82,9 @@ actions!(
         OpenForward,
         SplitRight,
         SplitDown,
-        CloseSplit
+        CloseSplit,
+        FindInTerminal,
+        CloseFind
     ]
 );
 
@@ -266,6 +268,18 @@ struct SplitView {
     direction: SplitDirection,
     /// 可拖拽的分隔条状态（比例只存活在内存，每次分屏从 50% 开始）。
     pane: Entity<SplitPaneState>,
+}
+
+/// 终端内查找条（Ctrl+F）的状态。
+struct FindBar {
+    /// 关键词输入框；关闭查找时只收起、不销毁，下次打开沿用上次的关键词。
+    input: Entity<InputState>,
+    /// 查找条当前是否展示。
+    visible: bool,
+    /// 按正则匹配；关闭时按字面量匹配（所见即所搜）。
+    regex: bool,
+    /// 最近一次下发给终端的关键词与匹配方式，避免每次重绘重复入队。
+    applied: Option<(String, bool)>,
 }
 
 /// 文件列表的排序依据。
@@ -1502,6 +1516,8 @@ struct RuTermApp {
     recent_hosts: Vec<i64>,
     /// 主机列表搜索框（按展示名 / user@host:port 子串过滤）。
     search: Entity<InputState>,
+    /// 终端内查找条（Ctrl+F）。
+    find: FindBar,
     /// 活动会话标签。
     tabs: Vec<SessionTab>,
     /// 当前选中标签 id。
@@ -1695,6 +1711,15 @@ impl RuTermApp {
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("搜索主机…"));
         cx.subscribe(&search, |_, _, _: &InputEvent, cx| cx.notify())
             .detach();
+        let find_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("查找终端内容…（回车下一个，Shift+回车上一个）")
+        });
+        cx.subscribe(&find_input, |this, _, event: &InputEvent, cx| match event {
+            InputEvent::Change => this.apply_find(cx),
+            InputEvent::PressEnter { shift, .. } => this.step_find(*shift, cx),
+            _ => {}
+        })
+        .detach();
         let mut app = Self {
             store,
             mode,
@@ -1702,6 +1727,12 @@ impl RuTermApp {
             hosts,
             recent_hosts: Vec::new(),
             search,
+            find: FindBar {
+                input: find_input,
+                visible: false,
+                regex: false,
+                applied: None,
+            },
             tabs: Vec::new(),
             active_tab: None,
             new_host: None,
@@ -5489,6 +5520,13 @@ impl RuTermApp {
             }
         })
         .detach();
+        // 查找是排队执行的：终端 sync 完才定状态，收到结果后重绘查找条。
+        cx.subscribe(&terminal, |_, _, event: &TerminalEvent, cx| {
+            if matches!(event, TerminalEvent::SearchUpdated(_)) {
+                cx.notify();
+            }
+        })
+        .detach();
         self.status = SharedString::from(format!("正在连接 {addr}…"));
         let tab = SessionTab {
             id,
@@ -6095,6 +6133,106 @@ impl RuTermApp {
         self.toggle_file_panel(window, cx);
     }
 
+    /// Ctrl+F / 菜单「终端内查找」：展开查找条并聚焦关键词输入框。
+    ///
+    /// 沿用上次的关键词并全选：直接敲字就替换，回车接着在旧词上跳转。
+    fn find_in_terminal(
+        &mut self,
+        _: &FindInTerminal,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.active_tab.is_none() {
+            self.status = "当前没有可查找的终端".into();
+            cx.notify();
+            return;
+        }
+        self.find.visible = true;
+        self.find.input.update(cx, |state, cx| {
+            let len = state.value().len();
+            state.set_selected_range(0..len, cx);
+            state.focus(window, cx);
+        });
+        // 新终端要重新下发一次关键词，不能沿用 applied 的去重判断。
+        self.find.applied = None;
+        self.apply_find(cx);
+        cx.notify();
+    }
+
+    fn close_find(&mut self, _: &CloseFind, window: &mut Window, cx: &mut Context<Self>) {
+        self.do_close_find(window, cx);
+    }
+
+    /// 收起查找条：清掉高亮与定位，焦点交回活动终端。
+    fn do_close_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.find.visible {
+            return;
+        }
+        self.find.visible = false;
+        self.find.applied = None;
+        if let Some(view) = self.active_terminal_view() {
+            // 空串＝清除搜索：高亮与滚动定位一并收回。
+            view.update(cx, |view, cx| view.search("", cx));
+            let focus = view.read(cx).focus_handle(cx);
+            focus.focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    /// 活动标签的终端视图；无标签时为 None。
+    fn active_terminal_view(&self) -> Option<Entity<TerminalView>> {
+        let id = self.active_tab?;
+        self.tabs
+            .iter()
+            .find(|tab| tab.id == id)
+            .map(|tab| tab.terminal_view.clone())
+    }
+
+    /// 把查找条的关键词下发给活动终端（关键词与匹配方式都没变就不重复入队）。
+    fn apply_find(&mut self, cx: &mut Context<Self>) {
+        let Some(view) = self.active_terminal_view() else {
+            return;
+        };
+        let query = self.find.input.read(cx).value().to_string();
+        let regex = self.find.regex;
+        if self
+            .find
+            .applied
+            .as_ref()
+            .is_some_and(|(last, last_regex)| *last == query && *last_regex == regex)
+        {
+            return;
+        }
+        self.find.applied = Some((query.clone(), regex));
+        view.update(cx, |view, cx| {
+            if query.is_empty() {
+                view.search("", cx);
+            } else if regex {
+                view.search(&query, cx);
+            } else {
+                view.search_literal(&query, cx);
+            }
+        });
+    }
+
+    /// 回车 / Shift+回车（或上/下按钮）：在匹配之间跳转。
+    fn step_find(&mut self, backward: bool, cx: &mut Context<Self>) {
+        let Some(view) = self.active_terminal_view() else {
+            return;
+        };
+        if self.find.input.read(cx).value().is_empty() {
+            return;
+        }
+        let terminal = view.read(cx).terminal().clone();
+        terminal.update(cx, |terminal, _| {
+            if backward {
+                terminal.search_previous();
+            } else {
+                terminal.search_next();
+            }
+        });
+    }
+
     /// 切到指定标签：选中、滚进可见范围（标签多到溢出时），并把焦点交给它的终端。
     fn activate_tab(&mut self, id: usize, window: &mut Window, cx: &mut Context<Self>) {
         // 分屏只描述"哪两个标签并排"：从标签栏 / 快捷键切到第三个会话时退出分屏，
@@ -6132,6 +6270,11 @@ impl RuTermApp {
             self.tab_scroll.scroll_to_item(ix);
             let focus = self.tabs[ix].terminal_view.read(cx).focus_handle(cx);
             focus.focus(window, cx);
+        }
+        // 查找条只作用于活动终端：切标签后把同一关键词带到新终端并跳首个匹配。
+        if self.find.visible {
+            self.find.applied = None;
+            self.apply_find(cx);
         }
         self.sync_tray(cx);
     }
@@ -6588,6 +6731,12 @@ impl RuTermApp {
             }
         })
         .detach();
+        cx.subscribe(&terminal, |_, _, event: &TerminalEvent, cx| {
+            if matches!(event, TerminalEvent::SearchUpdated(_)) {
+                cx.notify();
+            }
+        })
+        .detach();
         self.status = SharedString::from(format!("本地终端 {label}"));
         cx.notify();
     }
@@ -6616,6 +6765,8 @@ impl Render for RuTermApp {
             .on_action(cx.listener(Self::split_right))
             .on_action(cx.listener(Self::split_down))
             .on_action(cx.listener(Self::close_split_action))
+            .on_action(cx.listener(Self::find_in_terminal))
+            .on_action(cx.listener(Self::close_find))
             // 捕获阶段先看到回车：断开的终端已写不到远端，回车要用来重连而不是被它吞掉。
             .capture_key_down(cx.listener(Self::capture_session_key))
             .child(self.render_title_bar(window, cx))
@@ -6819,6 +6970,7 @@ impl RuTermApp {
             };
             menu.item(PopupMenuItem::new("下一个标签").action(Box::new(NextTab)))
                 .item(PopupMenuItem::new("上一个标签").action(Box::new(PrevTab)))
+                .item(PopupMenuItem::new("终端内查找…").action(Box::new(FindInTerminal)))
                 // 只折叠面板，最外缘的图标栏始终留着（RustRover 的工具窗口栏）。
                 .item(PopupMenuItem::new("折叠 / 展开侧栏面板").action(Box::new(ToggleSidebar)))
                 .item(PopupMenuItem::new("设置…").action(Box::new(OpenSettings)))
@@ -11100,6 +11252,9 @@ impl RuTermApp {
             .on_drop(cx.listener(move |this, paths: &ExternalPaths, _, cx| {
                 this.upload_via_terminal(id, paths.paths().to_vec(), cx);
             }))
+            .when(active && self.find.visible, |this| {
+                this.child(self.render_find_bar(tab, cx))
+            })
             .child(tab.terminal_view.clone())
             .when(tab.ended, |this| {
                 this.child(self.render_ended_banner(tab, cx))
@@ -11156,6 +11311,96 @@ impl RuTermApp {
                         ),
                 )
             })
+            .into_any_element()
+    }
+
+    /// 终端内查找条：关键词输入 + 匹配状态 + 上/下跳转 + 正则开关。
+    ///
+    /// 不显示「第几个 / 共几个」——rgpui-term 只给匹配状态、不给总数，
+    /// 所以用状态文案（正则无效 / 未找到）代替计数。
+    fn render_find_bar(&self, tab: &SessionTab, cx: &mut Context<Self>) -> AnyElement {
+        let pal = self.palette(cx);
+        let status = tab.terminal_view.read(cx).search_status(cx);
+        let (hint, hint_color) = match status {
+            SearchStatus::Invalid => ("正则无效", pal.danger),
+            SearchStatus::NotFound => ("未找到", pal.muted),
+            _ => ("", pal.muted),
+        };
+        let steppable = status == SearchStatus::Matched;
+        let regex = self.find.regex;
+        h_flex()
+            .id("find-bar")
+            .key_context("FindBar")
+            .flex_shrink_0()
+            .items_center()
+            .gap_2()
+            .mb_2()
+            .px_2()
+            .py_1()
+            .rounded(px(6.0))
+            .bg(pal.card_bg)
+            .border_1()
+            .border_color(pal.border)
+            .child(Icon::new(IconName::Search).small().text_color(pal.muted))
+            .child(
+                div()
+                    .w(px(260.0))
+                    .child(styled_input(Input::new(&self.find.input).text_xs(), &pal)),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .text_xs()
+                    .text_color(hint_color)
+                    .child(hint),
+            )
+            .child(
+                Button::new("find-prev")
+                    .icon(IconName::ArrowUp)
+                    .compact()
+                    .ghost()
+                    .tab_index(-1)
+                    .tooltip("上一个匹配（Shift+回车）")
+                    .disabled(!steppable)
+                    .on_click(cx.listener(|this, _, _, cx| this.step_find(true, cx))),
+            )
+            .child(
+                Button::new("find-next")
+                    .icon(IconName::ArrowDown)
+                    .compact()
+                    .ghost()
+                    .tab_index(-1)
+                    .tooltip("下一个匹配（回车）")
+                    .disabled(!steppable)
+                    .on_click(cx.listener(|this, _, _, cx| this.step_find(false, cx))),
+            )
+            .child(
+                Button::new("find-regex")
+                    .icon(IconName::CaseSensitive)
+                    .compact()
+                    .ghost()
+                    .tab_index(-1)
+                    .selected(regex)
+                    .tooltip(if regex {
+                        "正则匹配（点击改为按字面量）"
+                    } else {
+                        "按字面量匹配（点击启用正则）"
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.find.regex = !this.find.regex;
+                        this.find.applied = None;
+                        this.apply_find(cx);
+                    })),
+            )
+            .child(
+                Button::new("find-close")
+                    .icon(IconName::Close)
+                    .compact()
+                    .ghost()
+                    .tab_index(-1)
+                    .tooltip("关闭查找（Esc）")
+                    .on_click(cx.listener(|this, _, window, cx| this.do_close_find(window, cx))),
+            )
             .into_any_element()
     }
 
@@ -11739,6 +11984,9 @@ fn main() {
             KeyBinding::new("ctrl-pagedown", NextTab, None),
             KeyBinding::new("ctrl-pageup", PrevTab, None),
             KeyBinding::new("ctrl-,", OpenSettings, None),
+            // 终端内查找：Esc 只在查找条里关闭（终端里的 Esc 仍原样送给 shell）。
+            KeyBinding::new("ctrl-f", FindInTerminal, None),
+            KeyBinding::new("escape", CloseFind, Some("FindBar")),
             // 文件传输：给当前活动会话开 SFTP 上传 / 下载弹窗。
             // 端口转发：给当前活动会话配置本地监听 → 远端目标。
             KeyBinding::new("ctrl-shift-f", OpenForward, None),
