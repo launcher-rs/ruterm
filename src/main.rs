@@ -1516,6 +1516,8 @@ struct RuTermApp {
     recent_hosts: Vec<i64>,
     /// 主机列表搜索框（按展示名 / user@host:port 子串过滤）。
     search: Entity<InputState>,
+    /// 空工作区首页的主机搜索框（与边栏搜索互不影响）。
+    home_search: Entity<InputState>,
     /// 终端内查找条（Ctrl+F）。
     find: FindBar,
     /// 活动会话标签。
@@ -1711,6 +1713,9 @@ impl RuTermApp {
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("搜索主机…"));
         cx.subscribe(&search, |_, _, _: &InputEvent, cx| cx.notify())
             .detach();
+        let home_search = cx.new(|cx| InputState::new(window, cx).placeholder("搜索主机或地址…"));
+        cx.subscribe(&home_search, |_, _, _: &InputEvent, cx| cx.notify())
+            .detach();
         let find_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder("查找终端内容…（回车下一个，Shift+回车上一个）")
         });
@@ -1727,6 +1732,7 @@ impl RuTermApp {
             hosts,
             recent_hosts: Vec::new(),
             search,
+            home_search,
             find: FindBar {
                 input: find_input,
                 visible: false,
@@ -11188,27 +11194,191 @@ impl RuTermApp {
             self.active_tab
                 .and_then(|id| self.tabs.iter().find(|tab| tab.id == id))
                 .map(|tab| self.render_tab_pane(tab, true, false, terminal_bg, cx))
-                .unwrap_or_else(|| {
-                    // 边栏可以贴左边或右边，空状态提示跟着说对应的一侧。
-                    let side = match self.sidebar.side {
-                        SidebarSide::Left => "左侧",
-                        SidebarSide::Right => "右侧",
-                    };
-                    v_flex()
-                        .flex_1()
-                        .items_center()
-                        .justify_center()
-                        .child(
-                            div()
-                                .text_base()
-                                .text_color(pal.muted)
-                                .child(format!("从{side}点击主机账号开始连接")),
-                        )
-                        .into_any_element()
-                })
+                .unwrap_or_else(|| self.render_empty_state(&pal, cx))
         };
 
         v_flex().flex_1().h_full().child(tab_bar).child(body)
+    }
+
+    /// 空工作区首页：品牌 + 主机搜索 + 新建入口 + 最近连接。
+    ///
+    /// 参照 RustTerm-Egui 的空状态（路线图「界面与交互」①），但配色、图标与控件
+    /// 全部走主题与 `IconName`：搜索里敲字即列匹配主机，清空则回到最近连接。
+    fn render_empty_state(&self, pal: &Palette, cx: &mut Context<Self>) -> AnyElement {
+        let query = self.home_search.read(cx).value().trim().to_lowercase();
+        // 首页不做长列表：搜索最多 8 条，最近连接最多 6 条。
+        let (title, rows): (&'static str, Vec<usize>) = if query.is_empty() {
+            (
+                "最近连接",
+                self.recent_hosts
+                    .iter()
+                    .filter_map(|id| self.hosts.iter().position(|host| host.id == *id))
+                    .take(6)
+                    .collect(),
+            )
+        } else {
+            (
+                "匹配的主机",
+                self.hosts
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, host)| {
+                        host.name.to_lowercase().contains(&query)
+                            || host.addr().to_lowercase().contains(&query)
+                    })
+                    .map(|(index, _)| index)
+                    .take(8)
+                    .collect(),
+            )
+        };
+        let empty_hint = if query.is_empty() {
+            "还没有连接记录，从左侧主机列表选一台即可开始"
+        } else {
+            "没有匹配的主机"
+        };
+        let mut card = v_flex()
+            .w_full()
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(pal.border)
+            .bg(pal.card_bg)
+            .p_2()
+            .gap_1()
+            .child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .text_xs()
+                    .text_color(pal.muted)
+                    .child(title),
+            );
+        if rows.is_empty() {
+            card = card.child(
+                div()
+                    .w_full()
+                    .py_3()
+                    .text_xs()
+                    .text_color(pal.muted)
+                    .text_center()
+                    .child(empty_hint),
+            );
+        } else {
+            for index in rows {
+                card = card.child(self.render_home_host_row(index, pal, cx));
+            }
+        }
+        v_flex()
+            .flex_1()
+            .items_center()
+            .justify_center()
+            .p(px(24.0))
+            .child(
+                v_flex()
+                    .w(px(560.0))
+                    .gap_4()
+                    .items_center()
+                    .child(
+                        v_flex()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_size(px(30.0))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(pal.text)
+                                    .child("RuTerm"),
+                            )
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(pal.muted)
+                                    .child("远程终端会话管理器 · SSH / 本地终端"),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .gap_2()
+                            .items_center()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .child(styled_input(Input::new(&self.home_search), pal)),
+                            )
+                            .child(
+                                Button::new("home-new-host")
+                                    .icon(IconName::Plus)
+                                    .label("新建主机")
+                                    .primary()
+                                    .compact()
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.new_host(&NewHost, window, cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("home-local-terminal")
+                                    .icon(IconName::SquareTerminal)
+                                    .label("本地终端")
+                                    .secondary()
+                                    .outline()
+                                    .compact()
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.new_local_terminal(&NewLocalTerminal, window, cx);
+                                    })),
+                            ),
+                    )
+                    .child(card),
+            )
+            .into_any_element()
+    }
+
+    /// 首页里的一台主机：图标 + 展示名 + 地址，点一下即连接。
+    fn render_home_host_row(
+        &self,
+        index: usize,
+        pal: &Palette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let host = &self.hosts[index];
+        let title = if host.name.is_empty() {
+            host.addr()
+        } else {
+            host.name.clone()
+        };
+        Self::row_base(
+            SharedString::from(format!("home-host-{index}")),
+            pal,
+            px(8.0),
+        )
+        .on_click(cx.listener(move |this, _, window, cx| {
+            this.click_host(index, window, cx);
+        }))
+        .child(
+            Icon::new(Self::host_icon(host.auth))
+                .small()
+                .text_color(pal.muted),
+        )
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .child(
+                    div()
+                        .text_sm()
+                        .text_ellipsis()
+                        .font_weight(rgpui::FontWeight(500.0))
+                        .child(title),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_ellipsis()
+                        .text_color(pal.muted)
+                        .child(host.addr()),
+                ),
+        )
+        .into_any_element()
     }
 
     /// 主区里的一个会话面板：终端内容 + 内边距 + 断开横幅。
