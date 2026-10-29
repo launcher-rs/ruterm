@@ -17,6 +17,7 @@ mod transfer;
 mod vault;
 mod zmodem;
 
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -31,13 +32,13 @@ use rgpui::tabs::tab_drag::TabDragData;
 use rgpui::title_bar::TITLE_BAR_HEIGHT;
 use rgpui::{
     AbsoluteLength, AnyElement, App, Bounds, Button, ButtonVariants, Checkbox, ClickEvent, Context,
-    ContextMenuExt, Div, DropdownMenu, Entity, ExternalPaths, FocusHandle, Focusable,
+    ContextMenuExt, Disableable, Div, DropdownMenu, Entity, ExternalPaths, FocusHandle, Focusable,
     FontWeight, Hsla, Icon,
     IconName, Image, ImageFormat, InteractiveElement, IntoElement, KeyBinding, KeyDownEvent,
     MouseButton, NoAction, ParentElement, Pixels, Point, PopupMenu, PopupMenuItem, Render, Rgba,
     ScrollHandle, ScrollableElement, SharedString, Stateful, StatefulInteractiveElement, Styled,
-    TrayMenuItem, Window, WindowBounds, WindowControlArea, WindowOptions, actions, div, h_flex,
-    img, px, size, v_flex,
+    TrayIconEvent, TrayMenuItem, Window, WindowBounds, WindowControlArea, WindowOptions, actions,
+    div, h_flex, img, px, size, v_flex, icon_named, IconNamed,
 };
 use rgpui_term::{
     Event as TerminalEvent, TerminalBuilder, TerminalThemeConfig, TerminalView, TextStyle,
@@ -52,6 +53,16 @@ use crate::remote::{Metric, RemoteInfo};
 use crate::sessions::{AuthMethod, HostConfig, SessionStore};
 use crate::vault::Vault;
 
+// 文件面板自己的图标（来自 lucide，ISC 许可）：rgpui 内置集合里没有合适的
+// 「定位」「跟随」语义。`icon_named!` 会把 assets/lucide 下的 SVG 编译进二进制。
+icon_named!(FileIcon, "assets/lucide");
+
+impl RenderOnce for FileIcon {
+    fn render(self, _: &mut Window, _: &mut App) -> impl IntoElement {
+        Icon::new(self)
+    }
+}
+
 // 应用级动作：既绑到全局快捷键，也挂在标题栏菜单项上。rgpui 会按键绑定
 // 在菜单项右侧自动渲染按键（`PopupMenu::render_key_binding`），因此不再需要在
 // 「帮助」菜单里用纯文字罗列快捷键。
@@ -59,6 +70,7 @@ actions!(
     ruterm,
     [
         ToggleSidebar,
+        ToggleFilePanel,
         ToggleTheme,
         NewHost,
         NewLocalTerminal,
@@ -139,14 +151,22 @@ fn open_path_with_default(path: &Path) {
     }
 }
 
-/// 远端修改时间（Unix 秒，UTC）→ `YYYY-MM-DD HH:MM`。
-fn format_remote_time(seconds: u32) -> String {
+/// 文件列表固定列宽：表头与数据行共用，保证纵向对齐。
+const FILE_COL_KIND_W: f32 = 40.0;
+const FILE_COL_SIZE_W: f32 = 52.0;
+const FILE_COL_TIME_W: f32 = 78.0;
+const FILE_COL_PERM_W: f32 = 62.0;
+/// 行首图标 + 间距占位：让表头「名称」与行内文件名左对齐。
+const FILE_ROW_LEAD_W: f32 = 20.0;
+
+/// 远端修改时间（Unix 秒，UTC）→ `MM-DD HH:MM`（面板窄，省掉年份）。
+fn format_remote_time_short(seconds: u32) -> String {
     let secs = u64::from(seconds);
     let days = (secs / 86_400) as i64;
     let rem = secs % 86_400;
-    let (year, month, day) = civil_from_days(days);
+    let (_, month, day) = civil_from_days(days);
     format!(
-        "{year:04}-{month:02}-{day:02} {:02}:{:02}",
+        "{month:02}-{day:02} {:02}:{:02}",
         rem / 3600,
         (rem % 3600) / 60
     )
@@ -205,6 +225,9 @@ struct SessionTab {    /// 稳定标签 id（会话结束或用户关闭时据�
     forwards: Vec<session::ForwardRule>,
     /// 右侧文件面板的浏览状态（路径 / 列表 / 加载态），按标签各自保留。
     files: FileBrowser,
+    /// 终端当前工作目录：由 SSH 桥接层经 cd 跟踪 / OSC 7 上报确认后回传，
+    /// 文件面板"跟随终端"开关据此跳转；本地终端无此概念，为 None。
+    terminal_cwd: Option<String>,
     /// 拖文件到终端（lrzsz）的当前操作文案；None 表示空闲。
     zmodem: Option<SharedString>,
     /// lrzsz 上传进度 (已传, 总量)。
@@ -248,8 +271,17 @@ struct TransferDialog {
     info: Option<SharedString>,
 }
 
+/// 文件列表的排序依据。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FileSortKey {
+    Name,
+    Kind,
+    Size,
+    Modified,
+    Permissions,
+}
+
 /// 右侧文件面板的单个标签状态：当前目录、条目与操作反馈。
-#[derive(Default)]
 struct FileBrowser {
     /// 登录主目录（首次打开面板时列这里）。
     home: Option<String>,
@@ -264,6 +296,85 @@ struct FileBrowser {
     busy: Option<SharedString>,
     /// 上传进度 (已传, 总量)。
     progress: Option<(u64, u64)>,
+    /// 是否跟随终端当前目录：开启后，远端 shell cd 时面板自动跳转。
+    follow: bool,
+    /// 排序依据与方向；目录始终在前。
+    sort: FileSortKey,
+    sort_desc: bool,
+}
+
+impl Default for FileBrowser {
+    fn default() -> Self {
+        Self {
+            home: None,
+            path: None,
+            entries: Vec::new(),
+            loading: false,
+            error: None,
+            busy: None,
+            progress: None,
+            follow: false,
+            sort: FileSortKey::Name,
+            sort_desc: false,
+        }
+    }
+}
+
+impl FileBrowser {
+    /// 按当前排序状态重排条目：目录恒在前，其余按所选列比较，同值回落到名称。
+    fn sort_entries(&mut self) {
+        let key = self.sort;
+        let desc = self.sort_desc;
+        self.entries.sort_by(|left, right| {
+            let by_dir = right.is_dir.cmp(&left.is_dir);
+            if by_dir != Ordering::Equal {
+                return by_dir;
+            }
+            let by_key = match key {
+                // 名称列作为主键参与升降序；其余列同值时再回落到名称（恒升序）。
+                FileSortKey::Name => left
+                    .name
+                    .to_lowercase()
+                    .cmp(&right.name.to_lowercase())
+                    .then_with(|| left.name.cmp(&right.name)),
+                FileSortKey::Kind => kind_rank(left).cmp(&kind_rank(right)),
+                FileSortKey::Size => left.size.cmp(&right.size),
+                FileSortKey::Modified => left.modified.cmp(&right.modified),
+                FileSortKey::Permissions => left.permissions.cmp(&right.permissions),
+            };
+            let by_key = if desc { by_key.reverse() } else { by_key };
+            by_key
+                .then_with(|| {
+                    left.name
+                        .to_lowercase()
+                        .cmp(&right.name.to_lowercase())
+                })
+                .then_with(|| left.name.cmp(&right.name))
+        });
+    }
+}
+
+/// 类型排序次序：目录（已单独置顶）< 链接 < 普通文件。
+fn kind_rank(entry: &remote_fs::Entry) -> u8 {
+    if entry.is_dir {
+        0
+    } else if entry.is_symlink {
+        1
+    } else {
+        2
+    }
+}
+
+/// 两台已保存主机是否完全重复（忽略主键与收藏状态）。
+fn same_saved_host(left: &HostConfig, right: &HostConfig) -> bool {
+    left.name == right.name
+        && left.host == right.host
+        && left.port == right.port
+        && left.user == right.user
+        && left.auth == right.auth
+        && left.key_path == right.key_path
+        && left.key_inline == right.key_inline
+        && left.proxy_jump == right.proxy_jump
 }
 
 /// 文件面板里的新建 / 重命名弹窗。
@@ -1398,6 +1509,8 @@ struct RuTermApp {
     split_state: Entity<SplitPaneState>,
     /// 主区分屏（两个标签并排）；None＝单屏显示活动标签。
     view_split: Option<SplitView>,
+    /// 主区 ↔ 文件面板 的可调整大小状态（拖拽分隔条调整文件面板宽度）。
+    file_panel_resize: Entity<rgpui::components::resizable::ResizableState>,
     focus_handle: FocusHandle,
 }
 
@@ -1558,6 +1671,7 @@ impl RuTermApp {
             forward_prefs,
             split_state,
             view_split: None,
+            file_panel_resize: rgpui::components::resizable::ResizableState::new(cx),
             focus_handle: cx.focus_handle(),
         };
         app.boot_vault(window, cx);
@@ -1566,9 +1680,57 @@ impl RuTermApp {
         app.auto_scan_local_shells(cx);
         if let Some(target) = quick {
             let title = target.addr();
+            // 命令行快速连接也登记成主机：否则连过的主机在侧边栏里找不到。
+            app.adopt_quick_host(&target, cx);
             app.connect(title, target, None, None, false, window, cx);
         }
         app
+    }
+
+    /// 把命令行快速连接的目标登记进主机列表（同 user@host:port 已存在则跳过）。
+    ///
+    /// 只在加密库尚未打开时能确定 id，这里先留 0：`attach_vault` 会为所有
+    /// id==0 的主机补发主键并入库；降级模式则直接落在旧 JSON 里。
+    fn adopt_quick_host(&mut self, target: &SshTarget, cx: &mut Context<Self>) {
+        let exists = self.hosts.iter().any(|host| {
+            host.host == target.host && host.port == target.port && host.user == target.user
+        });
+        if exists {
+            return;
+        }
+        // 密码不落盘：认证方式只决定下次连接时向用户要什么。
+        let auth = if target.key_path.is_some() || target.key_data.is_some() {
+            AuthMethod::IdentityFile
+        } else if target.password.is_some() {
+            AuthMethod::Password
+        } else {
+            AuthMethod::Agent
+        };
+        let name = if target.port == 22 {
+            target.host.clone()
+        } else {
+            format!("{}:{}", target.host, target.port)
+        };
+        let host = HostConfig {
+            id: 0,
+            name,
+            host: target.host.clone(),
+            port: target.port,
+            user: target.user.clone(),
+            auth,
+            key_path: target
+                .key_path
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default(),
+            key_inline: false,
+            favorite: false,
+            proxy_jump: None,
+        };
+        self.hosts.push(host.clone());
+        self.persist_host(&host, cx);
+        self.status = SharedString::from(format!("已把 {} 加入主机列表", host.addr()));
+        cx.notify();
     }
 
     /// 异步打开加密凭据库：成功则接管主机列表（含一次性迁移旧库/JSON 并改名保留），
@@ -1661,9 +1823,39 @@ impl RuTermApp {
     ) {
         let vault = Arc::new(vault);
         self.unlock = None;
+        // 旧版本快速连接登记曾把同一台主机重复入库：字段完全一致时只留最早一条，
+        // 其余从库里删掉（名字、端口等有差异的条目不受影响）。
+        let mut unique: Vec<HostConfig> = Vec::with_capacity(db_hosts.len());
+        let mut stale: Vec<i64> = Vec::new();
+        for host in db_hosts.into_iter() {
+            if unique.iter().any(|kept| same_saved_host(kept, &host)) {
+                if host.id != 0 {
+                    stale.push(host.id);
+                }
+                continue;
+            }
+            unique.push(host);
+        }
+        db_hosts = unique;
+        for id in stale {
+            let vault = vault.clone();
+            cx.spawn(async move |_, _| {
+                if let Err(error) = vault.remove(id).await {
+                    log::warn!("清理重复主机失败: {error}");
+                }
+            })
+            .detach();
+        }
         // 开库完成前用户新增的主机（id==0，彼时尚无法入库）：补发 id 并入库。
         let mut next = db_hosts.iter().map(|host| host.id).max().unwrap_or(0) + 1;
         for host in self.hosts.iter().filter(|host| host.id == 0) {
+            // 快速连接登记时库还没打开，无法比对；库里已有同一 user@host:port 就跳过。
+            let duplicate = db_hosts.iter().any(|saved| {
+                saved.host == host.host && saved.port == host.port && saved.user == host.user
+            });
+            if duplicate {
+                continue;
+            }
             let mut host = host.clone();
             host.id = next;
             next += 1;
@@ -2383,18 +2575,29 @@ impl RuTermApp {
         cx.notify();
     }
 
-    /// 切换右侧远端文件面板；首次打开时自动列出登录主目录。
+    /// 切换右侧远端文件面板；首次打开时自动列出登录主目录（跟随终端开启时优先用终端目录）。
     fn toggle_file_panel(&mut self, cx: &mut Context<Self>) {
         self.file_panel = !self.file_panel;
         if self.file_panel
             && let Some(id) = self.active_tab
-            && self
+        {
+            let (need_load, initial) = self
                 .tabs
                 .iter()
                 .find(|tab| tab.id == id)
-                .is_some_and(|tab| tab.files.path.is_none())
-        {
-            self.load_files(id, None, cx);
+                .map(|tab| {
+                    let need = tab.files.path.is_none();
+                    let initial = if tab.files.follow {
+                        tab.terminal_cwd.clone()
+                    } else {
+                        None
+                    };
+                    (need, initial)
+                })
+                .unwrap_or((false, None));
+            if need_load {
+                self.load_files(id, initial, cx);
+            }
         }
         cx.notify();
     }
@@ -2447,6 +2650,7 @@ impl RuTermApp {
                         }
                         tab.files.path = Some(listing.path);
                         tab.files.entries = listing.entries;
+                        tab.files.sort_entries();
                         tab.files.error = None;
                     }
                     Err(error) => {
@@ -5312,6 +5516,7 @@ impl RuTermApp {
         let session::SshSession {
             join,
             mut remote_info,
+            mut cwd_events,
             started,
             ready,
             disconnect,
@@ -5348,6 +5553,7 @@ impl RuTermApp {
             commands: Some(commands),
             forwards: Vec::new(),
             files: FileBrowser::default(),
+            terminal_cwd: None,
             zmodem: None,
             zmodem_progress: None,
             auto_retry_attempt: retry_attempt,
@@ -5473,6 +5679,45 @@ impl RuTermApp {
                         .find(|tab| tab.id == id && tab.terminal_view == info_view)
                     {
                         tab.remote_info = Some(info);
+                        cx.notify();
+                    }
+                });
+            }
+        })
+        .detach();
+        // 终端工作目录确认流：仅在 SFTP 校验"确为目录"后到达。
+        // 始终更新 tab.terminal_cwd；若面板跟随开启且当前标签就是本会话，则立即跳转。
+        let cwd_view = terminal_view.clone();
+        cx.spawn(async move |this, cx| {
+            while let Some(path) = cwd_events.recv().await {
+                log::debug!("[cwd_events] 收到确认路径: {}", path);
+                let _ = this.update(cx, |this, cx| {
+                    let Some(pos) = this
+                        .tabs
+                        .iter()
+                        .position(|tab| tab.id == id && tab.terminal_view == cwd_view)
+                    else {
+                        log::debug!("[cwd_events] 未找到对应标签");
+                        return;
+                    };
+                    let tab = &mut this.tabs[pos];
+                    let changed = tab.terminal_cwd.as_deref() != Some(path.as_str());
+                    tab.terminal_cwd = Some(path.clone());
+                    let should_follow = tab.files.follow
+                        && this.file_panel
+                        && this.active_tab == Some(id)
+                        && tab.files.path.as_deref() != Some(path.as_str());
+                    log::debug!(
+                        "[cwd_events] follow={}, panel={}, active={}, path_diff={}",
+                        tab.files.follow,
+                        this.file_panel,
+                        this.active_tab == Some(id),
+                        tab.files.path.as_deref() != Some(path.as_str())
+                    );
+                    if should_follow {
+                        log::debug!("[cwd_events] 触发跟随，加载: {}", path);
+                        this.load_files(id, Some(path), cx);
+                    } else if changed {
                         cx.notify();
                     }
                 });
@@ -5787,6 +6032,16 @@ impl RuTermApp {
             state.toggle_collapse(CollapsiblePane::First, cx);
         });
         cx.notify();
+    }
+
+    /// `Ctrl+Shift+B`：展开 / 收起右侧文件面板。
+    fn toggle_file_panel_action(
+        &mut self,
+        _: &ToggleFilePanel,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_file_panel(cx);
     }
 
     /// 切到指定标签：选中、滚进可见范围（标签多到溢出时），并把焦点交给它的终端。
@@ -6252,6 +6507,7 @@ impl RuTermApp {
             commands: None,
             forwards: Vec::new(),
             files: FileBrowser::default(),
+            terminal_cwd: None,
             zmodem: None,
             zmodem_progress: None,
             auto_retry_attempt: 0,
@@ -6286,6 +6542,7 @@ impl Render for RuTermApp {
             .bg(pal.window_bg)
             .text_color(pal.text)
             .on_action(cx.listener(Self::toggle_sidebar))
+            .on_action(cx.listener(Self::toggle_file_panel_action))
             .on_action(cx.listener(Self::toggle_theme_action))
             .on_action(cx.listener(Self::new_host))
             .on_action(cx.listener(Self::new_local_terminal))
@@ -6425,15 +6682,12 @@ impl RuTermApp {
                     );
                 }
             }
-            let files_entity = menu_entity.clone();
             let menu = menu
                 .item(PopupMenuItem::new("本地终端…").action(Box::new(NewLocalTerminal)))
                 .item(
                     PopupMenuItem::new("远端文件面板")
                         .checked(file_panel_open)
-                        .on_click(move |_, _, cx| {
-                            files_entity.update(cx, |this, cx| this.toggle_file_panel(cx));
-                        }),
+                        .action(Box::new(ToggleFilePanel)),
                 )
                 .item(PopupMenuItem::new("上传 / 下载文件…").action(Box::new(OpenTransfer)))
                 .item(PopupMenuItem::new("端口转发…").action(Box::new(OpenForward)))
@@ -9655,7 +9909,60 @@ impl RuTermApp {
             .into_any_element()
     }
 
-    /// 右侧主区：当前终端（会话标签已并入标题栏）。
+    /// 文件列表表头的一格：点击切换排序；已排序列高亮并显示 ↑ / ↓。
+    fn file_sort_header(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        key: FileSortKey,
+        width: Option<f32>,
+        right_align: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let pal = self.palette(cx);
+        let state = self
+            .active_tab
+            .and_then(|id| self.tabs.iter().find(|tab| tab.id == id))
+            .map(|tab| (tab.files.sort, tab.files.sort_desc));
+        let active = state.is_some_and(|(sort, _)| sort == key);
+        let desc = state.is_some_and(|(sort, desc)| sort == key && desc);
+
+        let text = if active {
+            format!("{label}{}", if desc { "↓" } else { "↑" })
+        } else {
+            label.to_string()
+        };
+        let mut cell = div()
+            .id(id)
+            .flex_shrink_0()
+            .text_xs()
+            .cursor_pointer()
+            .text_color(if active { pal.text } else { pal.muted })
+            .hover(|style| style.text_color(pal.text))
+            .when(right_align, |this| this.text_right());
+        if let Some(width) = width {
+            cell = cell.w(px(width));
+        } else {
+            cell = cell.flex_1().min_w_0().text_ellipsis();
+        }
+        cell.child(text)
+            .on_click(cx.listener(move |this, _, _, cx| {
+                let Some(tab_id) = this.active_tab else { return };
+                let Some(tab) = this.tabs.iter_mut().find(|tab| tab.id == tab_id) else {
+                    return;
+                };
+                if tab.files.sort == key {
+                    tab.files.sort_desc = !tab.files.sort_desc;
+                } else {
+                    tab.files.sort = key;
+                    tab.files.sort_desc = false;
+                }
+                tab.files.sort_entries();
+                cx.notify();
+            }))
+            .into_any_element()
+    }
+
     /// 右侧远端文件面板：路径栏 + 目录列表 + 底部操作状态。
     ///
     /// 面板跟随活动标签；每个标签各自保留路径与列表，切换回来不重新拉取。
@@ -9678,6 +9985,7 @@ impl RuTermApp {
             .unwrap_or_default();
         let entity = cx.entity();
         let live = tab_id.filter(|_| remote_capable && !ended);
+        let follow_on = tab.is_some_and(|tab| tab.files.follow);
 
         let up_enabled = path
             .as_deref()
@@ -9708,6 +10016,7 @@ impl RuTermApp {
                         .icon(IconName::ArrowUp)
                         .compact()
                         .ghost()
+                        .tab_index(-1)
                         .tooltip("上级目录");
                     if up_enabled {
                         up.on_click(cx.listener(move |this, _, _, cx| {
@@ -9723,6 +10032,7 @@ impl RuTermApp {
                         .label("⟳")
                         .compact()
                         .ghost()
+                        .tab_index(-1)
                         .tooltip("刷新目录")
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.refresh_files(id, cx);
@@ -9733,6 +10043,7 @@ impl RuTermApp {
                         .icon(IconName::Plus)
                         .compact()
                         .ghost()
+                        .tab_index(-1)
                         .tooltip("新建文件夹")
                         .on_click(cx.listener(move |this, _, window, cx| {
                             let Some(dir) = this
@@ -9813,20 +10124,22 @@ impl RuTermApp {
                 .into_any_element()
         } else {
             v_flex()
-                .p_1()
+                .py_1()
                 .gap_1()
                 .children(entries.into_iter().map(|entry| {
                     let name = entry.name.clone();
                     let is_dir = entry.is_dir;
                     let mtime = entry
                         .modified
-                        .map(format_remote_time)
+                        .map(format_remote_time_short)
                         .unwrap_or_else(|| "—".to_string());
                     let size_text = if is_dir {
-                        String::new()
+                        "—".to_string()
                     } else {
                         transfer::format_bytes(entry.size)
                     };
+                    let kind_text = entry.kind_text();
+                    let perm_text = entry.permissions_text();
                     let row_id = SharedString::from(format!(
                         "file-row-{}-{}-{}",
                         tab_id.unwrap_or_default(),
@@ -9883,21 +10196,38 @@ impl RuTermApp {
                                 .text_sm()
                                 .child(name.clone()),
                         )
-                        .when(!size_text.is_empty(), |this| {
-                            this.child(
-                                div()
-                                    .flex_shrink_0()
-                                    .text_xs()
-                                    .text_color(pal.muted)
-                                    .child(size_text),
-                            )
-                        })
                         .child(
                             div()
+                                .w(px(FILE_COL_KIND_W))
+                                .flex_shrink_0()
+                                .text_xs()
+                                .text_color(pal.muted)
+                                .child(kind_text),
+                        )
+                        .child(
+                            div()
+                                .w(px(FILE_COL_SIZE_W))
+                                .flex_shrink_0()
+                                .text_xs()
+                                .text_right()
+                                .text_color(pal.muted)
+                                .child(size_text),
+                        )
+                        .child(
+                            div()
+                                .w(px(FILE_COL_TIME_W))
                                 .flex_shrink_0()
                                 .text_xs()
                                 .text_color(pal.muted)
                                 .child(mtime),
+                        )
+                        .child(
+                            div()
+                                .w(px(FILE_COL_PERM_W))
+                                .flex_shrink_0()
+                                .text_xs()
+                                .text_color(pal.muted)
+                                .child(perm_text),
                         );
                     let Some(id) = live else {
                         return row.into_any_element();
@@ -9977,6 +10307,23 @@ impl RuTermApp {
             }))
             .child(list_body);
 
+        // 表头：列宽与行内固定列共用常量；点击列名排序，再点切换升降序。
+        let head_row = h_flex()
+            .w_full()
+            .flex_shrink_0()
+            .px_2()
+            .py_1()
+            .gap_2()
+            .items_center()
+            .border_b_1()
+            .border_color(pal.border)
+            .child(div().w(px(FILE_ROW_LEAD_W)).flex_shrink_0())
+            .child(self.file_sort_header("files-sort-name", "名称", FileSortKey::Name, None, false, cx))
+            .child(self.file_sort_header("files-sort-kind", "类型", FileSortKey::Kind, Some(FILE_COL_KIND_W), false, cx))
+            .child(self.file_sort_header("files-sort-size", "大小", FileSortKey::Size, Some(FILE_COL_SIZE_W), true, cx))
+            .child(self.file_sort_header("files-sort-time", "修改时间", FileSortKey::Modified, Some(FILE_COL_TIME_W), false, cx))
+            .child(self.file_sort_header("files-sort-perm", "权限", FileSortKey::Permissions, Some(FILE_COL_PERM_W), false, cx));
+
         let mut footer = v_flex()
             .w_full()
             .flex_shrink_0()
@@ -10029,13 +10376,102 @@ impl RuTermApp {
         if let Some(error) = error {
             footer = footer.child(div().text_xs().text_color(pal.danger).child(error));
         }
-        footer = footer.child(div().text_xs().text_color(pal.muted).child(summary));
+        // 底部状态栏：左侧摘要信息，右侧「定位」+「跟随」两个按钮（同一行）
+        footer = footer.child(
+            h_flex()
+                .w_full()
+                .items_center()
+                .justify_between()
+                .child(div().text_xs().text_color(pal.muted).child(summary))
+                .child({
+                    // 优先使用 terminal_cwd（来自 cd/OSC7），回退到 files.home（SFTP 初始目录），
+                    // 再回退到 None（主目录）。
+                    let target_path = tab
+                        .and_then(|tab| tab.terminal_cwd.clone())
+                        .or_else(|| tab.and_then(|tab| tab.files.home.clone()));
+                    let follow_tooltip = if follow_on {
+                        "跟随终端：开（点击关闭）"
+                    } else {
+                        "跟随终端目录"
+                    };
+                    // 跟随开＝钉住的图钉；关＝同一图钉加斜杠（lucide 没有官方 off 版，按家族风格补的）。
+                    let follow_icon = if follow_on {
+                        FileIcon::MapPinned
+                    } else {
+                        FileIcon::MapPinnedOff
+                    };
+                    h_flex()
+                        .gap_1()
+                        .items_center()
+                        // 定位：一次性跳到终端当前目录
+                        .child(
+                            Button::new("files-locate")
+                                .icon(FileIcon::MapPin)
+                                .compact()
+                                .ghost()
+                                .tab_index(-1)
+                                .tooltip("定位到终端当前目录")
+                                .disabled(live.is_none())
+                                .on_click(cx.listener({
+                                    let target = target_path.clone();
+                                    move |this, _, _, cx| {
+                                        let Some(id) = live else { return };
+                                        let current = this
+                                            .tabs
+                                            .iter()
+                                            .find(|t| t.id == id)
+                                            .and_then(|t| t.files.path.clone());
+                                        if current.as_deref() != target.as_deref() {
+                                            this.load_files(id, target.clone(), cx);
+                                        } else {
+                                            cx.notify();
+                                        }
+                                    }
+                                })),
+                        )
+                        // 跟随开关：开＝钉住，关＝钉住加斜杠
+                        .child(
+                            Button::new("files-follow")
+                                .icon(follow_icon)
+                                .compact()
+                                .ghost()
+                                .tab_index(-1)
+                                .selected(follow_on)
+                                .tooltip(follow_tooltip)
+                                .disabled(live.is_none())
+                                .on_click(cx.listener({
+                                    let target = target_path.clone();
+                                    move |this, _, _, cx| {
+                                        let Some(id) = live else { return };
+                                        let turn_on = !follow_on;
+                                        if let Some(tab) =
+                                            this.tabs.iter_mut().find(|t| t.id == id)
+                                        {
+                                            tab.files.follow = turn_on;
+                                        }
+                                        // 开启跟随时立刻对齐到终端目录
+                                        if turn_on {
+                                            let current = this
+                                                .tabs
+                                                .iter()
+                                                .find(|t| t.id == id)
+                                                .and_then(|t| t.files.path.clone());
+                                            if current.as_deref() != target.as_deref() {
+                                                this.load_files(id, target.clone(), cx);
+                                                return;
+                                            }
+                                        }
+                                        cx.notify();
+                                    }
+                                })),
+                        )
+                }),
+        );
 
         v_flex()
             .id("file-panel")
-            .w(px(304.0))
-            .h_full()
-            .flex_shrink_0()
+            .size_full()
+            .min_w_0()
             .bg(pal.sidebar_bg)
             .border_l_1()
             .border_color(pal.border)
@@ -10067,6 +10503,7 @@ impl RuTermApp {
                             .label("×")
                             .compact()
                             .ghost()
+                            .tab_index(-1)
                             .tooltip("收起文件面板")
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.file_panel = false;
@@ -10075,6 +10512,7 @@ impl RuTermApp {
                     ),
             )
             .child(path_row)
+            .child(head_row)
             .child(list)
             .child(footer)
             .into_any_element()
@@ -10437,12 +10875,27 @@ impl RuTermApp {
         };
 
         // 文件面板挂在主区右侧：分屏时也跟随活动标签，而不是挤进某一侧终端。
+        // 使用 h_resizable 实现拖拽调整文件面板宽度。
         let body = if self.file_panel {
-            h_flex()
+            use rgpui::components::resizable::{h_resizable, resizable_panel};
+            let group = h_resizable("file-panel-resize", self.file_panel_resize.clone())
+                .child(resizable_panel().child(body))
+                .child(
+                    resizable_panel()
+                        .size(px(420.0))
+                        .size_range(px(240.0)..px(720.0))
+                        // 终端内容有固有宽度，靠比例收缩会把文件面板一起压扁；
+                        // 让右侧面板不参与收缩，宽度只由拖拽 / 列宽决定。
+                        .flex_shrink_0()
+                        .child(self.render_file_panel(cx)),
+                );
+            // 面板组内部是 size_full（高度 100%）：必须放进一个定高槽里，
+            // 否则百分比直接按主区算、把标签栏高度也算进去，底部会被窗口裁掉。
+            div()
                 .flex_1()
                 .min_h_0()
-                .child(body)
-                .child(self.render_file_panel(cx))
+                .w_full()
+                .child(group)
                 .into_any_element()
         } else {
             body
@@ -11121,6 +11574,8 @@ fn main() {
         // 全局快捷键：与菜单项上的 action 同名，菜单里会自动显示这组按键。
         cx.bind_keys([
             KeyBinding::new("ctrl-b", ToggleSidebar, None),
+            // 文件面板：与「会话」菜单里的“远端文件面板”同一条路径。
+            KeyBinding::new("ctrl-shift-b", ToggleFilePanel, None),
             KeyBinding::new("ctrl-t", ToggleTheme, None),
             KeyBinding::new("ctrl-n", NewHost, None),
             KeyBinding::new("ctrl-shift-t", NewLocalTerminal, None),
@@ -11182,12 +11637,20 @@ fn main() {
         };
         cx.activate(true);
 
-        // 系统托盘：品牌图标 + 悬停提示 + 右键菜单（活动会话 / 显示主界面 / 退出）。
+        // 系统托盘：品牌图标 + 悬停提示 + 右键菜单（活动会话 / 显示主界面 / 退出），
+        // 左键单击图标直接恢复主窗口（Windows 后端左键不弹菜单，菜单仅右键弹出）。
         // 图标以 32px PNG 内嵌，Windows 走 image 解码路径最稳；不依赖运行时文件路径。
         const TRAY_ICON: &[u8] = include_bytes!("../assets/icons/tray-32.png");
         cx.set_tray_icon(Some(TRAY_ICON));
         // 菜单与提示由应用按会话列表同步（隐藏到托盘后也能直接跳回某个标签）。
         let _ = window_handle.update(cx, |app, _, cx| app.sync_tray(cx));
+        cx.on_tray_icon_event(move |event, cx| {
+            if matches!(event, TrayIconEvent::LeftClick) {
+                window_handle
+                    .update(cx, |_, window, _| window.activate_window())
+                    .ok();
+            }
+        });
         cx.on_tray_menu_action(move |id: SharedString, cx: &mut App| {
             if let Some(rest) = id.strip_prefix("tab:") {
                 if let Ok(tab_id) = rest.parse::<usize>() {
@@ -11217,10 +11680,11 @@ mod tests {
     use super::{
         AUTO_RECONNECT_MAX, CONNECT_TIMEOUT_DEFAULT, CONNECT_TIMEOUT_MAX, CONNECT_TIMEOUT_MIN,
         CUSTOM_ANSI_BASE, CUSTOM_BRIGHT_BASE, CUSTOM_DEFAULT_ANSI, CUSTOM_DEFAULT_BRIGHT,
-        FONT_SIZE_MAX, FONT_SIZE_MIN, ForwardPrefs, JumpPrefs, LINE_HEIGHT_MAX, LINE_HEIGHT_MIN,
-        LocalShellPrefs, Metric, SavedForward, SessionPrefs, SidebarPrefs, StatusBarPrefs,
-        TERMINAL_THEME_DEFAULT, TerminalColors, TerminalPrefs, auto_reconnect_delay,
-        format_remote_time, hex_to_hsla, normalize_hex, safe_local_name,
+        FONT_SIZE_MAX, FONT_SIZE_MIN, FileBrowser, FileSortKey, ForwardPrefs, JumpPrefs,
+        LINE_HEIGHT_MAX, LINE_HEIGHT_MIN, LocalShellPrefs, Metric, SavedForward, SessionPrefs,
+        SidebarPrefs, StatusBarPrefs, TERMINAL_THEME_DEFAULT, TerminalColors, TerminalPrefs,
+        auto_reconnect_delay, format_remote_time_short, hex_to_hsla, normalize_hex, remote_fs,
+        safe_local_name,
     };
     use crate::session::ForwardKind;
 
@@ -11247,8 +11711,51 @@ mod tests {
 
     #[test]
     fn remote_time_uses_utc() {
-        assert_eq!(format_remote_time(0), "1970-01-01 00:00");
-        assert_eq!(format_remote_time(1_700_000_000), "2023-11-14 22:13");
+        assert_eq!(format_remote_time_short(0), "01-01 00:00");
+        assert_eq!(format_remote_time_short(1_700_000_000), "11-14 22:13");
+    }
+
+    fn entry(name: &str, is_dir: bool, size: u64, modified: Option<u32>) -> remote_fs::Entry {
+        remote_fs::Entry {
+            name: name.to_string(),
+            is_dir,
+            is_symlink: false,
+            size,
+            modified,
+            permissions: Some(0o644),
+        }
+    }
+
+    #[test]
+    fn file_sort_keeps_dirs_first_and_follows_key() {
+        let mut files = FileBrowser::default();
+        files.entries = vec![
+            entry("zeta", true, 0, None),
+            entry("Beta.txt", false, 20, Some(2)),
+            entry("alpha.txt", false, 10, Some(3)),
+        ];
+        files.sort_entries();
+        let names = |files: &FileBrowser| {
+            files
+                .entries
+                .iter()
+                .map(|entry| entry.name.clone())
+                .collect::<Vec<_>>()
+        };
+        // 名称升序：目录在前，文件按小写名称排。
+        assert_eq!(names(&files), ["zeta", "alpha.txt", "Beta.txt"]);
+        files.sort_desc = true;
+        files.sort_entries();
+        // 名称降序只反转文件之间的顺序，目录仍在最前。
+        assert_eq!(names(&files), ["zeta", "Beta.txt", "alpha.txt"]);
+
+        files.sort = FileSortKey::Size;
+        files.sort_desc = true;
+        files.sort_entries();
+        assert_eq!(names(&files), ["zeta", "Beta.txt", "alpha.txt"]);
+        files.sort_desc = false;
+        files.sort_entries();
+        assert_eq!(names(&files), ["zeta", "alpha.txt", "Beta.txt"]);
     }
 
     #[test]

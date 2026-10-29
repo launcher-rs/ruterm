@@ -16,8 +16,10 @@ use russh::Channel;
 use russh::ChannelId;
 use russh::client::{self, ChannelOpenHandle, Msg, Session};
 use russh::keys::{HashAlg, PublicKey, PublicKeyOrCertificate};
+use tokio::sync::mpsc;
 
 use crate::paths::StorageMode;
+use crate::session::CwdHint;
 use crate::vault::{Trust, Vault};
 
 /// 终端侧应当忽略的下行通道集合。
@@ -65,6 +67,90 @@ pub fn legacy_known_hosts_path() -> PathBuf {
     StorageMode::detect().legacy_path(crate::paths::LEGACY_KNOWN_HOSTS_FILE)
 }
 
+/// OSC 7 状态机：在远端 shell 的下行字节流里识别 `ESC ] 7 ; file://host/path BEL`
+/// （或 `ESC \` 终止），解码后作为目录线索回传 UI。
+///
+/// 跨 `data()` 调用保持状态，避免序列被分片时漏识别；超过 4KB 的 payload 直接丢弃，
+/// 防止畸形序列把缓冲区撑爆。
+#[derive(Default)]
+struct Osc7Scan {
+    state: Osc7State,
+}
+
+enum Osc7State {
+    Idle { matched: u8 },
+    Collecting { buf: Vec<u8>, esc_seen: bool },
+}
+
+impl Default for Osc7State {
+    fn default() -> Self {
+        Self::Idle { matched: 0 }
+    }
+}
+
+const OSC7_PREFIX: &[u8] = b"\x1b]7;";
+
+impl Osc7Scan {
+    fn feed(&mut self, data: &[u8], cwd: &Option<mpsc::UnboundedSender<CwdHint>>) {
+        for &b in data {
+            match &mut self.state {
+                Osc7State::Idle { matched } => {
+                    let idx = *matched as usize;
+                    if idx < OSC7_PREFIX.len() && b == OSC7_PREFIX[idx] {
+                        *matched += 1;
+                        if *matched as usize == OSC7_PREFIX.len() {
+                            self.state = Osc7State::Collecting {
+                                buf: Vec::new(),
+                                esc_seen: false,
+                            };
+                        }
+                    } else if b == OSC7_PREFIX[0] {
+                        *matched = 1;
+                    } else {
+                        *matched = 0;
+                    }
+                }
+                Osc7State::Collecting { buf, esc_seen } => {
+                    if *esc_seen {
+                        *esc_seen = false;
+                        if b == b'\\' {
+                            let payload = std::mem::take(buf);
+                            self.state = Osc7State::Idle { matched: 0 };
+                            Self::emit(&payload, cwd);
+                        } else {
+                            // ESC 不是 ST 终止的一部分，按字面量保留。
+                            buf.push(0x1b);
+                            buf.push(b);
+                        }
+                    } else if b == 0x07 {
+                        let payload = std::mem::take(buf);
+                        self.state = Osc7State::Idle { matched: 0 };
+                        Self::emit(&payload, cwd);
+                    } else if b == 0x1b {
+                        *esc_seen = true;
+                    } else if buf.len() < 4096 {
+                        buf.push(b);
+                    } else {
+                        // 超长 payload：视为畸形，丢弃并复位。
+                        self.state = Osc7State::Idle { matched: 0 };
+                    }
+                }
+            }
+        }
+    }
+
+    fn emit(payload: &[u8], cwd: &Option<mpsc::UnboundedSender<CwdHint>>) {
+        let Some(tx) = cwd else { return };
+        let Ok(s) = std::str::from_utf8(payload) else { return };
+        let Some(path) = crate::session::path_from_osc7(s) else {
+            log::debug!("[Osc7Scan] 解析 OSC 7 失败: {:?}", s);
+            return;
+        };
+        log::debug!("[Osc7Scan] 检测到 OSC 7: {}", path);
+        let _ = tx.send(CwdHint::Report(path));
+    }
+}
+
 /// 主机密钥的 SHA-256 指纹（hex 形式，避免依赖 base64 feature）。
 fn fingerprint_hex(key: &PublicKey) -> String {
     key.fingerprint(HashAlg::Sha256)
@@ -96,24 +182,30 @@ pub struct SshTerminalHandler {
     /// 加密凭据库；None 表示降级模式，known_hosts 回退旧文件。
     vault: Option<Arc<Vault>>,
     /// 交互通道结束信号：让会话任务退出 `handle.await`，释放底层连接。
-    ended: tokio::sync::mpsc::UnboundedSender<()>,
+    ended: mpsc::UnboundedSender<()>,
     /// 远程转发通道交给会话任务统一接本地目标（Handler 里不放业务状态）。
-    forwarded: tokio::sync::mpsc::UnboundedSender<ForwardedTcpip>,
+    forwarded: mpsc::UnboundedSender<ForwardedTcpip>,
     /// 安装后终端通道的下行字节转交 lrzsz 上传任务（见 [`ZmodemSink`]）。
     zmodem: Option<ZmodemSink>,
+    /// 目录线索回传：仅目标会话持有（跳板机为 None），下行字节经 OSC 7 扫描后投递。
+    cwd: Option<mpsc::UnboundedSender<CwdHint>>,
+    /// OSC 7 状态机：跨 `data()` 调用保持，处理分片到达的序列。
+    osc7: Osc7Scan,
 }
 
 impl SshTerminalHandler {
     /// 以下行注入句柄、主机信息、旁路通道集合与可选凭据库构造处理器。
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         feed: FeedHandle,
         host: String,
         port: u16,
         side: SideChannels,
         vault: Option<Arc<Vault>>,
-        ended: tokio::sync::mpsc::UnboundedSender<()>,
-        forwarded: tokio::sync::mpsc::UnboundedSender<ForwardedTcpip>,
+        ended: mpsc::UnboundedSender<()>,
+        forwarded: mpsc::UnboundedSender<ForwardedTcpip>,
         zmodem: Option<ZmodemSink>,
+        cwd: Option<mpsc::UnboundedSender<CwdHint>>,
     ) -> Self {
         Self {
             feed,
@@ -124,6 +216,8 @@ impl SshTerminalHandler {
             ended,
             forwarded,
             zmodem,
+            cwd,
+            osc7: Osc7Scan::default(),
         }
     }
 
@@ -313,6 +407,8 @@ impl client::Handler for SshTerminalHandler {
         if self.side.contains(channel) {
             return Ok(());
         }
+        // 先扫描 OSC 7（shell 工作目录上报），再决定是否转交 zmodem / 终端。
+        self.osc7.feed(data, &self.cwd);
         if !self.divert_zmodem(data) {
             self.feed.feed(data.to_vec());
         }
@@ -329,7 +425,9 @@ impl client::Handler for SshTerminalHandler {
         if self.side.contains(channel) {
             return Ok(());
         }
-        // stderr 与 stdout 在远端 PTY 下本就是同一条流，统一灌入终端。
+        // stderr 与 stdout 在远端 PTY 下本就是同一条流，统一灌入终端；
+        // OSC 7 只走 stdout，但扫描一下也无害（非 file:// 前缀会被丢弃）。
+        self.osc7.feed(data, &self.cwd);
         if !self.divert_zmodem(data) {
             self.feed.feed(data.to_vec());
         }

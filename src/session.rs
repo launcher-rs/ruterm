@@ -173,6 +173,11 @@ pub enum SessionCommand {
     Home {
         reply: oneshot::Sender<Result<String>>,
     },
+    /// 文件面板"跟随终端"：确认某路径是远端目录（用于校验 cd 猜测与 OSC 7 上报）。
+    FsStat {
+        path: String,
+        reply: oneshot::Sender<Result<bool>>,
+    },
     /// 执行一次上传 / 下载。
     Transfer(transfer::Task),
     /// 文件面板：列出目录（None / `~` 表示登录主目录）。
@@ -219,12 +224,23 @@ pub enum SessionCommand {
     },
 }
 
+/// 终端目录线索：文件面板"跟随终端"的输入源。
+#[derive(Debug)]
+pub enum CwdHint {
+    /// 从键入流里识别出的 cd / pushd 参数（空串＝回主目录）。
+    Cd(String),
+    /// 远端 shell 通过 OSC 7 上报的绝对路径（已百分号解码）。
+    Report(String),
+}
+
 /// 一次 SSH 会话：连接主体 + 远程基本信息回传 + 启动标记。
 pub struct SshSession {
     /// 会话任务，必须被持有（提前 drop 会取消 SSH）。
     pub join: Task<Result<()>>,
     /// 远程主机基本信息流（连接期间每 [`PROBE_INTERVAL`] 刷新一次；探测失败时无数据）。
     pub remote_info: mpsc::UnboundedReceiver<RemoteInfo>,
+    /// 终端工作目录确认流：仅在 SFTP 校验"确为目录"后回传（跟随时面板据此跳转）。
+    pub cwd_events: mpsc::UnboundedReceiver<String>,
     /// shell 是否成功开启。失败发生在开启之前＝没建立过终端，标签页应保留展示错误。
     pub started: Arc<AtomicBool>,
     /// shell 成功开启时发送一次：UI 据此记录"连接真正可用"的时刻（判断会话是否稳定过）。
@@ -259,6 +275,7 @@ pub fn start<C: AppContext>(
     let ExternalHandles { feed, rx } = handles;
     let (ui_tx, ui_rx) = mpsc::unbounded_channel::<PtyBoundMessage>();
     let (info_tx, info_rx) = mpsc::unbounded_channel::<RemoteInfo>();
+    let (cwd_tx, cwd_rx) = mpsc::unbounded_channel::<String>();
     let (ready_tx, ready_rx) = oneshot::channel::<()>();
     let (disconnect_tx, disconnect_rx) = oneshot::channel::<()>();
     let (command_tx, command_rx) = mpsc::unbounded_channel::<SessionCommand>();
@@ -290,6 +307,7 @@ pub fn start<C: AppContext>(
             feed,
             ui_rx,
             info_tx,
+            cwd_tx,
             started_flag,
             vault,
             disconnect_rx,
@@ -310,6 +328,7 @@ pub fn start<C: AppContext>(
     SshSession {
         join,
         remote_info: info_rx,
+        cwd_events: cwd_rx,
         started,
         ready: ready_rx,
         disconnect: disconnect_tx,
@@ -324,14 +343,18 @@ async fn run(
     feed: FeedHandle,
     ui_rx: mpsc::UnboundedReceiver<PtyBoundMessage>,
     info_tx: mpsc::UnboundedSender<RemoteInfo>,
+    cwd_tx: mpsc::UnboundedSender<String>,
     started: Arc<AtomicBool>,
     vault: Option<Arc<crate::vault::Vault>>,
     mut disconnect: oneshot::Receiver<()>,
     mut commands: mpsc::UnboundedReceiver<SessionCommand>,
-    _command_keepalive: mpsc::UnboundedSender<SessionCommand>,
+    command_keepalive: mpsc::UnboundedSender<SessionCommand>,
     connect_timeout: Duration,
     ready: oneshot::Sender<()>,
 ) -> Result<()> {
+    // 终端目录线索：上行键入解析（cd 参数）与下行 OSC 7 上报汇入同一条队列，
+    // 由校验任务逐条经 SFTP 确认后再回传 UI，猜测错误不会污染面板。
+    let (cwd_hint_tx, cwd_hint_rx) = mpsc::unbounded_channel::<CwdHint>();
     // 远程转发的通道由 Handler 接住后递到这里：会话循环统一拨本机目标并搬运字节。
     let (forwarded_tx, mut forwarded_rx) = mpsc::unbounded_channel::<ForwardedTcpip>();
     // lrzsz 上传的接管点与原始上行通道：接管期间终端输出改投 ZMODEM 状态机，
@@ -384,6 +407,7 @@ async fn run(
                 } else {
                     None
                 },
+                if is_target { Some(cwd_hint_tx.clone()) } else { None },
             );
             let hop = if index == 0 {
                 String::new()
@@ -454,7 +478,11 @@ async fn run(
         };
 
     // 上行转发先落地：探测通道握手即使被慢服务器拖住，也不能延迟按键转发。
-    tokio::spawn(forward_uplink(channel, ui_rx, raw_rx));
+    tokio::spawn(forward_uplink(channel, ui_rx, raw_rx, cwd_hint_tx));
+
+    // 目录线索校验：cd 猜测与 OSC 7 上报都先经 SFTP 确认"确为目录"，
+    // 只有确认成功才回传 UI 并推进本地跟踪状态（失败=cd 没成功，面板原地不动）。
+    tokio::spawn(follow_cwd(cwd_hint_rx, command_keepalive, cwd_tx));
 
     probe_remote_info(&handle, side.clone(), info_tx).await;
 
@@ -526,6 +554,21 @@ async fn run(
                         }
                         .await;
                         // 失败后丢掉缓存：下次点击重开子系统，避免抱着坏通道反复报错。
+                        if result.is_err() {
+                            fs_sftp = None;
+                        }
+                        let _ = reply.send(result);
+                    }
+                    SessionCommand::FsStat { path, reply } => {
+                        let result = async {
+                            let sftp = cached_sftp(&handle, &side, &mut fs_sftp).await?;
+                            let meta = sftp
+                                .metadata(&path)
+                                .await
+                                .context("无法读取远端路径信息")?;
+                            Ok(meta.is_dir())
+                        }
+                        .await;
                         if result.is_err() {
                             fs_sftp = None;
                         }
@@ -1236,11 +1279,16 @@ async fn probe_remote_info(
 
 /// 终端 → 远端：按键字节写通道，尺寸变化发 window_change；
 /// 另有原始字节通道给 lrzsz 上传直接写协议帧。
+///
+/// 同时逐字节扫描用户键入，识别 `cd` / `pushd` 行并作为目录线索回传，
+/// 由 [`follow_cwd`] 校验后再回传 UI，避免 cd 失败或含变量替换时污染面板。
 async fn forward_uplink(
     channel: SessionChannel,
     mut ui_rx: mpsc::UnboundedReceiver<PtyBoundMessage>,
     mut raw_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    cwd_hint_tx: mpsc::UnboundedSender<CwdHint>,
 ) {
+    let mut tracker = CwdKeystrokes::default();
     loop {
         let sent = tokio::select! {
             maybe = ui_rx.recv() => {
@@ -1249,6 +1297,9 @@ async fn forward_uplink(
                 };
                 match message {
                     PtyBoundMessage::Input(bytes) => {
+                        if let Some(arg) = tracker.feed(&bytes) {
+                            let _ = cwd_hint_tx.send(CwdHint::Cd(arg));
+                        }
                         channel.data_bytes(Bytes::from(bytes)).await
                     }
                     PtyBoundMessage::Resize(size) => {
@@ -1272,6 +1323,322 @@ async fn forward_uplink(
             log::debug!("上行通道已失效，结束转发");
             return;
         }
+    }
+}
+
+/// 逐字节跟踪用户键入：把终端的按键流还原成一行命令，识别 cd / pushd。
+///
+/// 遇到不可还原的编辑（方向键、Tab 补全、Ctrl+A 等）就把整行标成"不可信"，
+/// 宁可漏报也不误报——面板跳错目录比不跟更糟。
+#[derive(Default)]
+struct CwdKeystrokes {
+    buf: Vec<u8>,
+    skip: bool,
+}
+
+impl CwdKeystrokes {
+    fn feed(&mut self, bytes: &[u8]) -> Option<String> {
+        let mut done = None;
+        for &b in bytes {
+            match b {
+                0x0d | 0x0a => {
+                    if !self.skip
+                        && let Ok(line) = std::str::from_utf8(&self.buf)
+                        && let Some(arg) = cd_arg_from_line(line)
+                    {
+                        log::debug!("[CwdKeystrokes] 检测到 cd: {}", arg);
+                        done = Some(arg);
+                    } else if !self.skip {
+                        if let Ok(line) = std::str::from_utf8(&self.buf) {
+                            log::debug!("[CwdKeystrokes] 行结束但未检测到 cd: {:?}", line);
+                        }
+                    }
+                    self.buf.clear();
+                    self.skip = false;
+                }
+                0x03 | 0x15 => {
+                    // Ctrl+C / Ctrl+U：清空缓冲区，整行作废。
+                    self.buf.clear();
+                    self.skip = false;
+                }
+                0x17 => {
+                    // Ctrl+W：删除上一个词；只按 ASCII 空格切词，
+                    // 遇到 UTF-8 多字节字符会留下残缺字节，finalize 时 from_utf8 失败 → 整行跳过。
+                    while self.buf.last().is_some_and(|&b| b == b' ') {
+                        self.buf.pop();
+                    }
+                    while self.buf.last().is_some_and(|&b| b != b' ') {
+                        self.buf.pop();
+                    }
+                }
+                0x7f | 0x08 => {
+                    self.buf.pop();
+                }
+                0x1b | 0x09 => {
+                    // ESC（方向键 / 历史 / 粘贴括号）或 Tab（补全）：行内容已不可还原。
+                    self.skip = true;
+                }
+                b if b < 0x20 => {
+                    // 其他控制字符（Ctrl+A/E/B/F 等）：行编辑已偏离缓冲区。
+                    self.skip = true;
+                }
+                _ => {
+                    if self.buf.len() < 4096 {
+                        self.buf.push(b);
+                    } else {
+                        self.skip = true;
+                    }
+                }
+            }
+            if done.is_some() {
+                break;
+            }
+        }
+        done
+    }
+}
+
+/// 从一行命令里提取 cd / pushd 的目标路径（空串＝回主目录）。
+///
+/// 仅处理最简情形：行首命令是 `cd` 或 `pushd`，参数在第一个分号/管道/逻辑与/注释前，
+/// 成对引号会被剥掉；其余情形（含变量替换、通配、~user、pushd 无参等）一律返回 None，
+/// 由校验任务保守地跳过，避免面板跳到错误目录。
+fn cd_arg_from_line(line: &str) -> Option<String> {
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
+    let (cmd, rest) = match line.split_once(char::is_whitespace) {
+        Some((cmd, rest)) => (cmd, rest.trim()),
+        None => (line, ""),
+    };
+    if cmd != "cd" && cmd != "pushd" {
+        return None;
+    }
+    // pushd 无参 = 交换栈顶，无法跟踪；cd 无参 = 回主目录。
+    if cmd == "pushd" && rest.is_empty() {
+        return None;
+    }
+    let first = rest.split([';', '|', '&', '#']).next()?.trim();
+    let mut arg = first;
+    if arg.len() >= 2
+        && let Some(stripped) = strip_matching_quotes(arg)
+    {
+        arg = stripped;
+    }
+    // 丢弃前导选项（-L / -P / -e ...），但保留裸 "-"（回 OLDPWD）。
+    while arg.starts_with('-') && arg != "-" && arg.len() > 1 {
+        match arg.split_once(char::is_whitespace) {
+            Some((_, tail)) => arg = tail.trim(),
+            None => return None,
+        }
+    }
+    if arg.contains('$')
+        || arg.contains('`')
+        || arg.contains('*')
+        || arg.contains('?')
+        || (arg.starts_with('~') && arg != "~" && !arg.starts_with("~/"))
+    {
+        return None;
+    }
+    Some(arg.to_string())
+}
+
+fn strip_matching_quotes(s: &str) -> Option<&str> {
+    let bytes = s.as_bytes();
+    let first = bytes.first()?;
+    let last = bytes.last()?;
+    if (first == &b'"' && last == &b'"') || (first == &b'\'' && last == &b'\'') {
+        Some(&s[1..s.len() - 1])
+    } else {
+        None
+    }
+}
+
+/// 把相对路径按 POSIX 规则词法拼接到 base（base 必须绝对），
+/// 不查文件系统：`..` 弹栈、`.` 跳过、空段忽略。cd 失败时校验任务会拒收，
+/// 所以这里的"乐观拼接"不会污染面板。
+fn lex_join(base: &str, rel: &str) -> String {
+    let mut stack: Vec<&str> = base
+        .split('/')
+        .filter(|s| !s.is_empty() && *s != ".")
+        .collect();
+    for part in rel.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                stack.pop();
+            }
+            other => stack.push(other),
+        }
+    }
+    if stack.is_empty() {
+        "/".to_string()
+    } else {
+        let mut out = String::with_capacity(stack.iter().map(|s| s.len() + 1).sum());
+        out.push('/');
+        for (i, seg) in stack.iter().enumerate() {
+            if i > 0 {
+                out.push('/');
+            }
+            out.push_str(seg);
+        }
+        out
+    }
+}
+
+/// 百分号解码（`%XX` → 字节），非 UTF-8 序列用 lossy 还原；
+/// 无效 `%` 序列原样保留，避免把用户路径里的 `%` 误吞。
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 3 <= bytes.len() {
+            let hi = bytes[i + 1];
+            let lo = bytes[i + 2];
+            if let (Some(h), Some(l)) = (hex_digit(hi), hex_digit(lo)) {
+                out.push((h << 4) | l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_digit(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// 解析 OSC 7 上报的 `file://host/path` 或 `file:///path`，返回解码后的绝对路径。
+pub fn path_from_osc7(payload: &str) -> Option<String> {
+    let rest = payload.strip_prefix("file://")?;
+    let idx = rest.find('/')?;
+    let path = &rest[idx..];
+    if !path.starts_with('/') {
+        return None;
+    }
+    Some(percent_decode(path))
+}
+
+/// 校验任务：按序处理 cd / OSC 7 线索，解析出绝对路径后用 SFTP 确认是目录，
+/// 成功才回传 UI。顺序处理避免快速连 cd 时校验乱序导致面板跳错。
+async fn follow_cwd(
+    mut hints: mpsc::UnboundedReceiver<CwdHint>,
+    commands: mpsc::UnboundedSender<SessionCommand>,
+    confirmed: mpsc::UnboundedSender<String>,
+) {
+    let mut cwd: Option<String> = None;
+    let mut old: Option<String> = None;
+    let mut home: Option<String> = None;
+
+    while let Some(hint) = hints.recv().await {
+        log::debug!("[follow_cwd] 收到线索: {:?}", hint);
+        let (candidate, is_cd) = match hint {
+            CwdHint::Report(path) => {
+                if !path.starts_with('/') {
+                    continue;
+                }
+                (Some(path), false)
+            }
+            CwdHint::Cd(arg) => {
+                let arg = arg.trim().to_string();
+                let resolved = if arg.is_empty() || arg == "~" {
+                    fetch_home(&commands, &mut home).await
+                } else if arg == "-" {
+                    old.clone()
+                } else if let Some(rest) = arg.strip_prefix("~/") {
+                    fetch_home(&commands, &mut home)
+                        .await
+                        .map(|h| lex_join(&h, rest))
+                } else if arg.starts_with('/') {
+                    Some(arg)
+                } else {
+                    // 相对路径：以当前 cwd 为基准；首次 cd 时 shell 默认在主目录，
+                    // 同步取一次 home 作为起点，避免首条相对 cd 被丢弃。
+                    let base = if let Some(b) = cwd.clone() {
+                        Some(b)
+                    } else {
+                        fetch_home(&commands, &mut home).await
+                    };
+                    base.map(|b| lex_join(&b, &arg))
+                };
+                (resolved, true)
+            }
+        };
+        let Some(path) = candidate else {
+            log::debug!("[follow_cwd] 线索无法解析，跳过");
+            continue;
+        };
+        log::debug!("[follow_cwd] 校验路径: {}", path);
+        let (reply, rx) = oneshot::channel();
+        if commands
+            .send(SessionCommand::FsStat {
+                path: path.clone(),
+                reply,
+            })
+            .is_err()
+        {
+            return;
+        }
+        match rx.await {
+            Ok(Ok(true)) => {
+                log::debug!("[follow_cwd] 校验通过，发送路径: {}", path);
+                if is_cd {
+                    old = cwd.clone();
+                    cwd = Some(path.clone());
+                } else {
+                    cwd = Some(path.clone());
+                }
+                let _ = confirmed.send(path);
+            }
+            Ok(Ok(false)) => {
+                log::debug!("[follow_cwd] 校验失败（非目录）: {}", path);
+                if is_cd {
+                    cwd = old.clone();
+                }
+            }
+            Ok(Err(e)) => {
+                log::debug!("[follow_cwd] 校验出错: {}，路径: {}", e, path);
+                if is_cd {
+                    cwd = old.clone();
+                }
+            }
+            Err(_) => {
+                log::debug!("[follow_cwd] 校验通道关闭");
+                if is_cd {
+                    cwd = old.clone();
+                }
+            }
+        }
+    }
+}
+
+async fn fetch_home(
+    commands: &mpsc::UnboundedSender<SessionCommand>,
+    home: &mut Option<String>,
+) -> Option<String> {
+    if let Some(h) = home.clone() {
+        return Some(h);
+    }
+    let (reply, rx) = oneshot::channel();
+    if commands.send(SessionCommand::Home { reply }).is_err() {
+        return None;
+    }
+    match rx.await {
+        Ok(Ok(h)) => {
+            *home = Some(h.clone());
+            Some(h)
+        }
+        _ => None,
     }
 }
 
@@ -1486,5 +1853,101 @@ mod tests {
         client.read_exact(&mut reply).await.unwrap();
         assert_eq!(reply[1], 0x07);
         assert!(server.await.unwrap().is_err());
+    }
+
+    use super::{cd_arg_from_line, lex_join, path_from_osc7, percent_decode, CwdKeystrokes};
+
+    #[test]
+    fn cd_arg_plain_and_quoted() {
+        assert_eq!(cd_arg_from_line("cd /tmp"), Some("/tmp".into()));
+        assert_eq!(cd_arg_from_line("cd  /var/log"), Some("/var/log".into()));
+        assert_eq!(cd_arg_from_line("cd"), Some("".into()));
+        assert_eq!(cd_arg_from_line("cd ~"), Some("~".into()));
+        assert_eq!(cd_arg_from_line("cd ~/src"), Some("~/src".into()));
+        assert_eq!(cd_arg_from_line("cd -"), Some("-".into()));
+        assert_eq!(
+            cd_arg_from_line("cd \"/mnt/c/My Files\""),
+            Some("/mnt/c/My Files".into())
+        );
+        assert_eq!(
+            cd_arg_from_line("cd '/var/log'"),
+            Some("/var/log".into())
+        );
+    }
+
+    #[test]
+    fn cd_arg_strips_chain_and_options() {
+        assert_eq!(cd_arg_from_line("cd /tmp && ls"), Some("/tmp".into()));
+        assert_eq!(cd_arg_from_line("cd /tmp; pwd"), Some("/tmp".into()));
+        assert_eq!(cd_arg_from_line("cd /tmp | grep"), Some("/tmp".into()));
+        assert_eq!(cd_arg_from_line("cd /tmp # comment"), Some("/tmp".into()));
+        assert_eq!(cd_arg_from_line("cd -L /tmp"), Some("/tmp".into()));
+        assert_eq!(cd_arg_from_line("cd -L -P /tmp"), Some("/tmp".into()));
+    }
+
+    #[test]
+    fn cd_arg_rejects_unresolvable() {
+        assert_eq!(cd_arg_from_line("ls /tmp"), None);
+        assert_eq!(cd_arg_from_line("cd $HOME"), None);
+        assert_eq!(cd_arg_from_line("cd `pwd`"), None);
+        assert_eq!(cd_arg_from_line("cd *"), None);
+        assert_eq!(cd_arg_from_line("cd ~root"), None);
+        assert_eq!(cd_arg_from_line("pushd"), None);
+        assert_eq!(cd_arg_from_line(""), None);
+    }
+
+    #[test]
+    fn lex_join_handles_relative_and_dotdot() {
+        assert_eq!(lex_join("/home/user", "src"), "/home/user/src");
+        assert_eq!(lex_join("/home/user", ".."), "/home");
+        assert_eq!(lex_join("/home/user", "../.."), "/");
+        assert_eq!(lex_join("/", "a/b"), "/a/b");
+        assert_eq!(lex_join("/a/b", "./c"), "/a/b/c");
+        assert_eq!(lex_join("/a/b", "c/../d"), "/a/b/d");
+    }
+
+    #[test]
+    fn percent_decode_handles_utf8_and_invalid() {
+        assert_eq!(percent_decode("/tmp"), "/tmp");
+        assert_eq!(percent_decode("/a%20b"), "/a b");
+        // 中文 UTF-8 路径：`中` = E4 B8 AD
+        assert_eq!(percent_decode("/%E4%B8%AD"), "/中");
+        // 无效百分号保留原样
+        assert_eq!(percent_decode("/a%ZZb"), "/a%ZZb");
+        assert_eq!(percent_decode("/a%2"), "/a%2");
+    }
+
+    #[test]
+    fn path_from_osc7_parses_host_and_empty_host() {
+        assert_eq!(
+            path_from_osc7("file://server/tmp/logs"),
+            Some("/tmp/logs".into())
+        );
+        assert_eq!(
+            path_from_osc7("file:///home/user"),
+            Some("/home/user".into())
+        );
+        assert_eq!(
+            path_from_osc7("file://h/a%20b"),
+            Some("/a b".into())
+        );
+        assert_eq!(path_from_osc7("not-a-uri"), None);
+        assert_eq!(path_from_osc7("file://host"), None);
+    }
+
+    #[test]
+    fn keystroke_tracker_detects_cd_and_ignores_escapes() {
+        let mut t = CwdKeystrokes::default();
+        assert_eq!(t.feed(b"cd /tmp\r"), Some("/tmp".into()));
+        // 方向键（ESC）+ 回车：整行不可信
+        assert_eq!(t.feed(b"cd /var\x1b[Ar"), None);
+        assert_eq!(t.feed(b"\r"), None);
+        // 退格正常处理
+        assert_eq!(t.feed(b"cd /tmpx\x7f\r"), Some("/tmp".into()));
+        // Ctrl+W 删词
+        assert_eq!(t.feed(b"cd /tmp /var\x17\r"), Some("/tmp".into()));
+        // Ctrl+C 清空
+        assert_eq!(t.feed(b"garbage\x03"), None);
+        assert_eq!(t.feed(b"cd /etc\r"), Some("/etc".into()));
     }
 }
