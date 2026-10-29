@@ -13,6 +13,7 @@ mod session;
 mod sessions;
 mod ssh;
 mod ssh_config;
+mod telnet;
 mod transfer;
 mod vault;
 mod zmodem;
@@ -52,7 +53,7 @@ use crate::config::SshTarget;
 use crate::local_shell::ShellProfile;
 use crate::paths::StorageMode;
 use crate::remote::{Metric, RemoteInfo};
-use crate::sessions::{AuthMethod, HostConfig, SessionStore};
+use crate::sessions::{AuthMethod, HostConfig, ProtocolKind, SessionStore};
 use crate::vault::Vault;
 
 // 文件面板自己的图标（来自 lucide，ISC 许可）：rgpui 内置集合里没有合适的
@@ -525,17 +526,30 @@ struct ForwardDialog {
 
 /// 断线标签的重连参数快照。
 #[derive(Clone)]
-struct Resume {
-    /// 原连接目标（含仅内存持有的密码/口令，绝不落盘）。
-    target: SshTarget,
-    /// 来源主机（None＝命令行快速连接）；重连时优先用列表里的最新配置。
-    host: Option<HostConfig>,
-    /// 秘密是否取自加密库：重连仍失败时据此清掉库里的坏凭据。
-    secret_from_vault: bool,
+enum Resume {
+    /// SSH 会话。
+    Ssh {
+        /// 原连接目标（含仅内存持有的密码/口令，绝不落盘）。
+        target: SshTarget,
+        /// 来源主机（None＝命令行快速连接）；重连时优先用列表里的最新配置。
+        host: Option<HostConfig>,
+        /// 秘密是否取自加密库：重连仍失败时据此清掉库里的坏凭据。
+        secret_from_vault: bool,
+    },
+    /// Telnet 会话（明文 TCP，无秘密）。
+    Telnet {
+        /// 地址与端口：主机被删或改成 SSH 时仍能按原地址重连。
+        host: String,
+        port: u16,
+        /// 来源主机：重连时优先用列表里的最新地址 / 端口。
+        source: Option<HostConfig>,
+    },
 }
 
 /// 新建/编辑主机表单（各字段为受控输入状态）。
 struct NewHostForm {
+    /// 连接协议：决定下方哪些字段与认证方式有效。
+    protocol: ProtocolKind,
     name: Entity<InputState>,
     host: Entity<InputState>,
     port: Entity<InputState>,
@@ -1216,6 +1230,58 @@ impl JumpPrefs {
     }
 }
 
+/// 主机 → 协议映射（host id → protocol）。
+///
+/// 为什么不进 hosts 表：同 [`JumpPrefs`]，加密库的表由 toasty 建模，加列要手工
+/// ALTER 旧库；协议只记录非 SSH 的项，随 `settings` 表的 `protocols` 键持久化，
+/// 启动后回填到 [`HostConfig::protocol`]。降级模式直接随 sessions.json 落盘。
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProtocolPrefs {
+    /// 键是字符串形式的 host id（JSON 对象的键只能是字符串）。
+    #[serde(default)]
+    protocols: BTreeMap<String, ProtocolKind>,
+}
+
+impl ProtocolPrefs {
+    fn protocol_of(&self, host_id: i64) -> Option<ProtocolKind> {
+        self.protocols.get(&host_id.to_string()).copied()
+    }
+
+    fn set(&mut self, host_id: i64, protocol: ProtocolKind) -> bool {
+        let key = host_id.to_string();
+        match protocol {
+            ProtocolKind::Ssh => self.protocols.remove(&key).is_some(),
+            protocol => self.protocols.insert(key, protocol) != Some(protocol),
+        }
+    }
+
+    fn forget(&mut self, host_id: i64) {
+        self.protocols.remove(&host_id.to_string());
+    }
+
+    /// 迁移时把 JSON 里已有的协议选择转成映射（只收 Telnet 这类非默认值）。
+    fn from_hosts(hosts: &[HostConfig]) -> Self {
+        let mut prefs = Self::default();
+        for host in hosts {
+            if host.id != 0 && host.protocol != ProtocolKind::Ssh {
+                prefs.set(host.id, host.protocol);
+            }
+        }
+        prefs
+    }
+
+    fn to_json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
+    }
+
+    fn from_json(text: &str) -> Self {
+        if text.is_empty() {
+            return Self::default();
+        }
+        serde_json::from_str(text).unwrap_or_default()
+    }
+}
+
 /// 本机 shell 的偏好：自定义展示名 + 起始工作目录 + 启动参数 + 环境变量
 /// （按 profile id = 路径 + 参数记账）。
 ///
@@ -1587,6 +1653,8 @@ struct RuTermApp {
     sidebar: SidebarPrefs,
     /// 主机 → 跳板机映射（host id → jump id），双层持久化。
     jumps: JumpPrefs,
+    /// 主机 → 协议映射（host id → protocol），双层持久化。
+    protocols: ProtocolPrefs,
     /// 分组新建 / 重命名弹窗（`renaming` 为 None 表示新建）。
     group_prompt: Option<GroupPrompt>,
     /// 删除二次确认（真实下标；浮层遮挡期间列表不会变）。
@@ -1721,6 +1789,7 @@ impl RuTermApp {
         let sidebar = SidebarPrefs::from_json(&settings.sidebar);
         let forward_prefs = ForwardPrefs::from_json(&settings.forwards);
         let jumps = JumpPrefs::from_json(&settings.jumps);
+        let protocols = ProtocolPrefs::from_json(&settings.protocols);
         // 终端配色预设管理器：全局一份，`TerminalView::set_theme` 与自建样式都从这里取。
         if !cx.has_global::<ThemeManager>() {
             cx.set_global(ThemeManager::new(None));
@@ -1800,6 +1869,7 @@ impl RuTermApp {
             tab_scroll: ScrollHandle::new(),
             sidebar,
             jumps,
+            protocols,
             group_prompt: None,
             confirm_delete: None,
             unlock: None,
@@ -1876,6 +1946,7 @@ impl RuTermApp {
             format!("{}:{}", target.host, target.port)
         };
         let host = HostConfig {
+            protocol: ProtocolKind::Ssh,
             id: 0,
             name,
             host: target.host.clone(),
@@ -2155,6 +2226,32 @@ impl RuTermApp {
                     }
                 });
             }
+            // 协议映射同样以库内为准；库里读出的主机一律按 SSH 看待，
+            // 因此还要把开库前新增 / 迁移进来的 Telnet 选择并进偏好，避免被覆盖。
+            let stored_protocols = vault
+                .setting("protocols")
+                .await
+                .ok()
+                .flatten()
+                .map(|json| ProtocolPrefs::from_json(&json))
+                .unwrap_or_default();
+            let _ = this.update(cx, |this, cx| {
+                let mut prefs = stored_protocols;
+                let mut changed = false;
+                for host in &this.hosts {
+                    if host.id != 0 && host.protocol != ProtocolKind::Ssh {
+                        changed |= prefs.set(host.id, host.protocol);
+                    }
+                }
+                if changed {
+                    this.persist_protocols(cx);
+                }
+                if this.protocols != prefs {
+                    this.protocols = prefs;
+                    this.apply_protocols();
+                    cx.notify();
+                }
+            });
         })
         .detach();
     }
@@ -4150,6 +4247,12 @@ impl RuTermApp {
                 host.id = index as i64 + 1;
             }
             vault.import_hosts(&imported).await?;
+            // 协议不在 hosts 表列里：把 JSON 里的 Telnet 选择写进 settings 的
+            // protocols 键，否则下次启动会全部按 SSH 处理。
+            let protocols = ProtocolPrefs::from_hosts(&imported);
+            if !protocols.protocols.is_empty() {
+                let _ = vault.set_setting("protocols", &protocols.to_json()).await;
+            }
             return Ok(imported);
         }
         Ok(existing)
@@ -4222,6 +4325,7 @@ impl RuTermApp {
                 None => (AuthMethod::Agent, String::new()),
             };
             let mut host = HostConfig {
+                protocol: ProtocolKind::Ssh,
                 id: 0,
                 name: entry.alias,
                 host: entry.host_name,
@@ -4277,6 +4381,10 @@ impl RuTermApp {
     ) {
         let existing = edit_index.and_then(|index| self.hosts.get(index).cloned());
         let editing = existing.is_some();
+        let protocol = existing
+            .as_ref()
+            .map(|host| host.protocol)
+            .unwrap_or_default();
         let auth = existing
             .as_ref()
             .map(|host| host.auth)
@@ -4296,6 +4404,7 @@ impl RuTermApp {
             "展示名（留空用主机地址）"
         };
         let form = NewHostForm {
+            protocol,
             name: cx.new(|cx| {
                 let input = InputState::new(window, cx).placeholder(placeholder_name);
                 match &existing {
@@ -4311,7 +4420,11 @@ impl RuTermApp {
                 }
             }),
             port: cx.new(|cx| {
-                let input = InputState::new(window, cx).default_value("22");
+                let default_port = match protocol {
+                    ProtocolKind::Ssh => "22",
+                    ProtocolKind::Telnet => "23",
+                };
+                let input = InputState::new(window, cx).default_value(default_port);
                 match &existing {
                     Some(host) => InputState::new(window, cx).default_value(host.port.to_string()),
                     None => input,
@@ -4371,16 +4484,30 @@ impl RuTermApp {
             return;
         };
         let editing = form.editing;
-        let auth = form.auth;
+        let protocol = form.protocol;
+        // Telnet 不使用 SSH 认证材料：认证方式与私钥字段一律归零，
+        // 避免把旧 SSH 主机的私钥配置带到明文会话里。
+        let auth = if protocol == ProtocolKind::Telnet {
+            AuthMethod::Agent
+        } else {
+            form.auth
+        };
         let passphrase = form.passphrase.read(cx).value().trim().to_string();
         let save_secret = form.save_secret;
         let group = form.group.clone();
-        let jump = form.jump;
-        let key_inline = form.key_inline;
+        // Telnet 没有 SSH 跳板机的概念：表单切到 Telnet 时连同旧值一起清掉，
+        // 避免之后被当成 SSH 跳板机去连接一个明文端口。
+        let jump = if protocol == ProtocolKind::Telnet {
+            None
+        } else {
+            form.jump
+        };
+        let key_inline = protocol == ProtocolKind::Ssh && form.key_inline;
         let key_data = form.key_data.clone();
         let host_raw = form.host.read(cx).value().trim().to_string();
         let key_path = form.key_path.read(cx).value().trim().to_string();
         let mut host = HostConfig {
+            protocol,
             id: 0,
             name: form.name.read(cx).value().trim().to_string(),
             host: host_raw.clone(),
@@ -4390,7 +4517,10 @@ impl RuTermApp {
                 .value()
                 .trim()
                 .parse::<u16>()
-                .unwrap_or(22),
+                .unwrap_or(match protocol {
+                    ProtocolKind::Ssh => 22,
+                    ProtocolKind::Telnet => 23,
+                }),
             user: form.user.read(cx).value().trim().to_string(),
             auth,
             key_path: if key_inline { String::new() } else { key_path },
@@ -4398,7 +4528,7 @@ impl RuTermApp {
             favorite: false,
             proxy_jump: jump,
         };
-        if host.key_inline {
+        if host.protocol == ProtocolKind::Ssh && host.key_inline {
             if self.vault.is_none() {
                 self.status = "内嵌私钥需要加密凭据库（当前不可用），请改用本地私钥文件".into();
                 cx.notify();
@@ -4459,6 +4589,7 @@ impl RuTermApp {
                 self.hosts[index] = host.clone();
                 self.persist_host(&host, cx);
                 self.note_jump(&host, cx);
+                self.note_protocol(&host, cx);
                 let note = self.store_form_secret(&host, passphrase.clone(), save_secret, cx);
                 let key_note = self.store_form_key(&host, key_data, was_inline, cx);
                 self.apply_form_group(&host, group, cx);
@@ -4479,6 +4610,7 @@ impl RuTermApp {
         self.hosts.push(host.clone());
         self.persist_host(&host, cx);
         self.note_jump(&host, cx);
+        self.note_protocol(&host, cx);
         let note = self.store_form_secret(&host, passphrase, save_secret, cx);
         let key_note = self.store_form_key(&host, key_data, false, cx);
         self.apply_form_group(&host, group, cx);
@@ -4740,6 +4872,8 @@ impl RuTermApp {
                     }
                 }
                 self.persist_jumps(cx);
+                self.protocols.forget(removed.id);
+                self.persist_protocols(cx);
             }
             self.status = SharedString::from(format!("已删除主机 {label}"));
             cx.notify();
@@ -5209,6 +5343,11 @@ impl RuTermApp {
         let Some(host) = self.hosts.get(index).cloned() else {
             return;
         };
+        // Telnet 是明文 TCP，没有认证材料可问，直接建连。
+        if host.protocol == ProtocolKind::Telnet {
+            self.connect_telnet(&host, window, cx);
+            return;
+        }
         match host.auth {
             AuthMethod::Agent => {
                 let target = match self.host_target(&host, None) {
@@ -5329,6 +5468,9 @@ impl RuTermApp {
         }
         if jump.proxy_jump.is_some() {
             return Err("跳板机不能再挂跳板机，请先解除它的跳板机设置".to_string());
+        }
+        if jump.protocol != ProtocolKind::Ssh {
+            return Err("所选跳板机不是 SSH 主机，不能作为跳板".to_string());
         }
         let secret = self.password_cache.get(&jump.addr()).cloned();
         let password = if jump.auth == AuthMethod::Password {
@@ -5563,7 +5705,7 @@ impl RuTermApp {
         } else {
             AuthMethod::Agent
         };
-        let resume = Resume {
+        let resume = Resume::Ssh {
             target: target.clone(),
             host: host.clone(),
             secret_from_vault,
@@ -5791,6 +5933,181 @@ impl RuTermApp {
         cx.notify();
     }
 
+    /// 建立外接终端并启动 Telnet 会话，追加为新标签。
+    fn connect_telnet(&mut self, host: &HostConfig, window: &mut Window, cx: &mut Context<Self>) {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.view_split = None;
+        self.active_tab = Some(id);
+        let title = if host.name.trim().is_empty() {
+            format!("{}:{}", host.host, host.port)
+        } else {
+            host.name.clone()
+        };
+        self.start_telnet(
+            id,
+            title,
+            host.host.clone(),
+            host.port,
+            Some(host.clone()),
+            0,
+            false,
+            window,
+            cx,
+        );
+    }
+
+    /// 在指定标签槽位启动 Telnet 会话（与 [`Self::start_ssh`] 同形的落标签流程）：
+    /// 会话结束保留终端内容与断开横幅，可原标签重连。
+    #[allow(clippy::too_many_arguments)]
+    fn start_telnet(
+        &mut self,
+        id: usize,
+        title: String,
+        host: String,
+        port: u16,
+        source: Option<HostConfig>,
+        retry_attempt: u32,
+        reconnect: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Ok(mut builder) = TerminalBuilder::new_external(None) else {
+            log::error!("无法创建外接终端后端");
+            return;
+        };
+        let Some(handles) = builder.take_external_handles() else {
+            log::error!("new_external 之后缺失外接句柄");
+            return;
+        };
+        let terminal = cx.new(|cx| builder.subscribe(cx));
+        // 同步输入同样覆盖 Telnet 会话。
+        let mirror_tx = self.mirror_tx.clone();
+        terminal.update(cx, |terminal, _| {
+            terminal.add_middleware(Arc::new(MirrorInput { tab_id: id, tx: mirror_tx }));
+        });
+        let style = self.terminal_text_style(cx);
+        let terminal_view =
+            cx.new(|cx| TerminalView::new_with_style(terminal.clone(), style, window, cx));
+        let addr = format!("{host}:{port}");
+        let resume = Resume::Telnet {
+            host: host.clone(),
+            port,
+            source: source.clone(),
+        };
+        let crate::telnet::TelnetSession {
+            join,
+            started,
+            ready,
+            disconnect,
+        } = crate::telnet::start(
+            host,
+            port,
+            handles,
+            Duration::from_secs(self.session_prefs.connect_timeout),
+            cx,
+        );
+        // 远端关闭 / 断线 → 保留标签并展示断开横幅。
+        let close_view = terminal_view.clone();
+        cx.subscribe(&terminal, move |this, _, event: &TerminalEvent, cx| {
+            if matches!(event, TerminalEvent::CloseTerminal) && this.tab_is_current(id, &close_view)
+            {
+                this.end_session_tab(id, cx);
+            }
+        })
+        .detach();
+        cx.subscribe(&terminal, |_, _, event: &TerminalEvent, cx| {
+            if matches!(event, TerminalEvent::SearchUpdated(_)) {
+                cx.notify();
+            }
+        })
+        .detach();
+        self.status = SharedString::from(format!("正在连接 Telnet {addr}…"));
+        let tab = SessionTab {
+            id,
+            title: title.into(),
+            addr: addr.clone().into(),
+            auth: None,
+            remote_info: None,
+            terminal_view: terminal_view.clone(),
+            ended: false,
+            failed: false,
+            resume: Some(resume),
+            disconnect: Some(disconnect),
+            commands: None,
+            forwards: Vec::new(),
+            files: FileBrowser::default(),
+            terminal_cwd: None,
+            zmodem: None,
+            zmodem_progress: None,
+            auto_retry_attempt: retry_attempt,
+            auto_retry_pending: false,
+            connected_at: None,
+        };
+        match self.tabs.iter_mut().find(|tab| tab.id == id) {
+            Some(existing) if reconnect => *existing = tab,
+            Some(_) => log::warn!("标签 id {id} 已存在，忽略重复落标签"),
+            None => self.tabs.push(tab),
+        }
+        self.activate_tab(id, window, cx);
+        let ready_view = terminal_view.clone();
+        let ready_addr = addr.clone();
+        let recent_host_id = source.as_ref().map(|host| host.id).filter(|id| *id != 0);
+        cx.spawn(async move |this, cx| {
+            if ready.await.is_err() {
+                return;
+            }
+            let _ = this.update(cx, |this, cx| {
+                let Some(tab) = this
+                    .tabs
+                    .iter_mut()
+                    .find(|tab| tab.id == id && tab.terminal_view == ready_view)
+                else {
+                    return;
+                };
+                tab.connected_at = Some(Instant::now());
+                tab.auto_retry_pending = false;
+                if let Some(host_id) = recent_host_id {
+                    this.record_recent_host(host_id, cx);
+                }
+                let connecting = format!("正在连接 Telnet {ready_addr}…");
+                if this.status == connecting {
+                    this.status = SharedString::from(format!("已连接 Telnet {ready_addr}"));
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        let current_view = terminal_view.clone();
+        cx.spawn(async move |this, cx| {
+            let result = join.await;
+            let started = started.load(std::sync::atomic::Ordering::SeqCst);
+            let Some(entity) = this.upgrade() else {
+                return;
+            };
+            let entity_id = entity.entity_id();
+            let _ = cx.with_window(entity_id, move |_, cx| {
+                let _ = entity.update(cx, move |this, cx| {
+                    if !this.tab_is_current(id, &current_view) {
+                        return;
+                    }
+                    // 正常结束由终端的 CloseTerminal 收尾，这里只处理失败。
+                    let Err(error) = result else {
+                        return;
+                    };
+                    let message = if started {
+                        format!("连接中断：Telnet {addr}（{}）", session::error_summary(&error))
+                    } else {
+                        format!("连接失败：Telnet {addr}")
+                    };
+                    this.fail_session_tab(id, message.into(), started, cx);
+                });
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
     /// 标签仍属于当前这次连接（未被同 id 的新会话替换/移除）。
     fn tab_is_current(&self, id: usize, view: &Entity<TerminalView>) -> bool {
         self.tabs
@@ -5976,42 +6293,80 @@ impl RuTermApp {
         else {
             return;
         };
-        let secret_from_vault = resume.secret_from_vault;
-        let current_host = resume
-            .host
-            .as_ref()
-            .and_then(|host| self.hosts.iter().find(|item| item.id == host.id));
-        let (target, host, cache_key) = match current_host {
-            Some(host) => {
-                // 主机可能被编辑过：地址/端口/用户/认证方式以最新配置为准，
-                // 秘密沿用原会话（仅内存），避免重连时再弹一次窗。
-                let password = (host.auth == AuthMethod::Password)
-                    .then(|| resume.target.password.clone())
-                    .flatten();
-                let Ok(mut target) = self.host_target(host, password) else {
-                    self.status = "内嵌私钥不可用（加密库未解锁或数据损坏），无法重连".into();
-                    cx.notify();
-                    return;
+        match resume {
+            Resume::Ssh {
+                target: old_target,
+                host: old_host,
+                secret_from_vault,
+            } => {
+                let current_host = old_host
+                    .as_ref()
+                    .and_then(|host| self.hosts.iter().find(|item| item.id == host.id));
+                let (target, host, cache_key) = match current_host {
+                    Some(host) => {
+                        // 主机可能被编辑过：地址/端口/用户/认证方式以最新配置为准，
+                        // 秘密沿用原会话（仅内存），避免重连时再弹一次窗。
+                        let password = (host.auth == AuthMethod::Password)
+                            .then(|| old_target.password.clone())
+                            .flatten();
+                        let Ok(mut target) = self.host_target(host, password) else {
+                            self.status =
+                                "内嵌私钥不可用（加密库未解锁或数据损坏），无法重连".into();
+                            cx.notify();
+                            return;
+                        };
+                        if host.auth == AuthMethod::IdentityFile {
+                            target.passphrase = old_target.passphrase.clone();
+                        }
+                        (target, Some(host.clone()), Some(host.addr()))
+                    }
+                    None => (old_target, old_host, None),
                 };
-                if host.auth == AuthMethod::IdentityFile {
-                    target.passphrase = resume.target.passphrase.clone();
-                }
-                (target, Some(host.clone()), Some(host.addr()))
+                self.start_ssh(
+                    id,
+                    title,
+                    target,
+                    cache_key,
+                    host,
+                    secret_from_vault,
+                    retry_attempt,
+                    true,
+                    window,
+                    cx,
+                );
             }
-            None => (resume.target, resume.host, None),
-        };
-        self.start_ssh(
-            id,
-            title,
-            target,
-            cache_key,
-            host,
-            secret_from_vault,
-            retry_attempt,
-            true,
-            window,
-            cx,
-        );
+            Resume::Telnet {
+                host,
+                port,
+                source,
+            } => {
+                // 主机可能被编辑过：仍为 Telnet 时按最新地址 / 端口重连；
+                // 已改成 SSH 或已删除则沿用原地址。
+                let latest = source.as_ref().and_then(|saved| {
+                    self.hosts
+                        .iter()
+                        .find(|item| item.id == saved.id)
+                        .cloned()
+                });
+                let (host, port, source) = match latest {
+                    Some(latest) if latest.protocol == ProtocolKind::Telnet => {
+                        (latest.host.clone(), latest.port, Some(latest))
+                    }
+                    _ => (host, port, source),
+                };
+                self.start_telnet(
+                    id,
+                    title,
+                    host,
+                    port,
+                    source,
+                    retry_attempt,
+                    true,
+                    window,
+                    cx,
+                );
+            }
+        }
     }
 
     /// 用户点击标签关闭按钮。
@@ -9153,12 +9508,23 @@ impl RuTermApp {
         })
     }
 
-    /// 主机行图标：按认证方式区分，一眼看出连这台机器要什么凭据。
-    fn host_icon(auth: AuthMethod) -> IconName {
-        match auth {
-            AuthMethod::Agent => IconName::Network,
-            AuthMethod::IdentityFile => IconName::File,
-            AuthMethod::Password => IconName::CircleUser,
+    /// 主机行图标：Telnet 用地球标；SSH 按认证方式区分，一眼看出连这台机器要什么凭据。
+    fn host_icon(host: &HostConfig) -> IconName {
+        match host.protocol {
+            ProtocolKind::Telnet => IconName::Globe,
+            ProtocolKind::Ssh => match host.auth {
+                AuthMethod::Agent => IconName::Network,
+                AuthMethod::IdentityFile => IconName::File,
+                AuthMethod::Password => IconName::CircleUser,
+            },
+        }
+    }
+
+    /// 列表副标题：Telnet 前缀协议名，避免与 SSH 主机混淆。
+    fn host_subtitle(host: &HostConfig) -> String {
+        match host.protocol {
+            ProtocolKind::Ssh => host.addr(),
+            ProtocolKind::Telnet => format!("Telnet · {}", host.addr()),
         }
     }
 
@@ -9528,7 +9894,7 @@ impl RuTermApp {
             this.click_host(index, window, cx);
         }))
         .child(
-            Icon::new(Self::host_icon(host.auth))
+            Icon::new(Self::host_icon(host))
                 .small()
                 .text_color(if host.favorite { pal.accent } else { pal.muted }),
         )
@@ -9548,7 +9914,7 @@ impl RuTermApp {
                         .text_ellipsis()
                         .text_xs()
                         .text_color(pal.muted)
-                        .child(host.addr()),
+                        .child(Self::host_subtitle(host)),
                 ),
         )
         .child(
@@ -9702,6 +10068,7 @@ impl RuTermApp {
             AuthMethod::Password,
         ];
         let selected = form.auth;
+        let protocol = form.protocol;
         let save_checked = form.save_secret;
         let editing = form.editing.is_some();
         v_flex()
@@ -9761,6 +10128,74 @@ impl RuTermApp {
                             .gap_2()
                             .max_h(fields_max_height)
                             .overflow_y_scrollbar()
+                            .child({
+                                // 协议分段：SSH 与 Telnet 共用同一张连接卡片。
+                                // 切换时若端口仍是旧协议的默认值，顺带换成新协议默认端口。
+                                let options = [ProtocolKind::Ssh, ProtocolKind::Telnet];
+                                v_flex()
+                                    .gap_1()
+                                    .child(div().text_sm().child("协议"))
+                                    .child(h_flex().gap_2().children(options.into_iter().map(
+                                        |option| {
+                                            let is_selected = form.protocol == option;
+                                            div()
+                                                .id(SharedString::from(format!(
+                                                    "protocol-{}",
+                                                    option.label()
+                                                )))
+                                                .px_3()
+                                                .py_1()
+                                                .rounded(px(5.0))
+                                                .text_sm()
+                                                .cursor_pointer()
+                                                .bg(if is_selected {
+                                                    pal.accent
+                                                } else {
+                                                    pal.segment_bg
+                                                })
+                                                .text_color(if is_selected {
+                                                    cx.theme().primary_foreground
+                                                } else {
+                                                    pal.text
+                                                })
+                                                .when(is_selected, |this| {
+                                                    this.font_weight(FontWeight::BOLD)
+                                                })
+                                                .child(option.label())
+                                                .on_click(cx.listener(
+                                                    move |this, _, window, cx| {
+                                                        let Some(form) = this.new_host.as_mut()
+                                                        else {
+                                                            return;
+                                                        };
+                                                        if form.protocol == option {
+                                                            return;
+                                                        }
+                                                        let (previous, next) = match option {
+                                                            ProtocolKind::Ssh => ("23", "22"),
+                                                            ProtocolKind::Telnet => ("22", "23"),
+                                                        };
+                                                        let port_now = form
+                                                            .port
+                                                            .read(cx)
+                                                            .value()
+                                                            .trim()
+                                                            .to_string();
+                                                        form.protocol = option;
+                                                        if port_now == previous {
+                                                            form.port.update(
+                                                                cx,
+                                                                |state, cx| {
+                                                                    state.set_value(next, window, cx);
+                                                                },
+                                                            );
+                                                        }
+                                                        cx.notify();
+                                                    },
+                                                ))
+                                        },
+                                    )))
+                            })
                             .child(labeled_field("展示名", &form.name, &pal))
                             .child(labeled_field("主机地址", &form.host, &pal))
                     .child(
@@ -9771,11 +10206,14 @@ impl RuTermApp {
                                     .flex_1()
                                     .child(labeled_field("端口", &form.port, &pal)),
                             )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .child(labeled_field("用户名", &form.user, &pal)),
-                            ),
+                            // Telnet 的用户名在会话内交互输入，表单里没有对应字段。
+                            .when(protocol == ProtocolKind::Ssh, |this| {
+                                this.child(
+                                    div()
+                                        .flex_1()
+                                        .child(labeled_field("用户名", &form.user, &pal)),
+                                )
+                            }),
                     )
                     // 分组 / 跳板机并排一行：两项都是可选的下拉，各占一半宽度，
                     // 省下的竖向空间留给私钥字段。
@@ -9823,7 +10261,8 @@ impl RuTermApp {
                                     ),
                                 )
                             })
-                            .child({
+                            .when(protocol == ProtocolKind::Ssh, |this| {
+                                this.child({
                                 // 跳板机选择：只列出可作为跳板的主机（排除自己与已挂跳板机的主机，
                                 // 避免自环与多级链）。降级模式没有稳定的主机 id，只给「直连」。
                                 let self_id = form
@@ -9873,9 +10312,11 @@ impl RuTermApp {
                                             }),
                                     ),
                                 )
+                                })
                             }),
                     )
-                    .child(
+                    .when(protocol == ProtocolKind::Ssh, |this| {
+                        this.child(
                         v_flex()
                             .gap_1()
                             .child(div().text_sm().child("认证方式"))
@@ -9911,10 +10352,13 @@ impl RuTermApp {
                                         cx.notify();
                                     }))
                             }))),
-                    )
+                        )
+                    })
                     // 私钥区块只在「私钥」认证下渲染：常驻占位会白撑两百多像素，
                     // 默认窗口装不下。窗口更矮时由字段区自身滚动兜底。
-                    .when(selected == AuthMethod::IdentityFile, |this| {
+                    .when(
+                        protocol == ProtocolKind::Ssh && selected == AuthMethod::IdentityFile,
+                        |this| {
                         this.child(
                             v_flex()
                                 .gap_2()
@@ -11670,7 +12114,7 @@ impl RuTermApp {
                                 div()
                                     .text_sm()
                                     .text_color(pal.muted)
-                                    .child("远程终端会话管理器 · SSH / 本地终端"),
+                                    .child("远程终端会话管理器 · SSH / Telnet / 本地终端"),
                             ),
                     )
                     .child(
@@ -11733,7 +12177,7 @@ impl RuTermApp {
             this.click_host(index, window, cx);
         }))
         .child(
-            Icon::new(Self::host_icon(host.auth))
+            Icon::new(Self::host_icon(host))
                 .small()
                 .text_color(pal.muted),
         )
@@ -11753,7 +12197,7 @@ impl RuTermApp {
                         .text_xs()
                         .text_ellipsis()
                         .text_color(pal.muted)
-                        .child(host.addr()),
+                        .child(Self::host_subtitle(host)),
                 ),
         )
         .into_any_element()
@@ -12055,6 +12499,10 @@ impl RuTermApp {
         if let Some(tab) = active {
             if self.status_bar.addr {
                 left.push(StatusBarItem::new(tab.addr.clone()).id("addr"));
+            }
+            // Telnet 没有认证方式这一栏，用协议名占住同一位置。
+            if matches!(&tab.resume, Some(Resume::Telnet { .. })) {
+                left.push(StatusBarItem::new("Telnet").id("protocol").muted(true));
             }
             if let (true, Some(auth)) = (self.status_bar.auth, tab.auth) {
                 left.push(StatusBarItem::new(auth_label(auth)).id("auth").muted(true));
@@ -12358,6 +12806,43 @@ impl RuTermApp {
         .detach();
     }
 
+    /// 把协议映射回填到主机列表（只对加密库模式生效，理由同 [`Self::apply_jumps`]）。
+    fn apply_protocols(&mut self) {
+        if self.vault.is_none() {
+            return;
+        }
+        for host in &mut self.hosts {
+            host.protocol = self.protocols.protocol_of(host.id).unwrap_or_default();
+        }
+    }
+
+    /// 记录某主机的协议选择；降级模式下协议已随 sessions.json 落盘，这里不动。
+    fn note_protocol(&mut self, host: &HostConfig, cx: &mut Context<Self>) {
+        if self.vault.is_none()
+            || self.protocols.protocol_of(host.id).unwrap_or_default() == host.protocol
+        {
+            return;
+        }
+        if self.protocols.set(host.id, host.protocol) {
+            self.persist_protocols(cx);
+        }
+    }
+
+    /// 协议映射落库；加密库不可用时退回旧 settings.json。
+    fn persist_protocols(&self, cx: &mut Context<Self>) {
+        let json = self.protocols.to_json();
+        let Some(vault) = self.vault.clone() else {
+            self.store.save_protocols(&json);
+            return;
+        };
+        cx.spawn(async move |_, _| {
+            if let Err(error) = vault.set_setting("protocols", &json).await {
+                log::warn!("写入库内协议映射失败: {error}");
+            }
+        })
+        .detach();
+    }
+
     fn persist_sidebar(&self, cx: &mut Context<Self>) {
         let json = self.sidebar.to_json();
         let Some(vault) = self.vault.clone() else {
@@ -12647,12 +13132,13 @@ mod tests {
         AUTO_RECONNECT_MAX, CONNECT_TIMEOUT_DEFAULT, CONNECT_TIMEOUT_MAX, CONNECT_TIMEOUT_MIN,
         CUSTOM_ANSI_BASE, CUSTOM_BRIGHT_BASE, CUSTOM_DEFAULT_ANSI, CUSTOM_DEFAULT_BRIGHT,
         FONT_SIZE_MAX, FONT_SIZE_MIN, FileBrowser, FileSortKey, ForwardPrefs, JumpPrefs,
-        LINE_HEIGHT_MAX, LINE_HEIGHT_MIN, LocalShellPrefs, Metric, SavedForward, SessionPrefs,
-        SidebarPrefs, StatusBarPrefs, TERMINAL_THEME_DEFAULT, TerminalColors, TerminalPrefs,
-        auto_reconnect_delay, format_remote_time_short, hex_to_hsla, normalize_hex, remote_fs,
-        safe_local_name,
+        LINE_HEIGHT_MAX, LINE_HEIGHT_MIN, LocalShellPrefs, Metric, ProtocolPrefs, SavedForward,
+        SessionPrefs, SidebarPrefs, StatusBarPrefs, TERMINAL_THEME_DEFAULT, TerminalColors,
+        TerminalPrefs, auto_reconnect_delay, format_remote_time_short, hex_to_hsla, normalize_hex,
+        remote_fs, safe_local_name,
     };
     use crate::session::ForwardKind;
+    use crate::sessions::ProtocolKind;
 
     fn saved(name: &str, kind: ForwardKind, listen: u16) -> SavedForward {
         SavedForward {
@@ -12795,6 +13281,27 @@ mod tests {
         assert_eq!(prefs.jump_of(7), None);
         assert_eq!(JumpPrefs::from_json(""), JumpPrefs::default());
         assert_eq!(JumpPrefs::from_json("{ not json"), JumpPrefs::default());
+    }
+
+    #[test]
+    fn protocol_prefs_roundtrip_and_forget() {
+        let mut prefs = ProtocolPrefs::default();
+        // SSH 是默认值，不落条目：只有 Telnet 需要额外存储。
+        assert!(!prefs.set(5, ProtocolKind::Ssh));
+        assert!(prefs.set(6, ProtocolKind::Telnet));
+        assert!(!prefs.set(6, ProtocolKind::Telnet));
+        assert_eq!(prefs.protocol_of(6), Some(ProtocolKind::Telnet));
+        assert_eq!(prefs.protocol_of(7), None);
+        assert_eq!(ProtocolPrefs::from_json(&prefs.to_json()), prefs);
+
+        // 改回 SSH = 删条目；删主机 = 清引用。
+        assert!(prefs.set(6, ProtocolKind::Ssh));
+        assert_eq!(prefs.protocol_of(6), None);
+        prefs.set(8, ProtocolKind::Telnet);
+        prefs.forget(8);
+        assert_eq!(prefs.protocol_of(8), None);
+        assert_eq!(ProtocolPrefs::from_json(""), ProtocolPrefs::default());
+        assert_eq!(ProtocolPrefs::from_json("{ not json"), ProtocolPrefs::default());
     }
 
     #[test]

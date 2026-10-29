@@ -166,9 +166,11 @@ impl SshTarget {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sessions::ProtocolKind;
 
     fn host(auth: AuthMethod, key_path: &str, key_inline: bool) -> HostConfig {
         HostConfig {
+            protocol: ProtocolKind::Ssh,
             id: 1,
             name: "测试机".into(),
             host: "example.com".into(),

@@ -17,9 +17,34 @@ pub enum AuthMethod {
     Password,
 }
 
+/// 连接协议。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProtocolKind {
+    /// SSH（旧配置没有该字段时按它处理）。
+    #[default]
+    Ssh,
+    /// Telnet：明文 TCP + 最小 IAC 协商，不做认证与加密。
+    Telnet,
+}
+
+impl ProtocolKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Ssh => "SSH",
+            Self::Telnet => "Telnet",
+        }
+    }
+}
+
 /// 一台可连接的主机账号。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HostConfig {
+    /// 连接协议。
+    ///
+    /// 加密库模式下不进 hosts 表（表结构固定），而是随 `settings` 表的
+    /// `protocols` 键持久化，启动后回填到这里；降级模式直接随 sessions.json 落盘。
+    #[serde(default)]
+    pub protocol: ProtocolKind,
     /// 加密库中的主键（旧 JSON 数据迁移前为 0，入库时分配）
     #[serde(default)]
     pub id: i64,
@@ -51,9 +76,13 @@ pub struct HostConfig {
 }
 
 impl HostConfig {
-    /// 列表副标题（user@host:port）。
+    /// 列表副标题（user@host:port；Telnet 没有登录用户时只写 host:port）。
     pub fn addr(&self) -> String {
-        format!("{}@{}:{}", self.user, self.host, self.port)
+        if self.user.trim().is_empty() {
+            format!("{}:{}", self.host, self.port)
+        } else {
+            format!("{}@{}:{}", self.user, self.host, self.port)
+        }
     }
 
     /// 表单字段基本校验，返回首个错误描述。
@@ -61,17 +90,20 @@ impl HostConfig {
         if self.host.trim().is_empty() {
             return Some("主机地址不能为空".to_string());
         }
-        if self.user.trim().is_empty() {
-            return Some("用户名不能为空".to_string());
-        }
         if self.port == 0 {
             return Some("端口无效".to_string());
         }
-        if self.auth == AuthMethod::IdentityFile
-            && !self.key_inline
-            && self.key_path.trim().is_empty()
-        {
-            return Some("请填写私钥路径，或改为内嵌私钥".to_string());
+        // Telnet 的登录名由服务端提示交互输入，表单里可以留空。
+        if self.protocol == ProtocolKind::Ssh {
+            if self.user.trim().is_empty() {
+                return Some("用户名不能为空".to_string());
+            }
+            if self.auth == AuthMethod::IdentityFile
+                && !self.key_inline
+                && self.key_path.trim().is_empty()
+            {
+                return Some("请填写私钥路径，或改为内嵌私钥".to_string());
+            }
         }
         None
     }
@@ -104,6 +136,9 @@ pub struct Settings {
     /// 主机 → 跳板机映射（序列化成 JSON 字符串，键是主机 id）。
     #[serde(default)]
     pub jumps: String,
+    /// 主机 → 协议映射（序列化成 JSON 字符串，键是主机 id；只记录非 SSH 的项）。
+    #[serde(default)]
+    pub protocols: String,
 }
 
 impl Settings {
@@ -205,6 +240,12 @@ impl SessionStore {
     pub fn save_jumps(&self, json: &str) {
         let json = json.to_string();
         self.update_settings(|settings| settings.jumps = json);
+    }
+
+    /// 降级模式（无加密库）下保存主机协议映射。
+    pub fn save_protocols(&self, json: &str) {
+        let json = json.to_string();
+        self.update_settings(|settings| settings.protocols = json);
     }
 
     /// 迁移完成后把 sessions.json 改名为 sessions.json.migrated（保留现场，不删除）。

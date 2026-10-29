@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::paths::StorageMode;
-use crate::sessions::{AuthMethod, HostConfig};
+use crate::sessions::{AuthMethod, HostConfig, ProtocolKind};
 use anyhow::{Context as _, Result};
 use argon2::Argon2;
 use keyring::Entry;
@@ -48,7 +48,7 @@ pub const HOST_KEYS_SETTING: &str = "host_keys";
 mod schema {
     use toasty::Model;
 
-    use crate::sessions::HostConfig;
+    use crate::sessions::{HostConfig, ProtocolKind};
 
     /// 主机行；password 列存字段加密后的密文（见模块头的说明），未保存则 NULL。
     #[derive(Debug, Model)]
@@ -70,6 +70,7 @@ mod schema {
         /// 转成 UI/连接层使用的主机配置。
         pub fn to_host_config(&self) -> HostConfig {
             HostConfig {
+                protocol: ProtocolKind::Ssh,
                 id: self.id,
                 name: self.name.clone(),
                 host: self.host.clone(),
@@ -913,6 +914,7 @@ async fn read_legacy_vault(
         };
         hosts.push((
             HostConfig {
+                protocol: ProtocolKind::Ssh,
                 id: match row.get_value(0) {
                     Ok(Value::Integer(v)) => v,
                     _ => 0,
@@ -1216,6 +1218,7 @@ mod tests {
             .expect("打开加密库失败");
 
         let host = HostConfig {
+            protocol: ProtocolKind::Ssh,
             id: 3,
             name: "测试机".into(),
             host: "example.com".into(),
@@ -1296,6 +1299,7 @@ mod tests {
             .await
             .expect("打开旧密钥库失败");
         let host = HostConfig {
+            protocol: ProtocolKind::Ssh,
             id: 7,
             name: "搬迁机".into(),
             host: "10.0.0.7".into(),
@@ -1423,6 +1427,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ruterm-offrt-test-{tag}"));
         let mode = StorageMode::Global(dir.clone());
         let host = HostConfig {
+            protocol: ProtocolKind::Ssh,
             id: 1,
             name: "离线机".into(),
             host: "h.example".into(),
@@ -1639,6 +1644,7 @@ mod tests {
             .await
             .unwrap();
         let host = HostConfig {
+            protocol: ProtocolKind::Ssh,
             id: 5,
             name: "密文机".into(),
             host: "5.example".into(),
@@ -1694,6 +1700,7 @@ mod tests {
             .await
             .expect("打开库失败");
         let host = HostConfig {
+            protocol: ProtocolKind::Ssh,
             id: 9,
             name: "内嵌私钥机".into(),
             host: "9.example".into(),

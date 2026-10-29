@@ -15,7 +15,7 @@
 |---|---|---|---|
 | 终端内查找 | Ctrl+F 高亮 + 上/下跳转 | Ctrl+F 查找条（字面量 / 正则） | **已补** |
 | 多终端联动 | 批量执行 + 同步输入 | 同步输入 + 命令广播（菜单 + 二次确认） | **已补** |
-| Telnet / Ping | 原始 TCP + 最小 IAC；PTY 跑 ping | 无 | 补（Telnet）/缓（Ping） |
+| Telnet / Ping | 原始 TCP + 最小 IAC；PTY 跑 ping | Telnet 会话（最小 IAC + NAWS）已通 | 补（Telnet）**已补** /缓（Ping） |
 | 中英文界面 | i18n 静态词典 + 语言切换 | 仅中文 | 补 |
 | 键宏 | 组合键 → 字节流，导入导出 | 无 | 补 |
 | 本地文件页 | 单栏本机目录浏览器 | 只有远端 SFTP | 补 |
@@ -87,10 +87,14 @@
   「命令发到所有会话…」在「会话」菜单，弹窗列清目标会话名，勾选确认后才可发送；
   已结束 / 连接失败的会话跳过。同步输入的状态在状态栏右侧常驻一个可点击的指示，
   可用会话不足两个时自动关闭（危险命令拦截仍后置）。
-- [ ] **Telnet 会话** — `M`
+- [x] **Telnet 会话** — `M`
   新增轻量 TCP 后端（最小 IAC 协商：拒绝 0xFF 0xFA 子协商、回 WONT/DONT），
   终端渲染复用 rgpui-term；主机表单增加协议下拉（SSH / Telnet），端口默认 23。
   参考实现：`temp/RustTerm-Egui/src/backends/tcp.rs`。
+  落地：`src/telnet.rs`（IAC 过滤器 + 协商应答 + NAWS 尺寸上报 + 上行 0xFF 双写，含 9 项单测），
+  协议选择存加密库 `settings` 的 `protocols` 键（不动 hosts 列，沿用 proxy_jump 的既有先例），
+  断线横幅 / 回车重连 / 自动重连与 SSH 同形（`Resume::Telnet`）；Telnet 主机不参与跳板机与
+  SSH 认证字段，标签也不挂 SFTP/转发能力。侧栏以 Globe 图标 + `Telnet · host:port` 副标题区分。
 - [ ] **中英文界面** — `M`
   加 `tr!` 宏 + `settings.language`（加密库），先覆盖菜单 / 标题栏 / 设置 / 状态栏 / 文件与转发页，
   终端内与提示文案后续增量替换。参考词条表：`temp/RustTerm-Egui/src/i18n.rs`（约 90 条）。

@@ -14,6 +14,12 @@ GUI 会话管理器形态：左侧持久化的主机账号列表，点账号即�
   加密库不可用时内嵌选项禁用，绝不降级为明文落盘）。加密私钥可在表单直填口令或连接时自动弹口令窗；
   口令与密码均可勾选"保存"，加密存入本地凭据库，默认仅本次内存持有。
 - **主机指纹校验**：TOFU known_hosts 直接存入加密库的 `known_hosts` 表；指纹不符、写入或查询失败一律拒绝连接（fail-closed，防中间人）。
+- **Telnet 会话**：明文 TCP + 最小 IAC 协商（`src/telnet.rs`）。服务端 `WILL/DO` 只接受 ECHO / SGA，
+  其余回 `DONT/WONT`；子协商（`0xFF 0xFA … 0xFF 0xF0`）整段丢弃，不会在屏幕上漏出协商垃圾；
+  主动声明 **NAWS** 并把行列数随窗口变化上报（BBS / 全屏程序据此排版）；上行数据里的 `0xFF` 按
+  RFC 854 双写转义。主机表单顶部「协议」分段控件在 SSH / Telnet 间切换，切到 Telnet 时端口默认 23、
+  用户名与认证/私钥/跳板机字段一并隐藏（明文会话不带 SSH 凭据）。渲染与 SSH 共用 rgpui-term 外接 IO 后端，
+  断线横幅、回车重连、自动重连行为一致；协议选择记在加密库 `settings` 的 `protocols` 键，不额外改主机表结构。
 - **本地终端**：与 SSH 并列的本地 + 远程统一终端。`TerminalBuilder::new` 走 rgpui-term 内置 ConPTY 后端
   拉起本机 shell，入口是主机列表树顶的「本地终端」**折叠分组**：「会话」菜单 →「本地终端…」或 `Ctrl+Shift+T` 会开列表第一项。
   分组下逐条列出探测到的 shell（PowerShell 7 / Windows PowerShell / Git Bash / 命令提示符 / WSL），
@@ -242,6 +248,7 @@ src/
   main.rs       # UI：RuTermApp（边栏、标签栏、终端、状态栏、托盘）+ 解锁弹窗 + 设置弹窗（主密码、主题、边栏位置、状态栏显示项、终端外观）+ 边栏（主机 / 文件 / 转发页）+ 应用入口
   session.rs    # 会话桥接：rgpui-term 外接 IO ⇄ russh 双向字节流（上行泵线程 + 转发任务）+ 跳板机链式建连 + exec 远程信息探测 + SFTP 传输 / 端口转发（含 SOCKS5 握手）指令调度
   ssh.rs        # SSH 引擎：russh client::Handler、指纹校验（优先查加密库，降级回文本文件）、旁路通道过滤
+  telnet.rs     # Telnet 会话：tokio TCP + 最小 IAC 协商（ECHO/SGA 接受、NAWS 上报、子协商丢弃、上行 0xFF 双写），灌同一个外接 IO 后端（含单测）
   transfer.rs   # SFTP 上传 / 下载：复用当前 SSH 连接开子系统，分块搬运 + 节流进度 + 目录落点补文件名（含单测）
   remote.rs     # 远程主机信息：POSIX 探测脚本 + key=value 解析 + 可勾选指标枚举（含单测）
   config.rs     # 连接目标：命令行解析 + 主机账号 → SshTarget（含跳板机链 jump_chain）
