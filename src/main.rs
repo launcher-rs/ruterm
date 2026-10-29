@@ -17,9 +17,11 @@ mod transfer;
 mod vault;
 mod zmodem;
 
+use std::cell::Cell;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -32,13 +34,13 @@ use rgpui::tabs::tab_drag::TabDragData;
 use rgpui::title_bar::TITLE_BAR_HEIGHT;
 use rgpui::{
     AbsoluteLength, AnyElement, App, Bounds, Button, ButtonVariants, Checkbox, ClickEvent, Context,
-    ContextMenuExt, Disableable, Div, DragMoveEvent, DropdownMenu, ElementSize, Entity,
+    ContextMenuExt, Disableable, Div, DragMoveEvent, DropdownMenu, ElementSize, Empty, Entity,
     ExternalPaths, FocusHandle, Focusable, FontWeight, Hsla, Icon, IconName, Image, ImageFormat,
     InteractiveElement, IntoElement, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent,
-    NoAction, ParentElement, Pixels, Point, PopupMenu, PopupMenuItem, Render, Rgba, ScrollHandle,
-    ScrollableElement, SharedString, Stateful, StatefulInteractiveElement, Styled, Tooltip,
-    TrayIconEvent, TrayMenuItem, Window, WindowBounds, WindowControlArea, WindowOptions, actions,
-    div, h_flex, icon_named, img, px, size, v_flex, IconNamed,
+    MouseUpEvent, NoAction, ParentElement, Pixels, Point, PopupMenu, PopupMenuItem, Render, Rgba,
+    ScrollHandle, ScrollableElement, SharedString, Stateful, StatefulInteractiveElement, Styled,
+    Tooltip, TrayIconEvent, TrayMenuItem, Window, WindowBounds, WindowControlArea, WindowOptions,
+    actions, canvas, div, h_flex, icon_named, img, px, relative, size, v_flex, IconNamed,
 };
 use rgpui_term::{
     Event as TerminalEvent, TerminalBuilder, TerminalThemeConfig, TerminalView, TextStyle,
@@ -83,6 +85,17 @@ actions!(
         CloseSplit
     ]
 );
+
+/// 边栏分隔条的拖拽载荷。搭 rgpui 原生拖拽会话：面板内的表格等元素会拦下
+/// 冒泡的鼠标移动，只有拖拽会话能在指针划过它们时继续送达移动事件。
+#[derive(Clone)]
+struct SplitDividerDrag;
+
+impl Render for SplitDividerDrag {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        Empty
+    }
+}
 
 /// 认证方式的展示名。
 fn auth_label(method: AuthMethod) -> &'static str {
@@ -279,6 +292,14 @@ pub enum SidebarSide {
     #[default]
     Left,
     Right,
+}
+
+/// 边栏默认宽度占位（约 1/3）；边栏在右时「第一面板」是终端，比例要翻过来。
+pub fn default_sidebar_ratio(side: SidebarSide) -> f32 {
+    match side {
+        SidebarSide::Left => 0.32,
+        SidebarSide::Right => 0.68,
+    }
 }
 
 /// 列宽拖拽的载荷：`tab_id` 保证拖拽期间切换标签不会改错表。
@@ -1521,6 +1542,12 @@ struct RuTermApp {
     file_prompt: Option<FilePrompt>,
     /// 文件面板删除确认。
     file_confirm: Option<FileConfirm>,
+    /// 文件面板路径编辑输入框（点击路径栏时激活）。
+    path_edit: Option<Entity<InputState>>,
+    /// 边栏分隔条拖拽起点（指针 x、起点面板占比）。
+    split_drag: Option<(f32, f32)>,
+    /// 分隔容器宽度（canvas 回填）：拖拽时把指针位移换算成占比。
+    split_width: Rc<Cell<f32>>,
     /// 端口转发（内联在边栏的「转发」页里）。
     forward: Option<ForwardDialog>,
     /// 本次运行内缓存的密码（按 user@host:port），避免重复弹窗；绝不落盘。
@@ -1654,13 +1681,10 @@ impl RuTermApp {
                 input
             })
             .collect::<Vec<_>>();
-        // 侧边栏 ↔ 主区 分隔面板：默认边栏约占 0.42，够放下文件表格的五列。
+        // 侧边栏 ↔ 主区 分隔面板：默认边栏约占 0.32，够放下文件表格的五列。
         let split_state = cx.new(SplitPaneState::new);
-        // 边栏在右时「第一面板」是终端：比例翻过来，边栏仍占约 0.42。
-        let sidebar_ratio = match sidebar.side {
-            SidebarSide::Left => 0.42,
-            SidebarSide::Right => 0.58,
-        };
+        // 边栏在右时「第一面板」是终端：比例翻过来，边栏仍占约 0.32。
+        let sidebar_ratio = default_sidebar_ratio(sidebar.side);
         split_state.update(cx, |state, cx| {
             state.set_ratio(sidebar_ratio, cx);
             // WindTerm 式拖动：拖到最小宽度即停住，分隔线仍可抓住往大拖；
@@ -1698,6 +1722,9 @@ impl RuTermApp {
             col_drag: None,
             file_prompt: None,
             file_confirm: None,
+            path_edit: None,
+            split_drag: None,
+            split_width: Rc::new(Cell::new(0.0)),
             forward: None,
             unlocked_key: None,
             password_cache: HashMap::new(),
@@ -1980,11 +2007,7 @@ impl RuTermApp {
                         let side = prefs.side;
                         this.sidebar = prefs;
                         this.split_state.update(cx, |state, cx| {
-                            let ratio = match side {
-                                SidebarSide::Left => 0.42,
-                                SidebarSide::Right => 0.58,
-                            };
-                            state.set_ratio(ratio, cx);
+                            state.set_ratio(default_sidebar_ratio(side), cx);
                         });
                         cx.notify();
                     }
@@ -2405,6 +2428,42 @@ impl RuTermApp {
         if let Some(path) = path {
             self.load_files(tab_id, Some(path), cx);
         }
+    }
+
+    /// 点击路径栏：激活编辑模式，输入框预填当前路径。
+    fn start_path_edit(&mut self, tab_id: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let current = self
+            .tabs
+            .iter()
+            .find(|tab| tab.id == tab_id)
+            .and_then(|tab| tab.files.path.clone())
+            .unwrap_or_default();
+        let input = cx.new(|cx| InputState::new(window, cx).default_value(&current));
+        cx.subscribe(&input, |this, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::PressEnter { .. }) {
+                this.commit_path_edit(cx);
+            }
+        })
+        .detach();
+        self.path_edit = Some(input);
+        cx.notify();
+    }
+
+    /// 回车提交路径：跳转到输入的目录。
+    fn commit_path_edit(&mut self, cx: &mut Context<Self>) {
+        let Some(input) = self.path_edit.take() else {
+            return;
+        };
+        let tab_id = self.active_tab;
+        let target = input.read(cx).text().to_string().trim().to_string();
+        if target.is_empty() {
+            cx.notify();
+            return;
+        }
+        if let Some(tab_id) = tab_id {
+            self.load_files(tab_id, Some(target), cx);
+        }
+        cx.notify();
     }
 
     /// 双击条目：目录就进去，文件就下载到临时目录并用系统默认程序打开。
@@ -5944,6 +6003,88 @@ impl RuTermApp {
         cx.notify();
     }
 
+    /// 边栏面板占分隔容器的宽度比例（边栏在右时，状态里存的是主区份额）。
+    fn panel_ratio(&self, cx: &App) -> f32 {
+        let ratio = self.split_state.read(cx).ratio();
+        match self.sidebar.side {
+            SidebarSide::Left => ratio,
+            SidebarSide::Right => 1.0 - ratio,
+        }
+    }
+
+    /// 按面板占比写回分隔状态（边栏在右时翻转成主区份额）。
+    fn set_panel_ratio(&mut self, panel_ratio: f32, cx: &mut Context<Self>) {
+        let ratio = match self.sidebar.side {
+            SidebarSide::Left => panel_ratio,
+            SidebarSide::Right => 1.0 - panel_ratio,
+        };
+        self.split_state
+            .update(cx, |state, cx| state.set_ratio(ratio, cx));
+    }
+
+    /// 分隔条按下：记下起点，拖动时按容器宽度把指针位移换算成占比。
+    fn begin_split_drag(&mut self, event: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.split_drag = Some((event.position.x.as_f32(), self.panel_ratio(cx)));
+        cx.notify();
+    }
+
+    fn drag_split(
+        &mut self,
+        event: &DragMoveEvent<SplitDividerDrag>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let x = event.event.position.x.as_f32();
+        if self.split_drag.is_none() {
+            self.split_drag = Some((x, self.panel_ratio(cx)));
+        }
+        let Some((start_x, start_ratio)) = self.split_drag else {
+            return;
+        };
+        let width = self.split_width.get();
+        if width <= 0.0 {
+            return;
+        }
+        let delta = (x - start_x) / width;
+        let delta = match self.sidebar.side {
+            SidebarSide::Left => delta,
+            SidebarSide::Right => -delta,
+        };
+        // 两侧都留 260px：拖到最小即停住，完全收起交给 Ctrl+B。
+        let min_ratio = 260.0 / width;
+        let max_ratio = 1.0 - min_ratio;
+        let target = (start_ratio + delta).clamp(min_ratio, max_ratio.max(min_ratio));
+        self.set_panel_ratio(target, cx);
+    }
+
+    fn end_split_drag(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.split_drag.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// 边栏与主区之间的分隔条：4px 可见，按下即可拖动。
+    fn render_split_divider(&self, cx: &mut Context<Self>) -> AnyElement {
+        let pal = self.palette(cx);
+        div()
+            .id("sidebar-split-divider")
+            .occlude()
+            .flex_shrink_0()
+            .w(px(4.0))
+            .h_full()
+            .bg(pal.border)
+            .cursor_col_resize()
+            .hover(move |style| style.bg(pal.accent))
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::begin_split_drag))
+            .on_drag(SplitDividerDrag, |drag, _, _, cx| {
+                cx.stop_propagation();
+                cx.new(|_| drag.clone())
+            })
+            .on_drag_move(cx.listener(Self::drag_split))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::end_split_drag))
+            .into_any_element()
+    }
+
     /// `Ctrl+Shift+B`：切到文件页；已在文件页时收起边栏。
     fn toggle_file_panel_action(
         &mut self,
@@ -6479,41 +6620,59 @@ impl Render for RuTermApp {
             .capture_key_down(cx.listener(Self::capture_session_key))
             .child(self.render_title_bar(window, cx))
             .child({
-                // 边栏在哪一侧由设置决定：图标栏恒贴在窗口外缘，面板在它内侧。
-                // 图标栏在分隔面板之外，面板收起时它仍然留着（RustRover 的工具窗口栏）。
-                // 面板收起时不必再渲染页面内容（省掉每帧构建文件表格的开销）。
-                let panel = if self.sidebar_visible(cx) {
-                    self.render_sidebar_panel(cx)
-                } else {
-                    div().into_any_element()
-                };
+                // 边栏在哪一侧由设置决定：图标栏恒贴在窗口外缘，面板在它内侧，
+                // 中间是可拖拽的分隔条；面板收起时图标栏仍然留着（RustRover 的工具窗口栏）。
+                // 这里用普通 flex 行而不是 SplitPane：SplitPane 的面板是块级容器，
+                // Taffy 量它的 min-content 时会把面板内的子元素按内容宽写死，
+                // 面板自身的最终布局命中缓存后就不再纠正（终端被挤成标签栏那么宽）。
+                let visible = self.sidebar_visible(cx);
+                let panel_ratio = self.panel_ratio(cx);
+                let width_sink = self.split_width.clone();
+                let row = h_flex()
+                    .relative()
+                    .size_full()
+                    .min_w_0()
+                    .child(
+                        // 回填容器宽度给拖拽换算；绝对定位不参与布局。
+                        canvas(
+                            move |bounds, _, _| width_sink.set(bounds.size.width.as_f32()),
+                            |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .size_full(),
+                    )
+                    .child(self.render_sidebar_rail(cx));
+                // 每个 flex 项都显式 min_w_0：否则 Taffy 会按 min-content 量它，
+                // 量出来的内容宽会被写进子树布局（见上）。
+                let main = div()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .overflow_hidden()
+                    .child(self.render_main(cx))
+                    .into_any_element();
+                let panel = visible.then(|| {
+                    div()
+                        .w(relative(panel_ratio))
+                        .flex_shrink_0()
+                        .min_w_0()
+                        .h_full()
+                        .overflow_hidden()
+                        .child(self.render_sidebar_panel(cx))
+                        .into_any_element()
+                });
                 match self.sidebar.side {
-                    SidebarSide::Left => h_flex()
-                        .size_full()
-                        .min_w_0()
-                        .child(self.render_sidebar_rail(cx))
-                        .child(
-                            SplitPane::horizontal(self.split_state.clone())
-                                .show_collapse_buttons(false)
-                                .first(panel)
-                                .second(self.render_main(cx).into_any_element())
-                                .flex_1()
-                                .min_h_0()
-                                .overflow_hidden(),
-                        )
+                    SidebarSide::Left => row
+                        .when_some(panel, |row, panel| {
+                            row.child(panel).child(self.render_split_divider(cx))
+                        })
+                        .child(main)
                         .into_any_element(),
-                    SidebarSide::Right => h_flex()
-                        .size_full()
-                        .min_w_0()
-                        .child(
-                            SplitPane::horizontal(self.split_state.clone())
-                                .show_collapse_buttons(false)
-                                .first(self.render_main(cx).into_any_element())
-                                .second(panel)
-                                .flex_1()
-                                .min_h_0()
-                                .overflow_hidden(),
-                        )
+                    SidebarSide::Right => row
+                        .child(main)
+                        .when_some(panel, |row, panel| {
+                            row.child(self.render_split_divider(cx)).child(panel)
+                        })
                         .child(self.render_sidebar_rail(cx))
                         .into_any_element(),
                 }
@@ -6956,6 +7115,7 @@ impl RuTermApp {
             .id("sidebar-rail")
             .w(px(42.0))
             .flex_shrink_0()
+            .min_w_0()
             .h_full()
             .items_center()
             .py_2()
@@ -9965,6 +10125,7 @@ impl RuTermApp {
             .as_deref()
             .and_then(remote_fs::parent_of)
             .is_some();
+        let path_edit = self.path_edit.clone();
         let mut path_row = h_flex()
             .w_full()
             .flex_shrink_0()
@@ -9973,16 +10134,33 @@ impl RuTermApp {
             .gap_1()
             .items_center()
             .border_b_1()
-            .border_color(pal.border)
-            .child(
+            .border_color(pal.border);
+        if let Some(input) = path_edit {
+            path_row = path_row.child(
                 div()
                     .flex_1()
                     .min_w_0()
+                    .child(styled_input(Input::new(&input).text_xs(), &pal)),
+            );
+        } else {
+            let tab_id_for_edit = live;
+            path_row = path_row.child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .id("files-path-click")
+                    .cursor_pointer()
                     .text_ellipsis()
                     .text_xs()
                     .text_color(pal.muted)
-                    .child(path.clone().unwrap_or_else(|| "—".to_string())),
+                    .child(path.clone().unwrap_or_else(|| "—".to_string()))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        if let Some(id) = tab_id_for_edit {
+                            this.start_path_edit(id, window, cx);
+                        }
+                    })),
             );
+        }
         if let Some(id) = live {
             path_row = path_row
                 .child({
@@ -10895,7 +11073,6 @@ impl RuTermApp {
         let pal = self.palette(cx);
         let id = tab.id;
         div()
-            .relative()
             .flex_1()
             .min_w_0()
             .min_h_0()
