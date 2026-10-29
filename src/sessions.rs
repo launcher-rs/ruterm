@@ -153,6 +153,10 @@ pub struct SessionStore {
     path: PathBuf,
     /// 应用级设置文件路径（settings.json）。
     settings_path: PathBuf,
+    /// 界面语言启动镜像（locale.txt）。刻意不放进 settings.json：
+    /// 开库迁移会把 settings.json 当遗留文件归档并回灌各键，
+    /// 届时镜像里未设置的 `theme` 会抹掉库内主题。
+    locale_path: PathBuf,
 }
 
 impl SessionStore {
@@ -162,6 +166,7 @@ impl SessionStore {
         Self {
             path: dir.join(crate::paths::LEGACY_SESSIONS_FILE),
             settings_path: dir.join(crate::paths::LEGACY_SETTINGS_FILE),
+            locale_path: dir.join(crate::paths::LOCALE_FILE),
         }
     }
 
@@ -246,6 +251,25 @@ impl SessionStore {
     pub fn save_protocols(&self, json: &str) {
         let json = json.to_string();
         self.update_settings(|settings| settings.protocols = json);
+    }
+
+    /// 读取界面语言启动镜像；缺失或值不认识时按中文（界面原文语言）。
+    pub fn load_language(&self) -> String {
+        let text = std::fs::read_to_string(&self.locale_path).unwrap_or_default();
+        crate::i18n::normalize(text.trim()).to_string()
+    }
+
+    /// 保存界面语言偏好到启动镜像；失败仅记日志（库内那份才是权威值）。
+    pub fn save_language(&self, locale: &str) {
+        if let Some(parent) = self.locale_path.parent()
+            && let Err(error) = std::fs::create_dir_all(parent)
+        {
+            log::warn!("无法创建 {}（{error}），语言不持久化", parent.display());
+            return;
+        }
+        if let Err(error) = std::fs::write(&self.locale_path, locale) {
+            log::warn!("写入 {} 失败: {error}", self.locale_path.display());
+        }
     }
 
     /// 迁移完成后把 sessions.json 改名为 sessions.json.migrated（保留现场，不删除）。

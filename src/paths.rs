@@ -12,6 +12,8 @@ pub const DB_FILE: &str = "ruterm.db";
 pub const SALT_FILE: &str = "kdf-salt.bin";
 /// 解锁后端标记（`keyring` / `passphrase`），非敏感，明文存放。
 pub const UNLOCK_FILE: &str = "unlock.txt";
+/// 界面语言启动镜像（`zh-CN` / `en`），非敏感；开库后以库内值为准。
+pub const LOCALE_FILE: &str = "locale.txt";
 
 /// 旧版存储文件名（一次性迁移的读取对象）。
 pub const LEGACY_VAULT_FILE: &str = "vault.db";

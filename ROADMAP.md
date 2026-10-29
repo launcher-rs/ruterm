@@ -95,9 +95,21 @@
   协议选择存加密库 `settings` 的 `protocols` 键（不动 hosts 列，沿用 proxy_jump 的既有先例），
   断线横幅 / 回车重连 / 自动重连与 SSH 同形（`Resume::Telnet`）；Telnet 主机不参与跳板机与
   SSH 认证字段，标签也不挂 SFTP/转发能力。侧栏以 Globe 图标 + `Telnet · host:port` 副标题区分。
-- [ ] **中英文界面** — `M`
-  加 `tr!` 宏 + `settings.language`（加密库），先覆盖菜单 / 标题栏 / 设置 / 状态栏 / 文件与转发页，
+- [x] **中英文界面** — `M` — 已完成
+  加 `tr!` 宏 + 库内 `language` 设置，先覆盖菜单 / 标题栏 / 设置 / 状态栏 / 文件与转发页，
   终端内与提示文案后续增量替换。参考词条表：`temp/RustTerm-Egui/src/i18n.rs`（约 90 条）。
+  落地：`src/i18n.rs` 用 rgpui `I18nManager`，**中文原文即 key**（`t()` 找不到就回退 key），
+  所以漏翻只会露中文、不露 `settings.title` 之类占位符，翻译进度与可用性解耦；
+  英文表 `assets/locales/en.json`（199 条 + 3 条动态 key，`include_str!` 编进二进制，发布包不带 locales 目录）。
+  变量走命名占位符 `{name}`（rgpui 只支持命名替换）。切换入口两处：「外观」菜单项（当前语言打勾）
+  与设置弹窗「外观」分页的语言按钮，均即时生效。
+  持久化两份：加密库 `settings.language` 是权威值，`~/.ruterm/locale.txt` 是启动镜像
+  （窗口首帧早于解锁）。**不要**把镜像写进 `settings.json`：开库迁移会把它当遗留文件归档，
+  并把其中未设置的 `theme` 回灌进库、抹掉用户主题（本条即为此踩到后改的）。
+  对账工具 `temp/i18n_check.py`（校验 tr! 与词条表一一对应、占位符两边一致），
+  单测 `i18n::tests::en_table_is_valid_and_placeholders_match` 守住同一约定。
+  已知边界：输入框占位符在创建时取词，切换语言后需重启才更新；状态栏瞬态提示与
+  远端指标标签（`Metric::label`）仍是中文，属本条所述「后续增量替换」。
 
 ## P1 · 中期（差异化能力）
 

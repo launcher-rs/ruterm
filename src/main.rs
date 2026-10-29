@@ -5,6 +5,7 @@
 //! 认证直接连接。仍兼容一次性命令行快速连接（带目标参数时首启动即连上该主机）。
 
 mod config;
+mod i18n;
 mod local_shell;
 mod paths;
 mod remote;
@@ -36,12 +37,13 @@ use rgpui::title_bar::TITLE_BAR_HEIGHT;
 use rgpui::{
     AbsoluteLength, AnyElement, App, Bounds, Button, ButtonVariants, Checkbox, ClickEvent, Context,
     ContextMenuExt, Disableable, Div, DragMoveEvent, DropdownMenu, ElementSize, Empty, Entity,
-    ExternalPaths, FocusHandle, Focusable, FontWeight, Hsla, Icon, IconName, Image, ImageFormat,
-    InteractiveElement, IntoElement, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent,
-    MouseUpEvent, NoAction, ParentElement, Pixels, Point, PopupMenu, PopupMenuItem, Render, Rgba,
-    ScrollHandle, ScrollableElement, SharedString, Stateful, StatefulInteractiveElement, Styled,
-    Tooltip, TrayIconEvent, TrayMenuItem, Window, WindowBounds, WindowControlArea, WindowOptions,
-    actions, canvas, div, h_flex, icon_named, img, px, relative, size, v_flex, IconNamed,
+    ExternalPaths, FocusHandle, Focusable, FontWeight, Hsla, Icon, IconName, IconNamed, Image,
+    ImageFormat, InteractiveElement, IntoElement, KeyBinding, KeyDownEvent, MouseButton,
+    MouseDownEvent, MouseUpEvent, NoAction, ParentElement, Pixels, Point, PopupMenu, PopupMenuItem,
+    Render, Rgba, ScrollHandle, ScrollableElement, SharedString, Stateful,
+    StatefulInteractiveElement, Styled, Tooltip, TrayIconEvent, TrayMenuItem, Window, WindowBounds,
+    WindowControlArea, WindowOptions, actions, canvas, div, h_flex, icon_named, img, px, relative,
+    size, v_flex,
 };
 use rgpui_term::{
     Event as TerminalEvent, InputOrigin, SearchStatus, TerminalBuilder, TerminalMiddleware,
@@ -137,12 +139,12 @@ impl Render for SplitDividerDrag {
     }
 }
 
-/// 认证方式的展示名。
-fn auth_label(method: AuthMethod) -> &'static str {
+/// 认证方式的展示名（"SSH Agent" 是产品名，两种语言都原样显示）。
+fn auth_label(cx: &App, method: AuthMethod) -> SharedString {
     match method {
-        AuthMethod::Agent => "SSH Agent",
-        AuthMethod::IdentityFile => "私钥",
-        AuthMethod::Password => "密码",
+        AuthMethod::Agent => tr!(cx, "SSH Agent"),
+        AuthMethod::IdentityFile => tr!(cx, "私钥"),
+        AuthMethod::Password => tr!(cx, "密码"),
     }
 }
 
@@ -155,9 +157,7 @@ fn safe_local_name(name: &str) -> Option<String> {
     }
     let mut safe = String::with_capacity(trimmed.len());
     for ch in trimmed.chars() {
-        if ch.is_control()
-            || matches!(ch, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
-        {
+        if ch.is_control() || matches!(ch, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') {
             safe.push('_');
         } else {
             safe.push(ch);
@@ -255,7 +255,8 @@ fn join_notes(first: Option<String>, second: Option<String>) -> String {
 }
 
 /// 一个已连接的会话标签（持有终端视图）。
-struct SessionTab {    /// 稳定标签 id（会话结束或用户关闭时据此定位）。
+struct SessionTab {
+    /// 稳定标签 id（会话结束或用户关闭时据此定位）。
     id: usize,
     /// 标签标题（主机名）。
     title: SharedString,
@@ -450,11 +451,7 @@ impl FileBrowser {
             };
             let by_key = if desc { by_key.reverse() } else { by_key };
             by_key
-                .then_with(|| {
-                    left.name
-                        .to_lowercase()
-                        .cmp(&right.name.to_lowercase())
-                })
+                .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
                 .then_with(|| left.name.cmp(&right.name))
         });
     }
@@ -1822,14 +1819,16 @@ impl RuTermApp {
             state.set_min_first(260.0, cx);
             state.set_min_second(260.0, cx);
         });
-        let search = cx.new(|cx| InputState::new(window, cx).placeholder("搜索主机…"));
+        let search = cx.new(|cx| InputState::new(window, cx).placeholder(tr!(cx, "搜索主机…")));
         cx.subscribe(&search, |_, _, _: &InputEvent, cx| cx.notify())
             .detach();
-        let home_search = cx.new(|cx| InputState::new(window, cx).placeholder("搜索主机或地址…"));
+        let home_search =
+            cx.new(|cx| InputState::new(window, cx).placeholder(tr!(cx, "搜索主机或地址…")));
         cx.subscribe(&home_search, |_, _, _: &InputEvent, cx| cx.notify())
             .detach();
         let find_input = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("查找终端内容…（回车下一个，Shift+回车上一个）")
+            InputState::new(window, cx)
+                .placeholder(tr!(cx, "查找终端内容…（回车下一个，Shift+回车上一个）"))
         });
         cx.subscribe(&find_input, |this, _, event: &InputEvent, cx| match event {
             InputEvent::Change => this.apply_find(cx),
@@ -2136,6 +2135,17 @@ impl RuTermApp {
                     cx.notify();
                 });
             }
+            // 库内语言优先于启动镜像（换机器、或镜像写入前进程被杀时对不上）。
+            if let Ok(Some(locale)) = vault.setting("language").await
+                && !locale.is_empty()
+            {
+                let locale = locale.clone();
+                let _ = this.update(cx, |this, cx| {
+                    if i18n::current_locale(cx) != locale.as_str() {
+                        this.apply_language(&locale, cx);
+                    }
+                });
+            }
             // 状态栏显示项同样以库内为准。
             if let Ok(Some(json)) = vault.setting("status_bar").await {
                 let prefs = StatusBarPrefs::from_json(&json);
@@ -2261,8 +2271,8 @@ impl RuTermApp {
         if self.unlock.is_some() {
             return;
         }
-        let passphrase = cx.new(|cx| InputState::new(window, cx).placeholder("主密码"));
-        let confirm = cx.new(|cx| InputState::new(window, cx).placeholder("再次输入确认"));
+        let passphrase = cx.new(|cx| InputState::new(window, cx).placeholder(tr!(cx, "主密码")));
+        let confirm = cx.new(|cx| InputState::new(window, cx).placeholder(tr!(cx, "再次输入确认")));
         // 回车即解锁：两个输入框都订阅提交事件，无需再点按钮。
         for input in [&passphrase, &confirm] {
             cx.subscribe(input, |this, _, event: &InputEvent, cx| {
@@ -2380,11 +2390,15 @@ impl RuTermApp {
         // 已是口令档且处于解锁状态：换密钥必须先证明知道当前主密码。
         let needs_current = passphrase_mode && self.vault.is_some();
         let current = needs_current
-            .then(|| cx.new(|cx| InputState::new(window, cx).placeholder("当前主密码")));
+            .then(|| cx.new(|cx| InputState::new(window, cx).placeholder(tr!(cx, "当前主密码"))));
         let password = cx.new(|cx| {
-            InputState::new(window, cx).placeholder(password_placeholder(passphrase_mode))
+            InputState::new(window, cx).placeholder(i18n::translate(
+                cx,
+                password_placeholder(passphrase_mode),
+                &[],
+            ))
         });
-        let confirm = cx.new(|cx| InputState::new(window, cx).placeholder("再次输入确认"));
+        let confirm = cx.new(|cx| InputState::new(window, cx).placeholder(tr!(cx, "再次输入确认")));
         // 任一输入框回车即保存，不必再点按钮。
         for input in [&password, &confirm].into_iter().chain(current.iter()) {
             cx.subscribe(input, |this, _, event: &InputEvent, cx| {
@@ -2434,11 +2448,15 @@ impl RuTermApp {
         let passphrase_mode =
             crate::vault::read_unlock_marker(&self.mode) == crate::vault::UnlockBackend::Passphrase;
         let current = passphrase_mode
-            .then(|| cx.new(|cx| InputState::new(window, cx).placeholder("当前主密码")));
+            .then(|| cx.new(|cx| InputState::new(window, cx).placeholder(tr!(cx, "当前主密码"))));
         let password = cx.new(|cx| {
-            InputState::new(window, cx).placeholder(password_placeholder(passphrase_mode))
+            InputState::new(window, cx).placeholder(i18n::translate(
+                cx,
+                password_placeholder(passphrase_mode),
+                &[],
+            ))
         });
-        let confirm = cx.new(|cx| InputState::new(window, cx).placeholder("再次输入确认"));
+        let confirm = cx.new(|cx| InputState::new(window, cx).placeholder(tr!(cx, "再次输入确认")));
         for input in [&password, &confirm].into_iter().chain(current.iter()) {
             cx.subscribe(input, |this, _, event: &InputEvent, cx| {
                 if matches!(event, InputEvent::PressEnter { shift: false, .. }) {
@@ -2490,12 +2508,7 @@ impl RuTermApp {
     }
 
     /// 从导航 / 菜单切到某页：需要时展开边栏并准备该页数据。
-    fn set_sidebar_page(
-        &mut self,
-        page: SidebarPage,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn set_sidebar_page(&mut self, page: SidebarPage, window: &mut Window, cx: &mut Context<Self>) {
         self.show_sidebar_page(page, cx);
         match page {
             SidebarPage::Hosts => {}
@@ -2662,13 +2675,7 @@ impl RuTermApp {
     }
 
     /// 双击条目：目录就进去，文件就下载到临时目录并用系统默认程序打开。
-    fn open_file_entry(
-        &mut self,
-        tab_id: usize,
-        name: &str,
-        is_dir: bool,
-        cx: &mut Context<Self>,
-    ) {
+    fn open_file_entry(&mut self, tab_id: usize, name: &str, is_dir: bool, cx: &mut Context<Self>) {
         let Some(path) = self
             .tabs
             .iter()
@@ -2697,7 +2704,9 @@ impl RuTermApp {
             self.file_error(tab_id, "文件名不合法，无法在本地打开", cx);
             return;
         };
-        let dir = std::env::temp_dir().join("ruterm-open").join(tab_id.to_string());
+        let dir = std::env::temp_dir()
+            .join("ruterm-open")
+            .join(tab_id.to_string());
         if let Err(error) = std::fs::create_dir_all(&dir) {
             self.file_error(tab_id, format!("无法创建临时目录：{error}"), cx);
             return;
@@ -2745,8 +2754,7 @@ impl RuTermApp {
         tab.files.busy = Some(format!("正在{} {name}…", direction.label()).into());
         tab.files.progress = Some((0, 0));
         tab.files.error = None;
-        let (progress_tx, mut progress_rx) =
-            tokio::sync::mpsc::unbounded_channel::<(u64, u64)>();
+        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, u64)>();
         let (reply_tx, mut reply_rx) = tokio::sync::oneshot::channel();
         let command = session::SessionCommand::Transfer(transfer::Task {
             direction,
@@ -3123,7 +3131,10 @@ impl RuTermApp {
                     ),
                     None,
                 ),
-                Err(error) => (format!("下载失败：{error}"), Some(format!("下载失败：{error}"))),
+                Err(error) => (
+                    format!("下载失败：{error}"),
+                    Some(format!("下载失败：{error}")),
+                ),
             };
             let _ = this.update(cx, |this, cx| {
                 if let Some(tab) = this.tabs.iter_mut().find(|tab| tab.id == tab_id) {
@@ -3142,12 +3153,7 @@ impl RuTermApp {
     ///
     /// 与面板上传不同，落点由远端 shell 决定，这里不拼任何路径；
     /// 每个文件一个 `rz` 会话，失败后继续传下一个，最后汇总。
-    fn upload_via_terminal(
-        &mut self,
-        tab_id: usize,
-        paths: Vec<PathBuf>,
-        cx: &mut Context<Self>,
-    ) {
+    fn upload_via_terminal(&mut self, tab_id: usize, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
         let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) else {
             return;
         };
@@ -3252,7 +3258,11 @@ impl RuTermApp {
             let message = if failed.is_empty() {
                 format!("lrzsz 上传完成 · {total} 个文件")
             } else {
-                format!("lrzsz 上传结束 · {} 失败：{}", failed.len(), failed.join("；"))
+                format!(
+                    "lrzsz 上传结束 · {} 失败：{}",
+                    failed.len(),
+                    failed.join("；")
+                )
             };
             let _ = this.update(cx, |this, cx| {
                 if let Some(tab) = this.tabs.iter_mut().find(|tab| tab.id == tab_id) {
@@ -3279,7 +3289,7 @@ impl RuTermApp {
         let name = cx.new(|cx| {
             InputState::new(window, cx)
                 .default_value(default)
-                .placeholder("名称")
+                .placeholder(tr!(cx, "名称"))
         });
         name.update(cx, |state, cx| {
             state.focus(window, cx);
@@ -3391,7 +3401,13 @@ impl RuTermApp {
     }
 
     /// 请求删除（先弹二次确认）。
-    fn ask_delete_file(&mut self, tab_id: usize, name: String, is_dir: bool, cx: &mut Context<Self>) {
+    fn ask_delete_file(
+        &mut self,
+        tab_id: usize,
+        name: String,
+        is_dir: bool,
+        cx: &mut Context<Self>,
+    ) {
         let Some(path) = self
             .tabs
             .iter()
@@ -3515,7 +3531,11 @@ impl RuTermApp {
             return;
         };
         // 已经为这个会话准备好规则面板：只切分区，不重置正在编辑的表单。
-        if self.forward.as_ref().is_some_and(|dialog| dialog.tab_id == id) {
+        if self
+            .forward
+            .as_ref()
+            .is_some_and(|dialog| dialog.tab_id == id)
+        {
             self.show_sidebar_page(SidebarPage::Forward, cx);
             cx.notify();
             return;
@@ -3535,21 +3555,21 @@ impl RuTermApp {
         }
         let title = tab.title.clone();
         let addr = tab.addr.clone();
-        let name = cx.new(|cx| InputState::new(window, cx).placeholder("备注名（可选）"));
+        let name = cx.new(|cx| InputState::new(window, cx).placeholder(tr!(cx, "备注名（可选）")));
         let listen_port = cx.new(|cx| {
             InputState::new(window, cx)
                 .default_value("8080")
-                .placeholder("监听端口")
+                .placeholder(tr!(cx, "监听端口"))
         });
         let target_host = cx.new(|cx| {
             InputState::new(window, cx)
                 .default_value("127.0.0.1")
-                .placeholder("目标主机")
+                .placeholder(tr!(cx, "目标主机"))
         });
         let target_port = cx.new(|cx| {
             InputState::new(window, cx)
                 .default_value("80")
-                .placeholder("目标端口")
+                .placeholder(tr!(cx, "目标端口"))
         });
         listen_port.update(cx, |state, cx| state.focus(window, cx));
         self.show_sidebar_page(SidebarPage::Forward, cx);
@@ -4413,7 +4433,7 @@ impl RuTermApp {
                 }
             }),
             host: cx.new(|cx| {
-                let input = InputState::new(window, cx).placeholder("host 或 IP");
+                let input = InputState::new(window, cx).placeholder(tr!(cx, "host 或 IP"));
                 match &existing {
                     Some(host) => input.default_value(host.host.clone()),
                     None => input,
@@ -4431,7 +4451,7 @@ impl RuTermApp {
                 }
             }),
             user: cx.new(|cx| {
-                let input = InputState::new(window, cx).placeholder("登录用户名");
+                let input = InputState::new(window, cx).placeholder(tr!(cx, "登录用户名"));
                 match &existing {
                     Some(host) => input.default_value(host.user.clone()),
                     None => input,
@@ -4446,7 +4466,8 @@ impl RuTermApp {
             }),
             // 口令永不回填：编辑时留空即"不改动已保存的秘密"。
             passphrase: cx.new(|cx| {
-                InputState::new(window, cx).placeholder("私钥口令（可选，留空则连接时按需询问）")
+                InputState::new(window, cx)
+                    .placeholder(tr!(cx, "私钥口令（可选，留空则连接时按需询问）"))
             }),
             key_inline: existing.as_ref().is_some_and(|host| host.key_inline),
             key_data: None,
@@ -4551,7 +4572,9 @@ impl RuTermApp {
         }
         // 跳板机引用必须是仍存在的另一台主机，且不能自己挂自己或形成两级以上链。
         if let Some(jump_id) = host.proxy_jump {
-            let self_id = editing.and_then(|index| self.hosts.get(index)).map(|host| host.id);
+            let self_id = editing
+                .and_then(|index| self.hosts.get(index))
+                .map(|host| host.id);
             match self.hosts.iter().find(|item| item.id == jump_id) {
                 None => {
                     self.status = "所选跳板机已不存在，请重新选择".into();
@@ -5037,7 +5060,12 @@ impl RuTermApp {
         cx: &mut Context<Self>,
     ) {
         let id = profile.id();
-        let current = self.local_shell_prefs.args.get(&id).cloned().unwrap_or_default();
+        let current = self
+            .local_shell_prefs
+            .args
+            .get(&id)
+            .cloned()
+            .unwrap_or_default();
         self.open_shell_input(
             id,
             ShellPromptKind::Arguments,
@@ -5170,8 +5198,7 @@ impl RuTermApp {
                     let normalized = local_shell::env_text(&env);
                     let count = env.len();
                     self.local_shell_prefs.set_env(&prompt.id, &normalized);
-                    self.status =
-                        SharedString::from(format!("已设置 {count} 个环境变量"));
+                    self.status = SharedString::from(format!("已设置 {count} 个环境变量"));
                 }
             },
         }
@@ -5351,13 +5378,13 @@ impl RuTermApp {
         match host.auth {
             AuthMethod::Agent => {
                 let target = match self.host_target(&host, None) {
-                        Ok(target) => target,
-                        Err(error) => {
-                            self.status = SharedString::from(error);
-                            cx.notify();
-                            return;
-                        }
-                    };
+                    Ok(target) => target,
+                    Err(error) => {
+                        self.status = SharedString::from(error);
+                        cx.notify();
+                        return;
+                    }
+                };
                 let title = host.name.clone();
                 // 带上 host：Agent 主机也能进最近连接，且重连时按最新主机配置重建。
                 self.connect(title, target, None, Some(host), false, window, cx);
@@ -5485,7 +5512,10 @@ impl RuTermApp {
         };
         let key_data = if jump.auth == AuthMethod::IdentityFile && jump.key_inline {
             Some(self.inline_keys.get(&jump.id).cloned().ok_or_else(|| {
-                format!("跳板机 {} 的内嵌私钥不可用（加密库未解锁或数据损坏）", jump.addr())
+                format!(
+                    "跳板机 {} 的内嵌私钥不可用（加密库未解锁或数据损坏）",
+                    jump.addr()
+                )
             })?)
         } else {
             None
@@ -5520,13 +5550,13 @@ impl RuTermApp {
                 .map(|target| target.with_passphrase(Some(secret))),
         };
         let target = match target {
-                Ok(target) => target,
-                Err(error) => {
-                    self.status = SharedString::from(error);
-                    cx.notify();
-                    return;
-                }
-            };
+            Ok(target) => target,
+            Err(error) => {
+                self.status = SharedString::from(error);
+                cx.notify();
+                return;
+            }
+        };
         let title = host.name.clone();
         self.connect(title, target, Some(key), Some(host), from_vault, window, cx);
     }
@@ -5607,13 +5637,13 @@ impl RuTermApp {
                 .map(|target| target.with_passphrase(Some(secret))),
         };
         let target = match target {
-                Ok(target) => target,
-                Err(error) => {
-                    self.status = SharedString::from(error);
-                    cx.notify();
-                    return;
-                }
-            };
+            Ok(target) => target,
+            Err(error) => {
+                self.status = SharedString::from(error);
+                cx.notify();
+                return;
+            }
+        };
         self.connect(
             host.name.clone(),
             target,
@@ -5691,7 +5721,10 @@ impl RuTermApp {
         // Programmatic 从而不再反弹。
         let mirror_tx = self.mirror_tx.clone();
         terminal.update(cx, |terminal, _| {
-            terminal.add_middleware(Arc::new(MirrorInput { tab_id: id, tx: mirror_tx }));
+            terminal.add_middleware(Arc::new(MirrorInput {
+                tab_id: id,
+                tx: mirror_tx,
+            }));
         });
         let style = self.terminal_text_style(cx);
         let terminal_view =
@@ -5984,7 +6017,10 @@ impl RuTermApp {
         // 同步输入同样覆盖 Telnet 会话。
         let mirror_tx = self.mirror_tx.clone();
         terminal.update(cx, |terminal, _| {
-            terminal.add_middleware(Arc::new(MirrorInput { tab_id: id, tx: mirror_tx }));
+            terminal.add_middleware(Arc::new(MirrorInput {
+                tab_id: id,
+                tx: mirror_tx,
+            }));
         });
         let style = self.terminal_text_style(cx);
         let terminal_view =
@@ -6096,7 +6132,10 @@ impl RuTermApp {
                         return;
                     };
                     let message = if started {
-                        format!("连接中断：Telnet {addr}（{}）", session::error_summary(&error))
+                        format!(
+                            "连接中断：Telnet {addr}（{}）",
+                            session::error_summary(&error)
+                        )
                     } else {
                         format!("连接失败：Telnet {addr}")
                     };
@@ -6335,19 +6374,12 @@ impl RuTermApp {
                     cx,
                 );
             }
-            Resume::Telnet {
-                host,
-                port,
-                source,
-            } => {
+            Resume::Telnet { host, port, source } => {
                 // 主机可能被编辑过：仍为 Telnet 时按最新地址 / 端口重连；
                 // 已改成 SSH 或已删除则沿用原地址。
-                let latest = source.as_ref().and_then(|saved| {
-                    self.hosts
-                        .iter()
-                        .find(|item| item.id == saved.id)
-                        .cloned()
-                });
+                let latest = source
+                    .as_ref()
+                    .and_then(|saved| self.hosts.iter().find(|item| item.id == saved.id).cloned());
                 let (host, port, source) = match latest {
                     Some(latest) if latest.protocol == ProtocolKind::Telnet => {
                         (latest.host.clone(), latest.port, Some(latest))
@@ -6454,6 +6486,30 @@ impl RuTermApp {
             // 降级模式（无加密库）沿用旧 settings.json。
             self.store.save_theme(dark);
         }
+        cx.notify();
+    }
+
+    /// 切换界面语言：改全局 i18n 管理器、持久化后整体重绘。
+    ///
+    /// 与主题不同，这里两份存储都写：库内是权威值，`locale.txt` 是启动镜像——
+    /// 窗口首帧早于解锁，只有本地文件能让菜单第一时间就用对语言。
+    fn apply_language(&mut self, locale: &str, cx: &mut Context<Self>) {
+        if i18n::current_locale(cx) == locale {
+            return;
+        }
+        i18n::set_locale(locale, cx);
+        self.store.save_language(locale);
+        if let Some(vault) = self.vault.clone() {
+            let locale = locale.to_string();
+            cx.spawn(async move |_, _| {
+                if let Err(error) = vault.set_setting("language", &locale).await {
+                    log::warn!("写入库内界面语言失败: {error}");
+                }
+            })
+            .detach();
+        }
+        // 托盘菜单不在渲染树里，得显式重建一次才会取到新语言的词条。
+        self.sync_tray(cx);
         cx.notify();
     }
 
@@ -6768,7 +6824,8 @@ impl RuTermApp {
             return;
         }
         let input = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("要发送到所有会话的命令（回车在远端执行）")
+            InputState::new(window, cx)
+                .placeholder(tr!(cx, "要发送到所有会话的命令（回车在远端执行）"))
         });
         cx.subscribe(&input, |_, _, _: &InputEvent, cx| cx.notify())
             .detach();
@@ -6790,7 +6847,12 @@ impl RuTermApp {
         cx.notify();
     }
 
-    fn cancel_broadcast(&mut self, _: &CancelBroadcast, window: &mut Window, cx: &mut Context<Self>) {
+    fn cancel_broadcast(
+        &mut self,
+        _: &CancelBroadcast,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.close_broadcast(window, cx);
     }
 
@@ -6862,7 +6924,10 @@ impl RuTermApp {
         // 转发表单绑定单个会话：切到别的标签时重开该会话的面板，避免表单指向旧连接。
         if self.sidebar_visible(cx)
             && self.sidebar_page == SidebarPage::Forward
-            && self.forward.as_ref().is_some_and(|dialog| dialog.tab_id != id)
+            && self
+                .forward
+                .as_ref()
+                .is_some_and(|dialog| dialog.tab_id != id)
         {
             self.forward = None;
             self.open_forward(window, cx);
@@ -7004,21 +7069,21 @@ impl RuTermApp {
             menu.push(TrayMenuItem::Separator);
         }
         menu.push(TrayMenuItem::Action {
-            label: "显示主界面".into(),
+            label: tr!(cx, "显示主界面"),
             id: "show".into(),
         });
         menu.push(TrayMenuItem::Separator);
         menu.push(TrayMenuItem::Action {
-            label: "退出".into(),
+            label: tr!(cx, "退出"),
             id: "quit".into(),
         });
         cx.set_tray_menu(menu);
         let tooltip = if self.tabs.is_empty() {
-            "RuTerm 拾连".to_string()
+            tr!(cx, "RuTerm 拾连")
         } else {
-            format!("RuTerm 拾连 · {} 个会话", self.tabs.len())
+            tr!(cx, "RuTerm 拾连 · {count} 个会话", count = self.tabs.len())
         };
-        cx.set_tray_tooltip(&tooltip);
+        cx.set_tray_tooltip(tooltip.as_str());
     }
 
     /// 让标签栏滚到能看见指定标签（不改变选中态）。
@@ -7252,14 +7317,8 @@ impl RuTermApp {
             cx.notify();
             return;
         };
-        let builder = TerminalBuilder::new(
-            working_directory,
-            Some(program),
-            env,
-            None,
-            window_id,
-            cx,
-        );
+        let builder =
+            TerminalBuilder::new(working_directory, Some(program), env, None, window_id, cx);
         cx.spawn(async move |this, cx| {
             let builder = builder.await;
             let Some(entity) = this.upgrade() else {
@@ -7294,7 +7353,10 @@ impl RuTermApp {
         let terminal = cx.new(|cx| builder.subscribe(cx));
         let mirror_tx = self.mirror_tx.clone();
         terminal.update(cx, |terminal, _| {
-            terminal.add_middleware(Arc::new(MirrorInput { tab_id: id, tx: mirror_tx }));
+            terminal.add_middleware(Arc::new(MirrorInput {
+                tab_id: id,
+                tx: mirror_tx,
+            }));
         });
         let style = self.terminal_text_style(cx);
         let terminal_view =
@@ -7495,12 +7557,12 @@ impl RuTermApp {
         let passphrase_mode =
             crate::vault::read_unlock_marker(&self.mode) == crate::vault::UnlockBackend::Passphrase;
         let locked = passphrase_mode && self.vault.is_none();
-        let vault_state: &'static str = if !passphrase_mode {
-            "免主密码（系统密钥环）"
+        let vault_state = if !passphrase_mode {
+            tr!(cx, "免主密码（系统密钥环）")
         } else if locked {
-            "主密码档 · 已锁定"
+            tr!(cx, "主密码档 · 已锁定")
         } else {
-            "主密码档 · 已解锁"
+            tr!(cx, "主密码档 · 已解锁")
         };
         let entity = cx.entity();
 
@@ -7522,39 +7584,42 @@ impl RuTermApp {
                 let host = &self.hosts[index];
                 Some((
                     index,
-                    SharedString::from(format!("{}（{}）", host.name, host.addr())),
+                    tr!(
+                        cx,
+                        "{name}（{addr}）",
+                        name = host.name.clone(),
+                        addr = host.addr()
+                    ),
                 ))
             })
             .collect();
         let menu_entity = entity.clone();
-        let session_menu = move |menu: PopupMenu, _: &mut Window, _: &mut Context<PopupMenu>| {
+        let session_menu = move |menu: PopupMenu, _: &mut Window, cx: &mut Context<PopupMenu>| {
             let importing = menu_entity.clone();
             let mut menu = menu
-                .item(PopupMenuItem::new("新建主机…").action(Box::new(NewHost)))
-                .item(
-                    PopupMenuItem::new("导入 ~/.ssh/config…").on_click(move |_, _, cx| {
+                .item(PopupMenuItem::new(tr!(cx, "新建主机…")).action(Box::new(NewHost)))
+                .item(PopupMenuItem::new(tr!(cx, "导入 ~/.ssh/config…")).on_click(
+                    move |_, _, cx| {
                         importing.update(cx, |this, cx| this.import_ssh_config(cx));
-                    }),
-                );
+                    },
+                ));
             if !recent_items.is_empty() {
                 menu = menu
                     .separator()
-                    .item(PopupMenuItem::new("最近连接").disabled(true));
+                    .item(PopupMenuItem::new(tr!(cx, "最近连接")).disabled(true));
                 for (index, label) in recent_items.iter() {
                     let entity = menu_entity.clone();
                     let index = *index;
                     let label = label.clone();
-                    menu = menu.item(
-                        PopupMenuItem::new(label).on_click(move |_, window, cx| {
-                            entity.update(cx, |this, cx| this.click_host(index, window, cx));
-                        }),
-                    );
+                    menu = menu.item(PopupMenuItem::new(label).on_click(move |_, window, cx| {
+                        entity.update(cx, |this, cx| this.click_host(index, window, cx));
+                    }));
                 }
             }
             let menu = menu
-                .item(PopupMenuItem::new("本地终端…").action(Box::new(NewLocalTerminal)))
+                .item(PopupMenuItem::new(tr!(cx, "本地终端…")).action(Box::new(NewLocalTerminal)))
                 .item(
-                    PopupMenuItem::new("主机列表")
+                    PopupMenuItem::new(tr!(cx, "主机列表"))
                         .checked(hosts_open)
                         .on_click({
                             let entity = menu_entity.clone();
@@ -7566,43 +7631,46 @@ impl RuTermApp {
                         }),
                 )
                 .item(
-                    PopupMenuItem::new("文件浏览器")
+                    PopupMenuItem::new(tr!(cx, "文件浏览器"))
                         .checked(file_panel_open)
                         .action(Box::new(ToggleFilePanel)),
                 )
-                .item(PopupMenuItem::new("端口转发…").action(Box::new(OpenForward)))
-                .item(PopupMenuItem::new("左右分屏").action(Box::new(SplitRight)))
-                .item(PopupMenuItem::new("上下分屏").action(Box::new(SplitDown)));
+                .item(PopupMenuItem::new(tr!(cx, "端口转发…")).action(Box::new(OpenForward)))
+                .item(PopupMenuItem::new(tr!(cx, "左右分屏")).action(Box::new(SplitRight)))
+                .item(PopupMenuItem::new(tr!(cx, "上下分屏")).action(Box::new(SplitDown)));
             let menu = if split_open {
-                menu.item(PopupMenuItem::new("取消分屏").action(Box::new(CloseSplit)))
+                menu.item(PopupMenuItem::new(tr!(cx, "取消分屏")).action(Box::new(CloseSplit)))
             } else {
                 menu
             };
-            menu.item(PopupMenuItem::new("下一个标签").action(Box::new(NextTab)))
-                .item(PopupMenuItem::new("上一个标签").action(Box::new(PrevTab)))
-                .item(PopupMenuItem::new("终端内查找…").action(Box::new(FindInTerminal)))
+            menu.item(PopupMenuItem::new(tr!(cx, "下一个标签")).action(Box::new(NextTab)))
+                .item(PopupMenuItem::new(tr!(cx, "上一个标签")).action(Box::new(PrevTab)))
+                .item(PopupMenuItem::new(tr!(cx, "终端内查找…")).action(Box::new(FindInTerminal)))
                 .item(
-                    PopupMenuItem::new("同步输入")
+                    PopupMenuItem::new(tr!(cx, "同步输入"))
                         .checked(sync_on)
                         .disabled(live_tabs < 2)
                         .action(Box::new(ToggleSyncInput)),
                 )
                 .item(
-                    PopupMenuItem::new("命令发到所有会话…")
+                    PopupMenuItem::new(tr!(cx, "命令发到所有会话…"))
                         .disabled(live_tabs == 0)
                         .action(Box::new(BroadcastCommand)),
                 )
                 // 只折叠面板，最外缘的图标栏始终留着（RustRover 的工具窗口栏）。
-                .item(PopupMenuItem::new("折叠 / 展开侧栏面板").action(Box::new(ToggleSidebar)))
-                .item(PopupMenuItem::new("设置…").action(Box::new(OpenSettings)))
+                .item(
+                    PopupMenuItem::new(tr!(cx, "折叠 / 展开侧栏面板"))
+                        .action(Box::new(ToggleSidebar)),
+                )
+                .item(PopupMenuItem::new(tr!(cx, "设置…")).action(Box::new(OpenSettings)))
                 .separator()
                 .item(
-                    PopupMenuItem::new("隐藏到托盘").on_click(move |_, window, _| {
+                    PopupMenuItem::new(tr!(cx, "隐藏到托盘")).on_click(move |_, window, _| {
                         window.hide_window();
                     }),
                 )
                 .item(
-                    PopupMenuItem::new("退出 RuTerm")
+                    PopupMenuItem::new(tr!(cx, "退出 RuTerm"))
                         .danger(true)
                         .on_click(move |_, _, cx| cx.quit()),
                 )
@@ -7612,18 +7680,18 @@ impl RuTermApp {
         let unlock = entity.clone();
         let settings = entity.clone();
         let lock = entity.clone();
-        let vault_menu = move |menu: PopupMenu, _: &mut Window, _: &mut Context<PopupMenu>| {
+        let vault_menu = move |menu: PopupMenu, _: &mut Window, cx: &mut Context<PopupMenu>| {
             let unlock = unlock.clone();
             let settings = settings.clone();
             let lock = lock.clone();
             let menu = if locked {
-                menu.item(
-                    PopupMenuItem::new("解锁凭据库…").on_click(move |_, window, cx| {
+                menu.item(PopupMenuItem::new(tr!(cx, "解锁凭据库…")).on_click(
+                    move |_, window, cx| {
                         unlock.update(cx, |this, cx| this.open_unlock_dialog(window, cx));
-                    }),
-                )
+                    },
+                ))
             } else {
-                menu.item(PopupMenuItem::new("主密码与凭据库设置…").on_click(
+                menu.item(PopupMenuItem::new(tr!(cx, "主密码与凭据库设置…")).on_click(
                     move |_, window, cx| {
                         settings.update(cx, |this, cx| {
                             this.open_settings_at(SETTINGS_TAB_VAULT, window, cx);
@@ -7632,75 +7700,100 @@ impl RuTermApp {
                 ))
             };
             let menu = if passphrase_mode && !locked {
-                menu.item(
-                    PopupMenuItem::new("锁定凭据库").on_click(move |_, window, cx| {
+                menu.item(PopupMenuItem::new(tr!(cx, "锁定凭据库")).on_click(
+                    move |_, window, cx| {
                         lock.update(cx, |this, cx| this.lock_vault(window, cx));
-                    }),
-                )
+                    },
+                ))
             } else {
                 menu
             };
             menu.separator()
-                .item(PopupMenuItem::new(vault_state).disabled(true))
+                .item(PopupMenuItem::new(vault_state.clone()).disabled(true))
         };
 
-        // 外观菜单：明暗二选一（当前项打勾），外加设置面板的外观 / 状态栏 / 终端分页。
+        // 外观菜单：明暗二选一（当前项打勾）+ 语言二选一，外加设置面板的
+        // 外观 / 状态栏 / 终端分页。语言项显示各语言自署名，不跟着翻译。
         let to_dark = entity.clone();
         let to_light = entity.clone();
         let appearance = entity.clone();
         let status = entity.clone();
         let terminal = entity.clone();
+        let locale = i18n::current_locale(cx);
         let appearance_menu =
-            move |menu: PopupMenu, _: &mut Window, _: &mut Context<PopupMenu>| {
+            move |menu: PopupMenu, _: &mut Window, cx: &mut Context<PopupMenu>| {
                 let to_dark = to_dark.clone();
                 let to_light = to_light.clone();
                 let appearance = appearance.clone();
                 let status = status.clone();
                 let terminal = terminal.clone();
-                menu.item(PopupMenuItem::new("暗色主题").checked(dark).on_click(
-                    move |_, window, cx| {
-                        to_dark.update(cx, |this, cx| this.apply_theme(true, window, cx));
-                    },
-                ))
-                .item(PopupMenuItem::new("亮色主题").checked(!dark).on_click(
-                    move |_, window, cx| {
-                        to_light.update(cx, |this, cx| this.apply_theme(false, window, cx));
-                    },
-                ))
-                // 明暗二选一是"设为"，这条是"翻转"，与 Ctrl+T 同义，故挂 action 显示按键。
-                .item(PopupMenuItem::new("切换明暗主题").action(Box::new(ToggleTheme)))
-                .separator()
-                .item(
-                    PopupMenuItem::new("外观设置…").on_click(move |_, window, cx| {
-                        appearance.update(cx, |this, cx| {
-                            this.open_settings_at(SETTINGS_TAB_APPEARANCE, window, cx);
-                        });
-                    }),
-                )
-                .item(
-                    PopupMenuItem::new("状态栏显示项…").on_click(move |_, window, cx| {
-                        status.update(cx, |this, cx| {
-                            this.open_settings_at(SETTINGS_TAB_STATUS, window, cx);
-                        });
-                    }),
-                )
-                .item(
-                    PopupMenuItem::new("终端外观…").on_click(move |_, window, cx| {
-                        terminal.update(cx, |this, cx| {
-                            this.open_settings_at(SETTINGS_TAB_TERMINAL, window, cx);
-                        });
-                    }),
-                )
+                let menu = menu
+                    .item(
+                        PopupMenuItem::new(tr!(cx, "暗色主题"))
+                            .checked(dark)
+                            .on_click(move |_, window, cx| {
+                                to_dark.update(cx, |this, cx| this.apply_theme(true, window, cx));
+                            }),
+                    )
+                    .item(
+                        PopupMenuItem::new(tr!(cx, "亮色主题"))
+                            .checked(!dark)
+                            .on_click(move |_, window, cx| {
+                                to_light.update(cx, |this, cx| this.apply_theme(false, window, cx));
+                            }),
+                    )
+                    // 明暗二选一是"设为"，这条是"翻转"，与 Ctrl+T 同义，故挂 action 显示按键。
+                    .item(PopupMenuItem::new(tr!(cx, "切换明暗主题")).action(Box::new(ToggleTheme)))
+                    .separator();
+                let menu = i18n::LANGUAGES
+                    .iter()
+                    .fold(menu, |menu, (code, native_name)| {
+                        let entity = appearance.clone();
+                        menu.item(
+                            PopupMenuItem::new(*native_name)
+                                .checked(*code == locale)
+                                .on_click(move |_, _, cx| {
+                                    entity.update(cx, |this, cx| this.apply_language(code, cx));
+                                }),
+                        )
+                    });
+                menu.separator()
+                    .item(PopupMenuItem::new(tr!(cx, "外观设置…")).on_click(
+                        move |_, window, cx| {
+                            appearance.update(cx, |this, cx| {
+                                this.open_settings_at(SETTINGS_TAB_APPEARANCE, window, cx);
+                            });
+                        },
+                    ))
+                    .item(PopupMenuItem::new(tr!(cx, "状态栏显示项…")).on_click(
+                        move |_, window, cx| {
+                            status.update(cx, |this, cx| {
+                                this.open_settings_at(SETTINGS_TAB_STATUS, window, cx);
+                            });
+                        },
+                    ))
+                    .item(PopupMenuItem::new(tr!(cx, "终端外观…")).on_click(
+                        move |_, window, cx| {
+                            terminal.update(cx, |this, cx| {
+                                this.open_settings_at(SETTINGS_TAB_TERMINAL, window, cx);
+                            });
+                        },
+                    ))
             };
 
         // 帮助菜单只留版本信息：快捷键已随各菜单项右侧显示，不再单列一份文字清单。
-        let help_menu = move |menu: PopupMenu, _: &mut Window, _: &mut Context<PopupMenu>| {
+        let help_menu = move |menu: PopupMenu, _: &mut Window, cx: &mut Context<PopupMenu>| {
             menu.label("RuTerm").item(
-                PopupMenuItem::new(concat!("版本 ", env!("CARGO_PKG_VERSION"))).disabled(true),
+                PopupMenuItem::new(tr!(
+                    cx,
+                    "版本 {version}",
+                    version = env!("CARGO_PKG_VERSION")
+                ))
+                .disabled(true),
             )
         };
 
-        let menu_button = |id: &'static str, label: &'static str| {
+        let menu_button = |id: &'static str, label: SharedString| {
             Button::new(id)
                 .label(label)
                 .compact()
@@ -7736,7 +7829,12 @@ impl RuTermApp {
                             .child("RuTerm"),
                     )
                     .when(locked, |this| {
-                        this.child(div().text_sm().text_color(pal.muted).child("已锁定"))
+                        this.child(
+                            div()
+                                .text_sm()
+                                .text_color(pal.muted)
+                                .child(tr!(cx, "已锁定")),
+                        )
                     }),
             )
             // 菜单区：交互控件，必须落在 Drag 命中区之外。
@@ -7745,10 +7843,13 @@ impl RuTermApp {
                     .items_center()
                     .gap_1()
                     .flex_shrink_0()
-                    .child(menu_button("menu-session", "会话").dropdown_menu(session_menu))
-                    .child(menu_button("menu-vault", "凭据").dropdown_menu(vault_menu))
-                    .child(menu_button("menu-appearance", "外观").dropdown_menu(appearance_menu))
-                    .child(menu_button("menu-help", "帮助").dropdown_menu(help_menu)),
+                    .child(menu_button("menu-session", tr!(cx, "会话")).dropdown_menu(session_menu))
+                    .child(menu_button("menu-vault", tr!(cx, "凭据")).dropdown_menu(vault_menu))
+                    .child(
+                        menu_button("menu-appearance", tr!(cx, "外观"))
+                            .dropdown_menu(appearance_menu),
+                    )
+                    .child(menu_button("menu-help", tr!(cx, "帮助")).dropdown_menu(help_menu)),
             )
             // 可拖动段二：菜单与右侧按钮之间的空档（会话标签在下方标签栏，不占标题栏）。
             .child(
@@ -7776,7 +7877,7 @@ impl RuTermApp {
                                 .compact()
                                 .ghost()
                                 .text_color(fg)
-                                .tooltip("输入主密码解锁凭据库")
+                                .tooltip(tr!(cx, "输入主密码解锁凭据库"))
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.open_unlock_dialog(window, cx);
                                 })),
@@ -7790,7 +7891,7 @@ impl RuTermApp {
                                 .compact()
                                 .ghost()
                                 .text_color(fg)
-                                .tooltip("锁定凭据库（需主密码解锁）")
+                                .tooltip(tr!(cx, "锁定凭据库（需主密码解锁）"))
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.lock_vault(window, cx);
                                 })),
@@ -7875,12 +7976,22 @@ impl RuTermApp {
         // 高亮条画在贴窗口外缘的那一侧：边栏在左则亮条在左，反之在右。
         let stripe_at_left = self.sidebar.side == SidebarSide::Left;
         let pages = [
-            (SidebarPage::Hosts, "rail-hosts", "主机", IconName::User),
-            (SidebarPage::Files, "rail-files", "文件", IconName::FolderOpen),
+            (
+                SidebarPage::Hosts,
+                "rail-hosts",
+                tr!(cx, "主机"),
+                IconName::User,
+            ),
+            (
+                SidebarPage::Files,
+                "rail-files",
+                tr!(cx, "文件"),
+                IconName::FolderOpen,
+            ),
             (
                 SidebarPage::Forward,
                 "rail-forward",
-                "转发",
+                tr!(cx, "转发"),
                 IconName::Network,
             ),
         ];
@@ -7903,11 +8014,16 @@ impl RuTermApp {
             let active = self.sidebar_page == page;
             let color = if active { pal.accent } else { pal.muted };
             // 转发的生效条数是常驻状态，压成图标角标，不占竖向空间。
-            let badge = (page == SidebarPage::Forward && forward_count > 0)
-                .then_some(forward_count);
+            let badge =
+                (page == SidebarPage::Forward && forward_count > 0).then_some(forward_count);
             let tip = match badge {
-                Some(count) => format!("{label}（{count} 条生效）"),
-                None => label.to_string(),
+                Some(count) => tr!(
+                    cx,
+                    "{label}（{count} 条生效）",
+                    label = label.clone(),
+                    count = count
+                ),
+                None => label.clone(),
             };
             // 活动项的高亮条：RustRover 在选中图标外侧画一道竖条。
             let stripe = div()
@@ -8010,6 +8126,28 @@ impl RuTermApp {
             return div().into_any_element();
         };
         let is_new = state.is_new;
+        let title = if is_new {
+            tr!(cx, "设置主密码")
+        } else {
+            tr!(cx, "解锁凭据库")
+        };
+        let hint = if is_new {
+            tr!(
+                cx,
+                "便携模式首次使用：设置主密码以创建加密库。密码仅用于派生库密钥，不会保存到任何地方——一旦忘记无法恢复，请务必牢记。"
+            )
+        } else {
+            tr!(
+                cx,
+                "输入主密码解锁凭据库（库文件与密码均不离开本机/本目录）。"
+            )
+        };
+        let cancel_label = tr!(cx, "退出应用");
+        let confirm_label = if is_new {
+            tr!(cx, "创建并解锁")
+        } else {
+            tr!(cx, "解锁")
+        };
         v_flex()
             .id("unlock-backdrop")
             .absolute()
@@ -8042,18 +8180,9 @@ impl RuTermApp {
                         div()
                             .text_base()
                             .font_weight(rgpui::FontWeight(600.0))
-                            .child(if is_new {
-                                "设置主密码"
-                            } else {
-                                "解锁凭据库"
-                            }),
+                            .child(title),
                     )
-                    .child(div().text_sm().text_color(pal.muted).child(if is_new {
-                        "便携模式首次使用：设置主密码以创建加密库。密码仅用于派生库密钥，\
-                                 不会保存到任何地方——一旦忘记无法恢复，请务必牢记。"
-                    } else {
-                        "输入主密码解锁凭据库（库文件与密码均不离开本机/本目录）。"
-                    }))
+                    .child(div().text_sm().text_color(pal.muted).child(hint))
                     .child(styled_input(
                         Input::new(&state.passphrase).content_type(InputContentType::Password),
                         &pal,
@@ -8073,7 +8202,7 @@ impl RuTermApp {
                             .justify_end()
                             .child(
                                 Button::new("unlock-cancel")
-                                    .label("退出应用")
+                                    .label(cancel_label)
                                     .ghost()
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         // 未解锁即退出：保持旧行为，不落任何秘密。
@@ -8086,7 +8215,7 @@ impl RuTermApp {
                             )
                             .child(
                                 Button::new("unlock-confirm")
-                                    .label(if is_new { "创建并解锁" } else { "解锁" })
+                                    .label(confirm_label)
                                     .primary()
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.unlock_passphrase(cx);
@@ -8118,7 +8247,7 @@ impl RuTermApp {
         // 竖排分页条目：不套底色不描边，选中项靠左侧强调色竖条 + 粗体区分，
         // 未选中项只弱化文字色（竖条留空占位，文字位置不跳）。
         let tab_item =
-            |id: &'static str, label: &'static str, ix: usize, entity: Entity<RuTermApp>| {
+            |id: &'static str, label: SharedString, ix: usize, entity: Entity<RuTermApp>| {
                 let selected = state.tab == ix;
                 h_flex()
                     .id(id)
@@ -8181,7 +8310,7 @@ impl RuTermApp {
                             .text_base()
                             .font_weight(FontWeight(600.0))
                             .flex_shrink_0()
-                            .child("设置"),
+                            .child(tr!(cx, "设置")),
                     )
                     .child(
                         h_flex()
@@ -8195,31 +8324,31 @@ impl RuTermApp {
                                     .gap_1()
                                     .child(tab_item(
                                         "settings-tab-vault",
-                                        "凭据库与主密码",
+                                        tr!(cx, "凭据库与主密码"),
                                         SETTINGS_TAB_VAULT,
                                         entity.clone(),
                                     ))
                                     .child(tab_item(
                                         "settings-tab-appearance",
-                                        "外观",
+                                        tr!(cx, "外观"),
                                         SETTINGS_TAB_APPEARANCE,
                                         entity.clone(),
                                     ))
                                     .child(tab_item(
                                         "settings-tab-status",
-                                        "状态栏",
+                                        tr!(cx, "状态栏"),
                                         SETTINGS_TAB_STATUS,
                                         entity.clone(),
                                     ))
                                     .child(tab_item(
                                         "settings-tab-terminal",
-                                        "终端",
+                                        tr!(cx, "终端"),
                                         SETTINGS_TAB_TERMINAL,
                                         entity.clone(),
                                     ))
                                     .child(tab_item(
                                         "settings-tab-session",
-                                        "会话",
+                                        tr!(cx, "会话"),
                                         SETTINGS_TAB_SESSION,
                                         entity,
                                     )),
@@ -8240,7 +8369,7 @@ impl RuTermApp {
                     .child(
                         h_flex().flex_shrink_0().gap_2().justify_end().child(
                             Button::new("settings-close")
-                                .label("关闭")
+                                .label(tr!(cx, "关闭"))
                                 .secondary()
                                 .outline()
                                 .on_click(cx.listener(|this, _, _, cx| {
@@ -8264,16 +8393,21 @@ impl RuTermApp {
                 .justify_center()
                 .gap_2()
                 .p_4()
-                .child(div().text_sm().text_color(pal.muted).child("没有打开的转发配置"))
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(pal.muted)
+                        .child(tr!(cx, "没有打开的转发配置")),
+                )
                 .child(
                     div()
                         .text_xs()
                         .text_color(pal.muted)
-                        .child("转发规则绑定当前 SSH 会话，保存后用开关即时启停"),
+                        .child(tr!(cx, "转发规则绑定当前 SSH 会话，保存后用开关即时启停")),
                 )
                 .child(
                     Button::new("forward-start")
-                        .label("设置转发…")
+                        .label(tr!(cx, "设置转发…"))
                         .primary()
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.open_forward(window, cx);
@@ -8294,32 +8428,41 @@ impl RuTermApp {
         let kind = dialog.kind;
         let (listen_label, host_label, port_label, hint) = match kind {
             session::ForwardKind::Local => (
-                "本地端口",
-                "远端主机",
-                "远端端口",
-                "监听只绑本机 127.0.0.1，不对局域网开放；目标地址按服务器视角解析。",
+                tr!(cx, "本地端口"),
+                tr!(cx, "远端主机"),
+                tr!(cx, "远端端口"),
+                tr!(
+                    cx,
+                    "监听只绑本机 127.0.0.1，不对局域网开放；目标地址按服务器视角解析。"
+                ),
             ),
             session::ForwardKind::Remote => (
-                "服务器监听端口",
-                "本地目标主机",
-                "本地目标端口",
-                "服务器只监听其 127.0.0.1，不对公网开放；目标地址按本机视角解析。",
+                tr!(cx, "服务器监听端口"),
+                tr!(cx, "本地目标主机"),
+                tr!(cx, "本地目标端口"),
+                tr!(
+                    cx,
+                    "服务器只监听其 127.0.0.1，不对公网开放；目标地址按本机视角解析。"
+                ),
             ),
             session::ForwardKind::Dynamic => (
-                "SOCKS5 端口",
-                "",
-                "",
-                "在本机 127.0.0.1 上提供 SOCKS5 代理（无认证），目标地址由客户端请求给出、经服务器解析。",
+                tr!(cx, "SOCKS5 端口"),
+                SharedString::default(),
+                SharedString::default(),
+                tr!(
+                    cx,
+                    "在本机 127.0.0.1 上提供 SOCKS5 代理（无认证），目标地址由客户端请求给出、经服务器解析。"
+                ),
             ),
         };
         let is_dynamic = kind == session::ForwardKind::Dynamic;
         let local_button = if kind == session::ForwardKind::Local {
             Button::new("forward-kind-local")
-                .label("本地 -L")
+                .label(tr!(cx, "本地 -L"))
                 .primary()
         } else {
             Button::new("forward-kind-local")
-                .label("本地 -L")
+                .label(tr!(cx, "本地 -L"))
                 .ghost()
         }
         .on_click(cx.listener(|this, _, _, cx| {
@@ -8327,11 +8470,11 @@ impl RuTermApp {
         }));
         let remote_button = if kind == session::ForwardKind::Remote {
             Button::new("forward-kind-remote")
-                .label("远程 -R")
+                .label(tr!(cx, "远程 -R"))
                 .primary()
         } else {
             Button::new("forward-kind-remote")
-                .label("远程 -R")
+                .label(tr!(cx, "远程 -R"))
                 .ghost()
         }
         .on_click(cx.listener(|this, _, _, cx| {
@@ -8339,11 +8482,11 @@ impl RuTermApp {
         }));
         let dynamic_button = if is_dynamic {
             Button::new("forward-kind-dynamic")
-                .label("动态 -D")
+                .label(tr!(cx, "动态 -D"))
                 .primary()
         } else {
             Button::new("forward-kind-dynamic")
-                .label("动态 -D")
+                .label(tr!(cx, "动态 -D"))
                 .ghost()
         }
         .on_click(cx.listener(|this, _, _, cx| {
@@ -8367,12 +8510,11 @@ impl RuTermApp {
                             .w_full()
                             .items_center()
                             .justify_between()
-                            .child(
-                                div()
-                                    .text_base()
-                                    .font_weight(FontWeight(600.0))
-                                    .child(format!("端口转发 · {}", dialog.title)),
-                            )
+                            .child(div().text_base().font_weight(FontWeight(600.0)).child(tr!(
+                                cx,
+                                "端口转发 · {target}",
+                                target = dialog.title
+                            )))
                             .child(
                                 Button::new("close-forward")
                                     .label("×")
@@ -8387,7 +8529,7 @@ impl RuTermApp {
                                 div()
                                     .text_xs()
                                     .text_color(pal.muted)
-                                    .child("已保存的转发（开关即时生效）"),
+                                    .child(tr!(cx, "已保存的转发（开关即时生效）")),
                             )
                             .child(
                                 v_flex()
@@ -8396,11 +8538,9 @@ impl RuTermApp {
                                     .max_h(if editing { px(150.0) } else { px(260.0) })
                                     .overflow_y_scrollbar()
                                     .when(saved_rules.is_empty(), |this| {
-                                        this.child(
-                                            div().text_sm().text_color(pal.muted).child(
-                                                "暂无保存的规则，点下方「设置…」添加一条。",
-                                            ),
-                                        )
+                                        this.child(div().text_sm().text_color(pal.muted).child(
+                                            tr!(cx, "暂无保存的规则，点下方「设置…」添加一条。"),
+                                        ))
                                     })
                                     .children(saved_rules.iter().cloned().map(|saved| {
                                         let rule = saved.rule();
@@ -8465,7 +8605,7 @@ impl RuTermApp {
                                                     "forward-delete-{}",
                                                     rule.id()
                                                 )))
-                                                .label("删除")
+                                                .label(tr!(cx, "删除"))
                                                 .compact()
                                                 .ghost()
                                                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -8490,7 +8630,7 @@ impl RuTermApp {
                                     v_flex()
                                         .flex_1()
                                         .gap_1()
-                                        .child(div().text_sm().child("名称"))
+                                        .child(div().text_sm().child(tr!(cx, "名称")))
                                         .child(styled_input(Input::new(&dialog.name), &pal)),
                                 ),
                         )
@@ -8502,10 +8642,7 @@ impl RuTermApp {
                                         .w(px(130.0))
                                         .gap_1()
                                         .child(div().text_sm().child(listen_label))
-                                        .child(styled_input(
-                                            Input::new(&dialog.listen_port),
-                                            &pal,
-                                        )),
+                                        .child(styled_input(Input::new(&dialog.listen_port), &pal)),
                                 )
                                 .when(!is_dynamic, |this| {
                                     this.child(
@@ -8556,12 +8693,12 @@ impl RuTermApp {
                                                 }
                                             },
                                         ))
-                                        .child(div().text_sm().child("连接时自动开启")),
+                                        .child(div().text_sm().child(tr!(cx, "连接时自动开启"))),
                                 )
                                 .child(div().flex_1())
                                 .child(
                                     Button::new("forward-cancel")
-                                        .label("取消")
+                                        .label(tr!(cx, "取消"))
                                         .ghost()
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.set_forward_editing(false, cx);
@@ -8569,7 +8706,7 @@ impl RuTermApp {
                                 )
                                 .child(
                                     Button::new("forward-save")
-                                        .label("保存规则")
+                                        .label(tr!(cx, "保存规则"))
                                         .primary()
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.save_forward(cx);
@@ -8590,7 +8727,7 @@ impl RuTermApp {
                                 .items_center()
                                 .child(
                                     Button::new("forward-settings")
-                                        .label("设置…")
+                                        .label(tr!(cx, "设置…"))
                                         .secondary()
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.set_forward_editing(true, cx);
@@ -8600,16 +8737,16 @@ impl RuTermApp {
                                     div()
                                         .text_xs()
                                         .text_color(pal.muted)
-                                        .child("添加或修改转发规则"),
+                                        .child(tr!(cx, "添加或修改转发规则")),
                                 )
                                 .child(div().flex_1())
                                 .child(
                                     Button::new("forward-close")
-                                        .label("关闭")
+                                        .label(tr!(cx, "关闭"))
                                         .ghost()
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.close_forward(cx)
-                                        })),
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| this.close_forward(cx)),
+                                        ),
                                 ),
                         )
                     }),
@@ -8629,13 +8766,14 @@ impl RuTermApp {
         v_flex()
             .id("settings-tab-vault")
             .gap_3()
-            .child(div().text_sm().text_color(pal.muted).child(format!(
-                "位置：{}　解锁方式：{}",
-                self.mode.dir().display(),
-                if passphrase_mode {
-                    "主密码（Argon2id 派生）"
+            .child(div().text_sm().text_color(pal.muted).child(tr!(
+                cx,
+                "位置：{path}　解锁方式：{mode}",
+                path = self.mode.dir().display(),
+                mode = if passphrase_mode {
+                    tr!(cx, "主密码（Argon2id 派生）")
                 } else {
-                    "系统凭据管理器（无需输入）"
+                    tr!(cx, "系统凭据管理器（无需输入）")
                 }
             )))
             .child(
@@ -8643,11 +8781,9 @@ impl RuTermApp {
                     .text_sm()
                     .text_color(pal.muted)
                     .child(if passphrase_mode {
-                        "主密码只用于派生库密钥，不会写入任何文件；忘记主密码将无法恢复数据。\
-                         每次启动需输入主密码，库文件可凭口令带往其他机器解锁。"
+                        tr!(cx, "主密码只用于派生库密钥，不会写入任何文件；忘记主密码将无法恢复数据。每次启动需输入主密码，库文件可凭口令带往其他机器解锁。")
                     } else {
-                        "当前由系统凭据管理器免密解锁，开箱即用。建议设置主密码：库文件可凭口令\
-                         带往其他机器，他人取到文件也无法读取；忘记主密码将无法恢复数据。"
+                        tr!(cx, "当前由系统凭据管理器免密解锁，开箱即用。建议设置主密码：库文件可凭口令带往其他机器，他人取到文件也无法读取；忘记主密码将无法恢复数据。")
                     }),
             )
             .when(!unlocked, |this| {
@@ -8655,21 +8791,23 @@ impl RuTermApp {
                     div()
                         .text_sm()
                         .text_color(pal.danger)
-                        .child("凭据库未解锁，无法设置或更换主密码。"),
+                        .child(tr!(cx, "凭据库未解锁，无法设置或更换主密码。")),
                 )
             })
             .when(unlocked, |this| {
                 let form = state.password.as_ref().zip(state.confirm.as_ref());
                 match form {
                     Some((password, confirm)) => {
-                        let this =
-                            this.child(div().text_base().font_weight(FontWeight(600.0)).child(
-                                if passphrase_mode {
-                                    "更换主密码"
+                        let this = this.child(
+                            div()
+                                .text_base()
+                                .font_weight(FontWeight(600.0))
+                                .child(if passphrase_mode {
+                                    tr!(cx, "更换主密码")
                                 } else {
-                                    "设置主密码（可选）"
-                                },
-                            ));
+                                    tr!(cx, "设置主密码（可选）")
+                                }),
+                        );
                         let this = match state.current.as_ref() {
                             Some(current) => this.child(styled_input(
                                 Input::new(current).content_type(InputContentType::Password),
@@ -8693,7 +8831,7 @@ impl RuTermApp {
                                 div()
                                     .text_sm()
                                     .text_color(pal.muted)
-                                    .child("正在新建加密库并全量搬迁，请稍候…"),
+                                    .child(tr!(cx, "正在新建加密库并全量搬迁，请稍候…")),
                             )
                         })
                         .when(!state.busy, |this| {
@@ -8704,7 +8842,7 @@ impl RuTermApp {
                                     .when(passphrase_mode, |this| {
                                         this.child(
                                             Button::new("rekey-cancel")
-                                                .label("取消主密码")
+                                                .label(tr!(cx, "取消主密码"))
                                                 .secondary()
                                                 .outline()
                                                 .on_click(cx.listener(|this, _, _, cx| {
@@ -8715,9 +8853,9 @@ impl RuTermApp {
                                     .child(
                                         Button::new("rekey-apply")
                                             .label(if passphrase_mode {
-                                                "更换主密码"
+                                                tr!(cx, "更换主密码")
                                             } else {
-                                                "设置主密码"
+                                                tr!(cx, "设置主密码")
                                             })
                                             .primary()
                                             .on_click(cx.listener(|this, _, _, cx| {
@@ -8740,9 +8878,9 @@ impl RuTermApp {
                                 h_flex().gap_2().justify_end().child(
                                     Button::new("rekey-reopen")
                                         .label(if passphrase_mode {
-                                            "更换主密码"
+                                            tr!(cx, "更换主密码")
                                         } else {
-                                            "设置主密码"
+                                            tr!(cx, "设置主密码")
                                         })
                                         .ghost()
                                         .on_click(cx.listener(|this, _, window, cx| {
@@ -8757,7 +8895,7 @@ impl RuTermApp {
                 this.child(
                     h_flex().gap_2().justify_end().child(
                         Button::new("settings-lock")
-                            .label("锁定凭据库")
+                            .label(tr!(cx, "锁定凭据库"))
                             .secondary()
                             .outline()
                             .on_click(cx.listener(|this, _, window, cx| {
@@ -8769,8 +8907,9 @@ impl RuTermApp {
             .into_any_element()
     }
 
-    /// 「外观」分页：明暗主题（与 `Ctrl+T`、标题栏 ☀☾ 同一开关）。
+    /// 「外观」分页：明暗主题（与 `Ctrl+T`、标题栏 ☀☾ 同一开关）、边栏位置与界面语言。
     fn render_appearance_tab(&self, pal: &Palette, dark: bool, cx: &Context<Self>) -> AnyElement {
+        let locale = i18n::current_locale(cx);
         v_flex()
             .id("settings-tab-appearance")
             .gap_3()
@@ -8778,24 +8917,27 @@ impl RuTermApp {
                 div()
                     .text_sm()
                     .text_color(pal.muted)
-                    .child("主题切换立即生效并写入凭据库，下次启动沿用。"),
+                    .child(tr!(cx, "主题切换立即生效并写入凭据库，下次启动沿用。")),
             )
             .child(
                 h_flex()
                     .gap_2()
                     .items_center()
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(pal.muted)
-                            .child(format!("当前主题：{}", if dark { "暗色" } else { "亮色" })),
-                    )
+                    .child(div().text_sm().text_color(pal.muted).child(tr!(
+                        cx,
+                        "当前主题：{theme}",
+                        theme = if dark {
+                            tr!(cx, "暗色")
+                        } else {
+                            tr!(cx, "亮色")
+                        }
+                    )))
                     .child(
                         Button::new("settings-toggle-theme")
                             .label(if dark {
-                                "切换到亮色"
+                                tr!(cx, "切换到亮色")
                             } else {
-                                "切换到暗色"
+                                tr!(cx, "切换到暗色")
                             })
                             .secondary()
                             .outline()
@@ -8808,10 +8950,15 @@ impl RuTermApp {
                 h_flex()
                     .gap_2()
                     .items_center()
-                    .child(div().text_sm().text_color(pal.muted).child("边栏位置"))
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(pal.muted)
+                            .child(tr!(cx, "边栏位置")),
+                    )
                     .child({
                         let left = self.sidebar.side == SidebarSide::Left;
-                        let button = Button::new("settings-side-left").label("左侧");
+                        let button = Button::new("settings-side-left").label(tr!(cx, "左侧"));
                         let button = if left {
                             button.primary()
                         } else {
@@ -8823,7 +8970,7 @@ impl RuTermApp {
                     })
                     .child({
                         let right = self.sidebar.side == SidebarSide::Right;
-                        let button = Button::new("settings-side-right").label("右侧");
+                        let button = Button::new("settings-side-right").label(tr!(cx, "右侧"));
                         let button = if right {
                             button.primary()
                         } else {
@@ -8837,7 +8984,38 @@ impl RuTermApp {
                         div()
                             .text_xs()
                             .text_color(pal.muted)
-                            .child("导航栏始终贴在窗口外缘"),
+                            .child(tr!(cx, "导航栏始终贴在窗口外缘")),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(pal.muted)
+                            .child(tr!(cx, "界面语言")),
+                    )
+                    // 语言名恒用该语言本身书写，切过去之后才认得出这是刚才点的语言。
+                    .children(i18n::LANGUAGES.iter().map(|(code, native_name)| {
+                        let on = *code == locale;
+                        let button =
+                            Button::new(format!("settings-locale-{code}")).label(*native_name);
+                        let button = if on {
+                            button.primary()
+                        } else {
+                            button.secondary().outline()
+                        };
+                        button.on_click(cx.listener(move |this, _, _, cx| {
+                            this.apply_language(code, cx);
+                        }))
+                    }))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(pal.muted)
+                            .child(tr!(cx, "立即生效；菜单与面板即刻改用该语言")),
                     ),
             )
             .into_any_element()
@@ -8868,25 +9046,29 @@ impl RuTermApp {
         v_flex()
             .id("settings-tab-status")
             .gap_3()
-            .child(
-                div().text_sm().text_color(pal.muted).child(
-                    "勾选底部状态栏要显示的条目，取消勾选即隐藏；改动立即生效并写入凭据库。",
-                ),
-            )
+            .child(div().text_sm().text_color(pal.muted).child(tr!(
+                cx,
+                "勾选底部状态栏要显示的条目，取消勾选即隐藏；改动立即生效并写入凭据库。"
+            )))
             .child(
                 v_flex()
                     .gap_2()
-                    .child(div().text_sm().text_color(pal.muted).child("会话信息"))
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(pal.muted)
+                            .child(tr!(cx, "会话信息")),
+                    )
                     .child(row(
                         "status-addr".into(),
-                        "连接地址（user@host:port）".into(),
+                        tr!(cx, "连接地址（user@host:port）").to_string(),
                         self.status_bar.addr,
                         StatusPref::Addr,
                         entity.clone(),
                     ))
                     .child(row(
                         "status-auth".into(),
-                        "认证方式".into(),
+                        tr!(cx, "认证方式").to_string(),
                         self.status_bar.auth,
                         StatusPref::Auth,
                         entity,
@@ -8895,11 +9077,10 @@ impl RuTermApp {
             .child(
                 v_flex()
                     .gap_2()
-                    .child(
-                        div().text_sm().text_color(pal.muted).child(
-                            "远程主机信息（连接后经 exec 探测取得，远端没探到的项自动不显示）",
-                        ),
-                    )
+                    .child(div().text_sm().text_color(pal.muted).child(tr!(
+                        cx,
+                        "远程主机信息（连接后经 exec 探测取得，远端没探到的项自动不显示）"
+                    )))
                     .children(metrics),
             )
             .into_any_element()
@@ -8914,7 +9095,7 @@ impl RuTermApp {
             .position(|name| *name == self.terminal.theme)
             .unwrap_or(0);
         // 步进按钮：− / + 各一档，值显示在中间，比数字框少一层提交路径。
-        let row = |label: &'static str, value: String, minus, plus| {
+        let row = |label: SharedString, value: String, minus, plus| {
             h_flex()
                 .gap_2()
                 .items_center()
@@ -8939,11 +9120,14 @@ impl RuTermApp {
         v_flex()
             .id("settings-tab-terminal")
             .gap_3()
-            .child(div().text_sm().text_color(pal.muted).child(
-                "终端外观只影响会话终端（界面主题在「外观」分页里），改动立即生效并写入凭据库。",
-            ))
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(pal.muted)
+                    .child(tr!(cx, "终端外观只影响会话终端（界面主题在「外观」分页里），改动立即生效并写入凭据库。")),
+            )
             .child(row(
-                "字号",
+                tr!(cx, "字号"),
                 format!("{} px", self.terminal.font_size as i32),
                 stepper(
                     "terminal-font-minus",
@@ -8957,7 +9141,7 @@ impl RuTermApp {
                 ),
             ))
             .child(row(
-                "行高",
+                tr!(cx, "行高"),
                 format!("{:.1}", self.terminal.line_height),
                 stepper(
                     "terminal-line-minus",
@@ -8979,7 +9163,7 @@ impl RuTermApp {
                             .w(px(72.0))
                             .text_sm()
                             .text_color(pal.muted)
-                            .child("配色方案"),
+                            .child(tr!(cx, "配色方案")),
                     )
                     .child({
                         let options = themes.clone();
@@ -9003,17 +9187,17 @@ impl RuTermApp {
             })
             .child(self.render_local_shell_row(pal, cx))
             .child(
-                div().text_xs().text_color(pal.muted).child(
-                    "「一键扫描」会实际调用 wsl.exe 列出 WSL 发行版，故放在按钮后面而不是启动时；"
-                        .to_string()
-                        + &format!(
-                            "扫描结果列在{}「本地终端」分组里，点一下即开对应终端。",
-                            match self.sidebar.side {
-                                SidebarSide::Left => "左侧",
-                                SidebarSide::Right => "右侧",
-                            }
-                        ),
-                ),
+                div()
+                    .text_xs()
+                    .text_color(pal.muted)
+                    .child(tr!(
+                        cx,
+                        "「一键扫描」会实际调用 wsl.exe 列出 WSL 发行版，故放在按钮后面而不是启动时；扫描结果列在{side}「本地终端」分组里，点一下即开对应终端。",
+                        side = match self.sidebar.side {
+                            SidebarSide::Left => tr!(cx, "左侧"),
+                            SidebarSide::Right => tr!(cx, "右侧"),
+                        }
+                    )),
             )
             .into_any_element()
     }
@@ -9038,7 +9222,7 @@ impl RuTermApp {
                 )
                 .child(styled_input(Input::new(&self.custom_color_inputs[index]), pal).w(px(90.0)))
         };
-        let labeled = |label: &'static str, index: usize| {
+        let labeled = |label: SharedString, index: usize| {
             h_flex()
                 .w(px(150.0))
                 .gap_1()
@@ -9055,15 +9239,21 @@ impl RuTermApp {
         let mut grid = v_flex().gap_1().child(
             h_flex()
                 .gap_3()
-                .child(labeled("前景", 0))
-                .child(labeled("背景", 1)),
+                .child(labeled(tr!(cx, "前景"), 0))
+                .child(labeled(tr!(cx, "背景"), 1)),
         );
         for i in 0..8 {
             grid = grid.child(
                 h_flex()
                     .gap_3()
-                    .child(labeled(ANSI_COLOR_NAMES[i], CUSTOM_ANSI_BASE + i))
-                    .child(labeled(ANSI_COLOR_NAMES[i], CUSTOM_BRIGHT_BASE + i)),
+                    .child(labeled(
+                        SharedString::from(ANSI_COLOR_NAMES[i]),
+                        CUSTOM_ANSI_BASE + i,
+                    ))
+                    .child(labeled(
+                        SharedString::from(ANSI_COLOR_NAMES[i]),
+                        CUSTOM_BRIGHT_BASE + i,
+                    )),
             );
         }
         v_flex()
@@ -9081,11 +9271,11 @@ impl RuTermApp {
                         div()
                             .text_sm()
                             .text_color(pal.text)
-                            .child("自定义 16 色（左列普通 · 右列明亮）"),
+                            .child(tr!(cx, "自定义 16 色（左列普通 · 右列明亮）")),
                     )
                     .child(
                         Button::new("terminal-custom-reset")
-                            .label("恢复 One Dark")
+                            .label(tr!(cx, "恢复 One Dark"))
                             .secondary()
                             .outline()
                             .on_click(cx.listener(|this, _, window, cx| {
@@ -9094,12 +9284,10 @@ impl RuTermApp {
                     ),
             )
             .child(grid)
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(pal.muted)
-                    .child("输入 #RGB 或 #RRGGBB，回车前即生效；格式不合法时保持上一个有效颜色。"),
-            )
+            .child(div().text_xs().text_color(pal.muted).child(tr!(
+                cx,
+                "输入 #RGB 或 #RRGGBB，回车前即生效；格式不合法时保持上一个有效颜色。"
+            )))
             .into_any_element()
     }
 
@@ -9109,21 +9297,24 @@ impl RuTermApp {
         v_flex()
             .id("settings-tab-session")
             .gap_3()
-            .child(div().text_sm().text_color(pal.muted).child(
-                "连接意外中断（断网、服务端掉线）后自动重建 SSH 会话；远端主动 exit 不触发自动重连。",
-            ))
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(pal.muted)
+                    .child(tr!(cx, "连接意外中断（断网、服务端掉线）后自动重建 SSH 会话；远端主动 exit 不触发自动重连。")),
+            )
             .child(
                 Checkbox::new("session-auto-reconnect")
-                    .label("断线后自动重连")
+                    .label(tr!(cx, "断线后自动重连"))
                     .checked(self.session_prefs.auto_reconnect)
                     .on_change(move |value, _window, cx| {
                         auto.update(cx, |this, cx| this.set_auto_reconnect(value, cx));
                     }),
             )
-            .child(div().text_xs().text_color(pal.muted).child(format!(
-                "首次连接就失败（地址写错、端口不通）不自动重试；断线后最多连续重试 \
-                 {AUTO_RECONNECT_MAX} 次，退避 1 / 2 / 5 / 10 / 20 秒，\
-                 会话稳定运行 30 秒后重新计数。等待期间可在横幅里取消或按回车立即重连。"
+            .child(div().text_xs().text_color(pal.muted).child(tr!(
+                cx,
+                "首次连接就失败（地址写错、端口不通）不自动重试；断线后最多连续重试 {max} 次，退避 1 / 2 / 5 / 10 / 20 秒，会话稳定运行 30 秒后重新计数。等待期间可在横幅里取消或按回车立即重连。",
+                max = AUTO_RECONNECT_MAX
             )))
             .child(
                 h_flex()
@@ -9134,7 +9325,7 @@ impl RuTermApp {
                             .w(px(72.0))
                             .text_sm()
                             .text_color(pal.muted)
-                            .child("连接超时"),
+                            .child(tr!(cx, "连接超时")),
                     )
                     .child(stepper(
                         "session-timeout-minus",
@@ -9147,7 +9338,11 @@ impl RuTermApp {
                             .text_center()
                             .text_sm()
                             .flex_shrink_0()
-                            .child(format!("{} 秒", self.session_prefs.connect_timeout)),
+                            .child(tr!(
+                                cx,
+                                "{seconds} 秒",
+                                seconds = self.session_prefs.connect_timeout
+                            )),
                     )
                     .child(stepper(
                         "session-timeout-plus",
@@ -9155,9 +9350,12 @@ impl RuTermApp {
                         cx.listener(|this, _, _, cx| this.nudge_connect_timeout(1, cx)),
                     )),
             )
-            .child(div().text_xs().text_color(pal.muted).child(
-                "超时覆盖 DNS、TCP、握手、认证与开启 shell 的全过程；超时即结束本次尝试并报「连接超时」。",
-            ))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(pal.muted)
+                    .child(tr!(cx, "超时覆盖 DNS、TCP、握手、认证与开启 shell 的全过程；超时即结束本次尝试并报「连接超时」。")),
+            )
             .into_any_element()
     }
 
@@ -9173,19 +9371,19 @@ impl RuTermApp {
                     .w(px(72.0))
                     .text_sm()
                     .text_color(pal.muted)
-                    .child("本机 shell"),
+                    .child(tr!(cx, "本机 shell")),
             )
             .child(div().text_sm().child(if count == 0 {
-                "未扫描到".to_string()
+                tr!(cx, "未扫描到")
             } else {
-                format!("已扫到 {count} 个")
+                tr!(cx, "已扫到 {count} 个", count = count)
             }))
             .child(
                 Button::new("scan-local-shells")
                     .label(if self.scanning_shells {
-                        "扫描中…"
+                        tr!(cx, "扫描中…")
                     } else {
-                        "一键扫描"
+                        tr!(cx, "一键扫描")
                     })
                     .secondary()
                     .outline()
@@ -9566,6 +9764,7 @@ impl RuTermApp {
             return Vec::new();
         }
         let count = self.local_shells.len();
+        let group_label = tr!(cx, "本地终端");
         let collapsed = !searching && self.sidebar.local_collapsed;
         let parent = Self::row_base("local-terminal-row", pal, px(2.0))
             .font_weight(rgpui::FontWeight(600.0))
@@ -9588,7 +9787,7 @@ impl RuTermApp {
                     .small()
                     .text_color(pal.link),
             )
-            .child(div().flex_1().min_w_0().text_ellipsis().child("本地终端"))
+            .child(div().flex_1().min_w_0().text_ellipsis().child(group_label))
             .when(count > 0, |this| {
                 this.child(
                     div()
@@ -10132,234 +10331,255 @@ impl RuTermApp {
                                 // 协议分段：SSH 与 Telnet 共用同一张连接卡片。
                                 // 切换时若端口仍是旧协议的默认值，顺带换成新协议默认端口。
                                 let options = [ProtocolKind::Ssh, ProtocolKind::Telnet];
-                                v_flex()
-                                    .gap_1()
-                                    .child(div().text_sm().child("协议"))
-                                    .child(h_flex().gap_2().children(options.into_iter().map(
-                                        |option| {
-                                            let is_selected = form.protocol == option;
-                                            div()
-                                                .id(SharedString::from(format!(
-                                                    "protocol-{}",
-                                                    option.label()
-                                                )))
-                                                .px_3()
-                                                .py_1()
-                                                .rounded(px(5.0))
-                                                .text_sm()
-                                                .cursor_pointer()
-                                                .bg(if is_selected {
-                                                    pal.accent
-                                                } else {
-                                                    pal.segment_bg
-                                                })
-                                                .text_color(if is_selected {
-                                                    cx.theme().primary_foreground
-                                                } else {
-                                                    pal.text
-                                                })
-                                                .when(is_selected, |this| {
-                                                    this.font_weight(FontWeight::BOLD)
-                                                })
-                                                .child(option.label())
-                                                .on_click(cx.listener(
-                                                    move |this, _, window, cx| {
-                                                        let Some(form) = this.new_host.as_mut()
-                                                        else {
-                                                            return;
-                                                        };
-                                                        if form.protocol == option {
-                                                            return;
-                                                        }
-                                                        let (previous, next) = match option {
-                                                            ProtocolKind::Ssh => ("23", "22"),
-                                                            ProtocolKind::Telnet => ("22", "23"),
-                                                        };
-                                                        let port_now = form
-                                                            .port
-                                                            .read(cx)
-                                                            .value()
-                                                            .trim()
-                                                            .to_string();
-                                                        form.protocol = option;
-                                                        if port_now == previous {
-                                                            form.port.update(
-                                                                cx,
-                                                                |state, cx| {
-                                                                    state.set_value(next, window, cx);
-                                                                },
-                                                            );
-                                                        }
-                                                        cx.notify();
-                                                    },
-                                                ))
-                                        },
-                                    )))
+                                v_flex().gap_1().child(div().text_sm().child("协议")).child(
+                                    h_flex().gap_2().children(options.into_iter().map(|option| {
+                                        let is_selected = form.protocol == option;
+                                        div()
+                                            .id(SharedString::from(format!(
+                                                "protocol-{}",
+                                                option.label()
+                                            )))
+                                            .px_3()
+                                            .py_1()
+                                            .rounded(px(5.0))
+                                            .text_sm()
+                                            .cursor_pointer()
+                                            .bg(if is_selected {
+                                                pal.accent
+                                            } else {
+                                                pal.segment_bg
+                                            })
+                                            .text_color(if is_selected {
+                                                cx.theme().primary_foreground
+                                            } else {
+                                                pal.text
+                                            })
+                                            .when(is_selected, |this| {
+                                                this.font_weight(FontWeight::BOLD)
+                                            })
+                                            .child(option.label())
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                let Some(form) = this.new_host.as_mut() else {
+                                                    return;
+                                                };
+                                                if form.protocol == option {
+                                                    return;
+                                                }
+                                                let (previous, next) = match option {
+                                                    ProtocolKind::Ssh => ("23", "22"),
+                                                    ProtocolKind::Telnet => ("22", "23"),
+                                                };
+                                                let port_now =
+                                                    form.port.read(cx).value().trim().to_string();
+                                                form.protocol = option;
+                                                if port_now == previous {
+                                                    form.port.update(cx, |state, cx| {
+                                                        state.set_value(next, window, cx);
+                                                    });
+                                                }
+                                                cx.notify();
+                                            }))
+                                    })),
+                                )
                             })
                             .child(labeled_field("展示名", &form.name, &pal))
                             .child(labeled_field("主机地址", &form.host, &pal))
-                    .child(
-                        h_flex()
-                            .gap_3()
                             .child(
-                                div()
-                                    .flex_1()
-                                    .child(labeled_field("端口", &form.port, &pal)),
+                                h_flex()
+                                    .gap_3()
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .child(labeled_field("端口", &form.port, &pal)),
+                                    )
+                                    // Telnet 的用户名在会话内交互输入，表单里没有对应字段。
+                                    .when(protocol == ProtocolKind::Ssh, |this| {
+                                        this.child(div().flex_1().child(labeled_field(
+                                            "用户名",
+                                            &form.user,
+                                            &pal,
+                                        )))
+                                    }),
                             )
-                            // Telnet 的用户名在会话内交互输入，表单里没有对应字段。
+                            // 分组 / 跳板机并排一行：两项都是可选的下拉，各占一半宽度，
+                            // 省下的竖向空间留给私钥字段。
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .child({
+                                        // 分组选择：新建时默认未分组（从分组右键进入则预选该组），
+                                        // 编辑时预填原归属；保存即落到这里选中的组。
+                                        let mut options: Vec<SharedString> =
+                                            vec![SharedString::from(UNGROUPED)];
+                                        options.extend(
+                                            self.sidebar
+                                                .names()
+                                                .map(|name| SharedString::from(name.to_string())),
+                                        );
+                                        let selected = form
+                                            .group
+                                            .as_ref()
+                                            .and_then(|group| {
+                                                options.iter().position(|option| option == group)
+                                            })
+                                            .or(Some(0));
+                                        let change_options = options.clone();
+                                        let entity = cx.entity();
+                                        div().flex_1().child(
+                                            v_flex()
+                                                .gap_1()
+                                                .child(div().text_sm().child("分组"))
+                                                .child(
+                                                    Select::new(options)
+                                                        .id("host-group")
+                                                        .selected(selected)
+                                                        .w_full()
+                                                        .on_change(
+                                                            move |index, _name, _window, cx| {
+                                                                let group = if index == 0 {
+                                                                    None
+                                                                } else {
+                                                                    change_options
+                                                                        .get(index)
+                                                                        .cloned()
+                                                                };
+                                                                entity.update(cx, |this, cx| {
+                                                                    if let Some(form) =
+                                                                        this.new_host.as_mut()
+                                                                    {
+                                                                        form.group = group;
+                                                                        cx.notify();
+                                                                    }
+                                                                });
+                                                            },
+                                                        ),
+                                                ),
+                                        )
+                                    })
+                                    .when(protocol == ProtocolKind::Ssh, |this| {
+                                        this.child({
+                                            // 跳板机选择：只列出可作为跳板的主机（排除自己与已挂跳板机的主机，
+                                            // 避免自环与多级链）。降级模式没有稳定的主机 id，只给「直连」。
+                                            let self_id = form
+                                                .editing
+                                                .and_then(|index| self.hosts.get(index))
+                                                .map(|host| host.id);
+                                            let mut options: Vec<SharedString> =
+                                                vec![SharedString::from("直连（无跳板机）")];
+                                            let mut ids: Vec<Option<i64>> = vec![None];
+                                            if self.vault.is_some() {
+                                                for host in &self.hosts {
+                                                    if Some(host.id) == self_id
+                                                        || host.proxy_jump.is_some()
+                                                    {
+                                                        continue;
+                                                    }
+                                                    let label = if host.name.trim().is_empty() {
+                                                        host.addr()
+                                                    } else {
+                                                        host.name.clone()
+                                                    };
+                                                    ids.push(Some(host.id));
+                                                    options.push(SharedString::from(format!(
+                                                        "{label}（{}）",
+                                                        host.addr()
+                                                    )));
+                                                }
+                                            }
+                                            let selected = form
+                                                .jump
+                                                .and_then(|id| {
+                                                    ids.iter().position(|item| *item == Some(id))
+                                                })
+                                                .or(Some(0));
+                                            let change_ids = ids.clone();
+                                            let entity = cx.entity();
+                                            div().flex_1().child(
+                                                v_flex()
+                                                    .gap_1()
+                                                    .child(div().text_sm().child("跳板机"))
+                                                    .child(
+                                                        Select::new(options)
+                                                            .id("host-jump")
+                                                            .selected(selected)
+                                                            .w_full()
+                                                            .on_change(
+                                                                move |index, _name, _window, cx| {
+                                                                    let jump = change_ids
+                                                                        .get(index)
+                                                                        .copied()
+                                                                        .flatten();
+                                                                    entity.update(
+                                                                        cx,
+                                                                        |this, cx| {
+                                                                            if let Some(form) = this
+                                                                                .new_host
+                                                                                .as_mut()
+                                                                            {
+                                                                                form.jump = jump;
+                                                                                cx.notify();
+                                                                            }
+                                                                        },
+                                                                    );
+                                                                },
+                                                            ),
+                                                    ),
+                                            )
+                                        })
+                                    }),
+                            )
                             .when(protocol == ProtocolKind::Ssh, |this| {
                                 this.child(
-                                    div()
-                                        .flex_1()
-                                        .child(labeled_field("用户名", &form.user, &pal)),
-                                )
-                            }),
-                    )
-                    // 分组 / 跳板机并排一行：两项都是可选的下拉，各占一半宽度，
-                    // 省下的竖向空间留给私钥字段。
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .child({
-                                // 分组选择：新建时默认未分组（从分组右键进入则预选该组），
-                                // 编辑时预填原归属；保存即落到这里选中的组。
-                                let mut options: Vec<SharedString> =
-                                    vec![SharedString::from(UNGROUPED)];
-                                options.extend(
-                                    self.sidebar
-                                        .names()
-                                        .map(|name| SharedString::from(name.to_string())),
-                                );
-                                let selected = form
-                                    .group
-                                    .as_ref()
-                                    .and_then(|group| {
-                                        options.iter().position(|option| option == group)
-                                    })
-                                    .or(Some(0));
-                                let change_options = options.clone();
-                                let entity = cx.entity();
-                                div().flex_1().child(
-                                    v_flex().gap_1().child(div().text_sm().child("分组")).child(
-                                        Select::new(options)
-                                            .id("host-group")
-                                            .selected(selected)
-                                            .w_full()
-                                            .on_change(move |index, _name, _window, cx| {
-                                                let group = if index == 0 {
-                                                    None
-                                                } else {
-                                                    change_options.get(index).cloned()
-                                                };
-                                                entity.update(cx, |this, cx| {
-                                                    if let Some(form) = this.new_host.as_mut() {
-                                                        form.group = group;
+                                    v_flex()
+                                        .gap_1()
+                                        .child(div().text_sm().child(tr!(cx, "认证方式")))
+                                        .child(h_flex().gap_2().children(methods.into_iter().map(
+                                            |method| {
+                                                let auth_id = SharedString::from(format!(
+                                                    "auth-{}",
+                                                    auth_label(cx, method)
+                                                ));
+                                                let is_selected = method == selected;
+                                                div()
+                                                    .id(auth_id)
+                                                    .px_3()
+                                                    .py_1()
+                                                    .rounded(px(5.0))
+                                                    .text_sm()
+                                                    .cursor_pointer()
+                                                    .bg(if is_selected {
+                                                        pal.accent
+                                                    } else {
+                                                        pal.segment_bg
+                                                    })
+                                                    // 选中段文字用主题的 primary_foreground（与主按钮同规则），
+                                                    // 否则强调色底上会沿用默认文字色导致看不清。
+                                                    .text_color(if is_selected {
+                                                        cx.theme().primary_foreground
+                                                    } else {
+                                                        pal.text
+                                                    })
+                                                    .when(is_selected, |this| {
+                                                        this.font_weight(FontWeight::BOLD)
+                                                    })
+                                                    .child(auth_label(cx, method))
+                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                        if let Some(form) = this.new_host.as_mut() {
+                                                            form.auth = method;
+                                                        }
                                                         cx.notify();
-                                                    }
-                                                });
-                                            }),
-                                    ),
+                                                    }))
+                                            },
+                                        ))),
                                 )
                             })
-                            .when(protocol == ProtocolKind::Ssh, |this| {
-                                this.child({
-                                // 跳板机选择：只列出可作为跳板的主机（排除自己与已挂跳板机的主机，
-                                // 避免自环与多级链）。降级模式没有稳定的主机 id，只给「直连」。
-                                let self_id = form
-                                    .editing
-                                    .and_then(|index| self.hosts.get(index))
-                                    .map(|host| host.id);
-                                let mut options: Vec<SharedString> =
-                                    vec![SharedString::from("直连（无跳板机）")];
-                                let mut ids: Vec<Option<i64>> = vec![None];
-                                if self.vault.is_some() {
-                                    for host in &self.hosts {
-                                        if Some(host.id) == self_id || host.proxy_jump.is_some() {
-                                            continue;
-                                        }
-                                        let label = if host.name.trim().is_empty() {
-                                            host.addr()
-                                        } else {
-                                            host.name.clone()
-                                        };
-                                        ids.push(Some(host.id));
-                                        options.push(SharedString::from(format!(
-                                            "{label}（{}）",
-                                            host.addr()
-                                        )));
-                                    }
-                                }
-                                let selected = form
-                                    .jump
-                                    .and_then(|id| ids.iter().position(|item| *item == Some(id)))
-                                    .or(Some(0));
-                                let change_ids = ids.clone();
-                                let entity = cx.entity();
-                                div().flex_1().child(
-                                    v_flex().gap_1().child(div().text_sm().child("跳板机")).child(
-                                        Select::new(options)
-                                            .id("host-jump")
-                                            .selected(selected)
-                                            .w_full()
-                                            .on_change(move |index, _name, _window, cx| {
-                                                let jump = change_ids.get(index).copied().flatten();
-                                                entity.update(cx, |this, cx| {
-                                                    if let Some(form) = this.new_host.as_mut() {
-                                                        form.jump = jump;
-                                                        cx.notify();
-                                                    }
-                                                });
-                                            }),
-                                    ),
-                                )
-                                })
-                            }),
-                    )
-                    .when(protocol == ProtocolKind::Ssh, |this| {
-                        this.child(
-                        v_flex()
-                            .gap_1()
-                            .child(div().text_sm().child("认证方式"))
-                            .child(h_flex().gap_2().children(methods.into_iter().map(|method| {
-                                let auth_id =
-                                    SharedString::from(format!("auth-{}", auth_label(method)));
-                                let is_selected = method == selected;
-                                div()
-                                    .id(auth_id)
-                                    .px_3()
-                                    .py_1()
-                                    .rounded(px(5.0))
-                                    .text_sm()
-                                    .cursor_pointer()
-                                    .bg(if is_selected {
-                                        pal.accent
-                                    } else {
-                                        pal.segment_bg
-                                    })
-                                    // 选中段文字用主题的 primary_foreground（与主按钮同规则），
-                                    // 否则强调色底上会沿用默认文字色导致看不清。
-                                    .text_color(if is_selected {
-                                        cx.theme().primary_foreground
-                                    } else {
-                                        pal.text
-                                    })
-                                    .when(is_selected, |this| this.font_weight(FontWeight::BOLD))
-                                    .child(auth_label(method))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        if let Some(form) = this.new_host.as_mut() {
-                                            form.auth = method;
-                                        }
-                                        cx.notify();
-                                    }))
-                            }))),
-                        )
-                    })
-                    // 私钥区块只在「私钥」认证下渲染：常驻占位会白撑两百多像素，
-                    // 默认窗口装不下。窗口更矮时由字段区自身滚动兜底。
-                    .when(
-                        protocol == ProtocolKind::Ssh && selected == AuthMethod::IdentityFile,
-                        |this| {
-                        this.child(
+                            // 私钥区块只在「私钥」认证下渲染：常驻占位会白撑两百多像素，
+                            // 默认窗口装不下。窗口更矮时由字段区自身滚动兜底。
+                            .when(
+                                protocol == ProtocolKind::Ssh
+                                    && selected == AuthMethod::IdentityFile,
+                                |this| {
+                                    this.child(
                             v_flex()
                                 .gap_2()
                             // 私钥来源：本地文件 / 内嵌加密库。两段切换不改变弹窗高度
@@ -10529,7 +10749,8 @@ impl RuTermApp {
                                     )),
                             ),
                         )
-                    })
+                                },
+                            ),
                     )
                     .child(
                         h_flex()
@@ -10733,9 +10954,12 @@ impl RuTermApp {
                                 });
                             }),
                     )
-                    .child(div().text_xs().text_color(pal.danger).child(
-                        "命令以回车结尾写入，与手动在终端里输入等效，发出后无法撤回。",
-                    ))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(pal.danger)
+                            .child("命令以回车结尾写入，与手动在终端里输入等效，发出后无法撤回。"),
+                    )
                     .child(
                         h_flex()
                             .gap_2()
@@ -10800,7 +11024,11 @@ impl RuTermApp {
                     .to_string(),
             ),
         };
-        let width = if prompt.kind.multi_line() { 460.0 } else { 380.0 };
+        let width = if prompt.kind.multi_line() {
+            460.0
+        } else {
+            380.0
+        };
         let input_row = h_flex()
             .w_full()
             .gap_2()
@@ -10982,7 +11210,7 @@ impl RuTermApp {
     fn file_sort_header(
         &self,
         id: &'static str,
-        label: &'static str,
+        label: SharedString,
         key: FileSortKey,
         width: Option<(usize, f32)>,
         right_align: bool,
@@ -11012,20 +11240,24 @@ impl RuTermApp {
         if width.is_none() {
             cell = cell.flex_1().min_w(px(48.0)).text_ellipsis();
         }
-        let cell = cell.child(text).on_click(cx.listener(move |this, _, _, cx| {
-            let Some(tab_id) = this.active_tab else { return };
-            let Some(tab) = this.tabs.iter_mut().find(|tab| tab.id == tab_id) else {
-                return;
-            };
-            if tab.files.sort == key {
-                tab.files.sort_desc = !tab.files.sort_desc;
-            } else {
-                tab.files.sort = key;
-                tab.files.sort_desc = false;
-            }
-            tab.files.sort_entries();
-            cx.notify();
-        }));
+        let cell = cell
+            .child(text)
+            .on_click(cx.listener(move |this, _, _, cx| {
+                let Some(tab_id) = this.active_tab else {
+                    return;
+                };
+                let Some(tab) = this.tabs.iter_mut().find(|tab| tab.id == tab_id) else {
+                    return;
+                };
+                if tab.files.sort == key {
+                    tab.files.sort_desc = !tab.files.sort_desc;
+                } else {
+                    tab.files.sort = key;
+                    tab.files.sort_desc = false;
+                }
+                tab.files.sort_entries();
+                cx.notify();
+            }));
         let Some((col, width)) = width else {
             return cell.into_any_element();
         };
@@ -11086,25 +11318,18 @@ impl RuTermApp {
         let error = tab.and_then(|tab| tab.files.error.clone());
         let busy = tab.and_then(|tab| tab.files.busy.clone());
         let progress = tab.and_then(|tab| tab.files.progress);
-        let entries = tab
-            .map(|tab| tab.files.entries.clone())
-            .unwrap_or_default();
+        let entries = tab.map(|tab| tab.files.entries.clone()).unwrap_or_default();
         let entity = cx.entity();
         let live = tab_id.filter(|_| remote_capable && !ended);
         let follow_on = tab.is_some_and(|tab| tab.files.follow);
-        let cols = tab
-            .map(|tab| tab.files.cols)
-            .unwrap_or([
-                FILE_COL_KIND_W,
-                FILE_COL_SIZE_W,
-                FILE_COL_TIME_W,
-                FILE_COL_PERM_W,
-            ]);
+        let cols = tab.map(|tab| tab.files.cols).unwrap_or([
+            FILE_COL_KIND_W,
+            FILE_COL_SIZE_W,
+            FILE_COL_TIME_W,
+            FILE_COL_PERM_W,
+        ]);
 
-        let up_enabled = path
-            .as_deref()
-            .and_then(remote_fs::parent_of)
-            .is_some();
+        let up_enabled = path.as_deref().and_then(remote_fs::parent_of).is_some();
         let path_edit = self.path_edit.clone();
         let mut path_row = h_flex()
             .w_full()
@@ -11149,7 +11374,7 @@ impl RuTermApp {
                         .compact()
                         .ghost()
                         .tab_index(-1)
-                        .tooltip("上级目录");
+                        .tooltip(tr!(cx, "上级目录"));
                     if up_enabled {
                         up.on_click(cx.listener(move |this, _, _, cx| {
                             this.files_up(id, cx);
@@ -11165,7 +11390,7 @@ impl RuTermApp {
                         .compact()
                         .ghost()
                         .tab_index(-1)
-                        .tooltip("刷新目录")
+                        .tooltip(tr!(cx, "刷新目录"))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.refresh_files(id, cx);
                         })),
@@ -11176,7 +11401,7 @@ impl RuTermApp {
                         .compact()
                         .ghost()
                         .tab_index(-1)
-                        .tooltip("新建文件夹")
+                        .tooltip(tr!(cx, "新建文件夹"))
                         .on_click(cx.listener(move |this, _, window, cx| {
                             let Some(dir) = this
                                 .tabs
@@ -11196,7 +11421,7 @@ impl RuTermApp {
                         .compact()
                         .ghost()
                         .tab_index(-1)
-                        .tooltip("上传文件…")
+                        .tooltip(tr!(cx, "上传文件…"))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.browse_files_upload(id, cx);
                         })),
@@ -11205,15 +11430,26 @@ impl RuTermApp {
 
         let dir = path.clone().unwrap_or_default();
         let count = entries.len();
-        let total: u64 = entries.iter().filter(|entry| !entry.is_dir).map(|entry| entry.size).sum();
-        let mut summary = format!("{count} 个项目");
+        let total: u64 = entries
+            .iter()
+            .filter(|entry| !entry.is_dir)
+            .map(|entry| entry.size)
+            .sum();
+        // 摘要三段用「 · 」串起来：译文只负责各自片段，拼接受语言影响小。
+        let mut summary_parts: Vec<SharedString> = vec![tr!(cx, "{count} 个项目", count = count)];
         if total > 0 {
-            summary.push_str(" · ");
-            summary.push_str(&transfer::format_bytes(total));
+            summary_parts.push(SharedString::from(transfer::format_bytes(total)));
         }
         if remote_capable && !ended {
-            summary.push_str(" · 拖入文件即可上传");
+            summary_parts.push(tr!(cx, "拖入文件即可上传"));
         }
+        let summary = SharedString::from(
+            summary_parts
+                .iter()
+                .map(|part| part.as_str())
+                .collect::<Vec<_>>()
+                .join(" · "),
+        );
 
         let list_body: AnyElement = if !remote_capable {
             v_flex()
@@ -11226,9 +11462,9 @@ impl RuTermApp {
                         .text_xs()
                         .text_color(pal.muted)
                         .child(if tab.is_some() {
-                            "本地终端没有远端文件可浏览"
+                            tr!(cx, "本地终端没有远端文件可浏览")
                         } else {
-                            "没有活动会话"
+                            tr!(cx, "没有活动会话")
                         }),
                 )
                 .into_any_element()
@@ -11242,7 +11478,7 @@ impl RuTermApp {
                     div()
                         .text_xs()
                         .text_color(pal.muted)
-                        .child("会话已断开，请先重新连接"),
+                        .child(tr!(cx, "会话已断开，请先重新连接")),
                 )
                 .into_any_element()
         } else if loading && entries.is_empty() {
@@ -11251,7 +11487,12 @@ impl RuTermApp {
                 .items_center()
                 .justify_center()
                 .p_3()
-                .child(div().text_xs().text_color(pal.muted).child("正在读取远端目录…"))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(pal.muted)
+                        .child(tr!(cx, "正在读取远端目录…")),
+                )
                 .into_any_element()
         } else if entries.is_empty() {
             v_flex()
@@ -11263,7 +11504,11 @@ impl RuTermApp {
                     div()
                         .text_xs()
                         .text_color(pal.muted)
-                        .child(if error.is_some() { "目录读取失败" } else { "空目录" }),
+                        .child(if error.is_some() {
+                            tr!(cx, "目录读取失败")
+                        } else {
+                            tr!(cx, "空目录")
+                        }),
                 )
                 .into_any_element()
         } else {
@@ -11282,7 +11527,7 @@ impl RuTermApp {
                     } else {
                         transfer::format_bytes(entry.size)
                     };
-                    let kind_text = entry.kind_text();
+                    let kind_text = i18n::translate(cx, entry.kind_text(), &[]);
                     let perm_text = entry.permissions_text();
                     let row_id = SharedString::from(format!(
                         "file-row-{}-{}-{}",
@@ -11330,7 +11575,11 @@ impl RuTermApp {
                             })
                             .small()
                             .flex_shrink_0()
-                            .text_color(if is_dir { pal.link } else { pal.muted }),
+                            .text_color(if is_dir {
+                                pal.link
+                            } else {
+                                pal.muted
+                            }),
                         )
                         .child(
                             div()
@@ -11377,35 +11626,44 @@ impl RuTermApp {
                         return row.into_any_element();
                     };
                     let menu_entity = entity.clone();
+                    // 右键菜单的构造闭包是 'static（只拿得到 Entity），取不到 cx，
+                    // 所以词条在行渲染时先取好再移进闭包。
+                    let open_label = if is_dir {
+                        tr!(cx, "打开目录")
+                    } else {
+                        tr!(cx, "打开")
+                    };
+                    let download_label = tr!(cx, "下载到…");
+                    let rename_label = tr!(cx, "重命名…");
+                    let delete_label = tr!(cx, "删除");
+                    let refresh_label = tr!(cx, "刷新");
                     row.context_menu(move |menu, _, _| {
                         let opening = menu_entity.clone();
                         let opening_name = name.clone();
-                        let menu = menu
-                            .item(
-                                PopupMenuItem::new(if is_dir { "打开目录" } else { "打开" })
-                                    .on_click(move |_, _, cx| {
-                                        opening.update(cx, |this, cx| {
-                                            this.open_file_entry(id, &opening_name, is_dir, cx);
-                                        });
-                                    }),
-                            );
+                        let menu = menu.item(PopupMenuItem::new(open_label.clone()).on_click(
+                            move |_, _, cx| {
+                                opening.update(cx, |this, cx| {
+                                    this.open_file_entry(id, &opening_name, is_dir, cx);
+                                });
+                            },
+                        ));
                         let menu = if is_dir {
                             menu
                         } else {
                             let downloading = menu_entity.clone();
                             let download_name = name.clone();
-                            menu.item(
-                                PopupMenuItem::new("下载到…").on_click(move |_, _, cx| {
+                            menu.item(PopupMenuItem::new(download_label.clone()).on_click(
+                                move |_, _, cx| {
                                     downloading.update(cx, |this, cx| {
                                         this.download_file(id, download_name.clone(), cx);
                                     });
-                                }),
-                            )
+                                },
+                            ))
                         };
                         let renaming = menu_entity.clone();
                         let rename_name = name.clone();
-                        let menu = menu.item(
-                            PopupMenuItem::new("重命名…").on_click(move |_, window, cx| {
+                        let menu = menu.item(PopupMenuItem::new(rename_label.clone()).on_click(
+                            move |_, window, cx| {
                                 renaming.update(cx, |this, cx| {
                                     let Some(dir) = this
                                         .tabs
@@ -11423,12 +11681,12 @@ impl RuTermApp {
                                         cx,
                                     );
                                 });
-                            }),
-                        );
+                            },
+                        ));
                         let deleting = menu_entity.clone();
                         let delete_name = name.clone();
                         let menu = menu.item(
-                            PopupMenuItem::new("删除")
+                            PopupMenuItem::new(delete_label.clone())
                                 .danger(true)
                                 .on_click(move |_, _, cx| {
                                     deleting.update(cx, |this, cx| {
@@ -11437,11 +11695,12 @@ impl RuTermApp {
                                 }),
                         );
                         let refreshing = menu_entity.clone();
-                        menu.separator().item(PopupMenuItem::new("刷新").on_click(
-                            move |_, _, cx| {
-                                refreshing.update(cx, |this, cx| this.refresh_files(id, cx));
-                            },
-                        ))
+                        menu.separator()
+                            .item(PopupMenuItem::new(refresh_label.clone()).on_click(
+                                move |_, _, cx| {
+                                    refreshing.update(cx, |this, cx| this.refresh_files(id, cx));
+                                },
+                            ))
                     })
                     .into_any_element()
                 }))
@@ -11465,6 +11724,13 @@ impl RuTermApp {
             .child(list_body);
 
         // 表头：列宽与行内固定列共用常量；点击列名排序，再点切换升降序。
+        let head_labels = (
+            tr!(cx, "名称"),
+            tr!(cx, "类型"),
+            tr!(cx, "大小"),
+            tr!(cx, "修改时间"),
+            tr!(cx, "权限"),
+        );
         let head_row = h_flex()
             .w_full()
             .flex_shrink_0()
@@ -11475,11 +11741,46 @@ impl RuTermApp {
             .border_b_1()
             .border_color(pal.border)
             .child(div().w(px(FILE_ROW_LEAD_W)).flex_shrink_0())
-            .child(self.file_sort_header("files-sort-name", "名称", FileSortKey::Name, None, false, cx))
-            .child(self.file_sort_header("files-sort-kind", "类型", FileSortKey::Kind, Some((0, cols[0])), false, cx))
-            .child(self.file_sort_header("files-sort-size", "大小", FileSortKey::Size, Some((1, cols[1])), true, cx))
-            .child(self.file_sort_header("files-sort-time", "修改时间", FileSortKey::Modified, Some((2, cols[2])), false, cx))
-            .child(self.file_sort_header("files-sort-perm", "权限", FileSortKey::Permissions, Some((3, cols[3])), false, cx))
+            .child(self.file_sort_header(
+                "files-sort-name",
+                head_labels.0.clone(),
+                FileSortKey::Name,
+                None,
+                false,
+                cx,
+            ))
+            .child(self.file_sort_header(
+                "files-sort-kind",
+                head_labels.1.clone(),
+                FileSortKey::Kind,
+                Some((0, cols[0])),
+                false,
+                cx,
+            ))
+            .child(self.file_sort_header(
+                "files-sort-size",
+                head_labels.2.clone(),
+                FileSortKey::Size,
+                Some((1, cols[1])),
+                true,
+                cx,
+            ))
+            .child(self.file_sort_header(
+                "files-sort-time",
+                head_labels.3.clone(),
+                FileSortKey::Modified,
+                Some((2, cols[2])),
+                false,
+                cx,
+            ))
+            .child(self.file_sort_header(
+                "files-sort-perm",
+                head_labels.4,
+                FileSortKey::Permissions,
+                Some((3, cols[3])),
+                false,
+                cx,
+            ))
             // 拖拽列宽：监听整行，指针离开手柄也不中断；释放时清掉起点状态。
             .on_drag_move::<ColumnDrag>(cx.listener(
                 |this, event: &DragMoveEvent<ColumnDrag>, _, cx| {
@@ -11490,8 +11791,7 @@ impl RuTermApp {
                     if start.tab_id != drag.tab_id || start.col != drag.col {
                         return;
                     }
-                    let width = (start.start_w
-                        + (event.event.position.x.as_f32() - start.start_x))
+                    let width = (start.start_w + (event.event.position.x.as_f32() - start.start_x))
                         .clamp(FILE_COL_MIN_W, FILE_COL_MAX_W);
                     if let Some(tab) = this.tabs.iter_mut().find(|tab| tab.id == drag.tab_id)
                         && (tab.files.cols[drag.col] - width).abs() > 0.5
@@ -11537,20 +11837,15 @@ impl RuTermApp {
             footer = footer.child(
                 v_flex()
                     .gap_1()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(pal.text)
-                            .child(if total > 0 {
-                                format!(
-                                    "{text} {} / {}",
-                                    transfer::format_bytes(done),
-                                    transfer::format_bytes(total)
-                                )
-                            } else {
-                                text.to_string()
-                            }),
-                    )
+                    .child(div().text_xs().text_color(pal.text).child(if total > 0 {
+                        format!(
+                            "{text} {} / {}",
+                            transfer::format_bytes(done),
+                            transfer::format_bytes(total)
+                        )
+                    } else {
+                        text.to_string()
+                    }))
                     .child(
                         div()
                             .h(px(4.0))
@@ -11585,9 +11880,9 @@ impl RuTermApp {
                         .and_then(|tab| tab.terminal_cwd.clone())
                         .or_else(|| tab.and_then(|tab| tab.files.home.clone()));
                     let follow_tooltip = if follow_on {
-                        "跟随终端：开（点击关闭）"
+                        tr!(cx, "跟随终端：开（点击关闭）")
                     } else {
-                        "跟随终端目录"
+                        tr!(cx, "跟随终端目录")
                     };
                     // 跟随开＝钉住的图钉；关＝同一图钉加斜杠（lucide 没有官方 off 版，按家族风格补的）。
                     let follow_icon = if follow_on {
@@ -11605,7 +11900,7 @@ impl RuTermApp {
                                 .compact()
                                 .ghost()
                                 .tab_index(-1)
-                                .tooltip("定位到终端当前目录")
+                                .tooltip(tr!(cx, "定位到终端当前目录"))
                                 .disabled(live.is_none())
                                 .on_click(cx.listener({
                                     let target = target_path.clone();
@@ -11639,8 +11934,7 @@ impl RuTermApp {
                                     move |this, _, _, cx| {
                                         let Some(id) = live else { return };
                                         let turn_on = !follow_on;
-                                        if let Some(tab) =
-                                            this.tabs.iter_mut().find(|t| t.id == id)
+                                        if let Some(tab) = this.tabs.iter_mut().find(|t| t.id == id)
                                         {
                                             tab.files.follow = turn_on;
                                         }
@@ -11683,9 +11977,17 @@ impl RuTermApp {
         };
         let renaming = prompt.renaming.clone();
         let title = match &renaming {
-            Some(old) => format!("重命名：{old}"),
-            None => "新建文件夹".to_string(),
+            Some(old) => tr!(cx, "重命名：{old}", old = old),
+            None => tr!(cx, "新建文件夹"),
         };
+        let submit_label = if renaming.is_some() {
+            tr!(cx, "重命名")
+        } else {
+            tr!(cx, "创建")
+        };
+        let cancel_label = tr!(cx, "取消");
+        let name_label = tr!(cx, "名称");
+        let name_hint = tr!(cx, "名称不能包含 / 或 \\，也不能是 . 或 ..。");
         v_flex()
             .id("file-prompt-backdrop")
             .absolute()
@@ -11725,45 +12027,42 @@ impl RuTermApp {
                                     .font_weight(FontWeight(600.0))
                                     .child(title),
                             )
-                            .child(Button::new("close-file-prompt").label("×").ghost().on_click(
-                                cx.listener(|this, _, _, cx| {
-                                    this.cancel_file_prompt(cx);
-                                }),
-                            )),
+                            .child(
+                                Button::new("close-file-prompt")
+                                    .label("×")
+                                    .ghost()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.cancel_file_prompt(cx);
+                                    })),
+                            ),
                     )
                     .child(
                         v_flex()
                             .gap_1()
-                            .child(div().text_sm().child("名称"))
+                            .child(div().text_sm().child(name_label))
                             .child(styled_input(Input::new(&prompt.name), &pal)),
                     )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(pal.muted)
-                            .child("名称不能包含 / 或 \\，也不能是 . 或 ..。"),
-                    )
+                    .child(div().text_xs().text_color(pal.muted).child(name_hint))
                     .child(
                         h_flex()
                             .gap_2()
                             .justify_end()
                             .child(
                                 Button::new("commit-file-prompt")
-                                    .label(if renaming.is_some() {
-                                        "重命名"
-                                    } else {
-                                        "创建"
-                                    })
+                                    .label(submit_label)
                                     .primary()
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.commit_file_prompt(cx);
                                     })),
                             )
-                            .child(Button::new("cancel-file-prompt").label("取消").ghost().on_click(
-                                cx.listener(|this, _, _, cx| {
-                                    this.cancel_file_prompt(cx);
-                                }),
-                            )),
+                            .child(
+                                Button::new("cancel-file-prompt")
+                                    .label(cancel_label)
+                                    .ghost()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.cancel_file_prompt(cx);
+                                    })),
+                            ),
                     ),
             )
             .into_any_element()
@@ -11776,7 +12075,18 @@ impl RuTermApp {
             return div().into_any_element();
         };
         let name = confirm.name.clone();
-        let kind = if confirm.is_dir { "目录" } else { "文件" };
+        let title = if confirm.is_dir {
+            tr!(cx, "删除远端目录 {name}？", name = name)
+        } else {
+            tr!(cx, "删除远端文件 {name}？", name = name)
+        };
+        let warning = if confirm.is_dir {
+            tr!(cx, "目录必须为空才能删除；此操作不可撤销。")
+        } else {
+            tr!(cx, "文件将被永久删除，此操作不可撤销。")
+        };
+        let cancel_label = tr!(cx, "取消");
+        let delete_label = tr!(cx, "删除");
         v_flex()
             .id("file-delete-backdrop")
             .absolute()
@@ -11806,30 +12116,24 @@ impl RuTermApp {
                         div()
                             .text_base()
                             .font_weight(FontWeight(600.0))
-                            .child(format!("删除远端{kind} {name}？")),
+                            .child(title),
                     )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(pal.muted)
-                            .child(if confirm.is_dir {
-                                "目录必须为空才能删除；此操作不可撤销。"
-                            } else {
-                                "文件将被永久删除，此操作不可撤销。"
-                            }),
-                    )
+                    .child(div().text_xs().text_color(pal.muted).child(warning))
                     .child(
                         h_flex()
                             .gap_2()
                             .justify_end()
-                            .child(Button::new("cancel-file-delete").label("取消").ghost().on_click(
-                                cx.listener(|this, _, _, cx| {
-                                    this.cancel_delete_file(cx);
-                                }),
-                            ))
+                            .child(
+                                Button::new("cancel-file-delete")
+                                    .label(cancel_label)
+                                    .ghost()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.cancel_delete_file(cx);
+                                    })),
+                            )
                             .child(
                                 Button::new("confirm-file-delete")
-                                    .label("删除")
+                                    .label(delete_label)
                                     .danger()
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.confirm_delete_file(cx);
@@ -12029,9 +12333,9 @@ impl RuTermApp {
     fn render_empty_state(&self, pal: &Palette, cx: &mut Context<Self>) -> AnyElement {
         let query = self.home_search.read(cx).value().trim().to_lowercase();
         // 首页不做长列表：搜索最多 8 条，最近连接最多 6 条。
-        let (title, rows): (&'static str, Vec<usize>) = if query.is_empty() {
+        let (title, rows): (SharedString, Vec<usize>) = if query.is_empty() {
             (
-                "最近连接",
+                tr!(cx, "最近连接"),
                 self.recent_hosts
                     .iter()
                     .filter_map(|id| self.hosts.iter().position(|host| host.id == *id))
@@ -12040,7 +12344,7 @@ impl RuTermApp {
             )
         } else {
             (
-                "匹配的主机",
+                tr!(cx, "匹配的主机"),
                 self.hosts
                     .iter()
                     .enumerate()
@@ -12054,10 +12358,13 @@ impl RuTermApp {
             )
         };
         let empty_hint = if query.is_empty() {
-            "还没有连接记录，从左侧主机列表选一台即可开始"
+            tr!(cx, "还没有连接记录，从左侧主机列表选一台即可开始")
         } else {
-            "没有匹配的主机"
+            tr!(cx, "没有匹配的主机")
         };
+        let subtitle = tr!(cx, "远程终端会话管理器 · SSH / Telnet / 本地终端");
+        let new_host_label = tr!(cx, "新建主机");
+        let local_term_label = tr!(cx, "本地终端");
         let mut card = v_flex()
             .w_full()
             .rounded(px(8.0))
@@ -12110,12 +12417,7 @@ impl RuTermApp {
                                     .text_color(pal.text)
                                     .child("RuTerm"),
                             )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(pal.muted)
-                                    .child("远程终端会话管理器 · SSH / Telnet / 本地终端"),
-                            ),
+                            .child(div().text_sm().text_color(pal.muted).child(subtitle)),
                     )
                     .child(
                         h_flex()
@@ -12131,7 +12433,7 @@ impl RuTermApp {
                             .child(
                                 Button::new("home-new-host")
                                     .icon(IconName::Plus)
-                                    .label("新建主机")
+                                    .label(new_host_label)
                                     .primary()
                                     .compact()
                                     .on_click(cx.listener(|this, _, window, cx| {
@@ -12141,7 +12443,7 @@ impl RuTermApp {
                             .child(
                                 Button::new("home-local-terminal")
                                     .icon(IconName::SquareTerminal)
-                                    .label("本地终端")
+                                    .label(local_term_label)
                                     .secondary()
                                     .outline()
                                     .compact()
@@ -12272,20 +12574,15 @@ impl RuTermApp {
                         .border_1()
                         .border_color(pal.border)
                         .shadow_md()
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(pal.text)
-                                .child(if total > 0 {
-                                    format!(
-                                        "{text} {} / {}",
-                                        transfer::format_bytes(done),
-                                        transfer::format_bytes(total)
-                                    )
-                                } else {
-                                    text.to_string()
-                                }),
-                        )
+                        .child(div().text_xs().text_color(pal.text).child(if total > 0 {
+                            format!(
+                                "{text} {} / {}",
+                                transfer::format_bytes(done),
+                                transfer::format_bytes(total)
+                            )
+                        } else {
+                            text.to_string()
+                        }))
                         .child(
                             div()
                                 .h(px(4.0))
@@ -12339,13 +12636,7 @@ impl RuTermApp {
                     .w(px(260.0))
                     .child(styled_input(Input::new(&self.find.input).text_xs(), &pal)),
             )
-            .child(
-                div()
-                    .flex_1()
-                    .text_xs()
-                    .text_color(hint_color)
-                    .child(hint),
-            )
+            .child(div().flex_1().text_xs().text_color(hint_color).child(hint))
             .child(
                 Button::new("find-prev")
                     .icon(IconName::ArrowUp)
@@ -12412,17 +12703,27 @@ impl RuTermApp {
         let pending = tab.auto_retry_pending && reconnectable;
         let exhausted = reconnectable && !pending && attempt >= AUTO_RECONNECT_MAX;
         let hint = if pending {
-            format!(
-                "正在自动重连（第 {attempt} 次，{} 秒后）",
-                auto_reconnect_delay(attempt).as_secs()
+            tr!(
+                cx,
+                "正在自动重连（第 {attempt} 次，{secs} 秒后）",
+                attempt = attempt,
+                secs = auto_reconnect_delay(attempt).as_secs()
             )
         } else if exhausted {
-            "自动重连已停止，按回车手动重连".to_string()
+            tr!(cx, "自动重连已停止，按回车手动重连")
         } else if reconnectable {
-            "按回车重新连接".to_string()
+            tr!(cx, "按回车重新连接")
         } else {
-            "请从左侧重新点击该主机连接".to_string()
+            tr!(cx, "请从左侧重新点击该主机连接")
         };
+        let banner_title = tr!(cx, "远程通道已关闭");
+        let reason = if tab.failed {
+            tr!(cx, "连接中断。")
+        } else {
+            tr!(cx, "会话已断开连接。")
+        };
+        let cancel_retry_label = tr!(cx, "取消自动重连");
+        let reconnect_label = tr!(cx, "重新连接");
         h_flex()
             .id(SharedString::from(format!("ended-banner-{id}")))
             .absolute()
@@ -12441,19 +12742,15 @@ impl RuTermApp {
                 div()
                     .text_sm()
                     .font_weight(FontWeight(600.0))
-                    .child("远程通道已关闭"),
+                    .child(banner_title),
             )
-            .child(div().text_sm().child(if tab.failed {
-                "连接中断。"
-            } else {
-                "会话已断开连接。"
-            }))
+            .child(div().text_sm().child(reason))
             .child(div().flex_1())
             .child(div().text_xs().child(hint))
             .when(pending, |this| {
                 this.child(
                     Button::new(SharedString::from(format!("cancel-retry-{id}")))
-                        .label("取消自动重连")
+                        .label(cancel_retry_label)
                         .secondary()
                         .outline()
                         .compact()
@@ -12465,7 +12762,7 @@ impl RuTermApp {
             .when(reconnectable, |this| {
                 this.child(
                     Button::new(SharedString::from(format!("reconnect-{id}")))
-                        .label("重新连接")
+                        .label(reconnect_label)
                         .primary()
                         .compact()
                         .on_click(cx.listener(move |this, _, window, cx| {
@@ -12505,7 +12802,11 @@ impl RuTermApp {
                 left.push(StatusBarItem::new("Telnet").id("protocol").muted(true));
             }
             if let (true, Some(auth)) = (self.status_bar.auth, tab.auth) {
-                left.push(StatusBarItem::new(auth_label(auth)).id("auth").muted(true));
+                left.push(
+                    StatusBarItem::new(auth_label(cx, auth))
+                        .id("auth")
+                        .muted(true),
+                );
             }
             // 远程基本信息由 SSH 建立后的 exec 探测任务异步写入 tab.remote_info。
             if let Some(info) = tab.remote_info.as_ref() {
@@ -12524,11 +12825,11 @@ impl RuTermApp {
         if self.sync_input {
             let entity = cx.entity().downgrade();
             right.push(
-                StatusBarItem::new("同步输入")
+                StatusBarItem::new(tr!(cx, "同步输入"))
                     .id("sync-input")
                     .icon(IconName::Replace)
                     .active(true)
-                    .tooltip("按键正在同步到所有会话，点击关闭")
+                    .tooltip(tr!(cx, "按键正在同步到所有会话，点击关闭"))
                     .on_click(move |_, _, cx| {
                         if let Some(this) = entity.upgrade() {
                             this.update(cx, |this, cx| this.set_sync_input(false, cx));
@@ -12537,7 +12838,7 @@ impl RuTermApp {
             );
         }
         right.push(
-            StatusBarItem::new(format!("会话 {}", self.tabs.len()))
+            StatusBarItem::new(tr!(cx, "会话 {count}", count = self.tabs.len()))
                 .id("sessions")
                 .muted(true),
         );
@@ -12886,7 +13187,8 @@ impl RuTermApp {
     }
 
     /// 端口转发规则落库；加密库不可用时退回旧 settings.json。
-    fn persist_forwards(&self, cx: &mut Context<Self>) {        let json = self.forward_prefs.to_json();
+    fn persist_forwards(&self, cx: &mut Context<Self>) {
+        let json = self.forward_prefs.to_json();
         let Some(vault) = self.vault.clone() else {
             self.store.save_forwards(&json);
             return;
@@ -13006,9 +13308,11 @@ fn main() {
         rgpui::theme::init(cx);
         // theme::init 默认切到亮色；库内主题要等开库后才能读到，这里先按
         // 旧 settings.json（降级/迁移前）或默认暗色起窗，避免闪一下亮色。
-        let dark = SessionStore::new(&StorageMode::detect())
-            .load_settings()
-            .dark();
+        let store = SessionStore::new(&StorageMode::detect());
+        let dark = store.load_settings().dark();
+        // 语言管理器同样必须在开窗前装好：首帧的标题栏菜单、侧栏与状态栏就要取词。
+        // 读的是 locale.txt 镜像（不是 settings.json，见 SessionStore::locale_path）。
+        i18n::install(&store.load_language(), cx);
         rgpui::theme::Theme::change(
             if dark {
                 rgpui::theme::ThemeMode::Dark
@@ -13154,7 +13458,10 @@ mod tests {
     #[test]
     fn safe_local_name_keeps_basename_only() {
         assert_eq!(safe_local_name("a/b.txt").as_deref(), Some("a_b.txt"));
-        assert_eq!(safe_local_name("a\\b:c?.txt").as_deref(), Some("a_b_c_.txt"));
+        assert_eq!(
+            safe_local_name("a\\b:c?.txt").as_deref(),
+            Some("a_b_c_.txt")
+        );
         assert_eq!(safe_local_name("中文.md").as_deref(), Some("中文.md"));
         assert_eq!(safe_local_name(".."), None);
         assert_eq!(safe_local_name("..."), None);
@@ -13234,7 +13541,10 @@ mod tests {
         prefs.insert("tester@127.0.0.1:22", saved("", ForwardKind::Local, 8080));
         prefs.insert("tester@127.0.0.1:22", saved("", ForwardKind::Remote, 8080));
         // 同方向同端口视为同一条：原位替换而不是追加。
-        prefs.insert("tester@127.0.0.1:22", saved("web", ForwardKind::Local, 8080));
+        prefs.insert(
+            "tester@127.0.0.1:22",
+            saved("web", ForwardKind::Local, 8080),
+        );
         let list = prefs.rules_for("tester@127.0.0.1:22");
         assert_eq!(list.len(), 2);
         assert_eq!(list[0].name, "web");
@@ -13257,7 +13567,10 @@ mod tests {
         // 最后一条删除后不留空连接键。
         assert!(prefs.rules_for("tester@127.0.0.1:22").is_empty());
         assert_eq!(ForwardPrefs::from_json("{}"), ForwardPrefs::default());
-        assert_eq!(ForwardPrefs::from_json("{ not json"), ForwardPrefs::default());
+        assert_eq!(
+            ForwardPrefs::from_json("{ not json"),
+            ForwardPrefs::default()
+        );
     }
 
     #[test]
@@ -13301,7 +13614,10 @@ mod tests {
         prefs.forget(8);
         assert_eq!(prefs.protocol_of(8), None);
         assert_eq!(ProtocolPrefs::from_json(""), ProtocolPrefs::default());
-        assert_eq!(ProtocolPrefs::from_json("{ not json"), ProtocolPrefs::default());
+        assert_eq!(
+            ProtocolPrefs::from_json("{ not json"),
+            ProtocolPrefs::default()
+        );
     }
 
     #[test]
