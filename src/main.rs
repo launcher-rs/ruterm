@@ -82,6 +82,8 @@ actions!(
         NewLocalTerminal,
         NextTab,
         PrevTab,
+        CloseTab,
+        CancelRename,
         OpenSettings,
         OpenForward,
         SplitRight,
@@ -259,8 +261,12 @@ fn join_notes(first: Option<String>, second: Option<String>) -> String {
 struct SessionTab {
     /// 稳定标签 id（会话结束或用户关闭时据此定位）。
     id: usize,
-    /// 标签标题（主机名）。
+    /// 标签标题：当前实际显示的那一个（自定义 > 终端 OSC 标题 > 默认名）。
     title: SharedString,
+    /// 默认标题（主机名 / 本地 shell 名）：终端没报标题、或用户撤销重命名时回落它。
+    base_title: SharedString,
+    /// 用户双击重命名的标题：优先级最高，OSC 标题不再覆盖它。
+    custom_title: Option<SharedString>,
     /// 连接位置（user@host:port 或本地 shell 的路径），状态栏展示。
     addr: SharedString,
     /// 认证方式，状态栏展示；本地终端没有认证概念，为 None。
@@ -1775,6 +1781,8 @@ struct RuTermApp {
     shell_prompt: Option<ShellPrompt>,
     /// 标签栏横向滚动句柄：新建 / 切到标签时把它滚进可视区。
     tab_scroll: ScrollHandle,
+    /// 正在就地重命名的标签（标签 id + 输入框）；回车或失焦提交，Esc 取消。
+    renaming: Option<(usize, Entity<InputState>)>,
     /// 侧边栏分组（文件夹）偏好，随加密库 / settings.json 双层持久化。
     sidebar: SidebarPrefs,
     /// 主机 → 跳板机映射（host id → jump id），双层持久化。
@@ -1997,6 +2005,7 @@ impl RuTermApp {
             local_shell_prefs,
             shell_prompt: None,
             tab_scroll: ScrollHandle::new(),
+            renaming: None,
             sidebar,
             jumps,
             protocols,
@@ -5902,16 +5911,13 @@ impl RuTermApp {
         })
         .detach();
         // 查找是排队执行的：终端 sync 完才定状态，收到结果后重绘查找条。
-        cx.subscribe(&terminal, |_, _, event: &TerminalEvent, cx| {
-            if matches!(event, TerminalEvent::SearchUpdated(_)) {
-                cx.notify();
-            }
-        })
-        .detach();
+        self.watch_terminal(id, &terminal, cx);
         self.status = SharedString::from(format!("正在连接 {addr}…"));
         let tab = SessionTab {
             id,
-            title: title.into(),
+            title: title.clone().into(),
+            base_title: title.into(),
+            custom_title: None,
             addr: addr.clone().into(),
             auth: Some(auth),
             remote_info: None,
@@ -6185,16 +6191,13 @@ impl RuTermApp {
             }
         })
         .detach();
-        cx.subscribe(&terminal, |_, _, event: &TerminalEvent, cx| {
-            if matches!(event, TerminalEvent::SearchUpdated(_)) {
-                cx.notify();
-            }
-        })
-        .detach();
+        self.watch_terminal(id, &terminal, cx);
         self.status = SharedString::from(format!("正在连接 Telnet {addr}…"));
         let tab = SessionTab {
             id,
-            title: title.into(),
+            title: title.clone().into(),
+            base_title: title.into(),
+            custom_title: None,
             addr: addr.clone().into(),
             auth: None,
             remote_info: None,
@@ -6535,6 +6538,123 @@ impl RuTermApp {
     }
 
     /// 用户点击标签关闭按钮。
+    /// 订阅终端事件：查找状态变了要重绘查找条，OSC 0/2 标题变了要改标签名。
+    fn watch_terminal(&self, tab_id: usize, terminal: &Entity<Terminal>, cx: &mut Context<Self>) {
+        cx.subscribe(terminal, move |this, terminal, event: &TerminalEvent, cx| {
+            match event {
+                TerminalEvent::SearchUpdated(_) => cx.notify(),
+                TerminalEvent::TitleChanged => {
+                    let title = terminal.read(cx).breadcrumb_text.clone();
+                    this.apply_osc_title(tab_id, &title, cx);
+                }
+                _ => {}
+            }
+        })
+        .detach();
+    }
+
+    /// 把终端上报的 OSC 标题落到标签上；用户重命名过就不再覆盖。
+    fn apply_osc_title(&mut self, tab_id: usize, title: &str, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) else {
+            return;
+        };
+        if tab.custom_title.is_some() {
+            return;
+        }
+        // 终端清标题（ResetTitle 给空串）时回落默认名，别让标签空着。
+        tab.title = match title.trim() {
+            "" => tab.base_title.clone(),
+            text => SharedString::from(text.to_string()),
+        };
+        cx.notify();
+    }
+
+    /// 双击标签：把标题换成输入框就地改名。只影响这条会话，不落库。
+    fn begin_rename(&mut self, tab_id: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.iter().find(|tab| tab.id == tab_id) else {
+            return;
+        };
+        let initial = tab.title.to_string();
+        rdlog(&format!("begin_rename tab={tab_id} initial={initial:?}"));
+        let input = cx.new(|cx| InputState::new(window, cx).default_value(initial));
+        cx.subscribe(&input, move |this, input, event: &InputEvent, cx| {
+            rdlog(&format!(
+                "input event {} attached={} value={:?}",
+                match event {
+                    InputEvent::Change => "Change",
+                    InputEvent::PressEnter { .. } => "PressEnter",
+                    InputEvent::Focus => "Focus",
+                    InputEvent::Blur => "Blur",
+                },
+                this.renaming.as_ref().is_some_and(|(_, state)| state == &input),
+                input.read(cx).value()
+            ));
+            // 输入框可能已随上一次提交销毁，只认当前挂着的那个。
+            if !this.renaming.as_ref().is_some_and(|(_, state)| state == &input) {
+                return;
+            }
+            match event {
+                InputEvent::PressEnter { .. } | InputEvent::Blur => this.commit_rename(cx),
+                _ => {}
+            }
+        })
+        .detach();
+        input.update(cx, |state, cx| {
+            state.focus(window, cx);
+            let len = state.value().len();
+            state.set_selected_range(0..len, cx);
+            rdlog(&format!(
+                "  after setup value={:?} focused={}",
+                state.value(),
+                Focusable::focus_handle(state, cx).is_focused(window)
+            ));
+        });
+        self.renaming = Some((tab_id, input));
+        cx.notify();
+    }
+
+    /// 提交就地改名：空标题当作撤销，交还给终端上报的标题或默认名。
+    fn commit_rename(&mut self, cx: &mut Context<Self>) {
+        let Some((tab_id, input)) = self.renaming.take() else {
+            return;
+        };
+        let text = input.read(cx).value().trim().to_string();
+        rdlog(&format!("commit_rename tab={tab_id} text={text:?}"));
+        let Some(index) = self.tabs.iter().position(|tab| tab.id == tab_id) else {
+            cx.notify();
+            return;
+        };
+        if text.is_empty() {
+            self.tabs[index].custom_title = None;
+            let osc = self.tabs[index]
+                .terminal_view
+                .read(cx)
+                .terminal()
+                .read(cx)
+                .breadcrumb_text
+                .clone();
+            self.apply_osc_title(tab_id, &osc, cx);
+        } else {
+            let title = SharedString::from(text);
+            self.tabs[index].custom_title = Some(title.clone());
+            self.tabs[index].title = title;
+        }
+        cx.notify();
+    }
+
+    fn cancel_rename(&mut self, _: &CancelRename, _: &mut Window, cx: &mut Context<Self>) {
+        if self.renaming.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    fn close_active_tab(&mut self, _: &CloseTab, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.active_tab else {
+            return;
+        };
+        self.close_tab(id, cx);
+    }
+
     fn close_tab(&mut self, id: usize, cx: &mut Context<Self>) {
         self.remove_tab(id, cx);
     }
@@ -6783,6 +6903,7 @@ impl RuTermApp {
             cx.notify();
             return;
         }
+        rdlog("find_in_terminal OPEN");
         self.find.visible = true;
         self.find.input.update(cx, |state, cx| {
             let len = state.value().len();
@@ -7502,6 +7623,8 @@ impl RuTermApp {
         self.tabs.push(SessionTab {
             id,
             title: label.clone().into(),
+            base_title: label.clone().into(),
+            custom_title: None,
             addr,
             auth: None,
             remote_info: None,
@@ -7531,12 +7654,7 @@ impl RuTermApp {
             }
         })
         .detach();
-        cx.subscribe(&terminal, |_, _, event: &TerminalEvent, cx| {
-            if matches!(event, TerminalEvent::SearchUpdated(_)) {
-                cx.notify();
-            }
-        })
-        .detach();
+        self.watch_terminal(id, &terminal, cx);
         self.status = SharedString::from(format!("本地终端 {label}"));
         cx.notify();
     }
@@ -7560,6 +7678,8 @@ impl Render for RuTermApp {
             .on_action(cx.listener(Self::new_local_terminal))
             .on_action(cx.listener(Self::next_tab))
             .on_action(cx.listener(Self::prev_tab))
+            .on_action(cx.listener(Self::close_active_tab))
+            .on_action(cx.listener(Self::cancel_rename))
             .on_action(cx.listener(Self::open_settings_action))
             .on_action(cx.listener(Self::open_forward_action))
             .on_action(cx.listener(Self::split_right))
@@ -7705,6 +7825,7 @@ impl RuTermApp {
         let split_open = self.view_split.is_some();
         let sync_on = self.sync_input;
         let live_tabs = self.live_tab_count();
+        let any_tab = !self.tabs.is_empty();
         let sidebar_open = self.sidebar_visible(cx);
         let hosts_open = sidebar_open && self.sidebar_page == SidebarPage::Hosts;
         let file_panel_open = sidebar_open && self.sidebar_page == SidebarPage::Files;
@@ -7778,6 +7899,11 @@ impl RuTermApp {
             };
             menu.item(PopupMenuItem::new(tr!(cx, "下一个标签")).action(Box::new(NextTab)))
                 .item(PopupMenuItem::new(tr!(cx, "上一个标签")).action(Box::new(PrevTab)))
+                .item(
+                    PopupMenuItem::new(tr!(cx, "关闭标签"))
+                        .disabled(!any_tab)
+                        .action(Box::new(CloseTab)),
+                )
                 .item(PopupMenuItem::new(tr!(cx, "终端内查找…")).action(Box::new(FindInTerminal)))
                 .item(
                     PopupMenuItem::new(tr!(cx, "同步输入"))
@@ -12377,10 +12503,24 @@ impl RuTermApp {
                                 .on_drop(cx.listener(move |this, drag: &TabDragData, _, cx| {
                                     this.reorder_tab(drag.index, index, cx);
                                 }))
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.activate_tab(id, window, cx);
+                                .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                                    // 双击就地改名，单击仍是切标签（改名时也别丢激活态）。
+                                    if event.click_count() >= 2 {
+                                        this.begin_rename(id, window, cx);
+                                    } else {
+                                        this.activate_tab(id, window, cx);
+                                    }
                                     cx.notify();
                                 }))
+                                // 中键关标签：浏览器/终端用户的肌肉记忆，省一次「先切过去再点 ×」。
+                                .on_mouse_down(
+                                    MouseButton::Middle,
+                                    cx.listener(move |this, _, _, cx| this.close_tab(id, cx)),
+                                )
+                                .tooltip({
+                                    let tip = tr!(cx, "单击切换 · 双击重命名 · 中键关闭");
+                                    move |window, cx| Tooltip::new(tip.clone()).build(window, cx)
+                                })
                                 .when(active, |this| {
                                     this.child(
                                         div()
@@ -12403,7 +12543,19 @@ impl RuTermApp {
                                             .bg(pal.danger),
                                     )
                                 })
-                                .child(div().flex_1().min_w_0().truncate().child(tab.title.clone()))
+                                .child(match self.renaming.as_ref() {
+                                    // 就地改名：标题位置换成输入框，回车/失焦提交，Esc 取消。
+                                    Some((renaming_id, state)) if *renaming_id == id => div()
+                                        .key_context("TabRename")
+                                        .flex_1()
+                                        .min_w_0()
+                                        .child(styled_input(Input::new(state).text_xs(), &pal)),
+                                    _ => div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .truncate()
+                                        .child(tab.title.clone()),
+                                })
                                 // 只有活动标签常驻 ×：非活动项的 × 更挡标题，切换过去再关即可。
                                 .when(active, |this| {
                                     this.child(
@@ -13507,6 +13659,18 @@ fn labeled_field(
 }
 
 /// 统一输入框外观：随主题取底色/文字/边框，保证未聚焦时文字与边框都清晰可辨。
+/// TEMP 调试：就地改名链路追踪。
+fn rdlog(msg: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("temp/rename-debug.log")
+    {
+        let _ = writeln!(f, "{msg}");
+    }
+}
+
 fn styled_input(input: Input, pal: &Palette) -> Input {
     input
         .bg(pal.input_bg)
@@ -13584,6 +13748,14 @@ fn main() {
             KeyBinding::new("ctrl-shift-tab", PrevTab, None),
             KeyBinding::new("ctrl-pagedown", NextTab, None),
             KeyBinding::new("ctrl-pageup", PrevTab, None),
+            // 关标签：终端里的 Ctrl+W 要留给 shell（删词），所以在 Terminal 上下文用 NoAction
+            // 抢占、让它原样落到 PTY；焦点在边栏 / 标签栏 / 设置里时 Ctrl+W 才关标签。
+            // 想在手敲终端时关标签，用不跟 shell 冲突的 Ctrl+Shift+W。
+            KeyBinding::new("ctrl-w", CloseTab, None),
+            KeyBinding::new("ctrl-w", NoAction {}, Some("Terminal")),
+            KeyBinding::new("ctrl-shift-w", CloseTab, None),
+            // 就地改标签名时 Esc 取消（与查找条同一套路，不影响终端里的 Esc）。
+            KeyBinding::new("escape", CancelRename, Some("TabRename")),
             KeyBinding::new("ctrl-,", OpenSettings, None),
             // 终端内查找：Esc 只在查找条里关闭（终端里的 Esc 仍原样送给 shell）。
             KeyBinding::new("ctrl-f", FindInTerminal, None),
