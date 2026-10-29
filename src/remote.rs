@@ -44,17 +44,14 @@ impl RemoteInfo {
         self.fields.is_empty()
     }
 
-    /// 单项指标文案（含标签）；缺项返回 `None`，状态栏据此跳过该条目。
-    pub fn item(&self, metric: Metric) -> Option<String> {
+    /// 单项指标的原始值（不含标签）；缺项返回 `None`，状态栏据此跳过该条目。
+    ///
+    /// 标签由 UI 层拼接（`Metric::label()` 是中文原文即 tr! key，取词要带 App 上下文）。
+    pub fn value(&self, metric: Metric) -> Option<&str> {
         match metric {
-            // 发行版优先，缺 os-release 时回退内核标识，且不加标签。
-            Metric::Os => self
-                .get("os")
-                .or_else(|| self.get("sys"))
-                .map(str::to_string),
-            other => self
-                .get(other.key())
-                .map(|value| format!("{} {value}", other.label())),
+            // 发行版优先，缺 os-release 时回退内核标识。
+            Metric::Os => self.get("os").or_else(|| self.get("sys")),
+            other => self.get(other.key()),
         }
     }
 }
@@ -104,9 +101,18 @@ impl Metric {
 mod tests {
     use super::*;
 
+    /// 状态栏的拼法：标签 + 值（实际界面里标签先过一遍取词，这里用中文原文）。
+    fn text(info: &RemoteInfo, metric: Metric) -> Option<String> {
+        let value = info.value(metric)?;
+        Some(match metric {
+            Metric::Os => value.to_string(),
+            other => format!("{} {value}", other.label()),
+        })
+    }
+
     /// 全部指标按展示顺序拼成一行（测试与"整行摘要"式断言用）。
     fn line(info: &RemoteInfo) -> Option<String> {
-        let parts: Vec<String> = Metric::ALL.iter().filter_map(|m| info.item(*m)).collect();
+        let parts: Vec<String> = Metric::ALL.iter().filter_map(|m| text(info, *m)).collect();
         if parts.is_empty() {
             None
         } else {
@@ -119,7 +125,12 @@ mod tests {
         let raw = "host=ruterm-demo\nsys=Linux 6.8.0-45-generic\nos=Ubuntu 24.04.1 LTS\n\
                    mem=1.2/7.7G\ndisk=23G/98G(24%)\nload=0.13\nup=3d4h\n";
         let info = RemoteInfo::parse(raw);
-        assert_eq!(info.item(Metric::Os).as_deref(), Some("Ubuntu 24.04.1 LTS"));
+        assert_eq!(
+            text(&info, Metric::Os).as_deref(),
+            Some("Ubuntu 24.04.1 LTS")
+        );
+        // 取的是裸值，标签留给 UI 层，切语言时才能整条换词。
+        assert_eq!(info.value(Metric::Mem), Some("1.2/7.7G"));
         assert_eq!(
             line(&info).as_deref(),
             Some("Ubuntu 24.04.1 LTS · 内存 1.2/7.7G · 磁盘 23G/98G(24%) · 负载 0.13 · 运行 3d4h")
@@ -131,7 +142,7 @@ mod tests {
         // stderr 混入的报错行、空值、未知键都不应成为条目。
         let raw = "df: /: not mounted\ncat: no such file\nload=\nfoo=bar\nup=0d1h\n";
         let info = RemoteInfo::parse(raw);
-        assert_eq!(info.item(Metric::Load), None);
+        assert_eq!(text(&info, Metric::Load), None);
         assert_eq!(line(&info).as_deref(), Some("运行 0d1h"));
     }
 
@@ -139,7 +150,7 @@ mod tests {
     fn falls_back_to_kernel_when_no_os_release() {
         let info = RemoteInfo::parse("sys=FreeBSD 14.1-RELEASE\n");
         assert_eq!(
-            info.item(Metric::Os).as_deref(),
+            text(&info, Metric::Os).as_deref(),
             Some("FreeBSD 14.1-RELEASE")
         );
     }

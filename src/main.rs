@@ -46,8 +46,9 @@ use rgpui::{
     size, v_flex,
 };
 use rgpui_term::{
-    Event as TerminalEvent, InputOrigin, SearchStatus, TerminalBuilder, TerminalMiddleware,
-    TerminalThemeConfig, TerminalView, TextStyle, ThemeDefinition, ThemeManager,
+    Event as TerminalEvent, InputOrigin, SearchStatus, Terminal, TerminalBuilder,
+    TerminalMiddleware, TerminalThemeConfig, TerminalView, TextStyle, ThemeDefinition,
+    ThemeManager,
 };
 use serde::{Deserialize, Serialize};
 
@@ -701,6 +702,9 @@ pub struct StatusBarPrefs {
     /// 远程指标开关（键为 `Metric::id()`）。
     #[serde(default)]
     pub metrics: HashMap<String, bool>,
+    /// 终端状态读数开关（尺寸 / 光标 / 回滚 / 选区）。
+    #[serde(default)]
+    pub readout: StatusReadoutPrefs,
 }
 
 /// 状态栏里可勾选的一个显示项。
@@ -709,6 +713,130 @@ enum StatusPref {
     Addr,
     Auth,
     Metric(Metric),
+    Readout(ReadoutKey),
+}
+
+/// 状态栏「终端状态」四条目。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReadoutKey {
+    Size,
+    Cursor,
+    Scrollback,
+    Selection,
+}
+
+impl ReadoutKey {
+    const ALL: [ReadoutKey; 4] = [Self::Size, Self::Cursor, Self::Scrollback, Self::Selection];
+
+    /// 设置持久化用的稳定 id。
+    fn id(self) -> &'static str {
+        match self {
+            Self::Size => "size",
+            Self::Cursor => "cursor",
+            Self::Scrollback => "scrollback",
+            Self::Selection => "selection",
+        }
+    }
+
+    /// 条目标签（设置界面用，中文原文即 tr! key）。
+    fn label(self) -> &'static str {
+        match self {
+            Self::Size => "终端尺寸（列×行）",
+            Self::Cursor => "光标行列",
+            Self::Scrollback => "回滚行数（滚动到历史时出现）",
+            Self::Selection => "选区行数（选中时出现）",
+        }
+    }
+}
+
+/// 终端状态读数开关，单独成结构：四个条目同属一组，设置分页与序列化都按组走。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatusReadoutPrefs {
+    #[serde(default = "shown")]
+    pub size: bool,
+    #[serde(default = "shown")]
+    pub cursor: bool,
+    #[serde(default = "shown")]
+    pub scrollback: bool,
+    #[serde(default = "shown")]
+    pub selection: bool,
+}
+
+impl Default for StatusReadoutPrefs {
+    fn default() -> Self {
+        Self {
+            size: true,
+            cursor: true,
+            scrollback: true,
+            selection: true,
+        }
+    }
+}
+
+impl StatusReadoutPrefs {
+    fn on(&self, key: ReadoutKey) -> bool {
+        match key {
+            ReadoutKey::Size => self.size,
+            ReadoutKey::Cursor => self.cursor,
+            ReadoutKey::Scrollback => self.scrollback,
+            ReadoutKey::Selection => self.selection,
+        }
+    }
+
+    fn set(&mut self, key: ReadoutKey, on: bool) {
+        match key {
+            ReadoutKey::Size => self.size = on,
+            ReadoutKey::Cursor => self.cursor = on,
+            ReadoutKey::Scrollback => self.scrollback = on,
+            ReadoutKey::Selection => self.selection = on,
+        }
+    }
+
+    fn any(&self) -> bool {
+        ReadoutKey::ALL.iter().any(|key| self.on(*key))
+    }
+}
+
+/// 活动终端的一帧读数，取自 rgpui-term 的渲染内容。
+///
+/// 只读内存里已经算好的 `last_content`（终端元素每帧 `sync` 过），不碰 PTY 也不碰网络；
+/// 终端还没完成首次布局时列行都是 0，此时返回 `None`，不显示 `0×0`。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StatusReadout {
+    /// 列数。
+    cols: usize,
+    /// 可视行数。
+    rows: usize,
+    /// 光标行（1 基，含回滚偏移，即滚动到历史时也是画面上的行号）。
+    line: usize,
+    /// 光标列（1 基）。
+    column: usize,
+    /// 距底部滚过的行数。
+    scrolled: usize,
+    /// 选区跨过的行数。
+    selected: usize,
+}
+
+impl StatusReadout {
+    fn capture(terminal: &Entity<Terminal>, cx: &App) -> Option<Self> {
+        let content = terminal.read(cx).last_content();
+        let bounds = content.terminal_bounds;
+        if bounds.num_columns() == 0 || bounds.num_lines() == 0 {
+            return None;
+        }
+        Some(Self {
+            cols: bounds.num_columns(),
+            rows: bounds.num_lines(),
+            line: (content.cursor.point.line.0 + content.display_offset as i32).max(0) as usize + 1,
+            column: content.cursor.point.column.0 + 1,
+            scrolled: content.display_offset,
+            selected: content
+                .selection
+                .as_ref()
+                .map(|range| (range.end.line.0 - range.start.line.0).max(0) as usize + 1)
+                .unwrap_or(0),
+        })
+    }
 }
 
 /// 反序列化缺字段时的默认：显示。
@@ -722,6 +850,7 @@ impl Default for StatusBarPrefs {
             addr: true,
             auth: true,
             metrics: HashMap::new(),
+            readout: StatusReadoutPrefs::default(),
         }
     }
 }
@@ -1686,6 +1815,8 @@ struct RuTermApp {
     status: SharedString,
     /// 状态栏显示项偏好（勾选哪些条目），随加密库 / settings.json 持久化。
     status_bar: StatusBarPrefs,
+    /// 上一次刷进状态栏的终端读数，只用于判断「要不要重绘」（渲染时现读终端）。
+    readout_seen: Option<StatusReadout>,
     /// 终端外观偏好（字号 / 行高 / 配色方案 / 自定义 16 色），同样双层持久化。
     terminal: TerminalPrefs,
     /// 自定义配色的 18 个十六进制输入框（前景 / 背景 / 普通 8 色 / 明亮 8 色）。
@@ -1885,8 +2016,9 @@ impl RuTermApp {
             password_cache: HashMap::new(),
             inline_keys: HashMap::new(),
             next_id: 0,
-            status: "就绪".into(),
+            status: tr!(cx, "就绪"),
             status_bar,
+            readout_seen: None,
             terminal,
             custom_color_inputs,
             session_prefs,
@@ -1907,6 +2039,7 @@ impl RuTermApp {
             }
         })
         .detach();
+        app.watch_readout(cx);
         app.boot_vault(window, cx);
         // 启动档 shell 只有几个，图标走 shell 缓存、毫秒级，直接在主线程取好再进列表。
         app.refresh_shell_icons();
@@ -9037,9 +9170,19 @@ impl RuTermApp {
         for metric in Metric::ALL {
             metrics.push(row(
                 format!("status-{}", metric.id()),
-                metric.label().to_string(),
+                i18n::translate(cx, metric.label(), &[]).to_string(),
                 self.status_bar.metric_on(metric),
                 StatusPref::Metric(metric),
+                entity.clone(),
+            ));
+        }
+        let mut readouts = Vec::new();
+        for key in ReadoutKey::ALL {
+            readouts.push(row(
+                format!("status-readout-{}", key.id()),
+                i18n::translate(cx, key.label(), &[]).to_string(),
+                self.status_bar.readout.on(key),
+                StatusPref::Readout(key),
                 entity.clone(),
             ));
         }
@@ -9071,7 +9214,7 @@ impl RuTermApp {
                         tr!(cx, "认证方式").to_string(),
                         self.status_bar.auth,
                         StatusPref::Auth,
-                        entity,
+                        entity.clone(),
                     )),
             )
             .child(
@@ -9082,6 +9225,15 @@ impl RuTermApp {
                         "远程主机信息（连接后经 exec 探测取得，远端没探到的项自动不显示）"
                     )))
                     .children(metrics),
+            )
+            .child(
+                v_flex()
+                    .gap_2()
+                    .child(div().text_sm().text_color(pal.muted).child(tr!(
+                        cx,
+                        "终端状态（读自活动终端，本地终端与远程会话都适用）"
+                    )))
+                    .children(readouts),
             )
             .into_any_element()
     }
@@ -12815,10 +12967,22 @@ impl RuTermApp {
                         continue;
                     }
                     // 远端没探到该项就整条不显示，不留空占位。
-                    if let Some(text) = info.item(metric) {
+                    if let Some(value) = info.value(metric) {
+                        // 发行版名自成一条，其余加标签；标签取词后才能跟着界面换语言。
+                        let text = match metric {
+                            Metric::Os => value.to_string(),
+                            other => format!("{} {value}", i18n::translate(cx, other.label(), &[])),
+                        };
                         left.push(StatusBarItem::new(SharedString::from(text)).id(metric.id()));
                     }
                 }
+            }
+            // 终端读数取自终端上一帧同步好的渲染内容，本地读取、不碰 PTY。
+            if self.status_bar.readout.any()
+                && let Some(readout) =
+                    StatusReadout::capture(tab.terminal_view.read(cx).terminal(), cx)
+            {
+                left.extend(self.readout_items(readout, cx));
             }
         }
         let mut right = Vec::new();
@@ -12845,12 +13009,96 @@ impl RuTermApp {
         StatusBar::new().left(left).right(right)
     }
 
+    /// 终端读数条目：回滚与选区只在发生时出现，不显示 `回滚 0 行` 这种空占位。
+    fn readout_items(&self, readout: StatusReadout, cx: &App) -> Vec<StatusBarItem> {
+        let prefs = &self.status_bar.readout;
+        let mut items = Vec::new();
+        if prefs.size {
+            items.push(
+                StatusBarItem::new(format!("{}×{}", readout.cols, readout.rows))
+                    .id("readout-size")
+                    .muted(true)
+                    .tooltip(tr!(
+                        cx,
+                        "终端尺寸：{cols} 列 × {rows} 行",
+                        cols = readout.cols,
+                        rows = readout.rows
+                    )),
+            );
+        }
+        if prefs.cursor {
+            items.push(
+                StatusBarItem::new(tr!(
+                    cx,
+                    "行 {line} 列 {column}",
+                    line = readout.line,
+                    column = readout.column
+                ))
+                .id("readout-cursor")
+                .muted(true)
+                .tooltip(tr!(cx, "光标位置")),
+            );
+        }
+        if prefs.scrollback && readout.scrolled > 0 {
+            items.push(
+                StatusBarItem::new(tr!(cx, "回滚 {lines} 行", lines = readout.scrolled))
+                    .id("readout-scrollback")
+                    .muted(true)
+                    .tooltip(tr!(
+                        cx,
+                        "已向上滚动 {lines} 行，到底部时不再显示",
+                        lines = readout.scrolled
+                    )),
+            );
+        }
+        if prefs.selection && readout.selected > 0 {
+            items.push(
+                StatusBarItem::new(tr!(cx, "选区 {lines} 行", lines = readout.selected))
+                    .id("readout-selection")
+                    .tooltip(tr!(cx, "选中的行数")),
+            );
+        }
+        items
+    }
+
+    /// 状态栏终端读数的刷新循环。
+    ///
+    /// 终端的渲染内容只在元素绘制时 `sync`，而 `Wakeup` / `SelectionsChanged` 这些事件
+    /// 发在 sync 之前，事件回调里读到的是上一帧，光靠订阅会把读数钉死在旧值上。
+    /// 因此按 250ms 轮询活动终端的当前内容，读数没变就不触发重绘。
+    fn watch_readout(&self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(250))
+                    .await;
+                let Ok(()) = this.update(cx, |this, cx| {
+                    let active = this.active_tab;
+                    let next = active
+                        .and_then(|id| this.tabs.iter().find(|tab| tab.id == id))
+                        .and_then(|tab| {
+                            StatusReadout::capture(tab.terminal_view.read(cx).terminal(), cx)
+                        });
+                    if next == this.readout_seen {
+                        return;
+                    }
+                    this.readout_seen = next;
+                    cx.notify();
+                }) else {
+                    return;
+                };
+            }
+        })
+        .detach();
+    }
+
     /// 勾选状态栏显示项：即时生效并持久化（库内优先，降级时写 settings.json）。
     fn set_status_pref(&mut self, pref: StatusPref, on: bool, cx: &mut Context<Self>) {
         match pref {
             StatusPref::Addr => self.status_bar.addr = on,
             StatusPref::Auth => self.status_bar.auth = on,
             StatusPref::Metric(metric) => self.status_bar.set_metric(metric, on),
+            StatusPref::Readout(key) => self.status_bar.readout.set(key, on),
         }
         cx.notify();
         self.persist_status_bar(cx);
