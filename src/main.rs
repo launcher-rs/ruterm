@@ -32,13 +32,13 @@ use rgpui::tabs::tab_drag::TabDragData;
 use rgpui::title_bar::TITLE_BAR_HEIGHT;
 use rgpui::{
     AbsoluteLength, AnyElement, App, Bounds, Button, ButtonVariants, Checkbox, ClickEvent, Context,
-    ContextMenuExt, Disableable, Div, DragMoveEvent, DropdownMenu, Entity, ExternalPaths,
-    FocusHandle, Focusable, FontWeight, Hsla, Icon, IconName, Image, ImageFormat,
+    ContextMenuExt, Disableable, Div, DragMoveEvent, DropdownMenu, ElementSize, Entity,
+    ExternalPaths, FocusHandle, Focusable, FontWeight, Hsla, Icon, IconName, Image, ImageFormat,
     InteractiveElement, IntoElement, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent,
     NoAction, ParentElement, Pixels, Point, PopupMenu, PopupMenuItem, Render, Rgba, ScrollHandle,
-    ScrollableElement, SharedString, Stateful, StatefulInteractiveElement, Styled, TrayIconEvent,
-    TrayMenuItem, Window, WindowBounds, WindowControlArea, WindowOptions, actions, div, h_flex,
-    icon_named, img, px, size, v_flex, IconNamed,
+    ScrollableElement, SharedString, Stateful, StatefulInteractiveElement, Styled, Tooltip,
+    TrayIconEvent, TrayMenuItem, Window, WindowBounds, WindowControlArea, WindowOptions, actions,
+    div, h_flex, icon_named, img, px, size, v_flex, IconNamed,
 };
 use rgpui_term::{
     Event as TerminalEvent, TerminalBuilder, TerminalThemeConfig, TerminalView, TextStyle,
@@ -77,7 +77,6 @@ actions!(
         NextTab,
         PrevTab,
         OpenSettings,
-        OpenTransfer,
         OpenForward,
         SplitRight,
         SplitDown,
@@ -153,10 +152,10 @@ fn open_path_with_default(path: &Path) {
 
 /// 文件列表固定列宽：表头与数据行共用，保证纵向对齐。
 /// 是拖拽前的默认值；实际宽度存在每个标签的 [`FileBrowser::cols`] 里。
-const FILE_COL_KIND_W: f32 = 40.0;
-const FILE_COL_SIZE_W: f32 = 52.0;
-const FILE_COL_TIME_W: f32 = 78.0;
-const FILE_COL_PERM_W: f32 = 62.0;
+const FILE_COL_KIND_W: f32 = 36.0;
+const FILE_COL_SIZE_W: f32 = 48.0;
+const FILE_COL_TIME_W: f32 = 74.0;
+const FILE_COL_PERM_W: f32 = 66.0;
 /// 可拖拽列宽的上下限（名称列占剩余空间，不在这里）。
 const FILE_COL_MIN_W: f32 = 34.0;
 const FILE_COL_MAX_W: f32 = 180.0;
@@ -256,25 +255,6 @@ struct SplitView {
     pane: Entity<SplitPaneState>,
 }
 
-/// 文件传输弹窗：本地路径 + 远端路径，上传与下载共用。
-struct TransferDialog {
-    /// 目标会话标签 id（传输指令发往该标签的 SSH 连接）。
-    tab_id: usize,
-    /// 弹窗标题里的会话名。
-    title: SharedString,
-    local: Entity<InputState>,
-    remote: Entity<InputState>,
-    /// SFTP 查询到的远端主目录；用于预填上传落点。
-    home: Option<String>,
-    /// 传输进行中：按钮禁用、进度可见。
-    busy: bool,
-    direction: Option<transfer::Direction>,
-    /// (已传输, 总量)
-    progress: Option<(u64, u64)>,
-    error: Option<SharedString>,
-    info: Option<SharedString>,
-}
-
 /// 文件列表的排序依据。
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FileSortKey {
@@ -285,12 +265,20 @@ enum FileSortKey {
     Permissions,
 }
 
-/// 右侧边栏的分区：文件、传输、转发共用同一块面板。
+/// 边栏页面：主机列表、文件浏览器、端口转发共用同一条边栏。
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum RightSection {
+enum SidebarPage {
+    Hosts,
     Files,
-    Transfer,
     Forward,
+}
+
+/// 边栏靠哪一侧：贴着窗口左缘还是右缘。
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug, Serialize, Deserialize)]
+pub enum SidebarSide {
+    #[default]
+    Left,
+    Right,
 }
 
 /// 列宽拖拽的载荷：`tab_id` 保证拖拽期间切换标签不会改错表。
@@ -440,11 +428,11 @@ struct FileConfirm {
     is_dir: bool,
 }
 
-/// 端口转发弹窗：默认是规则列表，点「设置…」才展开新增 / 编辑表单。
+/// 端口转发表单：默认是规则列表，点「设置…」才展开新增 / 编辑表单。
 struct ForwardDialog {
     /// 目标会话标签 id（转发指令发往该标签的 SSH 连接）。
     tab_id: usize,
-    /// 弹窗标题里的会话名。
+    /// 表单标题里的会话名。
     title: SharedString,
     /// 该会话的连接键（user@host:port），保存规则时按它归档。
     addr: SharedString,
@@ -1272,6 +1260,9 @@ pub struct SidebarPrefs {
     /// 用户分组，按此顺序显示（未分组恒在末尾，不占位）。
     #[serde(default)]
     groups: Vec<GroupEntry>,
+    /// 边栏贴着窗口的哪一侧（贴边渲染，导航栏恒在最外侧）。
+    #[serde(default)]
+    side: SidebarSide,
     /// 主机 id → 组名。组被删除后残留的映射按未分组处理，不报错。
     #[serde(default)]
     assign: HashMap<i64, String>,
@@ -1522,19 +1513,15 @@ struct RuTermApp {
     unlock: Option<UnlockState>,
     /// 设置弹窗（主密码管理、主题、锁定）。
     settings: Option<SettingsState>,
-    /// 文件传输（内联在右侧边栏的「传输」分区里）。
-    transfer: Option<TransferDialog>,
-    /// 右侧边栏是否展开。
-    right_panel: bool,
-    /// 右侧边栏当前分区。
-    right_panel_section: RightSection,
+    /// 边栏当前页面（主机 / 文件 / 转发）。
+    sidebar_page: SidebarPage,
     /// 正在拖拽的文件列宽（起点指针位置 + 起始宽度）。
     col_drag: Option<ColumnDragState>,
     /// 文件面板的新建目录 / 重命名弹窗。
     file_prompt: Option<FilePrompt>,
     /// 文件面板删除确认。
     file_confirm: Option<FileConfirm>,
-    /// 端口转发（内联在右侧边栏的「转发」分区里）。
+    /// 端口转发（内联在边栏的「转发」页里）。
     forward: Option<ForwardDialog>,
     /// 本次运行内缓存的密码（按 user@host:port），避免重复弹窗；绝不落盘。
     password_cache: HashMap<String, String>,
@@ -1558,8 +1545,6 @@ struct RuTermApp {
     split_state: Entity<SplitPaneState>,
     /// 主区分屏（两个标签并排）；None＝单屏显示活动标签。
     view_split: Option<SplitView>,
-    /// 主区 ↔ 文件面板 的可调整大小状态（拖拽分隔条调整文件面板宽度）。
-    right_panel_resize: Entity<rgpui::components::resizable::ResizableState>,
     focus_handle: FocusHandle,
 }
 
@@ -1669,13 +1654,19 @@ impl RuTermApp {
                 input
             })
             .collect::<Vec<_>>();
-        // 侧边栏 ↔ 主区 分隔面板：初始侧边栏占比约 0.25。
+        // 侧边栏 ↔ 主区 分隔面板：默认边栏约占 0.42，够放下文件表格的五列。
         let split_state = cx.new(SplitPaneState::new);
+        // 边栏在右时「第一面板」是终端：比例翻过来，边栏仍占约 0.42。
+        let sidebar_ratio = match sidebar.side {
+            SidebarSide::Left => 0.42,
+            SidebarSide::Right => 0.58,
+        };
         split_state.update(cx, |state, cx| {
-            state.set_ratio(0.25, cx);
+            state.set_ratio(sidebar_ratio, cx);
             // WindTerm 式拖动：拖到最小宽度即停住，分隔线仍可抓住往大拖；
-            // 完全收起交给标题栏 « 折叠按钮 / Ctrl+B，不靠拖拽阈值自动折叠。
-            state.set_min_first(160.0, cx);
+            // 完全收起交给 Ctrl+B，不靠拖拽阈值自动折叠。
+            state.set_min_first(260.0, cx);
+            state.set_min_second(260.0, cx);
         });
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("搜索主机…"));
         cx.subscribe(&search, |_, _, _: &InputEvent, cx| cx.notify())
@@ -1703,9 +1694,7 @@ impl RuTermApp {
             confirm_delete: None,
             unlock: None,
             settings: None,
-            transfer: None,
-            right_panel: false,
-            right_panel_section: RightSection::Files,
+            sidebar_page: SidebarPage::Hosts,
             col_drag: None,
             file_prompt: None,
             file_confirm: None,
@@ -1722,7 +1711,6 @@ impl RuTermApp {
             forward_prefs,
             split_state,
             view_split: None,
-            right_panel_resize: rgpui::components::resizable::ResizableState::new(cx),
             focus_handle: cx.focus_handle(),
         };
         app.boot_vault(window, cx);
@@ -1989,7 +1977,15 @@ impl RuTermApp {
                 let prefs = SidebarPrefs::from_json(&json);
                 let _ = this.update(cx, |this, cx| {
                     if this.sidebar != prefs {
+                        let side = prefs.side;
                         this.sidebar = prefs;
+                        this.split_state.update(cx, |state, cx| {
+                            let ratio = match side {
+                                SidebarSide::Left => 0.42,
+                                SidebarSide::Right => 0.58,
+                            };
+                            state.set_ratio(ratio, cx);
+                        });
                         cx.notify();
                     }
                 });
@@ -2254,412 +2250,51 @@ impl RuTermApp {
         cx.notify();
     }
 
-    /// Ctrl+Shift+U / 会话菜单：为当前标签打开文件传输弹窗。
-    fn open_transfer_action(
+    /// 边栏折叠时隐藏的是当前靠边那一侧的面板。
+    fn sidebar_pane(&self) -> CollapsiblePane {
+        match self.sidebar.side {
+            SidebarSide::Left => CollapsiblePane::First,
+            SidebarSide::Right => CollapsiblePane::Second,
+        }
+    }
+
+    /// 边栏是否可见（由分隔面板的折叠状态决定）。
+    fn sidebar_visible(&self, cx: &App) -> bool {
+        !self.split_state.read(cx).is_collapsed()
+    }
+
+    /// 展开边栏并切到某页（不负责该页的数据准备）。
+    fn show_sidebar_page(&mut self, page: SidebarPage, cx: &mut Context<Self>) {
+        self.sidebar_page = page;
+        if self.split_state.read(cx).is_collapsed() {
+            self.split_state.update(cx, |state, cx| state.expand(cx));
+        }
+    }
+
+    /// 从导航 / 菜单切到某页：需要时展开边栏并准备该页数据。
+    fn set_sidebar_page(
         &mut self,
-        _: &OpenTransfer,
+        page: SidebarPage,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_transfer(window, cx);
-    }
-
-    /// 打开传输弹窗：借用当前 SSH 会话的 SFTP 子系统，不新开连接、不再认证。
-    fn open_transfer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.overlay_open() {
-            return;
-        }
-        let Some(id) = self.active_tab else {
-            self.status = "没有可传输的会话，请先连接 SSH 主机".into();
-            cx.notify();
-            return;
-        };
-        // 已经为这个会话准备好表单：只切分区，不重置已填路径。
-        if self.transfer.as_ref().is_some_and(|dialog| dialog.tab_id == id) {
-            self.right_panel = true;
-            self.right_panel_section = RightSection::Transfer;
-            cx.notify();
-            return;
-        }
-        let Some(tab) = self.tabs.iter().find(|tab| tab.id == id) else {
-            return;
-        };
-        if tab.ended {
-            self.status = "会话已断开，请先重新连接再传输文件".into();
-            cx.notify();
-            return;
-        }
-        let Some(sender) = tab.commands.clone() else {
-            self.status = "本地终端不支持文件传输，请连接 SSH 主机".into();
-            cx.notify();
-            return;
-        };
-        let title = tab.title.clone();
-        let local = cx.new(|cx| InputState::new(window, cx).placeholder("本地文件路径"));
-        let remote = cx.new(|cx| {
-            InputState::new(window, cx)
-                .default_value("~")
-                .placeholder("远端路径，如 /var/tmp/app.log")
-        });
-        local.update(cx, |state, cx| state.focus(window, cx));
-        self.right_panel = true;
-        self.right_panel_section = RightSection::Transfer;
-        self.transfer = Some(TransferDialog {
-            tab_id: id,
-            title,
-            local: local.clone(),
-            remote,
-            home: None,
-            busy: false,
-            direction: None,
-            progress: None,
-            error: None,
-            info: None,
-        });
-        // 主目录只是预填用：查不到也让用户手动输入路径，不挡住弹窗。
-        let (reply, rx) = tokio::sync::oneshot::channel();
-        if sender.send(session::SessionCommand::Home { reply }).is_ok() {
-            let entity = cx.entity();
-            let entity_id = entity.entity_id();
-            cx.spawn(async move |_, cx| {
-                let Ok(result) = rx.await else {
-                    return;
-                };
-                let _ = cx.with_window(entity_id, move |window, cx| {
-                    let _ = entity.update(cx, move |this, cx| {
-                        this.apply_transfer_home(local, result, window, cx);
-                    });
-                });
-            })
-            .detach();
-        }
-        self.status = "文件传输：选择本地文件上传，或输入远端文件下载".into();
-        cx.notify();
-    }
-
-    /// SFTP 主目录返回：预填远端路径（仅在用户尚未改写时），失败则提示手动输入。
-    fn apply_transfer_home(
-        &mut self,
-        identity: Entity<InputState>,
-        result: anyhow::Result<String>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(dialog) = self
-            .transfer
-            .as_mut()
-            .filter(|dialog| dialog.local == identity)
-        else {
-            return;
-        };
-        match result {
-            Ok(home) => {
-                dialog.home = Some(home.clone());
-                let remote = dialog.remote.clone();
-                let current = remote.read(cx).value();
-                let untouched = matches!(current.trim(), "" | "~" | "~/");
-                if untouched {
-                    remote.update(cx, |state, cx| state.set_value(home, window, cx));
-                }
-            }
-            Err(error) => {
-                dialog.info = Some(
-                    format!(
-                        "无法读取远端主目录（{}），请手动输入完整路径",
-                        session::error_summary(&error)
-                    )
-                    .into(),
-                );
-            }
+        self.show_sidebar_page(page, cx);
+        match page {
+            SidebarPage::Hosts => {}
+            SidebarPage::Files => self.ensure_files_shown(cx),
+            SidebarPage::Forward => self.open_forward(window, cx),
         }
         cx.notify();
     }
 
-    /// 关闭传输弹窗；进行中的任务继续跑完（结果仍写状态栏），只是不再展示进度。
-    fn close_transfer(&mut self, cx: &mut Context<Self>) {
-        self.transfer = None;
-        cx.notify();
-    }
-
-    /// 选择要上传的本地文件，并顺带把远端目标预填成「主目录/文件名」。
-    fn browse_transfer_local(&mut self, cx: &mut Context<Self>) {
-        let Some(dialog) = self.transfer.as_ref() else {
-            return;
-        };
-        let input = dialog.local.clone();
-        let entity = cx.entity();
-        let entity_id = entity.entity_id();
-        let rx = cx.prompt_for_paths(rgpui::PathPromptOptions {
-            files: true,
-            directories: false,
-            multiple: false,
-            prompt: Some("选择要上传的文件".into()),
-        });
-        cx.spawn(async move |_, cx| {
-            let Ok(Ok(Some(paths))) = rx.await else {
-                return;
-            };
-            let Some(path) = paths.first().cloned() else {
-                return;
-            };
-            let value = path.to_string_lossy().into_owned();
-            let name = path
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned());
-            let _ = cx.with_window(entity_id, move |window, cx| {
-                let _ = entity.update(cx, move |this, cx| {
-                    if this.transfer.as_ref().is_some_and(|d| d.local == input) {
-                        input.update(cx, |state, cx| state.set_value(value.clone(), window, cx));
-                    }
-                    let Some(dialog) = this.transfer.as_ref().filter(|d| d.local == input) else {
-                        return;
-                    };
-                    let current = dialog.remote.read(cx).value();
-                    let Some(home) = dialog.home.clone() else {
-                        cx.notify();
-                        return;
-                    };
-                    let Some(name) = name else {
-                        cx.notify();
-                        return;
-                    };
-                    // 用户没改过远端路径时，直接给出「主目录/文件名」，上传即可落地。
-                    if matches!(current.trim(), "" | "~" | "~/") {
-                        let target = format!("{}/{}", home.trim_end_matches('/'), name);
-                        dialog
-                            .remote
-                            .update(cx, |state, cx| state.set_value(target, window, cx));
-                    }
-                    cx.notify();
-                });
-            });
-        })
-        .detach();
-    }
-
-    /// 上传：本地路径 + 远端目标（目标为目录时由 transfer 层补上文件名）。
-    fn upload_transfer(&mut self, cx: &mut Context<Self>) {
-        let Some(dialog) = self.transfer.as_ref() else {
-            return;
-        };
-        if dialog.busy {
-            return;
-        }
-        let local = dialog.local.read(cx).value().trim().to_string();
-        let remote = dialog.remote.read(cx).value().trim().to_string();
-        if local.is_empty() {
-            self.transfer_error("请先选择要上传的本地文件", cx);
-            return;
-        }
-        if remote.is_empty() {
-            self.transfer_error("请先输入远端目标路径", cx);
-            return;
-        }
-        self.start_transfer(
-            transfer::Direction::Upload,
-            PathBuf::from(local),
-            remote,
-            cx,
-        );
-    }
-
-    /// 下载：先让用户选保存位置，再按远端文件开始传输。
-    fn download_transfer(&mut self, cx: &mut Context<Self>) {
-        let Some(dialog) = self.transfer.as_ref() else {
-            return;
-        };
-        if dialog.busy {
-            return;
-        }
-        let remote = dialog.remote.read(cx).value().trim().to_string();
-        if remote.is_empty() {
-            self.transfer_error("请先输入要下载的远端文件路径", cx);
-            return;
-        }
-        let name = Path::new(&remote)
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "download".to_string());
-        let start = downloads_dir();
-        let input = dialog.local.clone();
-        let entity = cx.entity();
-        let entity_id = entity.entity_id();
-        let rx = cx.prompt_for_new_path(&start, Some(&name));
-        cx.spawn(async move |_, cx| {
-            let Ok(Ok(Some(path))) = rx.await else {
-                return;
-            };
-            let _ = cx.with_window(entity_id, move |window, cx| {
-                let _ = entity.update(cx, move |this, cx| {
-                    if !this.transfer.as_ref().is_some_and(|d| d.local == input) {
-                        return;
-                    }
-                    let value = path.to_string_lossy().into_owned();
-                    input.update(cx, |state, cx| state.set_value(value, window, cx));
-                    this.start_transfer(transfer::Direction::Download, path, remote, cx);
-                });
-            });
-        })
-        .detach();
-    }
-
-    /// 发起一次传输：弹窗置忙，后台任务把进度与最终结果写回 UI。
-    fn start_transfer(
-        &mut self,
-        direction: transfer::Direction,
-        local: PathBuf,
-        remote: String,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(dialog) = self.transfer.as_ref() else {
-            return;
-        };
-        if dialog.busy {
-            return;
-        }
-        let tab_id = dialog.tab_id;
-        let identity = dialog.local.clone();
-        let Some(sender) = self
-            .tabs
-            .iter()
-            .find(|tab| tab.id == tab_id)
-            .and_then(|tab| tab.commands.clone())
-        else {
-            self.transfer_error("会话已断开，无法传输文件", cx);
-            return;
-        };
-        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, u64)>();
-        let (reply_tx, mut reply_rx) = tokio::sync::oneshot::channel();
-        let command = session::SessionCommand::Transfer(transfer::Task {
-            direction,
-            local,
-            remote,
-            progress: progress_tx,
-            reply: reply_tx,
-        });
-        if sender.send(command).is_err() {
-            self.transfer_error("会话已断开，无法传输文件", cx);
-            return;
-        }
-        if let Some(dialog) = self.transfer.as_mut() {
-            dialog.busy = true;
-            dialog.direction = Some(direction);
-            dialog.progress = Some((0, 0));
-            dialog.error = None;
-            dialog.info = None;
-        }
-        self.status = SharedString::from(format!("正在{}文件…", direction.label()));
-        cx.notify();
-        cx.spawn(async move |this, cx| {
-            let outcome = loop {
-                tokio::select! {
-                    result = &mut reply_rx => {
-                        break match result {
-                            Ok(Ok(summary)) => Ok(summary),
-                            Ok(Err(error)) => Err(session::error_summary(&error)),
-                            Err(_) => Err("传输任务已中断".to_string()),
-                        };
-                    }
-                    Some(progress) = progress_rx.recv() => {
-                        let _ = this.update(cx, |this, cx| {
-                            let Some(dialog) = this
-                                .transfer
-                                .as_mut()
-                                .filter(|dialog| dialog.local == identity)
-                            else {
-                                return;
-                            };
-                            if dialog.busy {
-                                dialog.progress = Some(progress);
-                                cx.notify();
-                            }
-                        });
-                    }
-                }
-            };
-            let _ = this.update(cx, |this, cx| {
-                this.finish_transfer(identity, direction, outcome, cx);
-            });
-        })
-        .detach();
-    }
-
-    /// 传输收尾：按钮解禁、写入结果文案（弹窗已关闭时只更新状态栏）。
-    fn finish_transfer(
-        &mut self,
-        identity: Entity<InputState>,
-        direction: transfer::Direction,
-        outcome: Result<transfer::Summary, String>,
-        cx: &mut Context<Self>,
-    ) {
-        let active = self
-            .transfer
-            .as_ref()
-            .is_some_and(|dialog| dialog.local == identity);
-        match outcome {
-            Ok(summary) => {
-                let message = format!(
-                    "{}完成 · {} · {:.1} 秒",
-                    direction.label(),
-                    transfer::format_bytes(summary.bytes),
-                    summary.elapsed.as_secs_f64()
-                );
-                if active && let Some(dialog) = self.transfer.as_mut() {
-                    dialog.busy = false;
-                    dialog.info = Some(message.clone().into());
-                    dialog.error = None;
-                    dialog.progress = Some((summary.bytes, summary.bytes));
-                }
-                self.status = message.into();
-            }
-            Err(error) => {
-                if active && let Some(dialog) = self.transfer.as_mut() {
-                    dialog.busy = false;
-                    dialog.info = None;
-                    dialog.error = Some(error.clone().into());
-                }
-                self.status = format!("{}失败：{error}", direction.label()).into();
-            }
-        }
-        cx.notify();
-    }
-
-    /// 传输相关的即时错误：写进弹窗（若还开着）并同步状态栏。
-    fn transfer_error(&mut self, message: impl Into<SharedString>, cx: &mut Context<Self>) {
-        let message = message.into();
-        if let Some(dialog) = self.transfer.as_mut() {
-            dialog.error = Some(message.clone());
-            dialog.info = None;
-        }
-        self.status = message;
-        cx.notify();
-    }
-
-    /// 切换右侧边栏；收起时任意分区再点都会重新展开到该分区。
-    fn toggle_file_panel(&mut self, cx: &mut Context<Self>) {
-        if self.right_panel && self.right_panel_section == RightSection::Files {
-            self.right_panel = false;
+    /// 切换「文件」页；已经停留在文件页时再按一次收起边栏。
+    fn toggle_file_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.sidebar_visible(cx) && self.sidebar_page == SidebarPage::Files {
+            let pane = self.sidebar_pane();
+            self.split_state
+                .update(cx, |state, cx| state.toggle_collapse(pane, cx));
         } else {
-            self.right_panel = true;
-            self.right_panel_section = RightSection::Files;
-            self.ensure_files_shown(cx);
-        }
-        cx.notify();
-    }
-
-    /// 打开右侧边栏并切到指定分区；传输 / 转发在切过去时就准备好对应会话状态。
-    fn set_right_section(
-        &mut self,
-        section: RightSection,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.right_panel = true;
-        self.right_panel_section = section;
-        match section {
-            RightSection::Files => self.ensure_files_shown(cx),
-            RightSection::Transfer => self.open_transfer(window, cx),
-            RightSection::Forward => self.open_forward(window, cx),
+            self.set_sidebar_page(SidebarPage::Files, window, cx);
         }
         cx.notify();
     }
@@ -3085,6 +2720,170 @@ impl RuTermApp {
         .detach();
     }
 
+    /// 面板「上传」：选本地文件后直接传到当前目录（不再经过传输表单）。
+    fn browse_files_upload(&mut self, tab_id: usize, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.iter().find(|tab| tab.id == tab_id) else {
+            return;
+        };
+        if tab.files.busy.is_some() {
+            self.status = "已有文件操作进行中，请稍候".into();
+            cx.notify();
+            return;
+        }
+        let Some(dir) = tab.files.path.clone() else {
+            return;
+        };
+        let entity = cx.entity();
+        let entity_id = entity.entity_id();
+        let rx = cx.prompt_for_paths(rgpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some("选择要上传的文件".into()),
+        });
+        cx.spawn(async move |_, cx| {
+            let Ok(Ok(Some(paths))) = rx.await else {
+                return;
+            };
+            if paths.is_empty() {
+                return;
+            }
+            let _ = cx.with_window(entity_id, move |_window, cx| {
+                let _ = entity.update(cx, move |this, cx| {
+                    this.upload_paths(tab_id, dir.clone(), paths, cx);
+                });
+            });
+        })
+        .detach();
+    }
+
+    /// 行菜单「下载到…」：选保存位置后把该远端文件拉到本地。
+    fn download_file(&mut self, tab_id: usize, name: String, cx: &mut Context<Self>) {
+        let Some(dir) = self
+            .tabs
+            .iter()
+            .find(|tab| tab.id == tab_id)
+            .and_then(|tab| tab.files.path.clone())
+        else {
+            return;
+        };
+        let remote = remote_fs::child(&dir, &name);
+        let start = downloads_dir();
+        let entity = cx.entity();
+        let entity_id = entity.entity_id();
+        let rx = cx.prompt_for_new_path(&start, Some(&name));
+        cx.spawn(async move |_, cx| {
+            let Ok(Ok(Some(path))) = rx.await else {
+                return;
+            };
+            let _ = cx.with_window(entity_id, move |_window, cx| {
+                let _ = entity.update(cx, move |this, cx| {
+                    this.start_download(tab_id, path, remote, cx);
+                });
+            });
+        })
+        .detach();
+    }
+
+    /// 单个文件下载：进度写在面板底栏，完成后提示结果。
+    fn start_download(
+        &mut self,
+        tab_id: usize,
+        local: PathBuf,
+        remote: String,
+        cx: &mut Context<Self>,
+    ) {
+        let name = Path::new(&remote)
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| remote.clone());
+        let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) else {
+            return;
+        };
+        if tab.files.busy.is_some() {
+            self.status = "已有文件操作进行中，请稍候".into();
+            cx.notify();
+            return;
+        }
+        let Some(sender) = tab.commands.clone() else {
+            tab.files.error = Some("会话已断开，无法下载文件".into());
+            cx.notify();
+            return;
+        };
+        tab.files.busy = Some(format!("正在下载 {name}…").into());
+        tab.files.progress = Some((0, 0));
+        tab.files.error = None;
+        self.status = format!("正在下载 {name}…").into();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let (progress_tx, mut progress_rx) =
+                tokio::sync::mpsc::unbounded_channel::<(u64, u64)>();
+            let (reply_tx, mut reply_rx) = tokio::sync::oneshot::channel();
+            let command = session::SessionCommand::Transfer(transfer::Task {
+                direction: transfer::Direction::Download,
+                local,
+                remote,
+                progress: progress_tx,
+                reply: reply_tx,
+            });
+            if sender.send(command).is_err() {
+                let message = "会话已断开，无法下载文件".to_string();
+                let _ = this.update(cx, |this, cx| {
+                    if let Some(tab) = this.tabs.iter_mut().find(|tab| tab.id == tab_id) {
+                        tab.files.busy = None;
+                        tab.files.progress = None;
+                        tab.files.error = Some(message.clone().into());
+                    }
+                    this.status = message.into();
+                    cx.notify();
+                });
+                return;
+            }
+            let outcome = loop {
+                tokio::select! {
+                    result = &mut reply_rx => {
+                        break match result {
+                            Ok(Ok(summary)) => Ok(summary),
+                            Ok(Err(error)) => Err(session::error_summary(&error)),
+                            Err(_) => Err("传输任务已中断".to_string()),
+                        };
+                    }
+                    Some(progress) = progress_rx.recv() => {
+                        let _ = this.update(cx, |this, cx| {
+                            if let Some(tab) = this.tabs.iter_mut().find(|tab| tab.id == tab_id)
+                                && tab.files.busy.is_some()
+                            {
+                                tab.files.progress = Some(progress);
+                                cx.notify();
+                            }
+                        });
+                    }
+                }
+            };
+            let (message, error) = match outcome {
+                Ok(summary) => (
+                    format!(
+                        "下载完成 · {} · {:.1} 秒",
+                        transfer::format_bytes(summary.bytes),
+                        summary.elapsed.as_secs_f64()
+                    ),
+                    None,
+                ),
+                Err(error) => (format!("下载失败：{error}"), Some(format!("下载失败：{error}"))),
+            };
+            let _ = this.update(cx, |this, cx| {
+                if let Some(tab) = this.tabs.iter_mut().find(|tab| tab.id == tab_id) {
+                    tab.files.busy = None;
+                    tab.files.progress = None;
+                    tab.files.error = error.map(Into::into);
+                }
+                this.status = message.into();
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// 拖文件到终端：逐个用 lrzsz（`rz`）上传到 shell 当前目录。
     ///
     /// 与面板上传不同，落点由远端 shell 决定，这里不拼任何路径；
@@ -3441,7 +3240,7 @@ impl RuTermApp {
         }
     }
 
-    /// Ctrl+Shift+F / 会话菜单：为当前标签打开端口转发弹窗。
+    /// Ctrl+Shift+F / 会话菜单：切到边栏「转发」页。
     fn open_forward_action(
         &mut self,
         _: &OpenForward,
@@ -3451,7 +3250,7 @@ impl RuTermApp {
         self.open_forward(window, cx);
     }
 
-    /// 打开端口转发弹窗：规则绑定当前 SSH 会话，不新开连接。
+    /// 打开转发分区：规则绑定当前 SSH 会话，不新开连接。
     fn open_forward(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.overlay_open() {
             return;
@@ -3463,8 +3262,7 @@ impl RuTermApp {
         };
         // 已经为这个会话准备好规则面板：只切分区，不重置正在编辑的表单。
         if self.forward.as_ref().is_some_and(|dialog| dialog.tab_id == id) {
-            self.right_panel = true;
-            self.right_panel_section = RightSection::Forward;
+            self.show_sidebar_page(SidebarPage::Forward, cx);
             cx.notify();
             return;
         }
@@ -3500,8 +3298,7 @@ impl RuTermApp {
                 .placeholder("目标端口")
         });
         listen_port.update(cx, |state, cx| state.focus(window, cx));
-        self.right_panel = true;
-        self.right_panel_section = RightSection::Forward;
+        self.show_sidebar_page(SidebarPage::Forward, cx);
         self.forward = Some(ForwardDialog {
             tab_id: id,
             title,
@@ -3565,7 +3362,7 @@ impl RuTermApp {
         cx.notify();
     }
 
-    /// 关闭端口转发弹窗；已开启的转发继续在后台工作，可在再次打开时停止。
+    /// 关闭转发表单；已开启的转发继续在后台工作，可在再次打开时停止。
     fn close_forward(&mut self, cx: &mut Context<Self>) {
         self.forward = None;
         cx.notify();
@@ -5795,17 +5592,19 @@ impl RuTermApp {
                         log::debug!("[cwd_events] 未找到对应标签");
                         return;
                     };
+                    let sidebar_visible = this.sidebar_visible(cx);
                     let tab = &mut this.tabs[pos];
                     let changed = tab.terminal_cwd.as_deref() != Some(path.as_str());
                     tab.terminal_cwd = Some(path.clone());
                     let should_follow = tab.files.follow
-                        && this.right_panel
+                        && sidebar_visible
+                        && this.sidebar_page == SidebarPage::Files
                         && this.active_tab == Some(id)
                         && tab.files.path.as_deref() != Some(path.as_str());
                     log::debug!(
                         "[cwd_events] follow={}, panel={}, active={}, path_diff={}",
                         tab.files.follow,
-                        this.right_panel,
+                        sidebar_visible,
                         this.active_tab == Some(id),
                         tab.files.path.as_deref() != Some(path.as_str())
                     );
@@ -6058,14 +5857,7 @@ impl RuTermApp {
         {
             self.view_split = None;
         }
-        // 传输/转发弹窗绑定的是这条连接：标签没了就一起关掉，避免对着死会话操作。
-        if self
-            .transfer
-            .as_ref()
-            .is_some_and(|dialog| dialog.tab_id == id)
-        {
-            self.transfer = None;
-        }
+        // 转发表单绑定的是这条连接：标签没了就一起关掉，避免对着死会话操作。
         if self
             .forward
             .as_ref()
@@ -6121,22 +5913,45 @@ impl RuTermApp {
         cx.notify();
     }
 
-    /// Ctrl+B / 菜单项：折叠或展开侧边栏（走分隔面板状态）。
-    fn toggle_sidebar(&mut self, _: &ToggleSidebar, _: &mut Window, cx: &mut Context<Self>) {
+    /// 设置边栏贴哪一侧：比例翻到另一头，折叠态也跟着搬到新侧。
+    fn set_sidebar_side(&mut self, side: SidebarSide, cx: &mut Context<Self>) {
+        if self.sidebar.side == side {
+            return;
+        }
+        let was_collapsed = self.split_state.read(cx).is_collapsed();
+        self.sidebar.side = side;
         self.split_state.update(cx, |state, cx| {
-            state.toggle_collapse(CollapsiblePane::First, cx);
+            state.expand(cx);
+            state.set_ratio(1.0 - state.ratio(), cx);
+            if was_collapsed {
+                let pane = match side {
+                    SidebarSide::Left => CollapsiblePane::First,
+                    SidebarSide::Right => CollapsiblePane::Second,
+                };
+                state.collapse(pane, cx);
+            }
+        });
+        self.persist_sidebar(cx);
+        cx.notify();
+    }
+
+    /// Ctrl+B / 菜单项：折叠或展开边栏（折叠当前靠边那一侧）。
+    fn toggle_sidebar(&mut self, _: &ToggleSidebar, _: &mut Window, cx: &mut Context<Self>) {
+        let pane = self.sidebar_pane();
+        self.split_state.update(cx, |state, cx| {
+            state.toggle_collapse(pane, cx);
         });
         cx.notify();
     }
 
-    /// `Ctrl+Shift+B`：展开 / 收起右侧文件面板。
+    /// `Ctrl+Shift+B`：切到文件页；已在文件页时收起边栏。
     fn toggle_file_panel_action(
         &mut self,
         _: &ToggleFilePanel,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.toggle_file_panel(cx);
+        self.toggle_file_panel(window, cx);
     }
 
     /// 切到指定标签：选中、滚进可见范围（标签多到溢出时），并把焦点交给它的终端。
@@ -6151,8 +5966,9 @@ impl RuTermApp {
             self.status = "已退出分屏".into();
         }
         self.active_tab = Some(id);
-        // 文件面板开着时切到尚未浏览过的新会话，顺手列出登录主目录。
-        let needs_files = self.right_panel
+        // 边栏停留在文件页时切到尚未浏览过的新会话，顺手列出登录主目录。
+        let needs_files = self.sidebar_visible(cx)
+            && self.sidebar_page == SidebarPage::Files
             && self.tabs.iter().any(|tab| {
                 tab.id == id
                     && tab.files.path.is_none()
@@ -6162,6 +5978,14 @@ impl RuTermApp {
             });
         if needs_files {
             self.load_files(id, None, cx);
+        }
+        // 转发表单绑定单个会话：切到别的标签时重开该会话的面板，避免表单指向旧连接。
+        if self.sidebar_visible(cx)
+            && self.sidebar_page == SidebarPage::Forward
+            && self.forward.as_ref().is_some_and(|dialog| dialog.tab_id != id)
+        {
+            self.forward = None;
+            self.open_forward(window, cx);
         }
         if let Some(ix) = self.tabs.iter().position(|tab| tab.id == id) {
             self.tab_scroll.scroll_to_item(ix);
@@ -6461,11 +6285,16 @@ impl RuTermApp {
                 this.local_shells = found;
                 this.refresh_shell_icons();
                 if !quiet {
+                    // 主机列表跟着边栏走，文案里的方位也要跟着变。
+                    let side = match this.sidebar.side {
+                        SidebarSide::Left => "左侧",
+                        SidebarSide::Right => "右侧",
+                    };
                     this.status = if count == 0 {
                         "扫描完成：没找到可用的本机 shell".into()
                     } else {
                         format!(
-                            "扫描完成：找到 {count} 个本机 shell，在左侧「本地终端」里点一下即可打开"
+                            "扫描完成：找到 {count} 个本机 shell，在{side}「本地终端」里点一下即可打开"
                         )
                         .into()
                     };
@@ -6642,7 +6471,6 @@ impl Render for RuTermApp {
             .on_action(cx.listener(Self::next_tab))
             .on_action(cx.listener(Self::prev_tab))
             .on_action(cx.listener(Self::open_settings_action))
-            .on_action(cx.listener(Self::open_transfer_action))
             .on_action(cx.listener(Self::open_forward_action))
             .on_action(cx.listener(Self::split_right))
             .on_action(cx.listener(Self::split_down))
@@ -6650,15 +6478,46 @@ impl Render for RuTermApp {
             // 捕获阶段先看到回车：断开的终端已写不到远端，回车要用来重连而不是被它吞掉。
             .capture_key_down(cx.listener(Self::capture_session_key))
             .child(self.render_title_bar(window, cx))
-            .child(
-                SplitPane::horizontal(self.split_state.clone())
-                    .show_collapse_buttons(false)
-                    .first(self.render_sidebar(cx))
-                    .second(self.render_main(cx))
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_hidden(),
-            )
+            .child({
+                // 边栏在哪一侧由设置决定：图标栏恒贴在窗口外缘，面板在它内侧。
+                // 图标栏在分隔面板之外，面板收起时它仍然留着（RustRover 的工具窗口栏）。
+                // 面板收起时不必再渲染页面内容（省掉每帧构建文件表格的开销）。
+                let panel = if self.sidebar_visible(cx) {
+                    self.render_sidebar_panel(cx)
+                } else {
+                    div().into_any_element()
+                };
+                match self.sidebar.side {
+                    SidebarSide::Left => h_flex()
+                        .size_full()
+                        .min_w_0()
+                        .child(self.render_sidebar_rail(cx))
+                        .child(
+                            SplitPane::horizontal(self.split_state.clone())
+                                .show_collapse_buttons(false)
+                                .first(panel)
+                                .second(self.render_main(cx).into_any_element())
+                                .flex_1()
+                                .min_h_0()
+                                .overflow_hidden(),
+                        )
+                        .into_any_element(),
+                    SidebarSide::Right => h_flex()
+                        .size_full()
+                        .min_w_0()
+                        .child(
+                            SplitPane::horizontal(self.split_state.clone())
+                                .show_collapse_buttons(false)
+                                .first(self.render_main(cx).into_any_element())
+                                .second(panel)
+                                .flex_1()
+                                .min_h_0()
+                                .overflow_hidden(),
+                        )
+                        .child(self.render_sidebar_rail(cx))
+                        .into_any_element(),
+                }
+            })
             .child(self.render_status_bar().flex_shrink_0().w_full())
             .child(self.render_overlay(window, cx))
     }
@@ -6726,17 +6585,14 @@ impl RuTermApp {
             "主密码档 · 已解锁"
         };
         let entity = cx.entity();
-        // 转发跑在后台：弹窗关了也要能从标题栏看出"还有几条在生效"。
-        let active_forwards = self
-            .active_tab
-            .and_then(|id| self.tabs.iter().find(|tab| tab.id == id))
-            .map_or(0, |tab| tab.forwards.len());
 
         // 会话菜单：新建主机、本地终端、标签切换、侧栏折叠、设置入口、托盘与退出。
         // 前六项挂 action（而非 on_click）：rgpui 会按键绑定在项右侧自动显示
         // Ctrl+N / Ctrl+Shift+T / Ctrl+Tab / Ctrl+,。
         let split_open = self.view_split.is_some();
-        let file_panel_open = self.right_panel;
+        let sidebar_open = self.sidebar_visible(cx);
+        let hosts_open = sidebar_open && self.sidebar_page == SidebarPage::Hosts;
+        let file_panel_open = sidebar_open && self.sidebar_page == SidebarPage::Files;
         // 菜单打开时把最近连接的 id 解析成当前列表里的条目（主机可能已删除或重排）。
         let recent_items: Vec<(usize, SharedString)> = self
             .recent_hosts
@@ -6778,11 +6634,22 @@ impl RuTermApp {
             let menu = menu
                 .item(PopupMenuItem::new("本地终端…").action(Box::new(NewLocalTerminal)))
                 .item(
-                    PopupMenuItem::new("远端文件面板")
+                    PopupMenuItem::new("主机列表")
+                        .checked(hosts_open)
+                        .on_click({
+                            let entity = menu_entity.clone();
+                            move |_, window, cx| {
+                                entity.update(cx, |this, cx| {
+                                    this.set_sidebar_page(SidebarPage::Hosts, window, cx);
+                                });
+                            }
+                        }),
+                )
+                .item(
+                    PopupMenuItem::new("文件浏览器")
                         .checked(file_panel_open)
                         .action(Box::new(ToggleFilePanel)),
                 )
-                .item(PopupMenuItem::new("上传 / 下载文件…").action(Box::new(OpenTransfer)))
                 .item(PopupMenuItem::new("端口转发…").action(Box::new(OpenForward)))
                 .item(PopupMenuItem::new("左右分屏").action(Box::new(SplitRight)))
                 .item(PopupMenuItem::new("上下分屏").action(Box::new(SplitDown)));
@@ -6793,7 +6660,8 @@ impl RuTermApp {
             };
             menu.item(PopupMenuItem::new("下一个标签").action(Box::new(NextTab)))
                 .item(PopupMenuItem::new("上一个标签").action(Box::new(PrevTab)))
-                .item(PopupMenuItem::new("折叠 / 展开侧边栏").action(Box::new(ToggleSidebar)))
+                // 只折叠面板，最外缘的图标栏始终留着（RustRover 的工具窗口栏）。
+                .item(PopupMenuItem::new("折叠 / 展开侧栏面板").action(Box::new(ToggleSidebar)))
                 .item(PopupMenuItem::new("设置…").action(Box::new(OpenSettings)))
                 .separator()
                 .item(
@@ -6959,70 +6827,14 @@ impl RuTermApp {
                     .h_full()
                     .window_control_area(WindowControlArea::Drag),
             )
-            // 右侧：传输 / 转发 + 锁定入口 + 细分隔线 + 系统窗口按钮。
-            // 传输与转发绑定当前会话，放在标题栏常驻比塞进标签栏更稳定：
-            // 标签一多时标签栏会横向滚动，右端按钮容易被挤出视野。
+            // 右侧：锁定入口 + 细分隔线 + 系统窗口按钮。
+            // 文件 / 转发的入口在边栏的竖向导航里，标题栏只留全局操作。
             .child(
                 h_flex()
                     .items_center()
                     .gap_1()
                     .flex_shrink_0()
                     .pr_3()
-                    .child(
-                        Button::new("title-files")
-                            .label("▤ 文件")
-                            .compact()
-                            .ghost()
-                            .text_color(if self.right_panel
-                                && self.right_panel_section == RightSection::Files
-                            {
-                                pal.accent
-                            } else {
-                                fg
-                            })
-                            .tooltip("远端文件面板")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.toggle_file_panel(cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("title-transfer")
-                            .label("⇅ 传输")
-                            .compact()
-                            .ghost()
-                            .text_color(if self.right_panel
-                                && self.right_panel_section == RightSection::Transfer
-                            {
-                                pal.accent
-                            } else {
-                                fg
-                            })
-                            .tooltip("上传 / 下载文件 (Ctrl+Shift+U)")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.set_right_section(RightSection::Transfer, window, cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("title-forward")
-                            .label(if active_forwards == 0 {
-                                "⇆ 转发".to_string()
-                            } else {
-                                format!("⇆ 转发 {active_forwards}")
-                            })
-                            .compact()
-                            .ghost()
-                            .text_color(if self.right_panel
-                                && self.right_panel_section == RightSection::Forward
-                            {
-                                pal.accent
-                            } else {
-                                fg
-                            })
-                            .tooltip("端口转发 (Ctrl+Shift+F)")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.set_right_section(RightSection::Forward, window, cx);
-                            })),
-                    )
                     // 口令档且未解锁：只留重新解锁入口（其余操作都需要库）。
                     .when(locked, |this| {
                         this.child(
@@ -7090,7 +6902,8 @@ impl RuTermApp {
     }
 
     /// 宽度与折叠由外层 SplitPane 负责，这里只填充第一面板区域。
-    fn render_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
+    /// 主机列表页：搜索框 + 主机树（待输入密码时换成密码面板）。
+    fn render_hosts_page(&self, cx: &mut Context<Self>) -> AnyElement {
         let pal = self.palette(cx);
         let panel = if self.pending.is_some() {
             self.render_pending_panel(cx)
@@ -7117,6 +6930,143 @@ impl RuTermApp {
                     .overflow_y_scrollbar()
                     .child(panel),
             )
+            .into_any_element()
+    }
+
+    /// 边栏导航条：贴窗口外缘的竖排图标。
+    ///
+    /// 学RustRover：只画图标，不排文字；文字交给悬停 tooltip。
+    /// 它独立于边栏面板，面板收起时依然留在窗口外缘，
+    /// 相当于 IDE 左侧那条工具窗口栏。
+    fn render_sidebar_rail(&self, cx: &mut Context<Self>) -> AnyElement {
+        let pal = self.palette(cx);
+        // 高亮条画在贴窗口外缘的那一侧：边栏在左则亮条在左，反之在右。
+        let stripe_at_left = self.sidebar.side == SidebarSide::Left;
+        let pages = [
+            (SidebarPage::Hosts, "rail-hosts", "主机", IconName::User),
+            (SidebarPage::Files, "rail-files", "文件", IconName::FolderOpen),
+            (
+                SidebarPage::Forward,
+                "rail-forward",
+                "转发",
+                IconName::Network,
+            ),
+        ];
+        let mut rail = v_flex()
+            .id("sidebar-rail")
+            .w(px(42.0))
+            .flex_shrink_0()
+            .h_full()
+            .items_center()
+            .py_2()
+            .gap_1()
+            .bg(pal.sidebar_bg);
+        // 转发跑在后台：收起面板也要能从导航上看出「还有几条在生效」。
+        let forward_count = self
+            .active_tab
+            .and_then(|id| self.tabs.iter().find(|tab| tab.id == id))
+            .map_or(0, |tab| tab.forwards.len());
+        for (page, id, label, icon) in pages {
+            let active = self.sidebar_page == page;
+            let color = if active { pal.accent } else { pal.muted };
+            // 转发的生效条数是常驻状态，压成图标角标，不占竖向空间。
+            let badge = (page == SidebarPage::Forward && forward_count > 0)
+                .then_some(forward_count);
+            let tip = match badge {
+                Some(count) => format!("{label}（{count} 条生效）"),
+                None => label.to_string(),
+            };
+            // 活动项的高亮条：RustRover 在选中图标外侧画一道竖条。
+            let stripe = div()
+                .absolute()
+                .top(px(7.0))
+                .bottom(px(7.0))
+                .w(px(2.0))
+                .rounded_full()
+                .bg(pal.accent)
+                .when(stripe_at_left, |this| this.left(px(0.0)))
+                .when(!stripe_at_left, |this| this.right(px(0.0)));
+            let item = v_flex()
+                .id(id)
+                .relative()
+                .w(px(34.0))
+                .h(px(34.0))
+                .items_center()
+                .justify_center()
+                .rounded(px(6.0))
+                .cursor_pointer()
+                .hover(|style| style.bg(pal.card_hover))
+                .when(active, |this| this.bg(pal.card_hover))
+                .child(
+                    Icon::new(icon)
+                        .with_size(ElementSize::ElementSize(px(18.0)))
+                        .text_color(color),
+                )
+                .when_some(badge, |this, count| {
+                    this.child(
+                        div()
+                            .absolute()
+                            .top(px(2.0))
+                            .right(px(2.0))
+                            .h(px(15.0))
+                            .min_w(px(15.0))
+                            .px_1()
+                            .items_center()
+                            .justify_center()
+                            .rounded_full()
+                            // 角标用强调色打底、边栏底色当字色，明暗主题下都读得清。
+                            .bg(pal.accent)
+                            .text_xs()
+                            .text_color(pal.sidebar_bg)
+                            .child(count.to_string()),
+                    )
+                })
+                .when(active, |this| this.child(stripe))
+                .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+                // 稍作延迟再浮出，避免鼠标路过时闪一下文字。
+                .tooltip_show_delay(Duration::from_millis(300))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    // 再点当前页的图标＝收起面板，和 IDE 里的工具窗口一个脾气。
+                    if this.sidebar_page == page && this.sidebar_visible(cx) {
+                        let pane = this.sidebar_pane();
+                        this.split_state
+                            .update(cx, |state, cx| state.toggle_collapse(pane, cx));
+                        cx.notify();
+                        return;
+                    }
+                    this.set_sidebar_page(page, window, cx)
+                }));
+            rail = rail.child(item);
+        }
+        // 导航贴窗口外缘：左边栏时亮条在左，右边栏时在右。
+        match self.sidebar.side {
+            SidebarSide::Left => rail
+                .border_r_1()
+                .border_color(pal.border)
+                .into_any_element(),
+            SidebarSide::Right => rail
+                .border_l_1()
+                .border_color(pal.border)
+                .into_any_element(),
+        }
+    }
+
+    /// 边栏面板：按当前页渲染主机列表 / 文件 / 转发。
+    fn render_sidebar_panel(&self, cx: &mut Context<Self>) -> AnyElement {
+        let pal = self.palette(cx);
+        let content = match self.sidebar_page {
+            SidebarPage::Hosts => self.render_hosts_page(cx),
+            SidebarPage::Files => self.render_files_section(cx),
+            SidebarPage::Forward => self.render_forward_section(cx),
+        };
+        // 页面内容需要在竖向 flex 里拿满高度：块级容器会让 flex_1 的子元素塌成 0。
+        v_flex()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .overflow_hidden()
+            .bg(pal.sidebar_bg)
+            .child(content)
             .into_any_element()
     }
 
@@ -7364,187 +7314,6 @@ impl RuTermApp {
                                     this.close_settings(cx);
                                 })),
                         ),
-                    ),
-            )
-            .into_any_element()
-    }
-
-    /// 边栏「传输」分区：本地文件 + 远端路径，上传 / 下载共用，传输中显示进度。
-    fn render_transfer_section(&self, cx: &Context<Self>) -> AnyElement {
-        let pal = self.palette(cx);
-        let Some(dialog) = self.transfer.as_ref() else {
-            return v_flex()
-                .id("transfer-empty")
-                .flex_1()
-                .min_h_0()
-                .items_center()
-                .justify_center()
-                .gap_2()
-                .p_4()
-                .child(div().text_sm().text_color(pal.muted).child("没有打开的传输"))
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(pal.muted)
-                        .child("传输借用当前 SSH 连接，选择会话后可上传或下载文件"),
-                )
-                .child(
-                    Button::new("transfer-start")
-                        .label("上传 / 下载…")
-                        .primary()
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.open_transfer(window, cx);
-                        })),
-                )
-                .into_any_element();
-        };
-        let busy = dialog.busy;
-        let direction = dialog.direction;
-        let (done, total) = dialog.progress.unwrap_or((0, 0));
-        let fraction = if total > 0 {
-            (done as f32 / total as f32).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-        let progress_text = match direction {
-            Some(direction) if busy => format!(
-                "{}中 · {} / {}（{:.0}%）",
-                direction.label(),
-                transfer::format_bytes(done),
-                transfer::format_bytes(total),
-                fraction * 100.0
-            ),
-            Some(direction) => format!(
-                "上次{} · {}",
-                direction.label(),
-                transfer::format_bytes(done)
-            ),
-            None => String::new(),
-        };
-        v_flex()
-            .id("transfer-section")
-            .flex_1()
-            .min_h_0()
-            .w_full()
-            .p_3()
-            .gap_3()
-            .overflow_y_scroll()
-            .child(
-                v_flex()
-                    .id("transfer-form")
-                    .w_full()
-                    .gap_3()
-                    .child(
-                        h_flex()
-                            .w_full()
-                            .items_center()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .text_base()
-                                    .font_weight(FontWeight(600.0))
-                                    .child(format!("文件传输 · {}", dialog.title)),
-                            )
-                            .child(
-                                Button::new("close-transfer").label("×").ghost().on_click(
-                                    cx.listener(|this, _, _, cx| this.close_transfer(cx)),
-                                ),
-                            ),
-                    )
-                    .child(
-                        v_flex()
-                            .gap_1()
-                            .child(div().text_sm().child("本地路径"))
-                            .child(
-                                h_flex()
-                                    .gap_2()
-                                    .child(styled_input(Input::new(&dialog.local), &pal).flex_1())
-                                    .child(
-                                        Button::new("transfer-browse")
-                                            .label("浏览…")
-                                            .secondary()
-                                            .outline()
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.browse_transfer_local(cx);
-                                            })),
-                                    ),
-                            )
-                            .child(
-                                div().text_xs().text_color(pal.muted).child(
-                                    "选择本地文件用于上传；下载时点「下载到…」另选保存位置。",
-                                ),
-                            ),
-                    )
-                    .child(labeled_field("远端路径", &dialog.remote, &pal))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(pal.muted)
-                            .child("支持 ~ 展开；上传到目录（如主目录）时自动沿用本地文件名。"),
-                    )
-                    .when(!progress_text.is_empty(), |this| {
-                        this.child(
-                            v_flex()
-                                .gap_1()
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(if busy { pal.text } else { pal.muted })
-                                        .child(progress_text),
-                                )
-                                .child(
-                                    div()
-                                        .h(px(6.0))
-                                        .w_full()
-                                        .rounded(px(3.0))
-                                        .bg(pal.border)
-                                        .overflow_hidden()
-                                        .child(
-                                            div()
-                                                .h_full()
-                                                .w(rgpui::relative(fraction))
-                                                .rounded(px(3.0))
-                                                .bg(pal.accent),
-                                        ),
-                                ),
-                        )
-                    })
-                    .when_some(dialog.error.clone(), |this, error| {
-                        this.child(div().text_sm().text_color(pal.danger).child(error))
-                    })
-                    .when_some(dialog.info.clone(), |this, info| {
-                        this.child(div().text_xs().text_color(pal.muted).child(info))
-                    })
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .justify_end()
-                            .child(
-                                Button::new("transfer-close")
-                                    .label("关闭")
-                                    .ghost()
-                                    .on_click(
-                                        cx.listener(|this, _, _, cx| this.close_transfer(cx)),
-                                    ),
-                            )
-                            .child(
-                                Button::new("transfer-download")
-                                    .label("下载到…")
-                                    .secondary()
-                                    .outline()
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.download_transfer(cx);
-                                    })),
-                            )
-                            .child(
-                                Button::new("transfer-upload")
-                                    .label("上传")
-                                    .primary()
-                                    .loading(busy && direction == Some(transfer::Direction::Upload))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.upload_transfer(cx);
-                                    })),
-                            ),
                     ),
             )
             .into_any_element()
@@ -8102,6 +7871,42 @@ impl RuTermApp {
                             })),
                     ),
             )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(div().text_sm().text_color(pal.muted).child("边栏位置"))
+                    .child({
+                        let left = self.sidebar.side == SidebarSide::Left;
+                        let button = Button::new("settings-side-left").label("左侧");
+                        let button = if left {
+                            button.primary()
+                        } else {
+                            button.secondary().outline()
+                        };
+                        button.on_click(cx.listener(|this, _, _, cx| {
+                            this.set_sidebar_side(SidebarSide::Left, cx);
+                        }))
+                    })
+                    .child({
+                        let right = self.sidebar.side == SidebarSide::Right;
+                        let button = Button::new("settings-side-right").label("右侧");
+                        let button = if right {
+                            button.primary()
+                        } else {
+                            button.secondary().outline()
+                        };
+                        button.on_click(cx.listener(|this, _, _, cx| {
+                            this.set_sidebar_side(SidebarSide::Right, cx);
+                        }))
+                    })
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(pal.muted)
+                            .child("导航栏始终贴在窗口外缘"),
+                    ),
+            )
             .into_any_element()
     }
 
@@ -8268,7 +8073,13 @@ impl RuTermApp {
                 div().text_xs().text_color(pal.muted).child(
                     "「一键扫描」会实际调用 wsl.exe 列出 WSL 发行版，故放在按钮后面而不是启动时；"
                         .to_string()
-                        + "扫描结果列在左侧「本地终端」分组里，点一下即开对应终端。",
+                        + &format!(
+                            "扫描结果列在{}「本地终端」分组里，点一下即开对应终端。",
+                            match self.sidebar.side {
+                                SidebarSide::Left => "左侧",
+                                SidebarSide::Right => "右侧",
+                            }
+                        ),
                 ),
             )
             .into_any_element()
@@ -10059,7 +9870,7 @@ impl RuTermApp {
             .hover(|style| style.text_color(pal.text))
             .when(right_align, |this| this.text_right());
         if width.is_none() {
-            cell = cell.flex_1().min_w_0().text_ellipsis();
+            cell = cell.flex_1().min_w(px(48.0)).text_ellipsis();
         }
         let cell = cell.child(text).on_click(cx.listener(move |this, _, _, cx| {
             let Some(tab_id) = this.active_tab else { return };
@@ -10118,257 +9929,7 @@ impl RuTermApp {
             .into_any_element()
     }
 
-    /// 右侧边栏：标题 + 文件 / 传输 / 转发三个分区，切换只换内容不换面板。
-    fn render_right_panel(&self, cx: &mut Context<Self>) -> AnyElement {
-        let pal = self.palette(cx);
-        if let Ok(stage) = std::env::var("RUTERM_PANEL_DEBUG") {
-            let stage = stage.as_str();
-            let mut simple = v_flex().id("right-panel").size_full().bg(pal.sidebar_bg);
-            if stage == "4" || stage == "5" || stage == "6" || stage == "8" {
-                let icon = IconName::FolderOpen;
-                simple = simple.child(
-                    h_flex()
-                        .w_full()
-                        .flex_shrink_0()
-                        .px_3()
-                        .py_2()
-                        .gap_2()
-                        .items_center()
-                        .border_b_1()
-                        .border_color(pal.border)
-                        .child(Icon::new(icon).small().text_color(pal.link))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .text_sm()
-                                .font_weight(FontWeight(600.0))
-                                .child("文件管理器"),
-                        )
-                        .child(
-                            Button::new("right-panel-close")
-                                .label("×")
-                                .compact()
-                                .ghost()
-                                .tab_index(-1)
-                                .tooltip("收起右侧边栏")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.right_panel = false;
-                                    cx.notify();
-                                })),
-                        ),
-                );
-            }
-            if stage == "5" || stage == "6" || stage == "7" {
-                let mut tabs = h_flex().w_full().px_2().py_1().gap_1();
-                for (section, id, label, icon) in [
-                    (RightSection::Files, "files-tab", "文件", IconName::FolderOpen),
-                    (
-                        RightSection::Transfer,
-                        "transfer-tab",
-                        "传输",
-                        IconName::Replace,
-                    ),
-                    (
-                        RightSection::Forward,
-                        "forward-tab",
-                        "转发",
-                        IconName::Network,
-                    ),
-                ] {
-                    let active = self.right_panel_section == section;
-                    let button = Button::new(id)
-                        .icon(icon)
-                        .label(label)
-                        .compact()
-                        .tab_index(-1);
-                    let button = if active { button.selected(true) } else { button.ghost() };
-                    tabs = tabs.child(button.flex_1().on_click(cx.listener(
-                        move |this, _, window, cx| this.set_right_section(section, window, cx),
-                    )));
-                }
-                simple = simple.child(tabs);
-            }
-            if stage == "3" || stage == "6" || stage == "7" || stage == "8" {
-                simple =
-                    simple.child(match self.right_panel_section {
-                        RightSection::Files => self.render_files_section(cx),
-                        RightSection::Transfer => self.render_transfer_section(cx),
-                        RightSection::Forward => self.render_forward_section(cx),
-                    });
-            }
-            if stage == "9" {
-                simple = simple.child(div().flex_1().child("body text"));
-            }
-            if stage == "b" {
-                simple = simple.child(v_flex().flex_1());
-            }
-            if stage == "c" {
-                simple = simple.child(v_flex().id("dbg-c").flex_1().child("t"));
-            }
-            if stage == "d" {
-                simple = simple.child(
-                    v_flex()
-                        .id("dbg-d")
-                        .flex_1()
-                        .min_h_0()
-                        .items_center()
-                        .justify_center()
-                        .gap_2()
-                        .p_4()
-                        .child("t"),
-                );
-            }
-            if stage == "e" {
-                simple = simple.child(
-                    v_flex()
-                        .id("dbg-e")
-                        .flex_1()
-                        .min_h_0()
-                        .items_center()
-                        .justify_center()
-                        .gap_2()
-                        .p_4()
-                        .child(Button::new("dbg-btn").label("按钮").primary().on_click(
-                            cx.listener(|this, _, window, cx| {
-                                this.set_right_section(RightSection::Files, window, cx);
-                            }),
-                        )),
-                );
-            }
-            if stage == "t" {
-                simple = simple.child(self.render_transfer_section(cx));
-            }
-            if stage == "q" {
-                simple = simple.child(self.render_forward_section(cx));
-            }
-            if stage == "p" {
-                let pal2 = self.palette(cx);
-                simple = simple.child(
-                    v_flex()
-                        .id("p-empty")
-                        .flex_1()
-                        .min_h_0()
-                        .items_center()
-                        .justify_center()
-                        .gap_2()
-                        .p_4()
-                        .child(div().text_sm().text_color(pal2.muted).child("没有打开的传输"))
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(pal2.muted)
-                                .child("传输借用当前 SSH 连接，选择会话后可上传或下载文件"),
-                        )
-                        .child(
-                            Button::new("p-start")
-                                .label("上传 / 下载…")
-                                .primary()
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.open_transfer(window, cx);
-                                })),
-                        ),
-                );
-            }
-            if stage == "f" {
-                simple = simple.child(self.render_forward_section(cx));
-            }
-            return simple.into_any_element();
-        }
-        let (icon, title) = match self.right_panel_section {
-            RightSection::Files => (IconName::FolderOpen, "文件管理器"),
-            RightSection::Transfer => (IconName::Replace, "文件传输"),
-            RightSection::Forward => (IconName::Network, "端口转发"),
-        };
-        let sections = [
-            (RightSection::Files, "files-tab", "文件", IconName::FolderOpen),
-            (
-                RightSection::Transfer,
-                "transfer-tab",
-                "传输",
-                IconName::Replace,
-            ),
-            (
-                RightSection::Forward,
-                "forward-tab",
-                "转发",
-                IconName::Network,
-            ),
-        ];
-        let mut switch = h_flex()
-            .w_full()
-            .flex_shrink_0()
-            .px_2()
-            .py_1()
-            .gap_1()
-            .border_b_1()
-            .border_color(pal.border);
-        for (section, id, label, icon) in sections {
-            let active = self.right_panel_section == section;
-            let button = Button::new(id)
-                .icon(icon)
-                .label(label)
-                .compact()
-                .tab_index(-1);
-            let button = if active {
-                button.selected(true)
-            } else {
-                button.ghost()
-            };
-            switch = switch.child(button.flex_1().on_click(cx.listener(
-                move |this, _, window, cx| this.set_right_section(section, window, cx),
-            )));
-        }
-        let body = match self.right_panel_section {
-            RightSection::Files => self.render_files_section(cx),
-            RightSection::Transfer => self.render_transfer_section(cx),
-            RightSection::Forward => self.render_forward_section(cx),
-        };
-        v_flex()
-            .id("right-panel")
-            .size_full()
-            .min_w_0()
-            .bg(pal.sidebar_bg)
-            .border_l_1()
-            .border_color(pal.border)
-            .child(
-                h_flex()
-                    .w_full()
-                    .flex_shrink_0()
-                    .px_3()
-                    .py_2()
-                    .gap_2()
-                    .items_center()
-                    .border_b_1()
-                    .border_color(pal.border)
-                    .child(Icon::new(icon).small().text_color(pal.link))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .text_sm()
-                            .font_weight(FontWeight(600.0))
-                            .child(title),
-                    )
-                    .child(
-                        Button::new("right-panel-close")
-                            .label("×")
-                            .compact()
-                            .ghost()
-                            .tab_index(-1)
-                            .tooltip("收起右侧边栏")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.right_panel = false;
-                                cx.notify();
-                            })),
-                    ),
-            )
-            .child(switch)
-            .child(body)
-            .into_any_element()
-    }
-
-    /// 右侧远端文件面板：路径栏 + 目录列表 + 底部操作状态。
+    /// 文件页：路径栏 + 目录列表 + 底部操作状态。
     ///
     /// 面板跟随活动标签；每个标签各自保留路径与列表，切换回来不重新拉取。
     /// 目录行和列表空白处都接受系统文件拖入，落到对应目录上传。
@@ -10469,6 +10030,18 @@ impl RuTermApp {
                             };
                             this.open_file_prompt(id, dir, None, window, cx);
                         })),
+                )
+                .child(
+                    // 有文件浏览器就不需要单独的传输表单：直接选本地文件传到当前目录。
+                    Button::new("files-upload")
+                        .icon(FileIcon::Upload)
+                        .compact()
+                        .ghost()
+                        .tab_index(-1)
+                        .tooltip("上传文件…")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.browse_files_upload(id, cx);
+                        })),
                 );
         }
 
@@ -10565,7 +10138,7 @@ impl RuTermApp {
                         .w_full()
                         .px_2()
                         .py_1()
-                        .gap_2()
+                        .gap_1()
                         .items_center()
                         .rounded(px(4.0))
                         .hover(|style| style.bg(pal.card_hover))
@@ -10604,7 +10177,7 @@ impl RuTermApp {
                         .child(
                             div()
                                 .flex_1()
-                                .min_w_0()
+                                .min_w(px(48.0))
                                 .text_ellipsis()
                                 .text_sm()
                                 .child(name.clone()),
@@ -10658,6 +10231,19 @@ impl RuTermApp {
                                         });
                                     }),
                             );
+                        let menu = if is_dir {
+                            menu
+                        } else {
+                            let downloading = menu_entity.clone();
+                            let download_name = name.clone();
+                            menu.item(
+                                PopupMenuItem::new("下载到…").on_click(move |_, _, cx| {
+                                    downloading.update(cx, |this, cx| {
+                                        this.download_file(id, download_name.clone(), cx);
+                                    });
+                                }),
+                            )
+                        };
                         let renaming = menu_entity.clone();
                         let rename_name = name.clone();
                         let menu = menu.item(
@@ -10726,7 +10312,7 @@ impl RuTermApp {
             .flex_shrink_0()
             .px_2()
             .py_1()
-            .gap_2()
+            .gap_1()
             .items_center()
             .border_b_1()
             .border_color(pal.border)
@@ -10749,11 +10335,11 @@ impl RuTermApp {
                     let width = (start.start_w
                         + (event.event.position.x.as_f32() - start.start_x))
                         .clamp(FILE_COL_MIN_W, FILE_COL_MAX_W);
-                    if let Some(tab) = this.tabs.iter_mut().find(|tab| tab.id == drag.tab_id) {
-                        if (tab.files.cols[drag.col] - width).abs() > 0.5 {
-                            tab.files.cols[drag.col] = width;
-                            cx.notify();
-                        }
+                    if let Some(tab) = this.tabs.iter_mut().find(|tab| tab.id == drag.tab_id)
+                        && (tab.files.cols[drag.col] - width).abs() > 0.5
+                    {
+                        tab.files.cols[drag.col] = width;
+                        cx.notify();
                     }
                 },
             ))
@@ -10773,11 +10359,7 @@ impl RuTermApp {
                     }
                 }),
             );
-        let head_row: AnyElement = if std::env::var("RUTERM_NO_HEAD").is_ok() {
-            div().h(px(20.0)).into_any_element()
-        } else {
-            head_row.into_any_element()
-        };
+        let head_row = head_row.into_any_element();
 
         let mut footer = v_flex()
             .w_full()
@@ -11277,6 +10859,11 @@ impl RuTermApp {
                 .and_then(|id| self.tabs.iter().find(|tab| tab.id == id))
                 .map(|tab| self.render_tab_pane(tab, true, false, terminal_bg, cx))
                 .unwrap_or_else(|| {
+                    // 边栏可以贴左边或右边，空状态提示跟着说对应的一侧。
+                    let side = match self.sidebar.side {
+                        SidebarSide::Left => "左侧",
+                        SidebarSide::Right => "右侧",
+                    };
                     v_flex()
                         .flex_1()
                         .items_center()
@@ -11285,37 +10872,10 @@ impl RuTermApp {
                             div()
                                 .text_base()
                                 .text_color(pal.muted)
-                                .child("从左侧点击主机账号开始连接"),
+                                .child(format!("从{side}点击主机账号开始连接")),
                         )
                         .into_any_element()
                 })
-        };
-
-        // 右侧边栏挂在主区右侧：分屏时也跟随活动标签，而不是挤进某一侧终端。
-        // 使用 h_resizable 实现拖拽调整边栏宽度。
-        let body = if self.right_panel {
-            use rgpui::components::resizable::{h_resizable, resizable_panel};
-            let group = h_resizable("right-panel-resize", self.right_panel_resize.clone())
-                .child(resizable_panel().child(body))
-                .child(
-                    resizable_panel()
-                        .size(px(480.0))
-                        .size_range(px(300.0)..px(800.0))
-                        // 终端内容有固有宽度，靠比例收缩会把边栏一起压扁；
-                        // 让右侧面板不参与收缩，宽度只由拖拽决定。
-                        .flex_shrink_0()
-                        .child(self.render_right_panel(cx)),
-                );
-            // 面板组内部是 size_full（高度 100%）：必须放进一个定高槽里，
-            // 否则百分比直接按主区算、把标签栏高度也算进去，底部会被窗口裁掉。
-            div()
-                .flex_1()
-                .min_h_0()
-                .w_full()
-                .child(group)
-                .into_any_element()
-        } else {
-            body
         };
 
         v_flex().flex_1().h_full().child(tab_bar).child(body)
@@ -12003,7 +11563,6 @@ fn main() {
             KeyBinding::new("ctrl-pageup", PrevTab, None),
             KeyBinding::new("ctrl-,", OpenSettings, None),
             // 文件传输：给当前活动会话开 SFTP 上传 / 下载弹窗。
-            KeyBinding::new("ctrl-shift-u", OpenTransfer, None),
             // 端口转发：给当前活动会话配置本地监听 → 远端目标。
             KeyBinding::new("ctrl-shift-f", OpenForward, None),
             // 分屏：左右 / 上下；同方向再按一次收起，换方向原地换排布。

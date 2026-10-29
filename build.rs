@@ -9,6 +9,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut res = winresource::WindowsResource::new();
         res.set_icon("assets/icons/ruterm.ico");
         res.compile()?;
+        // 调试构建的元素渲染帧很大，嵌套一深就会耗尽 Windows 默认的 1MB 主线程栈
+        // （表现为「has overflowed its stack」）。给主线程 16MB，UI 仍留在主线程。
+        println!("cargo:rustc-link-arg=/STACK:16777216");
     }
 
     Ok(())
