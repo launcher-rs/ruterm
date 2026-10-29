@@ -43,8 +43,8 @@ use rgpui::{
     actions, canvas, div, h_flex, icon_named, img, px, relative, size, v_flex, IconNamed,
 };
 use rgpui_term::{
-    Event as TerminalEvent, SearchStatus, TerminalBuilder, TerminalThemeConfig, TerminalView,
-    TextStyle, ThemeDefinition, ThemeManager,
+    Event as TerminalEvent, InputOrigin, SearchStatus, TerminalBuilder, TerminalMiddleware,
+    TerminalThemeConfig, TerminalView, TextStyle, ThemeDefinition, ThemeManager,
 };
 use serde::{Deserialize, Serialize};
 
@@ -84,9 +84,46 @@ actions!(
         SplitDown,
         CloseSplit,
         FindInTerminal,
-        CloseFind
+        CloseFind,
+        ToggleSyncInput,
+        BroadcastCommand,
+        CancelBroadcast
     ]
 );
+
+/// 终端输入镜像中间件：把用户敲进活动终端的字节转发给应用，供「同步输入」分发。
+///
+/// 只观察不改写（始终原样放行）。`Programmatic` 来源正是同步写回产生的输入，必须
+/// 忽略，否则几个会话之间会来回镜像、无限放大。
+struct MirrorInput {
+    tab_id: usize,
+    tx: tokio::sync::mpsc::UnboundedSender<(usize, InputOrigin, Vec<u8>)>,
+}
+
+impl TerminalMiddleware for MirrorInput {
+    fn on_input(
+        &self,
+        input: std::borrow::Cow<'static, [u8]>,
+        origin: InputOrigin,
+    ) -> Option<std::borrow::Cow<'static, [u8]>> {
+        // 只镜像"人输入"的三类：键盘、文本上屏、粘贴。鼠标上报与滚动属于
+        // 具体会话自己的交互，广播过去会污染其它程序。
+        if matches!(
+            origin,
+            InputOrigin::Keystroke | InputOrigin::Text | InputOrigin::Paste
+        ) && !input.is_empty()
+        {
+            let _ = self.tx.send((self.tab_id, origin, input.to_vec()));
+        }
+        Some(input)
+    }
+}
+
+/// 命令广播弹窗：把一条命令以回车结尾写进所有活动会话（需二次确认）。
+struct BroadcastState {
+    input: Entity<InputState>,
+    confirm: bool,
+}
 
 /// 边栏分隔条的拖拽载荷。搭 rgpui 原生拖拽会话：面板内的表格等元素会拦下
 /// 冒泡的鼠标移动，只有拖拽会话能在指针划过它们时继续送达移动事件。
@@ -1520,6 +1557,12 @@ struct RuTermApp {
     home_search: Entity<InputState>,
     /// 终端内查找条（Ctrl+F）。
     find: FindBar,
+    /// 同步输入开关：活动终端的按键同时写进其它会话（仅本次运行有效）。
+    sync_input: bool,
+    /// 终端输入镜像通道（中间件 → UI 分发循环）。
+    mirror_tx: tokio::sync::mpsc::UnboundedSender<(usize, InputOrigin, Vec<u8>)>,
+    /// 命令广播弹窗（一次性把命令发到所有会话）。
+    broadcast: Option<BroadcastState>,
     /// 活动会话标签。
     tabs: Vec<SessionTab>,
     /// 当前选中标签 id。
@@ -1725,6 +1768,9 @@ impl RuTermApp {
             _ => {}
         })
         .detach();
+        // 中间件跑在终端内部（按键路径上），投递到 tokio 通道后由 UI 侧分发：
+        // 终端实体之间不能互相直接写，否则借用与通知顺序会互相踩。
+        let (mirror_tx, mut mirror_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = Self {
             store,
             mode,
@@ -1739,6 +1785,9 @@ impl RuTermApp {
                 regex: false,
                 applied: None,
             },
+            sync_input: false,
+            mirror_tx,
+            broadcast: None,
             tabs: Vec::new(),
             active_tab: None,
             new_host: None,
@@ -1777,6 +1826,18 @@ impl RuTermApp {
             view_split: None,
             focus_handle: cx.focus_handle(),
         };
+        // 镜像分发循环：只在开关打开时把字节写进其它会话。实体销毁后 update 失败即退出。
+        cx.spawn(async move |this, cx| {
+            while let Some((source, origin, bytes)) = mirror_rx.recv().await {
+                if this
+                    .update(cx, |this, cx| this.mirror_input(source, origin, bytes, cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
         app.boot_vault(window, cx);
         // 启动档 shell 只有几个，图标走 shell 缓存、毫秒级，直接在主线程取好再进列表。
         app.refresh_shell_icons();
@@ -5484,6 +5545,12 @@ impl RuTermApp {
             return;
         };
         let terminal = cx.new(|cx| builder.subscribe(cx));
+        // 同步输入的观察点：终端所有输入都会经过中间件，程序化写回的会被标记为
+        // Programmatic 从而不再反弹。
+        let mirror_tx = self.mirror_tx.clone();
+        terminal.update(cx, |terminal, _| {
+            terminal.add_middleware(Arc::new(MirrorInput { tab_id: id, tx: mirror_tx }));
+        });
         let style = self.terminal_text_style(cx);
         let terminal_view =
             cx.new(|cx| TerminalView::new_with_style(terminal.clone(), style, window, cx));
@@ -5754,7 +5821,23 @@ impl RuTermApp {
             dialog.info = None;
             dialog.error = Some("会话已断开，端口转发已全部停止".into());
         }
+        self.prune_multi_session_state();
         cx.notify();
+    }
+
+    /// 会话减少后收拾依赖多个会话的状态：可用会话不足两个就关掉同步输入，
+    /// 一个都不剩就收起广播弹窗（继续留着只会对着空列表发命令）。
+    fn prune_multi_session_state(&mut self) {
+        let live = self.live_tab_count();
+        if self.sync_input && live < 2 {
+            self.sync_input = false;
+            if self.status.as_ref().starts_with("同步输入") {
+                self.status = "同步输入已关闭（可用会话不足两个）".into();
+            }
+        }
+        if live == 0 {
+            self.broadcast = None;
+        }
     }
 
     /// 会话以失败收场：标记断开原因，状态栏给出错误摘要（终端里另有完整错误文本）。
@@ -5818,6 +5901,8 @@ impl RuTermApp {
             }
             self.schedule_auto_reconnect(id, view, attempt, delay, cx);
         }
+        // 失败同样让该会话退出"可用"计数：不足两个就关掉同步输入。
+        self.prune_multi_session_state();
     }
 
     /// 延迟到点后在原标签重连；期间关标签、手动重连、取消或关掉开关都会让本次排定作废。
@@ -5977,6 +6062,7 @@ impl RuTermApp {
                 self.reveal_tab(active);
             }
         }
+        self.prune_multi_session_state();
         self.sync_tray(cx);
         cx.notify();
     }
@@ -6237,6 +6323,160 @@ impl RuTermApp {
                 terminal.search_next();
             }
         });
+    }
+
+    /// 可接收输入的会话数（不含已结束 / 连接失败的标签）。
+    fn live_tab_count(&self) -> usize {
+        self.tabs
+            .iter()
+            .filter(|tab| !tab.ended && !tab.failed)
+            .count()
+    }
+
+    /// 同步输入开关：打开后活动终端里的按键会同时写进其它会话。
+    fn toggle_sync_input(
+        &mut self,
+        _: &ToggleSyncInput,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_sync_input(!self.sync_input, cx);
+    }
+
+    fn set_sync_input(&mut self, on: bool, cx: &mut Context<Self>) {
+        let live = self.live_tab_count();
+        if on && live < 2 {
+            self.status = "同步输入至少需要两个可用会话".into();
+            cx.notify();
+            return;
+        }
+        self.sync_input = on;
+        self.status = if on {
+            SharedString::from(format!("同步输入：开（{live} 个会话）"))
+        } else {
+            "同步输入：关".into()
+        };
+        cx.notify();
+    }
+
+    /// 中间件送来的输入：只转发活动终端的输入，写到其它未结束的会话。
+    fn mirror_input(
+        &mut self,
+        source: usize,
+        origin: InputOrigin,
+        bytes: Vec<u8>,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.sync_input || self.active_tab != Some(source) {
+            return;
+        }
+        // 粘贴带的是本终端按自身 bracketed-paste 模式包好的字节；别的会话未必开了
+        // 同一模式，直接发过去会露出转义序列。还原成纯文本，按目标自己的能力处理。
+        let payload = if origin == InputOrigin::Paste {
+            match std::str::from_utf8(&bytes) {
+                Ok(text) => {
+                    let inner = text
+                        .strip_prefix("\x1b[200~")
+                        .and_then(|rest| rest.strip_suffix("\x1b[201~"))
+                        .unwrap_or(text);
+                    inner.replace("\r\n", "\r").replace('\n', "\r").into_bytes()
+                }
+                Err(_) => bytes.clone(),
+            }
+        } else {
+            bytes.clone()
+        };
+        for tab in self.tabs.iter() {
+            if tab.id == source || tab.ended || tab.failed {
+                continue;
+            }
+            let terminal = tab.terminal_view.read(cx).terminal().clone();
+            // 走 `input()`＝Programmatic 来源，中间件不再镜像，避免回流。
+            terminal.update(cx, |terminal, _| terminal.input(payload.clone()));
+        }
+    }
+
+    /// 菜单「命令发到所有会话…」：弹出输入框，确认后统一发送。
+    fn broadcast_command(
+        &mut self,
+        _: &BroadcastCommand,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.live_tab_count() == 0 {
+            self.status = "没有可发送命令的会话".into();
+            cx.notify();
+            return;
+        }
+        if let Some(state) = self.broadcast.as_ref() {
+            state.input.update(cx, |state, cx| state.focus(window, cx));
+            return;
+        }
+        let input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("要发送到所有会话的命令（回车在远端执行）")
+        });
+        cx.subscribe(&input, |_, _, _: &InputEvent, cx| cx.notify())
+            .detach();
+        input.update(cx, |state, cx| state.focus(window, cx));
+        self.broadcast = Some(BroadcastState {
+            input,
+            confirm: false,
+        });
+        cx.notify();
+    }
+
+    fn close_broadcast(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.broadcast.take().is_none() {
+            return;
+        }
+        if let Some(view) = self.active_terminal_view() {
+            view.read(cx).focus_handle(cx).focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    fn cancel_broadcast(&mut self, _: &CancelBroadcast, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_broadcast(window, cx);
+    }
+
+    /// 确认发送：命令 + 回车写进每个活动会话，等效于手动逐台输入。
+    fn commit_broadcast(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(state) = self.broadcast.as_ref() else {
+            return;
+        };
+        if !state.confirm {
+            self.status = "请先勾选确认再发送".into();
+            cx.notify();
+            return;
+        }
+        let command = state
+            .input
+            .read(cx)
+            .value()
+            .trim_end_matches(['\r', '\n'])
+            .to_string();
+        if command.is_empty() {
+            self.status = "命令不能为空".into();
+            cx.notify();
+            return;
+        }
+        let mut bytes = command.into_bytes();
+        bytes.push(b'\r');
+        let mut targets = 0;
+        for tab in self.tabs.iter() {
+            if tab.ended || tab.failed {
+                continue;
+            }
+            let terminal = tab.terminal_view.read(cx).terminal().clone();
+            terminal.update(cx, |terminal, _| terminal.input(bytes.clone()));
+            targets += 1;
+        }
+        self.broadcast = None;
+        self.status = SharedString::from(format!("已向 {targets} 个会话发送命令"));
+        if let Some(view) = self.active_terminal_view() {
+            view.read(cx).focus_handle(cx).focus(window, cx);
+        }
+        cx.notify();
     }
 
     /// 切到指定标签：选中、滚进可见范围（标签多到溢出时），并把焦点交给它的终端。
@@ -6694,12 +6934,16 @@ impl RuTermApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let id = self.next_id;
+        self.next_id += 1;
         let terminal = cx.new(|cx| builder.subscribe(cx));
+        let mirror_tx = self.mirror_tx.clone();
+        terminal.update(cx, |terminal, _| {
+            terminal.add_middleware(Arc::new(MirrorInput { tab_id: id, tx: mirror_tx }));
+        });
         let style = self.terminal_text_style(cx);
         let terminal_view =
             cx.new(|cx| TerminalView::new_with_style(terminal.clone(), style, window, cx));
-        let id = self.next_id;
-        self.next_id += 1;
         let addr = if cwd.is_empty() {
             label.clone().into()
         } else {
@@ -6773,6 +7017,9 @@ impl Render for RuTermApp {
             .on_action(cx.listener(Self::close_split_action))
             .on_action(cx.listener(Self::find_in_terminal))
             .on_action(cx.listener(Self::close_find))
+            .on_action(cx.listener(Self::toggle_sync_input))
+            .on_action(cx.listener(Self::broadcast_command))
+            .on_action(cx.listener(Self::cancel_broadcast))
             // 捕获阶段先看到回车：断开的终端已写不到远端，回车要用来重连而不是被它吞掉。
             .capture_key_down(cx.listener(Self::capture_session_key))
             .child(self.render_title_bar(window, cx))
@@ -6834,7 +7081,7 @@ impl Render for RuTermApp {
                         .into_any_element(),
                 }
             })
-            .child(self.render_status_bar().flex_shrink_0().w_full())
+            .child(self.render_status_bar(cx).flex_shrink_0().w_full())
             .child(self.render_overlay(window, cx))
     }
 }
@@ -6906,6 +7153,8 @@ impl RuTermApp {
         // 前六项挂 action（而非 on_click）：rgpui 会按键绑定在项右侧自动显示
         // Ctrl+N / Ctrl+Shift+T / Ctrl+Tab / Ctrl+,。
         let split_open = self.view_split.is_some();
+        let sync_on = self.sync_input;
+        let live_tabs = self.live_tab_count();
         let sidebar_open = self.sidebar_visible(cx);
         let hosts_open = sidebar_open && self.sidebar_page == SidebarPage::Hosts;
         let file_panel_open = sidebar_open && self.sidebar_page == SidebarPage::Files;
@@ -6977,6 +7226,17 @@ impl RuTermApp {
             menu.item(PopupMenuItem::new("下一个标签").action(Box::new(NextTab)))
                 .item(PopupMenuItem::new("上一个标签").action(Box::new(PrevTab)))
                 .item(PopupMenuItem::new("终端内查找…").action(Box::new(FindInTerminal)))
+                .item(
+                    PopupMenuItem::new("同步输入")
+                        .checked(sync_on)
+                        .disabled(live_tabs < 2)
+                        .action(Box::new(ToggleSyncInput)),
+                )
+                .item(
+                    PopupMenuItem::new("命令发到所有会话…")
+                        .disabled(live_tabs == 0)
+                        .action(Box::new(BroadcastCommand)),
+                )
                 // 只折叠面板，最外缘的图标栏始终留着（RustRover 的工具窗口栏）。
                 .item(PopupMenuItem::new("折叠 / 展开侧栏面板").action(Box::new(ToggleSidebar)))
                 .item(PopupMenuItem::new("设置…").action(Box::new(OpenSettings)))
@@ -8687,6 +8947,9 @@ impl RuTermApp {
         if self.shell_prompt.is_some() {
             return self.render_shell_prompt(cx);
         }
+        if self.broadcast.is_some() {
+            return self.render_broadcast_dialog(cx);
+        }
         div().into_any_element()
     }
 
@@ -9935,6 +10198,121 @@ impl RuTermApp {
                                     this.cancel_group_prompt(cx);
                                 }),
                             )),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// 命令广播弹窗：列清目标会话，勾选确认后才能发送。
+    fn render_broadcast_dialog(&self, cx: &Context<Self>) -> AnyElement {
+        let pal = self.palette(cx);
+        let Some(state) = self.broadcast.as_ref() else {
+            return div().into_any_element();
+        };
+        let live: Vec<&SessionTab> = self
+            .tabs
+            .iter()
+            .filter(|tab| !tab.ended && !tab.failed)
+            .collect();
+        let count = live.len();
+        let names = live
+            .iter()
+            .map(|tab| tab.title.to_string())
+            .collect::<Vec<_>>()
+            .join("、");
+        let confirm_entity = cx.entity();
+        v_flex()
+            .id("broadcast-backdrop")
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .size_full()
+            .items_center()
+            .justify_center()
+            .bg(rgpui::hsla(0.0, 0.0, 0.0, 0.45))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_, _, _, cx| cx.stop_propagation()),
+            )
+            .child(
+                v_flex()
+                    .id("broadcast-dialog")
+                    .key_context("BroadcastDialog")
+                    .w(px(480.0))
+                    .gap_3()
+                    .p_5()
+                    .rounded(px(8.0))
+                    .bg(pal.card_bg)
+                    .border_1()
+                    .border_color(pal.border)
+                    .shadow_md()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                    )
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_base()
+                                    .font_weight(FontWeight(600.0))
+                                    .child("命令发到所有会话"),
+                            )
+                            .child(Button::new("close-broadcast").label("×").ghost().on_click(
+                                cx.listener(|this, _, window, cx| {
+                                    this.close_broadcast(window, cx);
+                                }),
+                            )),
+                    )
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .child(div().text_sm().child("命令"))
+                            .child(styled_input(Input::new(&state.input), &pal)),
+                    )
+                    .child(div().text_xs().text_color(pal.muted).child(format!(
+                        "将向 {count} 个可用会话发送：{names}。已结束或连接失败的会话不在其中。"
+                    )))
+                    .child(
+                        Checkbox::new("broadcast-confirm")
+                            .label(format!("我确认：该命令会在 {count} 个会话中立即执行"))
+                            .checked(state.confirm)
+                            .on_change(move |on, _, cx| {
+                                confirm_entity.update(cx, |this, cx| {
+                                    if let Some(state) = this.broadcast.as_mut() {
+                                        state.confirm = on;
+                                    }
+                                    cx.notify();
+                                });
+                            }),
+                    )
+                    .child(div().text_xs().text_color(pal.danger).child(
+                        "命令以回车结尾写入，与手动在终端里输入等效，发出后无法撤回。",
+                    ))
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .justify_end()
+                            .child(
+                                Button::new("send-broadcast")
+                                    .label("发送")
+                                    .primary()
+                                    .disabled(!state.confirm)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.commit_broadcast(window, cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("cancel-broadcast")
+                                    .label("取消")
+                                    .ghost()
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.close_broadcast(window, cx);
+                                    })),
+                            ),
                     ),
             )
             .into_any_element()
@@ -11668,7 +12046,7 @@ impl RuTermApp {
     }
 
     /// 底部状态栏：左侧瞬态状态 + 活动会话信息（按用户勾选的显示项拼装），右侧会话计数。
-    fn render_status_bar(&self) -> StatusBar {
+    fn render_status_bar(&self, cx: &Context<Self>) -> StatusBar {
         let active = self
             .active_tab
             .and_then(|id| self.tabs.iter().find(|tab| tab.id == id));
@@ -11694,11 +12072,27 @@ impl RuTermApp {
                 }
             }
         }
-        let right = vec![
+        let mut right = Vec::new();
+        if self.sync_input {
+            let entity = cx.entity().downgrade();
+            right.push(
+                StatusBarItem::new("同步输入")
+                    .id("sync-input")
+                    .icon(IconName::Replace)
+                    .active(true)
+                    .tooltip("按键正在同步到所有会话，点击关闭")
+                    .on_click(move |_, _, cx| {
+                        if let Some(this) = entity.upgrade() {
+                            this.update(cx, |this, cx| this.set_sync_input(false, cx));
+                        }
+                    }),
+            );
+        }
+        right.push(
             StatusBarItem::new(format!("会话 {}", self.tabs.len()))
                 .id("sessions")
                 .muted(true),
-        ];
+        );
         StatusBar::new().left(left).right(right)
     }
 
@@ -12157,6 +12551,7 @@ fn main() {
             // 终端内查找：Esc 只在查找条里关闭（终端里的 Esc 仍原样送给 shell）。
             KeyBinding::new("ctrl-f", FindInTerminal, None),
             KeyBinding::new("escape", CloseFind, Some("FindBar")),
+            KeyBinding::new("escape", CancelBroadcast, Some("BroadcastDialog")),
             // 文件传输：给当前活动会话开 SFTP 上传 / 下载弹窗。
             // 端口转发：给当前活动会话配置本地监听 → 远端目标。
             KeyBinding::new("ctrl-shift-f", OpenForward, None),

@@ -14,7 +14,7 @@
 | 能力 | RustTerm-Egui | RuTerm | 结论 |
 |---|---|---|---|
 | 终端内查找 | Ctrl+F 高亮 + 上/下跳转 | Ctrl+F 查找条（字面量 / 正则） | **已补** |
-| 多终端联动 | 批量执行 + 同步输入 | 无 | 补 |
+| 多终端联动 | 批量执行 + 同步输入 | 同步输入 + 命令广播（菜单 + 二次确认） | **已补** |
 | Telnet / Ping | 原始 TCP + 最小 IAC；PTY 跑 ping | 无 | 补（Telnet）/缓（Ping） |
 | 中英文界面 | i18n 静态词典 + 语言切换 | 仅中文 | 补 |
 | 键宏 | 组合键 → 字节流，导入导出 | 无 | 补 |
@@ -77,10 +77,16 @@
   `Aa` 切换字面量 / 正则，Esc 收起并清高亮。状态文案只区分「未找到 / 正则无效」，
   不显示总匹配数（rgpui-term 不给计数）。实现走 `TerminalView::search` / `search_literal`
   排队下发，`Event::SearchUpdated` 回来后再重绘查找条。
-- [ ] **同步输入 / 命令广播** — `M`
-  活动终端按键镜像到其它终端，以及「命令发到所有会话」。需要把 `TerminalView` 的输入出口
-  （`SessionCommand::Input` / rgpui-term 的 write 通道）抽成可按 tab 列表广播；
-  批量执行额外提供菜单项 + 二次确认（危险命令拦截可后置）。
+- [x] **同步输入 / 命令广播** — `M` — 已完成
+  活动终端按键镜像到其它终端，以及「命令发到所有会话」。实现没有动会话层的
+  `SessionCommand`，而是在 `Terminal::add_middleware` 上挂 `MirrorInput`：所有输入本就
+  经过中间件，`on_input` 只观察不改写，把非 `Programmatic` 的键盘 / 文本 / 粘贴字节投进
+  tokio 通道；UI 侧 `mirror_input` 只在开关打开且来源是活动标签时用 `Terminal::input()`
+  （Programmatic，天然不回流）写进其它在线会话。粘贴会先剥掉本终端包的 bracketed-paste
+  标记、还原为纯文本再分发，避免目标没开该模式时露出转义序列。
+  「命令发到所有会话…」在「会话」菜单，弹窗列清目标会话名，勾选确认后才可发送；
+  已结束 / 连接失败的会话跳过。同步输入的状态在状态栏右侧常驻一个可点击的指示，
+  可用会话不足两个时自动关闭（危险命令拦截仍后置）。
 - [ ] **Telnet 会话** — `M`
   新增轻量 TCP 后端（最小 IAC 协商：拒绝 0xFF 0xFA 子协商、回 WONT/DONT），
   终端渲染复用 rgpui-term；主机表单增加协议下拉（SSH / Telnet），端口默认 23。
