@@ -32,13 +32,13 @@ use rgpui::tabs::tab_drag::TabDragData;
 use rgpui::title_bar::TITLE_BAR_HEIGHT;
 use rgpui::{
     AbsoluteLength, AnyElement, App, Bounds, Button, ButtonVariants, Checkbox, ClickEvent, Context,
-    ContextMenuExt, Disableable, Div, DropdownMenu, Entity, ExternalPaths, FocusHandle, Focusable,
-    FontWeight, Hsla, Icon,
-    IconName, Image, ImageFormat, InteractiveElement, IntoElement, KeyBinding, KeyDownEvent,
-    MouseButton, NoAction, ParentElement, Pixels, Point, PopupMenu, PopupMenuItem, Render, Rgba,
-    ScrollHandle, ScrollableElement, SharedString, Stateful, StatefulInteractiveElement, Styled,
-    TrayIconEvent, TrayMenuItem, Window, WindowBounds, WindowControlArea, WindowOptions, actions,
-    div, h_flex, img, px, size, v_flex, icon_named, IconNamed,
+    ContextMenuExt, Disableable, Div, DragMoveEvent, DropdownMenu, Entity, ExternalPaths,
+    FocusHandle, Focusable, FontWeight, Hsla, Icon, IconName, Image, ImageFormat,
+    InteractiveElement, IntoElement, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent,
+    NoAction, ParentElement, Pixels, Point, PopupMenu, PopupMenuItem, Render, Rgba, ScrollHandle,
+    ScrollableElement, SharedString, Stateful, StatefulInteractiveElement, Styled, TrayIconEvent,
+    TrayMenuItem, Window, WindowBounds, WindowControlArea, WindowOptions, actions, div, h_flex,
+    icon_named, img, px, size, v_flex, IconNamed,
 };
 use rgpui_term::{
     Event as TerminalEvent, TerminalBuilder, TerminalThemeConfig, TerminalView, TextStyle,
@@ -152,10 +152,14 @@ fn open_path_with_default(path: &Path) {
 }
 
 /// 文件列表固定列宽：表头与数据行共用，保证纵向对齐。
+/// 是拖拽前的默认值；实际宽度存在每个标签的 [`FileBrowser::cols`] 里。
 const FILE_COL_KIND_W: f32 = 40.0;
 const FILE_COL_SIZE_W: f32 = 52.0;
 const FILE_COL_TIME_W: f32 = 78.0;
 const FILE_COL_PERM_W: f32 = 62.0;
+/// 可拖拽列宽的上下限（名称列占剩余空间，不在这里）。
+const FILE_COL_MIN_W: f32 = 34.0;
+const FILE_COL_MAX_W: f32 = 180.0;
 /// 行首图标 + 间距占位：让表头「名称」与行内文件名左对齐。
 const FILE_ROW_LEAD_W: f32 = 20.0;
 
@@ -281,6 +285,39 @@ enum FileSortKey {
     Permissions,
 }
 
+/// 右侧边栏的分区：文件、传输、转发共用同一块面板。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RightSection {
+    Files,
+    Transfer,
+    Forward,
+}
+
+/// 列宽拖拽的载荷：`tab_id` 保证拖拽期间切换标签不会改错表。
+#[derive(Clone, Copy)]
+struct ColumnDrag {
+    tab_id: usize,
+    col: usize,
+}
+
+/// 列宽拖拽起点：按下时的指针 x 与当时的列宽。
+#[derive(Clone, Copy)]
+struct ColumnDragState {
+    tab_id: usize,
+    col: usize,
+    start_x: f32,
+    start_w: f32,
+}
+
+/// 列宽拖拽的空拖影：rgpui 要求拖拽载荷能渲染成实体。
+struct ColumnDragGhost;
+
+impl Render for ColumnDragGhost {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+    }
+}
+
 /// 右侧文件面板的单个标签状态：当前目录、条目与操作反馈。
 struct FileBrowser {
     /// 登录主目录（首次打开面板时列这里）。
@@ -301,6 +338,8 @@ struct FileBrowser {
     /// 排序依据与方向；目录始终在前。
     sort: FileSortKey,
     sort_desc: bool,
+    /// 类型 / 大小 / 修改时间 / 权限 四列宽度；名称列占剩余空间。
+    cols: [f32; 4],
 }
 
 impl Default for FileBrowser {
@@ -316,6 +355,12 @@ impl Default for FileBrowser {
             follow: false,
             sort: FileSortKey::Name,
             sort_desc: false,
+            cols: [
+                FILE_COL_KIND_W,
+                FILE_COL_SIZE_W,
+                FILE_COL_TIME_W,
+                FILE_COL_PERM_W,
+            ],
         }
     }
 }
@@ -1477,15 +1522,19 @@ struct RuTermApp {
     unlock: Option<UnlockState>,
     /// 设置弹窗（主密码管理、主题、锁定）。
     settings: Option<SettingsState>,
-    /// 文件传输弹窗（上传 / 下载）。
+    /// 文件传输（内联在右侧边栏的「传输」分区里）。
     transfer: Option<TransferDialog>,
-    /// 右侧远端文件面板是否展开。
-    file_panel: bool,
+    /// 右侧边栏是否展开。
+    right_panel: bool,
+    /// 右侧边栏当前分区。
+    right_panel_section: RightSection,
+    /// 正在拖拽的文件列宽（起点指针位置 + 起始宽度）。
+    col_drag: Option<ColumnDragState>,
     /// 文件面板的新建目录 / 重命名弹窗。
     file_prompt: Option<FilePrompt>,
     /// 文件面板删除确认。
     file_confirm: Option<FileConfirm>,
-    /// 端口转发弹窗。
+    /// 端口转发（内联在右侧边栏的「转发」分区里）。
     forward: Option<ForwardDialog>,
     /// 本次运行内缓存的密码（按 user@host:port），避免重复弹窗；绝不落盘。
     password_cache: HashMap<String, String>,
@@ -1510,7 +1559,7 @@ struct RuTermApp {
     /// 主区分屏（两个标签并排）；None＝单屏显示活动标签。
     view_split: Option<SplitView>,
     /// 主区 ↔ 文件面板 的可调整大小状态（拖拽分隔条调整文件面板宽度）。
-    file_panel_resize: Entity<rgpui::components::resizable::ResizableState>,
+    right_panel_resize: Entity<rgpui::components::resizable::ResizableState>,
     focus_handle: FocusHandle,
 }
 
@@ -1655,7 +1704,9 @@ impl RuTermApp {
             unlock: None,
             settings: None,
             transfer: None,
-            file_panel: false,
+            right_panel: false,
+            right_panel_section: RightSection::Files,
+            col_drag: None,
             file_prompt: None,
             file_confirm: None,
             forward: None,
@@ -1671,7 +1722,7 @@ impl RuTermApp {
             forward_prefs,
             split_state,
             view_split: None,
-            file_panel_resize: rgpui::components::resizable::ResizableState::new(cx),
+            right_panel_resize: rgpui::components::resizable::ResizableState::new(cx),
             focus_handle: cx.focus_handle(),
         };
         app.boot_vault(window, cx);
@@ -2215,7 +2266,7 @@ impl RuTermApp {
 
     /// 打开传输弹窗：借用当前 SSH 会话的 SFTP 子系统，不新开连接、不再认证。
     fn open_transfer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.transfer.is_some() || self.overlay_open() {
+        if self.overlay_open() {
             return;
         }
         let Some(id) = self.active_tab else {
@@ -2223,6 +2274,13 @@ impl RuTermApp {
             cx.notify();
             return;
         };
+        // 已经为这个会话准备好表单：只切分区，不重置已填路径。
+        if self.transfer.as_ref().is_some_and(|dialog| dialog.tab_id == id) {
+            self.right_panel = true;
+            self.right_panel_section = RightSection::Transfer;
+            cx.notify();
+            return;
+        }
         let Some(tab) = self.tabs.iter().find(|tab| tab.id == id) else {
             return;
         };
@@ -2244,6 +2302,8 @@ impl RuTermApp {
                 .placeholder("远端路径，如 /var/tmp/app.log")
         });
         local.update(cx, |state, cx| state.focus(window, cx));
+        self.right_panel = true;
+        self.right_panel_section = RightSection::Transfer;
         self.transfer = Some(TransferDialog {
             tab_id: id,
             title,
@@ -2575,31 +2635,57 @@ impl RuTermApp {
         cx.notify();
     }
 
-    /// 切换右侧远端文件面板；首次打开时自动列出登录主目录（跟随终端开启时优先用终端目录）。
+    /// 切换右侧边栏；收起时任意分区再点都会重新展开到该分区。
     fn toggle_file_panel(&mut self, cx: &mut Context<Self>) {
-        self.file_panel = !self.file_panel;
-        if self.file_panel
-            && let Some(id) = self.active_tab
-        {
-            let (need_load, initial) = self
-                .tabs
-                .iter()
-                .find(|tab| tab.id == id)
-                .map(|tab| {
-                    let need = tab.files.path.is_none();
-                    let initial = if tab.files.follow {
-                        tab.terminal_cwd.clone()
-                    } else {
-                        None
-                    };
-                    (need, initial)
-                })
-                .unwrap_or((false, None));
-            if need_load {
-                self.load_files(id, initial, cx);
-            }
+        if self.right_panel && self.right_panel_section == RightSection::Files {
+            self.right_panel = false;
+        } else {
+            self.right_panel = true;
+            self.right_panel_section = RightSection::Files;
+            self.ensure_files_shown(cx);
         }
         cx.notify();
+    }
+
+    /// 打开右侧边栏并切到指定分区；传输 / 转发在切过去时就准备好对应会话状态。
+    fn set_right_section(
+        &mut self,
+        section: RightSection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.right_panel = true;
+        self.right_panel_section = section;
+        match section {
+            RightSection::Files => self.ensure_files_shown(cx),
+            RightSection::Transfer => self.open_transfer(window, cx),
+            RightSection::Forward => self.open_forward(window, cx),
+        }
+        cx.notify();
+    }
+
+    /// 文件分区首次展示时列出登录主目录（跟随终端开启时优先用终端目录）。
+    fn ensure_files_shown(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.active_tab else {
+            return;
+        };
+        let (need_load, initial) = self
+            .tabs
+            .iter()
+            .find(|tab| tab.id == id)
+            .map(|tab| {
+                let need = tab.files.path.is_none();
+                let initial = if tab.files.follow {
+                    tab.terminal_cwd.clone()
+                } else {
+                    None
+                };
+                (need, initial)
+            })
+            .unwrap_or((false, None));
+        if need_load {
+            self.load_files(id, initial, cx);
+        }
     }
 
     /// 列出某标签的远端目录；`None` 表示登录主目录。
@@ -3367,7 +3453,7 @@ impl RuTermApp {
 
     /// 打开端口转发弹窗：规则绑定当前 SSH 会话，不新开连接。
     fn open_forward(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.forward.is_some() || self.overlay_open() {
+        if self.overlay_open() {
             return;
         }
         let Some(id) = self.active_tab else {
@@ -3375,6 +3461,13 @@ impl RuTermApp {
             cx.notify();
             return;
         };
+        // 已经为这个会话准备好规则面板：只切分区，不重置正在编辑的表单。
+        if self.forward.as_ref().is_some_and(|dialog| dialog.tab_id == id) {
+            self.right_panel = true;
+            self.right_panel_section = RightSection::Forward;
+            cx.notify();
+            return;
+        }
         let Some(tab) = self.tabs.iter().find(|tab| tab.id == id) else {
             return;
         };
@@ -3407,6 +3500,8 @@ impl RuTermApp {
                 .placeholder("目标端口")
         });
         listen_port.update(cx, |state, cx| state.focus(window, cx));
+        self.right_panel = true;
+        self.right_panel_section = RightSection::Forward;
         self.forward = Some(ForwardDialog {
             tab_id: id,
             title,
@@ -5704,13 +5799,13 @@ impl RuTermApp {
                     let changed = tab.terminal_cwd.as_deref() != Some(path.as_str());
                     tab.terminal_cwd = Some(path.clone());
                     let should_follow = tab.files.follow
-                        && this.file_panel
+                        && this.right_panel
                         && this.active_tab == Some(id)
                         && tab.files.path.as_deref() != Some(path.as_str());
                     log::debug!(
                         "[cwd_events] follow={}, panel={}, active={}, path_diff={}",
                         tab.files.follow,
-                        this.file_panel,
+                        this.right_panel,
                         this.active_tab == Some(id),
                         tab.files.path.as_deref() != Some(path.as_str())
                     );
@@ -6057,7 +6152,7 @@ impl RuTermApp {
         }
         self.active_tab = Some(id);
         // 文件面板开着时切到尚未浏览过的新会话，顺手列出登录主目录。
-        let needs_files = self.file_panel
+        let needs_files = self.right_panel
             && self.tabs.iter().any(|tab| {
                 tab.id == id
                     && tab.files.path.is_none()
@@ -6294,8 +6389,6 @@ impl RuTermApp {
     fn overlay_open(&self) -> bool {
         self.unlock.is_some()
             || self.settings.is_some()
-            || self.transfer.is_some()
-            || self.forward.is_some()
             || self.confirm_delete.is_some()
             || self.new_host.is_some()
             || self.group_prompt.is_some()
@@ -6643,7 +6736,7 @@ impl RuTermApp {
         // 前六项挂 action（而非 on_click）：rgpui 会按键绑定在项右侧自动显示
         // Ctrl+N / Ctrl+Shift+T / Ctrl+Tab / Ctrl+,。
         let split_open = self.view_split.is_some();
-        let file_panel_open = self.file_panel;
+        let file_panel_open = self.right_panel;
         // 菜单打开时把最近连接的 id 解析成当前列表里的条目（主机可能已删除或重排）。
         let recent_items: Vec<(usize, SharedString)> = self
             .recent_hosts
@@ -6880,7 +6973,13 @@ impl RuTermApp {
                             .label("▤ 文件")
                             .compact()
                             .ghost()
-                            .text_color(if self.file_panel { pal.accent } else { fg })
+                            .text_color(if self.right_panel
+                                && self.right_panel_section == RightSection::Files
+                            {
+                                pal.accent
+                            } else {
+                                fg
+                            })
                             .tooltip("远端文件面板")
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.toggle_file_panel(cx);
@@ -6891,10 +6990,16 @@ impl RuTermApp {
                             .label("⇅ 传输")
                             .compact()
                             .ghost()
-                            .text_color(fg)
+                            .text_color(if self.right_panel
+                                && self.right_panel_section == RightSection::Transfer
+                            {
+                                pal.accent
+                            } else {
+                                fg
+                            })
                             .tooltip("上传 / 下载文件 (Ctrl+Shift+U)")
                             .on_click(cx.listener(|this, _, window, cx| {
-                                this.open_transfer(window, cx);
+                                this.set_right_section(RightSection::Transfer, window, cx);
                             })),
                     )
                     .child(
@@ -6906,10 +7011,16 @@ impl RuTermApp {
                             })
                             .compact()
                             .ghost()
-                            .text_color(fg)
+                            .text_color(if self.right_panel
+                                && self.right_panel_section == RightSection::Forward
+                            {
+                                pal.accent
+                            } else {
+                                fg
+                            })
                             .tooltip("端口转发 (Ctrl+Shift+F)")
                             .on_click(cx.listener(|this, _, window, cx| {
-                                this.open_forward(window, cx);
+                                this.set_right_section(RightSection::Forward, window, cx);
                             })),
                     )
                     // 口令档且未解锁：只留重新解锁入口（其余操作都需要库）。
@@ -7258,11 +7369,34 @@ impl RuTermApp {
             .into_any_element()
     }
 
-    /// 文件传输弹窗：本地文件 + 远端路径，上传 / 下载共用，传输中显示进度。
-    fn render_transfer_dialog(&self, cx: &Context<Self>) -> AnyElement {
+    /// 边栏「传输」分区：本地文件 + 远端路径，上传 / 下载共用，传输中显示进度。
+    fn render_transfer_section(&self, cx: &Context<Self>) -> AnyElement {
         let pal = self.palette(cx);
         let Some(dialog) = self.transfer.as_ref() else {
-            return div().into_any_element();
+            return v_flex()
+                .id("transfer-empty")
+                .flex_1()
+                .min_h_0()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .p_4()
+                .child(div().text_sm().text_color(pal.muted).child("没有打开的传输"))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(pal.muted)
+                        .child("传输借用当前 SSH 连接，选择会话后可上传或下载文件"),
+                )
+                .child(
+                    Button::new("transfer-start")
+                        .label("上传 / 下载…")
+                        .primary()
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.open_transfer(window, cx);
+                        })),
+                )
+                .into_any_element();
         };
         let busy = dialog.busy;
         let direction = dialog.direction;
@@ -7288,37 +7422,18 @@ impl RuTermApp {
             None => String::new(),
         };
         v_flex()
-            .id("transfer-backdrop")
-            .absolute()
-            .top(px(0.0))
-            .left(px(0.0))
-            .size_full()
-            .items_center()
-            .justify_center()
-            .bg(rgpui::hsla(0.0, 0.0, 0.0, 0.45))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    if !this.transfer.as_ref().is_some_and(|dialog| dialog.busy) {
-                        this.close_transfer(cx);
-                    }
-                }),
-            )
+            .id("transfer-section")
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .p_3()
+            .gap_3()
+            .overflow_y_scroll()
             .child(
                 v_flex()
-                    .id("transfer-dialog")
-                    .w(px(540.0))
+                    .id("transfer-form")
+                    .w_full()
                     .gap_3()
-                    .p_5()
-                    .rounded(px(8.0))
-                    .bg(pal.card_bg)
-                    .border_1()
-                    .border_color(pal.border)
-                    .shadow_md()
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|_, _, _, cx| cx.stop_propagation()),
-                    )
                     .child(
                         h_flex()
                             .w_full()
@@ -7435,11 +7550,34 @@ impl RuTermApp {
             .into_any_element()
     }
 
-    /// 端口转发弹窗：已保存规则的开关列表 + 新建规则表单。
-    fn render_forward_dialog(&self, cx: &Context<Self>) -> AnyElement {
+    /// 边栏「转发」分区：已保存规则的开关列表 + 新建规则表单。
+    fn render_forward_section(&self, cx: &Context<Self>) -> AnyElement {
         let pal = self.palette(cx);
         let Some(dialog) = self.forward.as_ref() else {
-            return div().into_any_element();
+            return v_flex()
+                .id("forward-empty")
+                .flex_1()
+                .min_h_0()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .p_4()
+                .child(div().text_sm().text_color(pal.muted).child("没有打开的转发配置"))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(pal.muted)
+                        .child("转发规则绑定当前 SSH 会话，保存后用开关即时启停"),
+                )
+                .child(
+                    Button::new("forward-start")
+                        .label("设置转发…")
+                        .primary()
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.open_forward(window, cx);
+                        })),
+                )
+                .into_any_element();
         };
         let active = self
             .tabs
@@ -7510,34 +7648,18 @@ impl RuTermApp {
             this.set_forward_kind(session::ForwardKind::Dynamic, cx);
         }));
         v_flex()
-            .id("forward-backdrop")
-            .absolute()
-            .top(px(0.0))
-            .left(px(0.0))
-            .size_full()
-            .items_center()
-            .justify_center()
-            .bg(rgpui::hsla(0.0, 0.0, 0.0, 0.45))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| this.close_forward(cx)),
-            )
+            .id("forward-section")
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .p_3()
+            .gap_3()
+            .overflow_y_scroll()
             .child(
                 v_flex()
-                    .id("forward-dialog")
-                    .w(px(680.0))
-                    .max_h(px(560.0))
+                    .id("forward-form")
+                    .w_full()
                     .gap_3()
-                    .p_5()
-                    .rounded(px(8.0))
-                    .bg(pal.card_bg)
-                    .border_1()
-                    .border_color(pal.border)
-                    .shadow_md()
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|_, _, _, cx| cx.stop_propagation()),
-                    )
                     .child(
                         h_flex()
                             .w_full()
@@ -8340,12 +8462,6 @@ impl RuTermApp {
         }
         if self.settings.is_some() {
             return self.render_settings_dialog(cx);
-        }
-        if self.transfer.is_some() {
-            return self.render_transfer_dialog(cx);
-        }
-        if self.forward.is_some() {
-            return self.render_forward_dialog(cx);
         }
         if self.file_prompt.is_some() {
             return self.render_file_prompt(cx);
@@ -9910,12 +10026,14 @@ impl RuTermApp {
     }
 
     /// 文件列表表头的一格：点击切换排序；已排序列高亮并显示 ↑ / ↓。
+    ///
+    /// `width` 为 `Some((列下标, 宽度))` 时右边缘带拖拽手柄；名称列传 `None`，占剩余宽度。
     fn file_sort_header(
         &self,
         id: &'static str,
         label: &'static str,
         key: FileSortKey,
-        width: Option<f32>,
+        width: Option<(usize, f32)>,
         right_align: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -9940,26 +10058,313 @@ impl RuTermApp {
             .text_color(if active { pal.text } else { pal.muted })
             .hover(|style| style.text_color(pal.text))
             .when(right_align, |this| this.text_right());
-        if let Some(width) = width {
-            cell = cell.w(px(width));
-        } else {
+        if width.is_none() {
             cell = cell.flex_1().min_w_0().text_ellipsis();
         }
-        cell.child(text)
-            .on_click(cx.listener(move |this, _, _, cx| {
-                let Some(tab_id) = this.active_tab else { return };
-                let Some(tab) = this.tabs.iter_mut().find(|tab| tab.id == tab_id) else {
-                    return;
-                };
-                if tab.files.sort == key {
-                    tab.files.sort_desc = !tab.files.sort_desc;
-                } else {
-                    tab.files.sort = key;
-                    tab.files.sort_desc = false;
+        let cell = cell.child(text).on_click(cx.listener(move |this, _, _, cx| {
+            let Some(tab_id) = this.active_tab else { return };
+            let Some(tab) = this.tabs.iter_mut().find(|tab| tab.id == tab_id) else {
+                return;
+            };
+            if tab.files.sort == key {
+                tab.files.sort_desc = !tab.files.sort_desc;
+            } else {
+                tab.files.sort = key;
+                tab.files.sort_desc = false;
+            }
+            tab.files.sort_entries();
+            cx.notify();
+        }));
+        let Some((col, width)) = width else {
+            return cell.into_any_element();
+        };
+        let Some(tab_id) = self.active_tab else {
+            return div()
+                .w(px(width))
+                .flex_shrink_0()
+                .child(cell)
+                .into_any_element();
+        };
+        // 手柄压在相邻间距上（不占布局宽度），悬停时露出细线提示可拖。
+        let grip = div()
+            .id(("file-col-grip", col))
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .right(px(-5.0))
+            .w(px(10.0))
+            .cursor_col_resize()
+            .hover(|style| style.bg(pal.border))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &MouseDownEvent, _, _| {
+                    this.col_drag = Some(ColumnDragState {
+                        tab_id,
+                        col,
+                        start_x: event.position.x.as_f32(),
+                        start_w: width,
+                    });
+                }),
+            )
+            .on_drag(ColumnDrag { tab_id, col }, |_, _, _, cx| {
+                cx.new(|_| ColumnDragGhost)
+            });
+        div()
+            .relative()
+            .flex_shrink_0()
+            .w(px(width))
+            .child(cell.w_full())
+            .child(grip)
+            .into_any_element()
+    }
+
+    /// 右侧边栏：标题 + 文件 / 传输 / 转发三个分区，切换只换内容不换面板。
+    fn render_right_panel(&self, cx: &mut Context<Self>) -> AnyElement {
+        let pal = self.palette(cx);
+        if let Ok(stage) = std::env::var("RUTERM_PANEL_DEBUG") {
+            let stage = stage.as_str();
+            let mut simple = v_flex().id("right-panel").size_full().bg(pal.sidebar_bg);
+            if stage == "4" || stage == "5" || stage == "6" || stage == "8" {
+                let icon = IconName::FolderOpen;
+                simple = simple.child(
+                    h_flex()
+                        .w_full()
+                        .flex_shrink_0()
+                        .px_3()
+                        .py_2()
+                        .gap_2()
+                        .items_center()
+                        .border_b_1()
+                        .border_color(pal.border)
+                        .child(Icon::new(icon).small().text_color(pal.link))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_sm()
+                                .font_weight(FontWeight(600.0))
+                                .child("文件管理器"),
+                        )
+                        .child(
+                            Button::new("right-panel-close")
+                                .label("×")
+                                .compact()
+                                .ghost()
+                                .tab_index(-1)
+                                .tooltip("收起右侧边栏")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.right_panel = false;
+                                    cx.notify();
+                                })),
+                        ),
+                );
+            }
+            if stage == "5" || stage == "6" || stage == "7" {
+                let mut tabs = h_flex().w_full().px_2().py_1().gap_1();
+                for (section, id, label, icon) in [
+                    (RightSection::Files, "files-tab", "文件", IconName::FolderOpen),
+                    (
+                        RightSection::Transfer,
+                        "transfer-tab",
+                        "传输",
+                        IconName::Replace,
+                    ),
+                    (
+                        RightSection::Forward,
+                        "forward-tab",
+                        "转发",
+                        IconName::Network,
+                    ),
+                ] {
+                    let active = self.right_panel_section == section;
+                    let button = Button::new(id)
+                        .icon(icon)
+                        .label(label)
+                        .compact()
+                        .tab_index(-1);
+                    let button = if active { button.selected(true) } else { button.ghost() };
+                    tabs = tabs.child(button.flex_1().on_click(cx.listener(
+                        move |this, _, window, cx| this.set_right_section(section, window, cx),
+                    )));
                 }
-                tab.files.sort_entries();
-                cx.notify();
-            }))
+                simple = simple.child(tabs);
+            }
+            if stage == "3" || stage == "6" || stage == "7" || stage == "8" {
+                simple =
+                    simple.child(match self.right_panel_section {
+                        RightSection::Files => self.render_files_section(cx),
+                        RightSection::Transfer => self.render_transfer_section(cx),
+                        RightSection::Forward => self.render_forward_section(cx),
+                    });
+            }
+            if stage == "9" {
+                simple = simple.child(div().flex_1().child("body text"));
+            }
+            if stage == "b" {
+                simple = simple.child(v_flex().flex_1());
+            }
+            if stage == "c" {
+                simple = simple.child(v_flex().id("dbg-c").flex_1().child("t"));
+            }
+            if stage == "d" {
+                simple = simple.child(
+                    v_flex()
+                        .id("dbg-d")
+                        .flex_1()
+                        .min_h_0()
+                        .items_center()
+                        .justify_center()
+                        .gap_2()
+                        .p_4()
+                        .child("t"),
+                );
+            }
+            if stage == "e" {
+                simple = simple.child(
+                    v_flex()
+                        .id("dbg-e")
+                        .flex_1()
+                        .min_h_0()
+                        .items_center()
+                        .justify_center()
+                        .gap_2()
+                        .p_4()
+                        .child(Button::new("dbg-btn").label("按钮").primary().on_click(
+                            cx.listener(|this, _, window, cx| {
+                                this.set_right_section(RightSection::Files, window, cx);
+                            }),
+                        )),
+                );
+            }
+            if stage == "t" {
+                simple = simple.child(self.render_transfer_section(cx));
+            }
+            if stage == "q" {
+                simple = simple.child(self.render_forward_section(cx));
+            }
+            if stage == "p" {
+                let pal2 = self.palette(cx);
+                simple = simple.child(
+                    v_flex()
+                        .id("p-empty")
+                        .flex_1()
+                        .min_h_0()
+                        .items_center()
+                        .justify_center()
+                        .gap_2()
+                        .p_4()
+                        .child(div().text_sm().text_color(pal2.muted).child("没有打开的传输"))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(pal2.muted)
+                                .child("传输借用当前 SSH 连接，选择会话后可上传或下载文件"),
+                        )
+                        .child(
+                            Button::new("p-start")
+                                .label("上传 / 下载…")
+                                .primary()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.open_transfer(window, cx);
+                                })),
+                        ),
+                );
+            }
+            if stage == "f" {
+                simple = simple.child(self.render_forward_section(cx));
+            }
+            return simple.into_any_element();
+        }
+        let (icon, title) = match self.right_panel_section {
+            RightSection::Files => (IconName::FolderOpen, "文件管理器"),
+            RightSection::Transfer => (IconName::Replace, "文件传输"),
+            RightSection::Forward => (IconName::Network, "端口转发"),
+        };
+        let sections = [
+            (RightSection::Files, "files-tab", "文件", IconName::FolderOpen),
+            (
+                RightSection::Transfer,
+                "transfer-tab",
+                "传输",
+                IconName::Replace,
+            ),
+            (
+                RightSection::Forward,
+                "forward-tab",
+                "转发",
+                IconName::Network,
+            ),
+        ];
+        let mut switch = h_flex()
+            .w_full()
+            .flex_shrink_0()
+            .px_2()
+            .py_1()
+            .gap_1()
+            .border_b_1()
+            .border_color(pal.border);
+        for (section, id, label, icon) in sections {
+            let active = self.right_panel_section == section;
+            let button = Button::new(id)
+                .icon(icon)
+                .label(label)
+                .compact()
+                .tab_index(-1);
+            let button = if active {
+                button.selected(true)
+            } else {
+                button.ghost()
+            };
+            switch = switch.child(button.flex_1().on_click(cx.listener(
+                move |this, _, window, cx| this.set_right_section(section, window, cx),
+            )));
+        }
+        let body = match self.right_panel_section {
+            RightSection::Files => self.render_files_section(cx),
+            RightSection::Transfer => self.render_transfer_section(cx),
+            RightSection::Forward => self.render_forward_section(cx),
+        };
+        v_flex()
+            .id("right-panel")
+            .size_full()
+            .min_w_0()
+            .bg(pal.sidebar_bg)
+            .border_l_1()
+            .border_color(pal.border)
+            .child(
+                h_flex()
+                    .w_full()
+                    .flex_shrink_0()
+                    .px_3()
+                    .py_2()
+                    .gap_2()
+                    .items_center()
+                    .border_b_1()
+                    .border_color(pal.border)
+                    .child(Icon::new(icon).small().text_color(pal.link))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_sm()
+                            .font_weight(FontWeight(600.0))
+                            .child(title),
+                    )
+                    .child(
+                        Button::new("right-panel-close")
+                            .label("×")
+                            .compact()
+                            .ghost()
+                            .tab_index(-1)
+                            .tooltip("收起右侧边栏")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.right_panel = false;
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(switch)
+            .child(body)
             .into_any_element()
     }
 
@@ -9967,7 +10372,7 @@ impl RuTermApp {
     ///
     /// 面板跟随活动标签；每个标签各自保留路径与列表，切换回来不重新拉取。
     /// 目录行和列表空白处都接受系统文件拖入，落到对应目录上传。
-    fn render_file_panel(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_files_section(&self, cx: &mut Context<Self>) -> AnyElement {
         let pal = self.palette(cx);
         let tab = self
             .active_tab
@@ -9986,6 +10391,14 @@ impl RuTermApp {
         let entity = cx.entity();
         let live = tab_id.filter(|_| remote_capable && !ended);
         let follow_on = tab.is_some_and(|tab| tab.files.follow);
+        let cols = tab
+            .map(|tab| tab.files.cols)
+            .unwrap_or([
+                FILE_COL_KIND_W,
+                FILE_COL_SIZE_W,
+                FILE_COL_TIME_W,
+                FILE_COL_PERM_W,
+            ]);
 
         let up_enabled = path
             .as_deref()
@@ -10198,7 +10611,7 @@ impl RuTermApp {
                         )
                         .child(
                             div()
-                                .w(px(FILE_COL_KIND_W))
+                                .w(px(cols[0]))
                                 .flex_shrink_0()
                                 .text_xs()
                                 .text_color(pal.muted)
@@ -10206,7 +10619,7 @@ impl RuTermApp {
                         )
                         .child(
                             div()
-                                .w(px(FILE_COL_SIZE_W))
+                                .w(px(cols[1]))
                                 .flex_shrink_0()
                                 .text_xs()
                                 .text_right()
@@ -10215,7 +10628,7 @@ impl RuTermApp {
                         )
                         .child(
                             div()
-                                .w(px(FILE_COL_TIME_W))
+                                .w(px(cols[2]))
                                 .flex_shrink_0()
                                 .text_xs()
                                 .text_color(pal.muted)
@@ -10223,7 +10636,7 @@ impl RuTermApp {
                         )
                         .child(
                             div()
-                                .w(px(FILE_COL_PERM_W))
+                                .w(px(cols[3]))
                                 .flex_shrink_0()
                                 .text_xs()
                                 .text_color(pal.muted)
@@ -10319,10 +10732,52 @@ impl RuTermApp {
             .border_color(pal.border)
             .child(div().w(px(FILE_ROW_LEAD_W)).flex_shrink_0())
             .child(self.file_sort_header("files-sort-name", "名称", FileSortKey::Name, None, false, cx))
-            .child(self.file_sort_header("files-sort-kind", "类型", FileSortKey::Kind, Some(FILE_COL_KIND_W), false, cx))
-            .child(self.file_sort_header("files-sort-size", "大小", FileSortKey::Size, Some(FILE_COL_SIZE_W), true, cx))
-            .child(self.file_sort_header("files-sort-time", "修改时间", FileSortKey::Modified, Some(FILE_COL_TIME_W), false, cx))
-            .child(self.file_sort_header("files-sort-perm", "权限", FileSortKey::Permissions, Some(FILE_COL_PERM_W), false, cx));
+            .child(self.file_sort_header("files-sort-kind", "类型", FileSortKey::Kind, Some((0, cols[0])), false, cx))
+            .child(self.file_sort_header("files-sort-size", "大小", FileSortKey::Size, Some((1, cols[1])), true, cx))
+            .child(self.file_sort_header("files-sort-time", "修改时间", FileSortKey::Modified, Some((2, cols[2])), false, cx))
+            .child(self.file_sort_header("files-sort-perm", "权限", FileSortKey::Permissions, Some((3, cols[3])), false, cx))
+            // 拖拽列宽：监听整行，指针离开手柄也不中断；释放时清掉起点状态。
+            .on_drag_move::<ColumnDrag>(cx.listener(
+                |this, event: &DragMoveEvent<ColumnDrag>, _, cx| {
+                    let drag = *event.drag(cx);
+                    let Some(start) = this.col_drag else {
+                        return;
+                    };
+                    if start.tab_id != drag.tab_id || start.col != drag.col {
+                        return;
+                    }
+                    let width = (start.start_w
+                        + (event.event.position.x.as_f32() - start.start_x))
+                        .clamp(FILE_COL_MIN_W, FILE_COL_MAX_W);
+                    if let Some(tab) = this.tabs.iter_mut().find(|tab| tab.id == drag.tab_id) {
+                        if (tab.files.cols[drag.col] - width).abs() > 0.5 {
+                            tab.files.cols[drag.col] = width;
+                            cx.notify();
+                        }
+                    }
+                },
+            ))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    if this.col_drag.take().is_some() {
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    if this.col_drag.take().is_some() {
+                        cx.notify();
+                    }
+                }),
+            );
+        let head_row: AnyElement = if std::env::var("RUTERM_NO_HEAD").is_ok() {
+            div().h(px(20.0)).into_any_element()
+        } else {
+            head_row.into_any_element()
+        };
 
         let mut footer = v_flex()
             .w_full()
@@ -10469,48 +10924,10 @@ impl RuTermApp {
         );
 
         v_flex()
-            .id("file-panel")
-            .size_full()
-            .min_w_0()
-            .bg(pal.sidebar_bg)
-            .border_l_1()
-            .border_color(pal.border)
-            .child(
-                h_flex()
-                    .w_full()
-                    .flex_shrink_0()
-                    .px_3()
-                    .py_2()
-                    .gap_2()
-                    .items_center()
-                    .border_b_1()
-                    .border_color(pal.border)
-                    .child(
-                        Icon::new(IconName::FolderOpen)
-                            .small()
-                            .text_color(pal.link),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .text_sm()
-                            .font_weight(FontWeight(600.0))
-                            .child("文件管理器"),
-                    )
-                    .child(
-                        Button::new("files-close")
-                            .label("×")
-                            .compact()
-                            .ghost()
-                            .tab_index(-1)
-                            .tooltip("收起文件面板")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.file_panel = false;
-                                cx.notify();
-                            })),
-                    ),
-            )
+            .id("files-section")
+            .flex_1()
+            .min_h_0()
+            .w_full()
             .child(path_row)
             .child(head_row)
             .child(list)
@@ -10874,20 +11291,20 @@ impl RuTermApp {
                 })
         };
 
-        // 文件面板挂在主区右侧：分屏时也跟随活动标签，而不是挤进某一侧终端。
-        // 使用 h_resizable 实现拖拽调整文件面板宽度。
-        let body = if self.file_panel {
+        // 右侧边栏挂在主区右侧：分屏时也跟随活动标签，而不是挤进某一侧终端。
+        // 使用 h_resizable 实现拖拽调整边栏宽度。
+        let body = if self.right_panel {
             use rgpui::components::resizable::{h_resizable, resizable_panel};
-            let group = h_resizable("file-panel-resize", self.file_panel_resize.clone())
+            let group = h_resizable("right-panel-resize", self.right_panel_resize.clone())
                 .child(resizable_panel().child(body))
                 .child(
                     resizable_panel()
-                        .size(px(420.0))
-                        .size_range(px(240.0)..px(720.0))
-                        // 终端内容有固有宽度，靠比例收缩会把文件面板一起压扁；
-                        // 让右侧面板不参与收缩，宽度只由拖拽 / 列宽决定。
+                        .size(px(480.0))
+                        .size_range(px(300.0)..px(800.0))
+                        // 终端内容有固有宽度，靠比例收缩会把边栏一起压扁；
+                        // 让右侧面板不参与收缩，宽度只由拖拽决定。
                         .flex_shrink_0()
-                        .child(self.render_file_panel(cx)),
+                        .child(self.render_right_panel(cx)),
                 );
             // 面板组内部是 size_full（高度 100%）：必须放进一个定高槽里，
             // 否则百分比直接按主区算、把标签栏高度也算进去，底部会被窗口裁掉。
