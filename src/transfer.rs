@@ -7,15 +7,36 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
-use russh_sftp::client::SftpSession;
+use russh_sftp::client::{Config as SftpConfig, SftpSession};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 
 /// 单次读写的块大小：太小系统调用多，太大占内存且进度刷新变粗。
-const CHUNK: usize = 64 * 1024;
+const CHUNK: usize = 128 * 1024;
 /// 进度上报间隔：大文件按块发会让 UI 频繁重绘，节流到约 10 次/秒。
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
+
+/// 单次 SFTP 请求（写一个包 / 读一次）等服务器回应的上限。
+///
+/// 库默认只有 10 秒：慢链路上大文件传到一半会突然报 `写入数据失败：Timeout`，
+/// 而服务器其实只是还没确认（磁盘或带宽慢）。放宽后由 TCP 自己兜底断链。
+const REQUEST_TIMEOUT_SECS: u64 = 120;
+
+/// SFTP 客户端调优：提高并发写请求数与单包大小，提升高延迟链路吞吐。
+///
+/// 在途请求数别超过 SSH 通道窗口（OpenSSH 默认 2 MiB）：多出来的请求既发不出去，
+/// 又会从入队那刻起累计"单请求超时"，慢链路上反而更容易被判超时。
+/// 32 × 64 KiB = 2 MiB，正好吃满窗口。
+pub fn client_config() -> SftpConfig {
+    SftpConfig {
+        max_concurrent_writes: 32,
+        max_concurrent_reads: 8,
+        max_write_packet_len: 64 * 1024,
+        request_timeout_secs: REQUEST_TIMEOUT_SECS,
+        ..SftpConfig::default()
+    }
+}
 
 /// 传输方向。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -59,7 +80,7 @@ pub async fn remote_home(sftp: &SftpSession) -> Result<String> {
 }
 
 /// 展开远端路径里的 `~`：SFTP 协议不会替客户端做这件事。
-async fn resolve_remote(sftp: &SftpSession, remote: &str) -> Result<String> {
+pub async fn resolve_remote(sftp: &SftpSession, remote: &str) -> Result<String> {
     let remote = remote.trim();
     if remote.is_empty() {
         anyhow::bail!("远端路径不能为空");
@@ -203,7 +224,7 @@ where
         writer
             .write_all(&buffer[..read])
             .await
-            .context("写入数据失败")?;
+            .map_err(write_error)?;
         done += read as u64;
         if last_report.elapsed() >= PROGRESS_INTERVAL {
             let _ = progress.send((done, total));
@@ -212,6 +233,17 @@ where
     }
     let _ = progress.send((done, total));
     Ok(())
+}
+
+/// 写入失败时的统一文案：超时要能看出是"服务器迟迟没确认"而非本地写错。
+fn write_error(error: std::io::Error) -> anyhow::Error {
+    if error.kind() == std::io::ErrorKind::TimedOut {
+        anyhow::anyhow!(
+            "写入数据失败：服务器 {REQUEST_TIMEOUT_SECS} 秒未确认（网络或远端磁盘过慢）"
+        )
+    } else {
+        anyhow::anyhow!("写入数据失败：{error}")
+    }
 }
 
 /// 字节数的紧凑展示（B / KiB / MiB / GiB）。

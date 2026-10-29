@@ -1,4 +1,4 @@
-//! RuLink：基于 rgpui + rgpui-term 外接 IO 后端的 SSH 客户端。
+//! RuTerm：基于 rgpui + rgpui-term 外接 IO 后端的 SSH 客户端。
 //!
 //! 形态为 GUI 会话管理器：无参数启动即进入主界面，左侧是持久化的主机账号列表，
 //! 点击账号即连接；密码认证的账号在连接时临时输入密码（绝不落盘），私钥/Agent
@@ -8,12 +8,14 @@ mod config;
 mod local_shell;
 mod paths;
 mod remote;
+mod remote_fs;
 mod session;
 mod sessions;
 mod ssh;
 mod ssh_config;
 mod transfer;
 mod vault;
+mod zmodem;
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -29,7 +31,8 @@ use rgpui::tabs::tab_drag::TabDragData;
 use rgpui::title_bar::TITLE_BAR_HEIGHT;
 use rgpui::{
     AbsoluteLength, AnyElement, App, Bounds, Button, ButtonVariants, Checkbox, ClickEvent, Context,
-    ContextMenuExt, Div, DropdownMenu, Entity, FocusHandle, Focusable, FontWeight, Hsla, Icon,
+    ContextMenuExt, Div, DropdownMenu, Entity, ExternalPaths, FocusHandle, Focusable,
+    FontWeight, Hsla, Icon,
     IconName, Image, ImageFormat, InteractiveElement, IntoElement, KeyBinding, KeyDownEvent,
     MouseButton, NoAction, ParentElement, Pixels, Point, PopupMenu, PopupMenuItem, Render, Rgba,
     ScrollHandle, ScrollableElement, SharedString, Stateful, StatefulInteractiveElement, Styled,
@@ -53,7 +56,7 @@ use crate::vault::Vault;
 // 在菜单项右侧自动渲染按键（`PopupMenu::render_key_binding`），因此不再需要在
 // 「帮助」菜单里用纯文字罗列快捷键。
 actions!(
-    rulink,
+    ruterm,
     [
         ToggleSidebar,
         ToggleTheme,
@@ -79,6 +82,90 @@ fn auth_label(method: AuthMethod) -> &'static str {
     }
 }
 
+/// 远端文件名洗净成本地可用的文件名：拒绝空名与相对目录，替换路径分隔符和
+/// Windows 非法字符，避免下载时跳目录或建不出文件。
+fn safe_local_name(name: &str) -> Option<String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
+        return None;
+    }
+    let mut safe = String::with_capacity(trimmed.len());
+    for ch in trimmed.chars() {
+        if ch.is_control()
+            || matches!(ch, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+        {
+            safe.push('_');
+        } else {
+            safe.push(ch);
+        }
+    }
+    let safe = safe.trim_end_matches(['.', ' ']);
+    if safe.is_empty() {
+        None
+    } else {
+        Some(safe.to_string())
+    }
+}
+
+/// 用系统默认程序打开本地文件（文件面板里的“打开”）。
+fn open_path_with_default(path: &Path) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt as _;
+        use windows::Win32::UI::Shell::ShellExecuteW;
+        use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+        use windows::core::PCWSTR;
+
+        let wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        // 谓词留空按文件关联选择默认动作（打开 / 编辑），不额外拼接命令。
+        let _ = unsafe {
+            ShellExecuteW(
+                None,
+                PCWSTR::null(),
+                PCWSTR(wide.as_ptr()),
+                PCWSTR::null(),
+                PCWSTR::null(),
+                SW_SHOWNORMAL,
+            )
+        };
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(path).spawn();
+    }
+}
+
+/// 远端修改时间（Unix 秒，UTC）→ `YYYY-MM-DD HH:MM`。
+fn format_remote_time(seconds: u32) -> String {
+    let secs = u64::from(seconds);
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let (year, month, day) = civil_from_days(days);
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02}",
+        rem / 3600,
+        (rem % 3600) / 60
+    )
+}
+
+/// Howard Hinnant 的 `civil_from_days`：Unix 天数 → 公历年月日（无需时区库）。
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if month <= 2 { year + 1 } else { year }, month, day)
+}
+
 /// 合并两条状态附注（保存成功时的括注）。
 fn join_notes(first: Option<String>, second: Option<String>) -> String {
     let mut joined = String::new();
@@ -92,8 +179,7 @@ fn join_notes(first: Option<String>, second: Option<String>) -> String {
 }
 
 /// 一个已连接的会话标签（持有终端视图）。
-struct SessionTab {
-    /// 稳定标签 id（会话结束或用户关闭时据此定位）。
+struct SessionTab {    /// 稳定标签 id（会话结束或用户关闭时据此定位）。
     id: usize,
     /// 标签标题（主机名）。
     title: SharedString,
@@ -117,6 +203,12 @@ struct SessionTab {
     commands: Option<tokio::sync::mpsc::UnboundedSender<session::SessionCommand>>,
     /// 本标签当前生效的端口转发规则（随会话结束清空，不持久化）。
     forwards: Vec<session::ForwardRule>,
+    /// 右侧文件面板的浏览状态（路径 / 列表 / 加载态），按标签各自保留。
+    files: FileBrowser,
+    /// 拖文件到终端（lrzsz）的当前操作文案；None 表示空闲。
+    zmodem: Option<SharedString>,
+    /// lrzsz 上传进度 (已传, 总量)。
+    zmodem_progress: Option<(u64, u64)>,
     /// 本轮连续自动重连已尝试次数（0＝不在自动重连中，手动重连会清零）。
     auto_retry_attempt: u32,
     /// 已排定一次自动重连（横幅展示等待与取消入口）。
@@ -154,6 +246,42 @@ struct TransferDialog {
     progress: Option<(u64, u64)>,
     error: Option<SharedString>,
     info: Option<SharedString>,
+}
+
+/// 右侧文件面板的单个标签状态：当前目录、条目与操作反馈。
+#[derive(Default)]
+struct FileBrowser {
+    /// 登录主目录（首次打开面板时列这里）。
+    home: Option<String>,
+    /// 当前目录绝对路径。
+    path: Option<String>,
+    entries: Vec<remote_fs::Entry>,
+    /// 正在等 SFTP 回目录列表。
+    loading: bool,
+    /// 最近一次操作错误；成功加载后清空。
+    error: Option<SharedString>,
+    /// 正在执行的上传 / 打开等操作（面板底部提示）。
+    busy: Option<SharedString>,
+    /// 上传进度 (已传, 总量)。
+    progress: Option<(u64, u64)>,
+}
+
+/// 文件面板里的新建 / 重命名弹窗。
+struct FilePrompt {
+    tab_id: usize,
+    /// 目标目录（新建落在这里，重命名也在这里换名）。
+    dir: String,
+    /// 重命名时的原名称；None 表示新建目录。
+    renaming: Option<String>,
+    name: Entity<InputState>,
+}
+
+/// 文件面板的删除二次确认（远端删除不可撤销）。
+struct FileConfirm {
+    tab_id: usize,
+    path: String,
+    name: String,
+    is_dir: bool,
 }
 
 /// 端口转发弹窗：默认是规则列表，点「设置…」才展开新增 / 编辑表单。
@@ -994,6 +1122,9 @@ pub struct SidebarPrefs {
     /// 「未分组」文件夹是否折叠。
     #[serde(default)]
     ungrouped_collapsed: bool,
+    /// 内置「本地终端」分组是否折叠。它不入 `groups`，但折叠态同样要跨重启保留。
+    #[serde(default)]
+    local_collapsed: bool,
     /// 主机 id 的手动排序（跨组一条序列，渲染时只取组内相对次序）。
     #[serde(default)]
     order: Vec<i64>,
@@ -1076,6 +1207,11 @@ impl SidebarPrefs {
         if let Some(group) = self.groups.iter_mut().find(|group| group.name == name) {
             group.collapsed = !group.collapsed;
         }
+    }
+
+    /// 折叠 / 展开内置「本地终端」分组。
+    fn toggle_local(&mut self) {
+        self.local_collapsed = !self.local_collapsed;
     }
 
     /// 展开分组（新主机落进折叠组时调用，避免保存后"看不见"）。
@@ -1181,8 +1317,8 @@ enum ReorderAction {
     Top,
 }
 
-/// RuLink 主视图：左侧主机账号管理，右侧会话标签终端。
-struct RuLinkApp {
+/// RuTerm 主视图：左侧主机账号管理，右侧会话标签终端。
+struct RuTermApp {
     /// 会话仓库（负责持久化）。
     store: SessionStore,
     /// 存储模式（便携 / 全局），启动时探测一次。
@@ -1212,8 +1348,6 @@ struct RuLinkApp {
     shell_icons: HashMap<String, Arc<Image>>,
     /// 扫描进行中：按钮禁用 + 状态栏提示，避免连点起多个 wsl.exe。
     scanning_shells: bool,
-    /// 「本地终端」分组的折叠状态。只影响这次会话——它不是库里的分组，没必要占持久化键。
-    local_group_collapsed: bool,
     /// 本机 shell 的自定义展示名，随加密库 / settings.json 双层持久化。
     local_shell_prefs: LocalShellPrefs,
     /// 本地 shell 重命名弹窗。
@@ -1234,6 +1368,12 @@ struct RuLinkApp {
     settings: Option<SettingsState>,
     /// 文件传输弹窗（上传 / 下载）。
     transfer: Option<TransferDialog>,
+    /// 右侧远端文件面板是否展开。
+    file_panel: bool,
+    /// 文件面板的新建目录 / 重命名弹窗。
+    file_prompt: Option<FilePrompt>,
+    /// 文件面板删除确认。
+    file_confirm: Option<FileConfirm>,
     /// 端口转发弹窗。
     forward: Option<ForwardDialog>,
     /// 本次运行内缓存的密码（按 user@host:port），避免重复弹窗；绝不落盘。
@@ -1331,7 +1471,7 @@ impl Palette {
     }
 }
 
-impl RuLinkApp {
+impl RuTermApp {
     /// 载入已保存主机，可选执行命令行快速连接。
     fn new(quick: Option<SshTarget>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let mode = StorageMode::detect();
@@ -1392,7 +1532,6 @@ impl RuLinkApp {
             local_shells: local_shell::detect(),
             shell_icons: HashMap::new(),
             scanning_shells: false,
-            local_group_collapsed: false,
             local_shell_prefs,
             shell_prompt: None,
             tab_scroll: ScrollHandle::new(),
@@ -1403,6 +1542,9 @@ impl RuLinkApp {
             unlock: None,
             settings: None,
             transfer: None,
+            file_panel: false,
+            file_prompt: None,
+            file_confirm: None,
             forward: None,
             unlocked_key: None,
             password_cache: HashMap::new(),
@@ -2241,6 +2383,774 @@ impl RuLinkApp {
         cx.notify();
     }
 
+    /// 切换右侧远端文件面板；首次打开时自动列出登录主目录。
+    fn toggle_file_panel(&mut self, cx: &mut Context<Self>) {
+        self.file_panel = !self.file_panel;
+        if self.file_panel
+            && let Some(id) = self.active_tab
+            && self
+                .tabs
+                .iter()
+                .find(|tab| tab.id == id)
+                .is_some_and(|tab| tab.files.path.is_none())
+        {
+            self.load_files(id, None, cx);
+        }
+        cx.notify();
+    }
+
+    /// 列出某标签的远端目录；`None` 表示登录主目录。
+    fn load_files(&mut self, tab_id: usize, path: Option<String>, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) else {
+            return;
+        };
+        if tab.ended {
+            tab.files.error = Some("会话已断开，请先重新连接".into());
+            cx.notify();
+            return;
+        }
+        let Some(sender) = tab.commands.clone() else {
+            tab.files.error = Some("本地终端没有远端文件".into());
+            cx.notify();
+            return;
+        };
+        tab.files.loading = true;
+        tab.files.error = None;
+        cx.notify();
+
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        if sender
+            .send(session::SessionCommand::FsList { path, reply })
+            .is_err()
+        {
+            if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) {
+                tab.files.loading = false;
+                tab.files.error = Some("会话已断开，无法读取远端目录".into());
+            }
+            cx.notify();
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let outcome = match rx.await {
+                Ok(result) => result,
+                Err(_) => Err(anyhow::anyhow!("文件列表请求已中断")),
+            };
+            let _ = this.update(cx, |this, cx| {
+                let Some(tab) = this.tabs.iter_mut().find(|tab| tab.id == tab_id) else {
+                    return;
+                };
+                tab.files.loading = false;
+                match outcome {
+                    Ok(listing) => {
+                        if tab.files.home.is_none() {
+                            tab.files.home = Some(listing.path.clone());
+                        }
+                        tab.files.path = Some(listing.path);
+                        tab.files.entries = listing.entries;
+                        tab.files.error = None;
+                    }
+                    Err(error) => {
+                        tab.files.error = Some(session::error_summary(&error).into());
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 刷新当前标签的目录（面板工具栏）。
+    fn refresh_files(&mut self, tab_id: usize, cx: &mut Context<Self>) {
+        let path = self
+            .tabs
+            .iter()
+            .find(|tab| tab.id == tab_id)
+            .and_then(|tab| tab.files.path.clone());
+        self.load_files(tab_id, path, cx);
+    }
+
+    /// 进入上级目录。
+    fn files_up(&mut self, tab_id: usize, cx: &mut Context<Self>) {
+        let path = self
+            .tabs
+            .iter()
+            .find(|tab| tab.id == tab_id)
+            .and_then(|tab| tab.files.path.as_deref())
+            .and_then(remote_fs::parent_of);
+        if let Some(path) = path {
+            self.load_files(tab_id, Some(path), cx);
+        }
+    }
+
+    /// 双击条目：目录就进去，文件就下载到临时目录并用系统默认程序打开。
+    fn open_file_entry(
+        &mut self,
+        tab_id: usize,
+        name: &str,
+        is_dir: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(path) = self
+            .tabs
+            .iter()
+            .find(|tab| tab.id == tab_id)
+            .and_then(|tab| tab.files.path.clone())
+        else {
+            return;
+        };
+        let target = remote_fs::child(&path, name);
+        if is_dir {
+            self.load_files(tab_id, Some(target), cx);
+            return;
+        }
+        self.open_remote_file(tab_id, target, name, cx);
+    }
+
+    /// 下载到临时目录后交给系统默认程序（“打开”）。
+    fn open_remote_file(
+        &mut self,
+        tab_id: usize,
+        remote: String,
+        name: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(safe) = safe_local_name(name) else {
+            self.file_error(tab_id, "文件名不合法，无法在本地打开", cx);
+            return;
+        };
+        let dir = std::env::temp_dir().join("ruterm-open").join(tab_id.to_string());
+        if let Err(error) = std::fs::create_dir_all(&dir) {
+            self.file_error(tab_id, format!("无法创建临时目录：{error}"), cx);
+            return;
+        }
+        let local = dir.join(safe);
+        self.file_transfer(
+            tab_id,
+            transfer::Direction::Download,
+            local,
+            remote,
+            true,
+            false,
+            cx,
+        );
+    }
+
+    /// 面板内的一次上传 / 下载：进度写进面板底部，完成后刷新或打开。
+    fn file_transfer(
+        &mut self,
+        tab_id: usize,
+        direction: transfer::Direction,
+        local: PathBuf,
+        remote: String,
+        open_after: bool,
+        reload: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) else {
+            return;
+        };
+        if tab.files.busy.is_some() {
+            self.status = "已有文件操作进行中，请稍候".into();
+            cx.notify();
+            return;
+        }
+        let Some(sender) = tab.commands.clone() else {
+            tab.files.error = Some("会话已断开，无法传输文件".into());
+            cx.notify();
+            return;
+        };
+        let name = local
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| remote.clone());
+        tab.files.busy = Some(format!("正在{} {name}…", direction.label()).into());
+        tab.files.progress = Some((0, 0));
+        tab.files.error = None;
+        let (progress_tx, mut progress_rx) =
+            tokio::sync::mpsc::unbounded_channel::<(u64, u64)>();
+        let (reply_tx, mut reply_rx) = tokio::sync::oneshot::channel();
+        let command = session::SessionCommand::Transfer(transfer::Task {
+            direction,
+            local: local.clone(),
+            remote: remote.clone(),
+            progress: progress_tx,
+            reply: reply_tx,
+        });
+        if sender.send(command).is_err() {
+            tab.files.busy = None;
+            tab.files.progress = None;
+            tab.files.error = Some("会话已断开，无法传输文件".into());
+            cx.notify();
+            return;
+        }
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let outcome = loop {
+                tokio::select! {
+                    result = &mut reply_rx => {
+                        break match result {
+                            Ok(Ok(summary)) => Ok(summary),
+                            Ok(Err(error)) => Err(session::error_summary(&error)),
+                            Err(_) => Err("传输任务已中断".to_string()),
+                        };
+                    }
+                    Some(progress) = progress_rx.recv() => {
+                        let _ = this.update(cx, |this, cx| {
+                            if let Some(tab) = this.tabs.iter_mut().find(|tab| tab.id == tab_id)
+                                && tab.files.busy.is_some()
+                            {
+                                tab.files.progress = Some(progress);
+                                cx.notify();
+                            }
+                        });
+                    }
+                }
+            };
+            let failed = outcome.is_err();
+            let _ = this.update(cx, |this, cx| {
+                let Some(tab) = this.tabs.iter_mut().find(|tab| tab.id == tab_id) else {
+                    return;
+                };
+                tab.files.busy = None;
+                tab.files.progress = None;
+                match outcome {
+                    Ok(summary) => {
+                        let message = format!(
+                            "{}完成 · {} · {:.1} 秒",
+                            direction.label(),
+                            transfer::format_bytes(summary.bytes),
+                            summary.elapsed.as_secs_f64()
+                        );
+                        this.status = message.into();
+                        tab.files.error = None;
+                    }
+                    Err(error) => {
+                        tab.files.error = Some(error.clone().into());
+                        this.status = format!("{}失败：{error}", direction.label()).into();
+                    }
+                }
+                cx.notify();
+            });
+            if open_after && !failed {
+                open_path_with_default(&local);
+            }
+            if reload {
+                let path = this
+                    .update(cx, |this, _| {
+                        this.tabs
+                            .iter()
+                            .find(|tab| tab.id == tab_id)
+                            .and_then(|tab| tab.files.path.clone())
+                    })
+                    .ok()
+                    .flatten();
+                if let Some(path) = path {
+                    let _ = this.update(cx, |this, cx| this.load_files(tab_id, Some(path), cx));
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// 拖入本地文件：逐个上传到当前目录（目录项拖放时传它自己的路径）。
+    fn upload_paths(
+        &mut self,
+        tab_id: usize,
+        dir: String,
+        paths: Vec<PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) else {
+            return;
+        };
+        if tab.files.busy.is_some() {
+            self.status = "已有文件操作进行中，请稍候".into();
+            cx.notify();
+            return;
+        }
+        let Some(sender) = tab.commands.clone() else {
+            tab.files.error = Some("会话已断开，无法上传文件".into());
+            cx.notify();
+            return;
+        };
+        let mut files = Vec::new();
+        let mut skipped = Vec::new();
+        for path in paths {
+            match std::fs::metadata(&path) {
+                Ok(metadata) if metadata.is_file() => files.push(path),
+                Ok(_) => skipped.push(format!("{}（不是文件）", path.display())),
+                Err(error) => skipped.push(format!("{}（{error}）", path.display())),
+            }
+        }
+        if files.is_empty() {
+            self.file_error(
+                tab_id,
+                format!("没有可上传的文件：{}", skipped.join("；")),
+                cx,
+            );
+            return;
+        }
+        let total = files.len();
+        let note = if skipped.is_empty() {
+            String::new()
+        } else {
+            format!("，跳过 {} 项", skipped.len())
+        };
+        if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) {
+            tab.files.busy = Some(format!("正在上传 {total} 个文件…").into());
+            tab.files.progress = Some((0, 0));
+            tab.files.error = None;
+        }
+        self.status = format!("正在上传 {total} 个文件…{note}").into();
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let mut failed = Vec::new();
+            for path in files {
+                let Some(name) = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                else {
+                    failed.push(format!("{}（没有文件名）", path.display()));
+                    continue;
+                };
+                let remote = remote_fs::child(&dir, &name);
+                let (progress_tx, mut progress_rx) =
+                    tokio::sync::mpsc::unbounded_channel::<(u64, u64)>();
+                let (reply_tx, mut reply_rx) = tokio::sync::oneshot::channel();
+                let command = session::SessionCommand::Transfer(transfer::Task {
+                    direction: transfer::Direction::Upload,
+                    local: path.clone(),
+                    remote,
+                    progress: progress_tx,
+                    reply: reply_tx,
+                });
+                if sender.send(command).is_err() {
+                    failed.push(format!("{name}（会话已断开）"));
+                    break;
+                }
+                let _ = this.update(cx, |this, cx| {
+                    if let Some(tab) = this.tabs.iter_mut().find(|tab| tab.id == tab_id) {
+                        tab.files.busy = Some(format!("正在上传 {name}…").into());
+                        cx.notify();
+                    }
+                });
+                let outcome = loop {
+                    tokio::select! {
+                        result = &mut reply_rx => {
+                            break match result {
+                                Ok(Ok(summary)) => Ok(summary),
+                                Ok(Err(error)) => Err(session::error_summary(&error)),
+                                Err(_) => Err("传输任务已中断".to_string()),
+                            };
+                        }
+                        Some(progress) = progress_rx.recv() => {
+                            let _ = this.update(cx, |this, cx| {
+                                if let Some(tab) = this.tabs.iter_mut().find(|tab| tab.id == tab_id)
+                                    && tab.files.busy.is_some()
+                                {
+                                    tab.files.progress = Some(progress);
+                                    cx.notify();
+                                }
+                            });
+                        }
+                    }
+                };
+                if let Err(error) = outcome {
+                    failed.push(format!("{name}（{error}）"));
+                }
+            }
+            let message = if failed.is_empty() {
+                format!("上传完成 · {total} 个文件")
+            } else {
+                format!("上传结束 · {} 失败：{}", failed.len(), failed.join("；"))
+            };
+            let _ = this.update(cx, |this, cx| {
+                if let Some(tab) = this.tabs.iter_mut().find(|tab| tab.id == tab_id) {
+                    tab.files.busy = None;
+                    tab.files.progress = None;
+                    tab.files.error = if failed.is_empty() {
+                        None
+                    } else {
+                        Some(message.clone().into())
+                    };
+                }
+                this.status = message.into();
+                cx.notify();
+            });
+            let path = this
+                .update(cx, |this, _| {
+                    this.tabs
+                        .iter()
+                        .find(|tab| tab.id == tab_id)
+                        .and_then(|tab| tab.files.path.clone())
+                })
+                .ok()
+                .flatten();
+            if let Some(path) = path {
+                let _ = this.update(cx, |this, cx| this.load_files(tab_id, Some(path), cx));
+            }
+        })
+        .detach();
+    }
+
+    /// 拖文件到终端：逐个用 lrzsz（`rz`）上传到 shell 当前目录。
+    ///
+    /// 与面板上传不同，落点由远端 shell 决定，这里不拼任何路径；
+    /// 每个文件一个 `rz` 会话，失败后继续传下一个，最后汇总。
+    fn upload_via_terminal(
+        &mut self,
+        tab_id: usize,
+        paths: Vec<PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) else {
+            return;
+        };
+        if tab.zmodem.is_some() {
+            self.status = "已有 lrzsz 上传进行中，请稍候".into();
+            cx.notify();
+            return;
+        }
+        if tab.ended {
+            self.status = "会话已断开，无法上传文件".into();
+            cx.notify();
+            return;
+        }
+        let Some(sender) = tab.commands.clone() else {
+            self.status = "本地终端不支持 lrzsz 上传，请使用 SSH 会话".into();
+            cx.notify();
+            return;
+        };
+        let mut files = Vec::new();
+        let mut skipped = Vec::new();
+        for path in paths {
+            match std::fs::metadata(&path) {
+                Ok(metadata) if metadata.is_file() => files.push(path),
+                Ok(_) => skipped.push(format!("{}（不是文件）", path.display())),
+                Err(error) => skipped.push(format!("{}（{error}）", path.display())),
+            }
+        }
+        if files.is_empty() {
+            self.status = format!("没有可上传的文件：{}", skipped.join("；")).into();
+            cx.notify();
+            return;
+        }
+        let total = files.len();
+        let note = if skipped.is_empty() {
+            String::new()
+        } else {
+            format!("，跳过 {} 项", skipped.len())
+        };
+        if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) {
+            tab.zmodem = Some(format!("正在通过 lrzsz 上传 {total} 个文件…").into());
+            tab.zmodem_progress = Some((0, 0));
+        }
+        self.status = format!("正在通过 lrzsz 上传 {total} 个文件…{note}").into();
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let mut failed = Vec::new();
+            for path in files {
+                let Some(name) = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                else {
+                    failed.push(format!("{}（没有文件名）", path.display()));
+                    continue;
+                };
+                let (progress_tx, mut progress_rx) =
+                    tokio::sync::mpsc::unbounded_channel::<(u64, u64)>();
+                let (reply_tx, mut reply_rx) = tokio::sync::oneshot::channel();
+                if sender
+                    .send(session::SessionCommand::ZmodemUpload {
+                        local: path.clone(),
+                        name: name.clone(),
+                        progress: progress_tx,
+                        reply: reply_tx,
+                    })
+                    .is_err()
+                {
+                    failed.push(format!("{name}（会话已断开）"));
+                    break;
+                }
+                let _ = this.update(cx, |this, cx| {
+                    if let Some(tab) = this.tabs.iter_mut().find(|tab| tab.id == tab_id) {
+                        tab.zmodem = Some(format!("正在通过 lrzsz 上传 {name}…").into());
+                        cx.notify();
+                    }
+                });
+                let outcome = loop {
+                    tokio::select! {
+                        result = &mut reply_rx => {
+                            break match result {
+                                Ok(Ok(summary)) => Ok(summary),
+                                Ok(Err(error)) => Err(session::error_summary(&error)),
+                                Err(_) => Err("上传任务已中断".to_string()),
+                            };
+                        }
+                        Some(progress) = progress_rx.recv() => {
+                            let _ = this.update(cx, |this, cx| {
+                                if let Some(tab) = this.tabs.iter_mut().find(|tab| tab.id == tab_id)
+                                    && tab.zmodem.is_some()
+                                {
+                                    tab.zmodem_progress = Some(progress);
+                                    cx.notify();
+                                }
+                            });
+                        }
+                    }
+                };
+                if let Err(error) = outcome {
+                    failed.push(format!("{name}（{error}）"));
+                }
+            }
+            let message = if failed.is_empty() {
+                format!("lrzsz 上传完成 · {total} 个文件")
+            } else {
+                format!("lrzsz 上传结束 · {} 失败：{}", failed.len(), failed.join("；"))
+            };
+            let _ = this.update(cx, |this, cx| {
+                if let Some(tab) = this.tabs.iter_mut().find(|tab| tab.id == tab_id) {
+                    tab.zmodem = None;
+                    tab.zmodem_progress = None;
+                }
+                this.status = message.into();
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 打开文件面板的新建 / 重命名弹窗。
+    fn open_file_prompt(
+        &mut self,
+        tab_id: usize,
+        dir: String,
+        renaming: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let default = renaming.clone().unwrap_or_default();
+        let name = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(default)
+                .placeholder("名称")
+        });
+        name.update(cx, |state, cx| {
+            state.focus(window, cx);
+            let len = state.value().len();
+            state.set_selected_range(0..len, cx);
+        });
+        cx.subscribe(&name, |this, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::PressEnter { shift: false, .. }) {
+                this.commit_file_prompt(cx);
+            }
+        })
+        .detach();
+        self.file_prompt = Some(FilePrompt {
+            tab_id,
+            dir,
+            renaming,
+            name,
+        });
+        cx.notify();
+    }
+
+    fn cancel_file_prompt(&mut self, cx: &mut Context<Self>) {
+        self.file_prompt = None;
+        cx.notify();
+    }
+
+    /// 提交新建 / 重命名；成功后刷新当前目录。
+    fn commit_file_prompt(&mut self, cx: &mut Context<Self>) {
+        let Some(prompt) = self.file_prompt.as_ref() else {
+            return;
+        };
+        let name = prompt.name.read(cx).value().trim().to_string();
+        if name.is_empty() {
+            self.status = "名称不能为空".into();
+            cx.notify();
+            return;
+        }
+        let tab_id = prompt.tab_id;
+        let dir = prompt.dir.clone();
+        let renaming = prompt.renaming.clone();
+        let Some(sender) = self
+            .tabs
+            .iter()
+            .find(|tab| tab.id == tab_id)
+            .and_then(|tab| tab.commands.clone())
+        else {
+            self.status = "会话已断开，无法修改远端文件".into();
+            self.file_prompt = None;
+            cx.notify();
+            return;
+        };
+        self.file_prompt = None;
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        let command = match &renaming {
+            Some(from) => session::SessionCommand::FsRename {
+                dir: dir.clone(),
+                from: from.clone(),
+                to: name.clone(),
+                reply,
+            },
+            None => session::SessionCommand::FsMkdir {
+                dir: dir.clone(),
+                name: name.clone(),
+                reply,
+            },
+        };
+        if sender.send(command).is_err() {
+            self.status = "会话已断开，无法修改远端文件".into();
+            cx.notify();
+            return;
+        }
+        let action = if renaming.is_some() {
+            "重命名"
+        } else {
+            "创建目录"
+        };
+        self.status = format!("正在{action} {name}…").into();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let outcome = match rx.await {
+                Ok(result) => result,
+                Err(_) => Err(anyhow::anyhow!("远端操作请求已中断")),
+            };
+            let _ = this.update(cx, |this, cx| match outcome {
+                Ok(_) => {
+                    this.status = format!("{action}完成：{name}").into();
+                    this.file_error_clear(tab_id);
+                }
+                Err(error) => {
+                    let message = format!("{action}失败：{}", session::error_summary(&error));
+                    this.status = message.clone().into();
+                    this.file_error(tab_id, message, cx);
+                }
+            });
+            let path = this
+                .update(cx, |this, _| {
+                    this.tabs
+                        .iter()
+                        .find(|tab| tab.id == tab_id)
+                        .and_then(|tab| tab.files.path.clone())
+                })
+                .ok()
+                .flatten();
+            if let Some(path) = path {
+                let _ = this.update(cx, |this, cx| this.load_files(tab_id, Some(path), cx));
+            }
+        })
+        .detach();
+    }
+
+    /// 请求删除（先弹二次确认）。
+    fn ask_delete_file(&mut self, tab_id: usize, name: String, is_dir: bool, cx: &mut Context<Self>) {
+        let Some(path) = self
+            .tabs
+            .iter()
+            .find(|tab| tab.id == tab_id)
+            .and_then(|tab| tab.files.path.as_deref())
+        else {
+            return;
+        };
+        let path = remote_fs::child(path, &name);
+        self.file_confirm = Some(FileConfirm {
+            tab_id,
+            path,
+            name,
+            is_dir,
+        });
+        cx.notify();
+    }
+
+    fn cancel_delete_file(&mut self, cx: &mut Context<Self>) {
+        self.file_confirm = None;
+        cx.notify();
+    }
+
+    fn confirm_delete_file(&mut self, cx: &mut Context<Self>) {
+        let Some(confirm) = self.file_confirm.take() else {
+            return;
+        };
+        let Some(sender) = self
+            .tabs
+            .iter()
+            .find(|tab| tab.id == confirm.tab_id)
+            .and_then(|tab| tab.commands.clone())
+        else {
+            self.status = "会话已断开，无法删除远端文件".into();
+            cx.notify();
+            return;
+        };
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        if sender
+            .send(session::SessionCommand::FsDelete {
+                path: confirm.path.clone(),
+                reply,
+            })
+            .is_err()
+        {
+            self.status = "会话已断开，无法删除远端文件".into();
+            cx.notify();
+            return;
+        }
+        let tab_id = confirm.tab_id;
+        let name = confirm.name;
+        self.status = format!("正在删除 {name}…").into();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let outcome = match rx.await {
+                Ok(result) => result,
+                Err(_) => Err(anyhow::anyhow!("删除请求已中断")),
+            };
+            let _ = this.update(cx, |this, cx| match outcome {
+                Ok(()) => {
+                    this.status = format!("已删除 {name}").into();
+                    this.file_error_clear(tab_id);
+                    let path = this
+                        .tabs
+                        .iter()
+                        .find(|tab| tab.id == tab_id)
+                        .and_then(|tab| tab.files.path.clone());
+                    if let Some(path) = path {
+                        this.load_files(tab_id, Some(path), cx);
+                    }
+                }
+                Err(error) => {
+                    let message = format!("删除失败：{}", session::error_summary(&error));
+                    this.status = message.clone().into();
+                    this.file_error(tab_id, message, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// 面板内的错误：写该标签的 files.error 并同步状态栏。
+    fn file_error(
+        &mut self,
+        tab_id: usize,
+        message: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        let message = message.into();
+        if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) {
+            tab.files.error = Some(message.clone());
+        }
+        self.status = message;
+        cx.notify();
+    }
+
+    fn file_error_clear(&mut self, tab_id: usize) {
+        if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) {
+            tab.files.error = None;
+        }
+    }
+
     /// Ctrl+Shift+F / 会话菜单：为当前标签打开端口转发弹窗。
     fn open_forward_action(
         &mut self,
@@ -2805,7 +3715,7 @@ impl RuLinkApp {
                 let salt_path = mode.salt_path();
                 let previous_salt = std::fs::read(&salt_path).ok();
                 // turso 无 rekey：新建加密库全量搬迁，再原子换名。
-                let staging = mode.db_path().with_file_name("rulink.db.new");
+                let staging = mode.db_path().with_file_name("ruterm.db.new");
                 // 上一轮失败可能留下带旧数据的暂存束（含 -wal），必须先整套清掉。
                 crate::vault::remove_db_bundle(&staging);
                 std::fs::create_dir_all(mode.dir())?;
@@ -2817,11 +3727,11 @@ impl RuLinkApp {
                 let db_path = mode.db_path();
                 let mut backup: Option<std::path::PathBuf> = None;
                 if db_path.exists() {
-                    let candidate = db_path.with_file_name("rulink.db.keyring-bak");
+                    let candidate = db_path.with_file_name("ruterm.db.keyring-bak");
                     let candidate = if candidate.exists() {
                         // 备份名被占用时带时间戳另存，确保旧库不丢。
                         db_path.with_file_name(format!(
-                            "rulink.db.bak-{}",
+                            "ruterm.db.bak-{}",
                             std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .map(|d| d.as_secs())
@@ -4401,7 +5311,7 @@ impl RuLinkApp {
         };
         let session::SshSession {
             join,
-            remote_info,
+            mut remote_info,
             started,
             ready,
             disconnect,
@@ -4437,6 +5347,9 @@ impl RuLinkApp {
             disconnect: Some(disconnect),
             commands: Some(commands),
             forwards: Vec::new(),
+            files: FileBrowser::default(),
+            zmodem: None,
+            zmodem_progress: None,
             auto_retry_attempt: retry_attempt,
             auto_retry_pending: false,
             connected_at: None,
@@ -4450,6 +5363,7 @@ impl RuLinkApp {
         self.activate_tab(id, window, cx);
         // shell 真正开起来才算"连接可用"：记录时刻供断线后判断会话是否稳定过。
         let ready_view = terminal_view.clone();
+        let ready_addr = addr.clone();
         let recent_host_id = host.as_ref().map(|host| host.id).filter(|id| *id != 0);
         cx.spawn(async move |this, cx| {
             if ready.await.is_err() {
@@ -4468,6 +5382,11 @@ impl RuLinkApp {
                 }
                 if let Some(host_id) = recent_host_id {
                     this.record_recent_host(host_id, cx);
+                }
+                // 连上后状态栏不该一直停在"正在连接"；但用户此时可能已经看到别的提示，只在原文案未变时替换。
+                let connecting = format!("正在连接 {ready_addr}…");
+                if this.status == connecting {
+                    this.status = SharedString::from(format!("已连接 {ready_addr}"));
                 }
                 cx.notify();
                 this.auto_start_forwards(id, cx);
@@ -4543,10 +5462,10 @@ impl RuLinkApp {
             });
         })
         .detach();
-        // 远程基本信息比会话短得多：探测回来时标签可能已关闭/重连，据此判断后再写入。
+        // 远程基本信息按固定间隔持续回传：负载/内存/磁盘会随会话变化，只写第一次会一直停在连接时的值。
         let info_view = terminal_view.clone();
         cx.spawn(async move |this, cx| {
-            if let Ok(info) = remote_info.await {
+            while let Some(info) = remote_info.recv().await {
                 let _ = this.update(cx, |this, cx| {
                     if let Some(tab) = this
                         .tabs
@@ -4882,6 +5801,18 @@ impl RuLinkApp {
             self.status = "已退出分屏".into();
         }
         self.active_tab = Some(id);
+        // 文件面板开着时切到尚未浏览过的新会话，顺手列出登录主目录。
+        let needs_files = self.file_panel
+            && self.tabs.iter().any(|tab| {
+                tab.id == id
+                    && tab.files.path.is_none()
+                    && tab.commands.is_some()
+                    && !tab.ended
+                    && !tab.files.loading
+            });
+        if needs_files {
+            self.load_files(id, None, cx);
+        }
         if let Some(ix) = self.tabs.iter().position(|tab| tab.id == id) {
             self.tab_scroll.scroll_to_item(ix);
             let focus = self.tabs[ix].terminal_view.read(cx).focus_handle(cx);
@@ -5024,9 +5955,9 @@ impl RuLinkApp {
         });
         cx.set_tray_menu(menu);
         let tooltip = if self.tabs.is_empty() {
-            "RuLink 拾连".to_string()
+            "RuTerm 拾连".to_string()
         } else {
-            format!("RuLink 拾连 · {} 个会话", self.tabs.len())
+            format!("RuTerm 拾连 · {} 个会话", self.tabs.len())
         };
         cx.set_tray_tooltip(&tooltip);
     }
@@ -5320,6 +6251,9 @@ impl RuLinkApp {
             disconnect: None,
             commands: None,
             forwards: Vec::new(),
+            files: FileBrowser::default(),
+            zmodem: None,
+            zmodem_progress: None,
             auto_retry_attempt: 0,
             auto_retry_pending: false,
             connected_at: None,
@@ -5340,11 +6274,11 @@ impl RuLinkApp {
     }
 }
 
-impl Render for RuLinkApp {
+impl Render for RuTermApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let pal = self.palette(cx);
         v_flex()
-            .id("rulink-root")
+            .id("ruterm-root")
             .track_focus(&self.focus_handle)
             .relative()
             .size_full()
@@ -5380,7 +6314,7 @@ impl Render for RuLinkApp {
     }
 }
 
-impl RuLinkApp {
+impl RuTermApp {
     /// 标题栏右侧的窗口控制按钮：登记为 `WindowControlArea`，交给系统
     /// HTMINBUTTON / HTMAXBUTTON / HTCLOSE（关闭仍会走 `on_window_should_close`，
     /// 即隐藏到托盘）。
@@ -5452,6 +6386,7 @@ impl RuLinkApp {
         // 前六项挂 action（而非 on_click）：rgpui 会按键绑定在项右侧自动显示
         // Ctrl+N / Ctrl+Shift+T / Ctrl+Tab / Ctrl+,。
         let split_open = self.view_split.is_some();
+        let file_panel_open = self.file_panel;
         // 菜单打开时把最近连接的 id 解析成当前列表里的条目（主机可能已删除或重排）。
         let recent_items: Vec<(usize, SharedString)> = self
             .recent_hosts
@@ -5490,8 +6425,16 @@ impl RuLinkApp {
                     );
                 }
             }
+            let files_entity = menu_entity.clone();
             let menu = menu
                 .item(PopupMenuItem::new("本地终端…").action(Box::new(NewLocalTerminal)))
+                .item(
+                    PopupMenuItem::new("远端文件面板")
+                        .checked(file_panel_open)
+                        .on_click(move |_, _, cx| {
+                            files_entity.update(cx, |this, cx| this.toggle_file_panel(cx));
+                        }),
+                )
                 .item(PopupMenuItem::new("上传 / 下载文件…").action(Box::new(OpenTransfer)))
                 .item(PopupMenuItem::new("端口转发…").action(Box::new(OpenForward)))
                 .item(PopupMenuItem::new("左右分屏").action(Box::new(SplitRight)))
@@ -5512,7 +6455,7 @@ impl RuLinkApp {
                     }),
                 )
                 .item(
-                    PopupMenuItem::new("退出 RuLink")
+                    PopupMenuItem::new("退出 RuTerm")
                         .danger(true)
                         .on_click(move |_, _, cx| cx.quit()),
                 )
@@ -5605,7 +6548,7 @@ impl RuLinkApp {
 
         // 帮助菜单只留版本信息：快捷键已随各菜单项右侧显示，不再单列一份文字清单。
         let help_menu = move |menu: PopupMenu, _: &mut Window, _: &mut Context<PopupMenu>| {
-            menu.label("RuLink").item(
+            menu.label("RuTerm").item(
                 PopupMenuItem::new(concat!("版本 ", env!("CARGO_PKG_VERSION"))).disabled(true),
             )
         };
@@ -5643,7 +6586,7 @@ impl RuLinkApp {
                         div()
                             .text_base()
                             .font_weight(FontWeight(700.0))
-                            .child("RuLink"),
+                            .child("RuTerm"),
                     )
                     .when(locked, |this| {
                         this.child(div().text_sm().text_color(pal.muted).child("已锁定"))
@@ -5678,6 +6621,17 @@ impl RuLinkApp {
                     .gap_1()
                     .flex_shrink_0()
                     .pr_3()
+                    .child(
+                        Button::new("title-files")
+                            .label("▤ 文件")
+                            .compact()
+                            .ghost()
+                            .text_color(if self.file_panel { pal.accent } else { fg })
+                            .tooltip("远端文件面板")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.toggle_file_panel(cx);
+                            })),
+                    )
                     .child(
                         Button::new("title-transfer")
                             .label("⇅ 传输")
@@ -5916,7 +6870,7 @@ impl RuLinkApp {
         // 竖排分页条目：不套底色不描边，选中项靠左侧强调色竖条 + 粗体区分，
         // 未选中项只弱化文字色（竖条留空占位，文字位置不跳）。
         let tab_item =
-            |id: &'static str, label: &'static str, ix: usize, entity: Entity<RuLinkApp>| {
+            |id: &'static str, label: &'static str, ix: usize, entity: Entity<RuTermApp>| {
                 let selected = state.tab == ix;
                 h_flex()
                     .id(id)
@@ -6779,7 +7733,7 @@ impl RuLinkApp {
     fn render_status_tab(&self, pal: &Palette, cx: &Context<Self>) -> AnyElement {
         let entity = cx.entity();
         let row =
-            |id: String, label: String, on: bool, pref: StatusPref, entity: Entity<RuLinkApp>| {
+            |id: String, label: String, on: bool, pref: StatusPref, entity: Entity<RuTermApp>| {
                 Checkbox::new(id)
                     .label(label)
                     .checked(on)
@@ -7139,6 +8093,12 @@ impl RuLinkApp {
         if self.forward.is_some() {
             return self.render_forward_dialog(cx);
         }
+        if self.file_prompt.is_some() {
+            return self.render_file_prompt(cx);
+        }
+        if self.file_confirm.is_some() {
+            return self.render_file_confirm(cx);
+        }
         // 删除二次确认：半透明遮罩 + 居中卡片，点遮罩或"取消"关闭。
         if let Some(index) = self.confirm_delete {
             let label = self
@@ -7241,7 +8201,7 @@ impl RuLinkApp {
         target: MenuTarget,
         groups: Vec<SharedString>,
         current_group: Option<SharedString>,
-        entity: Entity<RuLinkApp>,
+        entity: Entity<RuTermApp>,
         menu: PopupMenu,
     ) -> PopupMenu {
         let menu = menu.min_w(px(168.0));
@@ -7414,12 +8374,12 @@ impl RuLinkApp {
 
     /// 右键菜单的一项：回调要求 `Send + Sync`，故只捕获实体与标签，不捕获 `&self`。
     fn menu_item(
-        entity: Entity<RuLinkApp>,
+        entity: Entity<RuTermApp>,
         label: impl Into<SharedString>,
         icon: Option<IconName>,
         danger: bool,
         checked: bool,
-        run: impl Fn(&mut RuLinkApp, &mut Window, &mut Context<RuLinkApp>) + Send + Sync + 'static,
+        run: impl Fn(&mut RuTermApp, &mut Window, &mut Context<RuTermApp>) + Send + Sync + 'static,
     ) -> PopupMenuItem {
         let label = label.into();
         let mut item = PopupMenuItem::new(label).danger(danger).checked(checked);
@@ -7478,11 +8438,12 @@ impl RuLinkApp {
             return Vec::new();
         }
         let count = self.local_shells.len();
-        let collapsed = !searching && self.local_group_collapsed;
+        let collapsed = !searching && self.sidebar.local_collapsed;
         let parent = Self::row_base("local-terminal-row", pal, px(2.0))
             .font_weight(rgpui::FontWeight(600.0))
             .on_click(cx.listener(|this, _, _, cx| {
-                this.local_group_collapsed = !this.local_group_collapsed;
+                this.sidebar.toggle_local();
+                this.persist_sidebar(cx);
                 cx.notify();
             }))
             .child(
@@ -8695,6 +9656,599 @@ impl RuLinkApp {
     }
 
     /// 右侧主区：当前终端（会话标签已并入标题栏）。
+    /// 右侧远端文件面板：路径栏 + 目录列表 + 底部操作状态。
+    ///
+    /// 面板跟随活动标签；每个标签各自保留路径与列表，切换回来不重新拉取。
+    /// 目录行和列表空白处都接受系统文件拖入，落到对应目录上传。
+    fn render_file_panel(&self, cx: &mut Context<Self>) -> AnyElement {
+        let pal = self.palette(cx);
+        let tab = self
+            .active_tab
+            .and_then(|id| self.tabs.iter().find(|tab| tab.id == id));
+        let tab_id = tab.map(|tab| tab.id);
+        let remote_capable = tab.is_some_and(|tab| tab.commands.is_some());
+        let ended = tab.is_some_and(|tab| tab.ended);
+        let path = tab.and_then(|tab| tab.files.path.clone());
+        let loading = tab.is_some_and(|tab| tab.files.loading);
+        let error = tab.and_then(|tab| tab.files.error.clone());
+        let busy = tab.and_then(|tab| tab.files.busy.clone());
+        let progress = tab.and_then(|tab| tab.files.progress);
+        let entries = tab
+            .map(|tab| tab.files.entries.clone())
+            .unwrap_or_default();
+        let entity = cx.entity();
+        let live = tab_id.filter(|_| remote_capable && !ended);
+
+        let up_enabled = path
+            .as_deref()
+            .and_then(remote_fs::parent_of)
+            .is_some();
+        let mut path_row = h_flex()
+            .w_full()
+            .flex_shrink_0()
+            .px_2()
+            .py_1()
+            .gap_1()
+            .items_center()
+            .border_b_1()
+            .border_color(pal.border)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_ellipsis()
+                    .text_xs()
+                    .text_color(pal.muted)
+                    .child(path.clone().unwrap_or_else(|| "—".to_string())),
+            );
+        if let Some(id) = live {
+            path_row = path_row
+                .child({
+                    let up = Button::new("files-up")
+                        .icon(IconName::ArrowUp)
+                        .compact()
+                        .ghost()
+                        .tooltip("上级目录");
+                    if up_enabled {
+                        up.on_click(cx.listener(move |this, _, _, cx| {
+                            this.files_up(id, cx);
+                        }))
+                    } else {
+                        // 已在根目录：保留按钮位置，弱化且不挂回调。
+                        up.text_color(pal.muted)
+                    }
+                })
+                .child(
+                    Button::new("files-refresh")
+                        .label("⟳")
+                        .compact()
+                        .ghost()
+                        .tooltip("刷新目录")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.refresh_files(id, cx);
+                        })),
+                )
+                .child(
+                    Button::new("files-mkdir")
+                        .icon(IconName::Plus)
+                        .compact()
+                        .ghost()
+                        .tooltip("新建文件夹")
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            let Some(dir) = this
+                                .tabs
+                                .iter()
+                                .find(|tab| tab.id == id)
+                                .and_then(|tab| tab.files.path.clone())
+                            else {
+                                return;
+                            };
+                            this.open_file_prompt(id, dir, None, window, cx);
+                        })),
+                );
+        }
+
+        let dir = path.clone().unwrap_or_default();
+        let count = entries.len();
+        let total: u64 = entries.iter().filter(|entry| !entry.is_dir).map(|entry| entry.size).sum();
+        let mut summary = format!("{count} 个项目");
+        if total > 0 {
+            summary.push_str(" · ");
+            summary.push_str(&transfer::format_bytes(total));
+        }
+        if remote_capable && !ended {
+            summary.push_str(" · 拖入文件即可上传");
+        }
+
+        let list_body: AnyElement = if !remote_capable {
+            v_flex()
+                .flex_1()
+                .items_center()
+                .justify_center()
+                .p_3()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(pal.muted)
+                        .child(if tab.is_some() {
+                            "本地终端没有远端文件可浏览"
+                        } else {
+                            "没有活动会话"
+                        }),
+                )
+                .into_any_element()
+        } else if ended {
+            v_flex()
+                .flex_1()
+                .items_center()
+                .justify_center()
+                .p_3()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(pal.muted)
+                        .child("会话已断开，请先重新连接"),
+                )
+                .into_any_element()
+        } else if loading && entries.is_empty() {
+            v_flex()
+                .flex_1()
+                .items_center()
+                .justify_center()
+                .p_3()
+                .child(div().text_xs().text_color(pal.muted).child("正在读取远端目录…"))
+                .into_any_element()
+        } else if entries.is_empty() {
+            v_flex()
+                .flex_1()
+                .items_center()
+                .justify_center()
+                .p_3()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(pal.muted)
+                        .child(if error.is_some() { "目录读取失败" } else { "空目录" }),
+                )
+                .into_any_element()
+        } else {
+            v_flex()
+                .p_1()
+                .gap_1()
+                .children(entries.into_iter().map(|entry| {
+                    let name = entry.name.clone();
+                    let is_dir = entry.is_dir;
+                    let mtime = entry
+                        .modified
+                        .map(format_remote_time)
+                        .unwrap_or_else(|| "—".to_string());
+                    let size_text = if is_dir {
+                        String::new()
+                    } else {
+                        transfer::format_bytes(entry.size)
+                    };
+                    let row_id = SharedString::from(format!(
+                        "file-row-{}-{}-{}",
+                        tab_id.unwrap_or_default(),
+                        if is_dir { "d" } else { "f" },
+                        name
+                    ));
+                    let dir_row = remote_fs::child(&dir, &name);
+                    let mut row = h_flex()
+                        .id(row_id)
+                        .w_full()
+                        .px_2()
+                        .py_1()
+                        .gap_2()
+                        .items_center()
+                        .rounded(px(4.0))
+                        .hover(|style| style.bg(pal.card_hover))
+                        .cursor_pointer();
+                    if is_dir {
+                        // 拖到文件夹行上＝上传到该文件夹；其余行交给父级列表处理。
+                        let target = dir_row.clone();
+                        row = row
+                            .drag_over::<ExternalPaths>(move |style, _, _, _| {
+                                style.bg(pal.card_hover).border_1().border_color(pal.accent)
+                            })
+                            .on_drop(cx.listener(move |this, paths: &ExternalPaths, _, cx| {
+                                let Some(id) = live else {
+                                    return;
+                                };
+                                this.upload_paths(id, target.clone(), paths.paths().to_vec(), cx);
+                            }));
+                    }
+                    if let Some(id) = live {
+                        let opening_name = name.clone();
+                        row = row.on_double_click(cx.listener(move |this, _, _, cx| {
+                            this.open_file_entry(id, &opening_name, is_dir, cx);
+                        }));
+                    }
+                    let row = row
+                        .child(
+                            Icon::new(if is_dir {
+                                IconName::FolderOpen
+                            } else {
+                                IconName::File
+                            })
+                            .small()
+                            .flex_shrink_0()
+                            .text_color(if is_dir { pal.link } else { pal.muted }),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_ellipsis()
+                                .text_sm()
+                                .child(name.clone()),
+                        )
+                        .when(!size_text.is_empty(), |this| {
+                            this.child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_xs()
+                                    .text_color(pal.muted)
+                                    .child(size_text),
+                            )
+                        })
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .text_xs()
+                                .text_color(pal.muted)
+                                .child(mtime),
+                        );
+                    let Some(id) = live else {
+                        return row.into_any_element();
+                    };
+                    let menu_entity = entity.clone();
+                    row.context_menu(move |menu, _, _| {
+                        let opening = menu_entity.clone();
+                        let opening_name = name.clone();
+                        let menu = menu
+                            .item(
+                                PopupMenuItem::new(if is_dir { "打开目录" } else { "打开" })
+                                    .on_click(move |_, _, cx| {
+                                        opening.update(cx, |this, cx| {
+                                            this.open_file_entry(id, &opening_name, is_dir, cx);
+                                        });
+                                    }),
+                            );
+                        let renaming = menu_entity.clone();
+                        let rename_name = name.clone();
+                        let menu = menu.item(
+                            PopupMenuItem::new("重命名…").on_click(move |_, window, cx| {
+                                renaming.update(cx, |this, cx| {
+                                    let Some(dir) = this
+                                        .tabs
+                                        .iter()
+                                        .find(|tab| tab.id == id)
+                                        .and_then(|tab| tab.files.path.clone())
+                                    else {
+                                        return;
+                                    };
+                                    this.open_file_prompt(
+                                        id,
+                                        dir,
+                                        Some(rename_name.clone()),
+                                        window,
+                                        cx,
+                                    );
+                                });
+                            }),
+                        );
+                        let deleting = menu_entity.clone();
+                        let delete_name = name.clone();
+                        let menu = menu.item(
+                            PopupMenuItem::new("删除")
+                                .danger(true)
+                                .on_click(move |_, _, cx| {
+                                    deleting.update(cx, |this, cx| {
+                                        this.ask_delete_file(id, delete_name.clone(), is_dir, cx);
+                                    });
+                                }),
+                        );
+                        let refreshing = menu_entity.clone();
+                        menu.separator().item(PopupMenuItem::new("刷新").on_click(
+                            move |_, _, cx| {
+                                refreshing.update(cx, |this, cx| this.refresh_files(id, cx));
+                            },
+                        ))
+                    })
+                    .into_any_element()
+                }))
+                .into_any_element()
+        };
+
+        let list = div()
+            .id("file-list")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scrollbar()
+            .drag_over::<ExternalPaths>(move |style, _, _, _| {
+                style.bg(pal.card_hover).border_1().border_color(pal.accent)
+            })
+            .on_drop(cx.listener(move |this, paths: &ExternalPaths, _, cx| {
+                let Some(id) = live else {
+                    return;
+                };
+                this.upload_paths(id, dir.clone(), paths.paths().to_vec(), cx);
+            }))
+            .child(list_body);
+
+        let mut footer = v_flex()
+            .w_full()
+            .flex_shrink_0()
+            .px_2()
+            .py_1()
+            .gap_1()
+            .border_t_1()
+            .border_color(pal.border);
+        if let Some(text) = busy {
+            let (done, total) = progress.unwrap_or((0, 0));
+            let fraction = if total > 0 {
+                (done as f32 / total as f32).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            footer = footer.child(
+                v_flex()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(pal.text)
+                            .child(if total > 0 {
+                                format!(
+                                    "{text} {} / {}",
+                                    transfer::format_bytes(done),
+                                    transfer::format_bytes(total)
+                                )
+                            } else {
+                                text.to_string()
+                            }),
+                    )
+                    .child(
+                        div()
+                            .h(px(4.0))
+                            .w_full()
+                            .rounded(px(2.0))
+                            .bg(pal.border)
+                            .overflow_hidden()
+                            .child(
+                                div()
+                                    .h_full()
+                                    .w(rgpui::relative(fraction))
+                                    .rounded(px(2.0))
+                                    .bg(pal.accent),
+                            ),
+                    ),
+            );
+        }
+        if let Some(error) = error {
+            footer = footer.child(div().text_xs().text_color(pal.danger).child(error));
+        }
+        footer = footer.child(div().text_xs().text_color(pal.muted).child(summary));
+
+        v_flex()
+            .id("file-panel")
+            .w(px(304.0))
+            .h_full()
+            .flex_shrink_0()
+            .bg(pal.sidebar_bg)
+            .border_l_1()
+            .border_color(pal.border)
+            .child(
+                h_flex()
+                    .w_full()
+                    .flex_shrink_0()
+                    .px_3()
+                    .py_2()
+                    .gap_2()
+                    .items_center()
+                    .border_b_1()
+                    .border_color(pal.border)
+                    .child(
+                        Icon::new(IconName::FolderOpen)
+                            .small()
+                            .text_color(pal.link),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_sm()
+                            .font_weight(FontWeight(600.0))
+                            .child("文件管理器"),
+                    )
+                    .child(
+                        Button::new("files-close")
+                            .label("×")
+                            .compact()
+                            .ghost()
+                            .tooltip("收起文件面板")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.file_panel = false;
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(path_row)
+            .child(list)
+            .child(footer)
+            .into_any_element()
+    }
+
+    /// 文件面板的新建 / 重命名弹窗。
+    fn render_file_prompt(&self, cx: &Context<Self>) -> AnyElement {
+        let pal = self.palette(cx);
+        let Some(prompt) = self.file_prompt.as_ref() else {
+            return div().into_any_element();
+        };
+        let renaming = prompt.renaming.clone();
+        let title = match &renaming {
+            Some(old) => format!("重命名：{old}"),
+            None => "新建文件夹".to_string(),
+        };
+        v_flex()
+            .id("file-prompt-backdrop")
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .size_full()
+            .items_center()
+            .justify_center()
+            .bg(rgpui::hsla(0.0, 0.0, 0.0, 0.45))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_, _, _, cx| cx.stop_propagation()),
+            )
+            .child(
+                v_flex()
+                    .id("file-prompt")
+                    .w(px(360.0))
+                    .gap_3()
+                    .p_5()
+                    .rounded(px(8.0))
+                    .bg(pal.card_bg)
+                    .border_1()
+                    .border_color(pal.border)
+                    .shadow_md()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                    )
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_base()
+                                    .font_weight(FontWeight(600.0))
+                                    .child(title),
+                            )
+                            .child(Button::new("close-file-prompt").label("×").ghost().on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    this.cancel_file_prompt(cx);
+                                }),
+                            )),
+                    )
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .child(div().text_sm().child("名称"))
+                            .child(styled_input(Input::new(&prompt.name), &pal)),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(pal.muted)
+                            .child("名称不能包含 / 或 \\，也不能是 . 或 ..。"),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .justify_end()
+                            .child(
+                                Button::new("commit-file-prompt")
+                                    .label(if renaming.is_some() {
+                                        "重命名"
+                                    } else {
+                                        "创建"
+                                    })
+                                    .primary()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.commit_file_prompt(cx);
+                                    })),
+                            )
+                            .child(Button::new("cancel-file-prompt").label("取消").ghost().on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    this.cancel_file_prompt(cx);
+                                }),
+                            )),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// 远端删除的二次确认（目录非空会失败，提示文案同步说明）。
+    fn render_file_confirm(&self, cx: &Context<Self>) -> AnyElement {
+        let pal = self.palette(cx);
+        let Some(confirm) = self.file_confirm.as_ref() else {
+            return div().into_any_element();
+        };
+        let name = confirm.name.clone();
+        let kind = if confirm.is_dir { "目录" } else { "文件" };
+        v_flex()
+            .id("file-delete-backdrop")
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .size_full()
+            .items_center()
+            .justify_center()
+            .bg(rgpui::hsla(0.0, 0.0, 0.0, 0.45))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.cancel_delete_file(cx);
+                }),
+            )
+            .child(
+                v_flex()
+                    .id("file-delete-dialog")
+                    .w(px(360.0))
+                    .gap_3()
+                    .p_4()
+                    .rounded(px(8.0))
+                    .bg(pal.card_bg)
+                    .border_1()
+                    .border_color(pal.border)
+                    .child(
+                        div()
+                            .text_base()
+                            .font_weight(FontWeight(600.0))
+                            .child(format!("删除远端{kind} {name}？")),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(pal.muted)
+                            .child(if confirm.is_dir {
+                                "目录必须为空才能删除；此操作不可撤销。"
+                            } else {
+                                "文件将被永久删除，此操作不可撤销。"
+                            }),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .justify_end()
+                            .child(Button::new("cancel-file-delete").label("取消").ghost().on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    this.cancel_delete_file(cx);
+                                }),
+                            ))
+                            .child(
+                                Button::new("confirm-file-delete")
+                                    .label("删除")
+                                    .danger()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.confirm_delete_file(cx);
+                                    })),
+                            ),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                    ),
+            )
+            .into_any_element()
+    }
+
     fn render_main(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let pal = self.palette(cx);
         let tab_bar = if self.tabs.is_empty() {
@@ -8882,6 +10436,18 @@ impl RuLinkApp {
                 })
         };
 
+        // 文件面板挂在主区右侧：分屏时也跟随活动标签，而不是挤进某一侧终端。
+        let body = if self.file_panel {
+            h_flex()
+                .flex_1()
+                .min_h_0()
+                .child(body)
+                .child(self.render_file_panel(cx))
+                .into_any_element()
+        } else {
+            body
+        };
+
         v_flex().flex_1().h_full().child(tab_bar).child(body)
     }
 
@@ -8920,9 +10486,68 @@ impl RuLinkApp {
                     }
                 }),
             )
+            // 本地文件拖到终端＝用 lrzsz 传到 shell 当前目录（落点由远端决定）。
+            .drag_over::<ExternalPaths>(move |style, _, _, _| {
+                style.border_1().border_color(pal.accent)
+            })
+            .on_drop(cx.listener(move |this, paths: &ExternalPaths, _, cx| {
+                this.upload_via_terminal(id, paths.paths().to_vec(), cx);
+            }))
             .child(tab.terminal_view.clone())
             .when(tab.ended, |this| {
                 this.child(self.render_ended_banner(tab, cx))
+            })
+            .when_some(tab.zmodem.clone(), |this, text| {
+                let (done, total) = tab.zmodem_progress.unwrap_or((0, 0));
+                let fraction = if total > 0 {
+                    (done as f32 / total as f32).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                this.child(
+                    v_flex()
+                        .absolute()
+                        .top(px(10.0))
+                        .right(px(10.0))
+                        .w(px(260.0))
+                        .gap_1()
+                        .px_3()
+                        .py_2()
+                        .rounded(px(6.0))
+                        .bg(pal.card_bg)
+                        .border_1()
+                        .border_color(pal.border)
+                        .shadow_md()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(pal.text)
+                                .child(if total > 0 {
+                                    format!(
+                                        "{text} {} / {}",
+                                        transfer::format_bytes(done),
+                                        transfer::format_bytes(total)
+                                    )
+                                } else {
+                                    text.to_string()
+                                }),
+                        )
+                        .child(
+                            div()
+                                .h(px(4.0))
+                                .w_full()
+                                .rounded(px(2.0))
+                                .bg(pal.border)
+                                .overflow_hidden()
+                                .child(
+                                    div()
+                                        .h_full()
+                                        .w(rgpui::relative(fraction))
+                                        .rounded(px(2.0))
+                                        .bg(pal.accent),
+                                ),
+                        ),
+                )
             })
             .into_any_element()
     }
@@ -9450,7 +11075,7 @@ fn downloads_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-impl Focusable for RuLinkApp {
+impl Focusable for RuTermApp {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
     }
@@ -9526,7 +11151,7 @@ fn main() {
                     cx,
                 ))),
                 titlebar: Some(rgpui::TitlebarOptions {
-                    title: Some("RuLink".into()),
+                    title: Some("RuTerm".into()),
                     // 隐藏系统标题栏，改由应用自绘（品牌 + 菜单 + 窗口控制按钮）。
                     appears_transparent: true,
                     ..Default::default()
@@ -9538,7 +11163,7 @@ fn main() {
             },
             |window, cx| {
                 let quick = quick.clone();
-                let app = cx.new(|cx| RuLinkApp::new(quick, window, cx));
+                let app = cx.new(|cx| RuTermApp::new(quick, window, cx));
                 // 关闭按钮改为隐藏到托盘：窗口不销毁，会话后台保活；
                 // 返回 false 中断关闭，真正退出走托盘"退出"（cx.quit 直接投 WM_QUIT，不经此回调）。
                 window.on_window_should_close(cx, |window, _cx| {
@@ -9594,8 +11219,8 @@ mod tests {
         CUSTOM_ANSI_BASE, CUSTOM_BRIGHT_BASE, CUSTOM_DEFAULT_ANSI, CUSTOM_DEFAULT_BRIGHT,
         FONT_SIZE_MAX, FONT_SIZE_MIN, ForwardPrefs, JumpPrefs, LINE_HEIGHT_MAX, LINE_HEIGHT_MIN,
         LocalShellPrefs, Metric, SavedForward, SessionPrefs, SidebarPrefs, StatusBarPrefs,
-        TERMINAL_THEME_DEFAULT, TerminalColors, TerminalPrefs, auto_reconnect_delay, hex_to_hsla,
-        normalize_hex,
+        TERMINAL_THEME_DEFAULT, TerminalColors, TerminalPrefs, auto_reconnect_delay,
+        format_remote_time, hex_to_hsla, normalize_hex, safe_local_name,
     };
     use crate::session::ForwardKind;
 
@@ -9608,6 +11233,22 @@ mod tests {
             target_port: 80,
             auto_start: false,
         }
+    }
+
+    #[test]
+    fn safe_local_name_keeps_basename_only() {
+        assert_eq!(safe_local_name("a/b.txt").as_deref(), Some("a_b.txt"));
+        assert_eq!(safe_local_name("a\\b:c?.txt").as_deref(), Some("a_b_c_.txt"));
+        assert_eq!(safe_local_name("中文.md").as_deref(), Some("中文.md"));
+        assert_eq!(safe_local_name(".."), None);
+        assert_eq!(safe_local_name("..."), None);
+        assert_eq!(safe_local_name("   "), None);
+    }
+
+    #[test]
+    fn remote_time_uses_utc() {
+        assert_eq!(format_remote_time(0), "1970-01-01 00:00");
+        assert_eq!(format_remote_time(1_700_000_000), "2023-11-14 22:13");
     }
 
     #[test]
@@ -9827,8 +11468,18 @@ mod tests {
         prefs.toggle("未分组");
         assert!(prefs.collapsed("未分组"));
 
+        // 内置「本地终端」不是库里的分组，折叠态也要跨重启保留。
+        prefs.toggle_local();
+        assert!(prefs.local_collapsed);
+
         let restored = SidebarPrefs::from_json(&prefs.to_json());
         assert_eq!(restored, prefs);
+        assert!(restored.local_collapsed);
+
+        // 旧版 JSON 没有该字段：读回默认展开，不能报错或丢其它偏好。
+        let old = SidebarPrefs::from_json(r#"{"groups":[{"name":"生产","collapsed":true}]}"#);
+        assert!(!old.local_collapsed);
+        assert!(old.collapsed("生产"));
 
         assert_eq!(SidebarPrefs::from_json(""), SidebarPrefs::default());
         assert_eq!(

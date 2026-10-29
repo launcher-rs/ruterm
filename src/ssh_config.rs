@@ -1,7 +1,7 @@
 //! `~/.ssh/config` 导入：只收具体别名，通配符与 `Match` 块整体跳过。
 //!
 //! 解析刻意做小：不支持 `Include` / `ProxyJump` / 环境变量插值，
-//! 只把能直接变成 RuLink 主机的四项（HostName / User / Port / IdentityFile）读出来。
+//! 只把能直接变成 RuTerm 主机的四项（HostName / User / Port / IdentityFile）读出来。
 //! 同一别名在多个块里出现时保留第一个块（与 ssh 的 first-obtained-wins 语义接近）。
 
 use std::path::PathBuf;

@@ -116,7 +116,7 @@ mod tests {
 
     #[test]
     fn parses_typical_linux_probe() {
-        let raw = "host=rulink-demo\nsys=Linux 6.8.0-45-generic\nos=Ubuntu 24.04.1 LTS\n\
+        let raw = "host=ruterm-demo\nsys=Linux 6.8.0-45-generic\nos=Ubuntu 24.04.1 LTS\n\
                    mem=1.2/7.7G\ndisk=23G/98G(24%)\nload=0.13\nup=3d4h\n";
         let info = RemoteInfo::parse(raw);
         assert_eq!(info.item(Metric::Os).as_deref(), Some("Ubuntu 24.04.1 LTS"));

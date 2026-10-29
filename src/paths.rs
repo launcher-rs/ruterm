@@ -1,4 +1,4 @@
-//! 数据目录与存储模式判定：便携模式（exe 旁 `data/`）与全局模式（`~/.rulink`）。
+//! 数据目录与存储模式判定：便携模式（exe 旁 `data/`）与全局模式（`~/.ruterm`）。
 //!
 //! 便携判定**只探测不创建**：`data/` 目录存在即便携，用户手动创建即切换；
 //! 不存在则维持全局模式，绝不在别人机器的工作目录里悄悄落文件。
@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 
 /// 新版单文件加密库（toasty + turso 页级加密）。
-pub const DB_FILE: &str = "rulink.db";
+pub const DB_FILE: &str = "ruterm.db";
 /// argon2 主密码派生的随机盐（公开值，非秘密）。
 pub const SALT_FILE: &str = "kdf-salt.bin";
 /// 解锁后端标记（`keyring` / `passphrase`），非敏感，明文存放。
@@ -24,7 +24,7 @@ pub const LEGACY_KNOWN_HOSTS_FILE: &str = "known_hosts";
 pub enum StorageMode {
     /// 便携模式：数据全部放 exe 同目录的 `data/` 下，可随 exe 拷贝。
     Portable(PathBuf),
-    /// 全局模式：`~/.rulink`（Windows 取 `%USERPROFILE%`，其他平台取 `$HOME`）。
+    /// 全局模式：`~/.ruterm`（Windows 取 `%USERPROFILE%`，其他平台取 `$HOME`）。
     Global(PathBuf),
 }
 
@@ -83,11 +83,11 @@ fn portable_dir_if_exists() -> Option<PathBuf> {
     candidate.is_dir().then_some(candidate)
 }
 
-/// `~/.rulink` 全局目录。
+/// `~/.ruterm` 全局目录。
 fn global_dir() -> PathBuf {
     let home = std::env::var_os("USERPROFILE")
         .or_else(|| std::env::var_os("HOME"))
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
-    home.join(".rulink")
+    home.join(".ruterm")
 }

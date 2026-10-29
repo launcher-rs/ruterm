@@ -67,8 +67,11 @@ impl std::error::Error for SecretRejected {}
 const INIT_COLS: u16 = 80;
 const INIT_ROWS: u16 = 24;
 
-/// 远程信息探测的整体超时：远端禁用 exec 或命令挂死时放弃，状态栏不显示该项。
+/// 远程信息首次探测的超时：远端禁用 exec 或命令挂死时放弃，状态栏不显示该项。
 const PROBE_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// 远程信息刷新间隔（负载/内存/磁盘随会话持续变化，只探一次会一直显示连接时的值）。
+const PROBE_INTERVAL: Duration = Duration::from_secs(5);
 
 /// 客户端会话通道别名。
 type SessionChannel = Channel<Msg>;
@@ -172,6 +175,36 @@ pub enum SessionCommand {
     },
     /// 执行一次上传 / 下载。
     Transfer(transfer::Task),
+    /// 文件面板：列出目录（None / `~` 表示登录主目录）。
+    FsList {
+        path: Option<String>,
+        reply: oneshot::Sender<Result<crate::remote_fs::Listing>>,
+    },
+    /// 文件面板：在 `dir` 下新建目录，回传新目录完整路径。
+    FsMkdir {
+        dir: String,
+        name: String,
+        reply: oneshot::Sender<Result<String>>,
+    },
+    /// 文件面板：重命名 `dir` 下的条目，回传新路径。
+    FsRename {
+        dir: String,
+        from: String,
+        to: String,
+        reply: oneshot::Sender<Result<String>>,
+    },
+    /// 文件面板：删除文件或空目录。
+    FsDelete {
+        path: String,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    /// 拖文件到终端：在 shell 当前目录用 `rz`（lrzsz）接收该文件。
+    ZmodemUpload {
+        local: std::path::PathBuf,
+        name: String,
+        progress: mpsc::UnboundedSender<(u64, u64)>,
+        reply: oneshot::Sender<Result<transfer::Summary>>,
+    },
     /// 开始一条转发（本机监听，或请求服务器监听）。
     ///
     /// 回传生效规则：远程转发请求端口 0 时服务器会分配实际端口。
@@ -190,8 +223,8 @@ pub enum SessionCommand {
 pub struct SshSession {
     /// 会话任务，必须被持有（提前 drop 会取消 SSH）。
     pub join: Task<Result<()>>,
-    /// 远程主机基本信息（探测失败/无信息时发送端被丢弃，收到 `Err`）。
-    pub remote_info: oneshot::Receiver<RemoteInfo>,
+    /// 远程主机基本信息流（连接期间每 [`PROBE_INTERVAL`] 刷新一次；探测失败时无数据）。
+    pub remote_info: mpsc::UnboundedReceiver<RemoteInfo>,
     /// shell 是否成功开启。失败发生在开启之前＝没建立过终端，标签页应保留展示错误。
     pub started: Arc<AtomicBool>,
     /// shell 成功开启时发送一次：UI 据此记录"连接真正可用"的时刻（判断会话是否稳定过）。
@@ -225,7 +258,7 @@ pub fn start<C: AppContext>(
 ) -> SshSession {
     let ExternalHandles { feed, rx } = handles;
     let (ui_tx, ui_rx) = mpsc::unbounded_channel::<PtyBoundMessage>();
-    let (info_tx, info_rx) = oneshot::channel::<RemoteInfo>();
+    let (info_tx, info_rx) = mpsc::unbounded_channel::<RemoteInfo>();
     let (ready_tx, ready_rx) = oneshot::channel::<()>();
     let (disconnect_tx, disconnect_rx) = oneshot::channel::<()>();
     let (command_tx, command_rx) = mpsc::unbounded_channel::<SessionCommand>();
@@ -234,7 +267,7 @@ pub fn start<C: AppContext>(
     // 上行泵：把终端的阻塞通道接到 tokio 通道；send 是非阻塞的，
     // 泵线程只在 recv 上休眠，不碰 UI 也不占运行时。
     std::thread::Builder::new()
-        .name("rulink-uplink".to_string())
+        .name("ruterm-uplink".to_string())
         .spawn(move || {
             while let Some(message) = rx.recv() {
                 if ui_tx.send(message).is_err() {
@@ -242,9 +275,9 @@ pub fn start<C: AppContext>(
                 }
             }
         })
-        .expect("无法启动 rulink 上行泵线程");
+        .expect("无法启动 ruterm 上行泵线程");
 
-    feed.feed(format!("\r\n[rulink] 正在连接 {}…\r\n", target.addr()).into_bytes());
+    feed.feed(format!("\r\n[ruterm] 正在连接 {}…\r\n", target.addr()).into_bytes());
 
     let closing_feed = feed.clone();
     let started_flag = started.clone();
@@ -268,7 +301,7 @@ pub fn start<C: AppContext>(
         .await;
         if let Err(error) = &result {
             closing_feed
-                .feed(format!("\r\n[rulink] 会话结束: {}\r\n", error_summary(error)).into_bytes());
+                .feed(format!("\r\n[ruterm] 会话结束: {}\r\n", error_summary(error)).into_bytes());
         }
         // 无论成功失败都以"远端退出"收场，UI 表现与本地 shell 退出一致。
         closing_feed.end_session();
@@ -290,7 +323,7 @@ async fn run(
     target: SshTarget,
     feed: FeedHandle,
     ui_rx: mpsc::UnboundedReceiver<PtyBoundMessage>,
-    info_tx: oneshot::Sender<RemoteInfo>,
+    info_tx: mpsc::UnboundedSender<RemoteInfo>,
     started: Arc<AtomicBool>,
     vault: Option<Arc<crate::vault::Vault>>,
     mut disconnect: oneshot::Receiver<()>,
@@ -301,6 +334,10 @@ async fn run(
 ) -> Result<()> {
     // 远程转发的通道由 Handler 接住后递到这里：会话循环统一拨本机目标并搬运字节。
     let (forwarded_tx, mut forwarded_rx) = mpsc::unbounded_channel::<ForwardedTcpip>();
+    // lrzsz 上传的接管点与原始上行通道：接管期间终端输出改投 ZMODEM 状态机，
+    // 原始上行绕过终端 IO 直接写通道（`rz` 命令与协议帧都不能经过行编辑）。
+    let zmodem_sink = crate::ssh::zmodem_sink();
+    let (raw_tx, raw_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     // 建连 → 认证 → 开 shell 整体限时：服务器不响应时应明确报超时，
     // 而不是让标签永远停在"正在连接"（拖住自动重连的退避节奏）。
     let setup = async {
@@ -319,7 +356,7 @@ async fn run(
                 .chain(std::iter::once(target.addr()))
                 .collect::<Vec<_>>()
                 .join(" → ");
-            feed.feed(format!("\r\n[rulink] 经跳板机连接：{path}\r\n").into_bytes());
+            feed.feed(format!("\r\n[ruterm] 经跳板机连接：{path}\r\n").into_bytes());
         }
         // 跳板机自己的通道结束 / forwarded 信号与主会话无关：接收端马上丢弃，
         // 发送失败由 `let _ =` 吞掉。
@@ -342,6 +379,11 @@ async fn run(
                 vault.clone(),
                 if is_target { ended_tx.clone() } else { jump_ended_tx.clone() },
                 if is_target { forwarded_tx.clone() } else { jump_forwarded_tx.clone() },
+                if is_target {
+                    Some(zmodem_sink.clone())
+                } else {
+                    None
+                },
             );
             let hop = if index == 0 {
                 String::new()
@@ -412,7 +454,7 @@ async fn run(
         };
 
     // 上行转发先落地：探测通道握手即使被慢服务器拖住，也不能延迟按键转发。
-    tokio::spawn(forward_uplink(channel, ui_rx));
+    tokio::spawn(forward_uplink(channel, ui_rx, raw_rx));
 
     probe_remote_info(&handle, side.clone(), info_tx).await;
 
@@ -426,6 +468,9 @@ async fn run(
     let mut local_forwards: HashMap<u16, ActiveForward> = HashMap::new();
     let mut remote_forwards: HashMap<u16, ActiveForward> = HashMap::new();
     let mut dynamic_forwards: HashMap<u16, ActiveForward> = HashMap::new();
+    // 文件面板专用 SFTP：浏览 / 新建 / 重命名 / 删除共用一条子系统通道，
+    // 不随每次点击重开（否则每次目录操作都要多一轮握手）。
+    let mut fs_sftp: Option<Arc<SftpSession>> = None;
     let (accepted_tx, mut accepted_rx) = mpsc::unbounded_channel::<AcceptedForward>();
     let mut health = tokio::time::interval(Duration::from_secs(1));
     loop {
@@ -473,6 +518,97 @@ async fn run(
                                 let _ = task.reply.send(Err(error));
                             }
                         }
+                    }
+                    SessionCommand::FsList { path, reply } => {
+                        let result = async {
+                            let sftp = cached_sftp(&handle, &side, &mut fs_sftp).await?;
+                            crate::remote_fs::list(&sftp, path.as_deref()).await
+                        }
+                        .await;
+                        // 失败后丢掉缓存：下次点击重开子系统，避免抱着坏通道反复报错。
+                        if result.is_err() {
+                            fs_sftp = None;
+                        }
+                        let _ = reply.send(result);
+                    }
+                    SessionCommand::FsMkdir { dir, name, reply } => {
+                        let result = async {
+                            let sftp = cached_sftp(&handle, &side, &mut fs_sftp).await?;
+                            crate::remote_fs::mkdir(&sftp, &dir, &name).await
+                        }
+                        .await;
+                        if result.is_err() {
+                            fs_sftp = None;
+                        }
+                        let _ = reply.send(result);
+                    }
+                    SessionCommand::FsRename {
+                        dir,
+                        from,
+                        to,
+                        reply,
+                    } => {
+                        let result = async {
+                            let sftp = cached_sftp(&handle, &side, &mut fs_sftp).await?;
+                            crate::remote_fs::rename(&sftp, &dir, &from, &to).await
+                        }
+                        .await;
+                        if result.is_err() {
+                            fs_sftp = None;
+                        }
+                        let _ = reply.send(result);
+                    }
+                    SessionCommand::FsDelete { path, reply } => {
+                        let result = async {
+                            let sftp = cached_sftp(&handle, &side, &mut fs_sftp).await?;
+                            crate::remote_fs::delete(&sftp, &path).await
+                        }
+                        .await;
+                        if result.is_err() {
+                            fs_sftp = None;
+                        }
+                        let _ = reply.send(result);
+                    }
+                    SessionCommand::ZmodemUpload {
+                        local,
+                        name,
+                        progress,
+                        reply,
+                    } => {
+                        // 下行接管与 `rz` 命令必须在同一个任务里成对安装 / 摘除，
+                        // 否则 shell 提示符会被 ZMODEM 状态机吃掉。
+                        let (down_tx, mut down_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+                        *zmodem_sink
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(down_tx);
+                        let sink = zmodem_sink.clone();
+                        let raw = raw_tx.clone();
+                        let feed = feed.clone();
+                        tokio::spawn(async move {
+                            let result = async {
+                                raw.send(b"rz -y\r".to_vec())
+                                    .map_err(|_| anyhow::anyhow!("会话上行通道已关闭"))?;
+                                crate::zmodem::send_file(
+                                    &local, &name, &mut down_rx, &raw, &progress,
+                                )
+                                .await
+                            }
+                            .await;
+                            // 先恢复终端输出，再回执：UI 收到结果即可继续输入。
+                            *sink
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                            if result.is_err() {
+                                // 远端可能停在 rz 的交互里：发 Ctrl+C 回到 shell。
+                                let _ = raw.send(vec![0x03]);
+                            }
+                            // 协议结束后 shell 的提示符可能已经排进接管通道：
+                            // 恢复终端后补投，避免用户以为会话卡住。
+                            while let Ok(bytes) = down_rx.try_recv() {
+                                feed.feed(bytes);
+                            }
+                            let _ = reply.send(result);
+                        });
                     }
                     SessionCommand::ForwardStart { rule, reply } => {
                         let result = match rule.kind {
@@ -1000,7 +1136,7 @@ async fn open_sftp(
             .request_subsystem(true, "sftp")
             .await
             .context("服务器未启用 SFTP 子系统")?;
-        SftpSession::new(channel.into_stream())
+        SftpSession::new_with_config(channel.into_stream(), transfer::client_config())
             .await
             .context("SFTP 会话初始化失败")
     };
@@ -1009,14 +1145,28 @@ async fn open_sftp(
         .map_err(|_| anyhow::anyhow!("SFTP 通道超时（服务器未响应）"))?
 }
 
-/// 另开一条 exec 通道采集远程主机基本信息，结果异步回传状态栏。
+/// 取文件面板的 SFTP 会话；首次访问时打开并缓存。
+async fn cached_sftp(
+    handle: &Handle<SshTerminalHandler>,
+    side: &SideChannels,
+    cache: &mut Option<Arc<SftpSession>>,
+) -> Result<Arc<SftpSession>> {
+    if let Some(sftp) = cache.as_ref() {
+        return Ok(sftp.clone());
+    }
+    let sftp = Arc::new(open_sftp(handle, side).await?);
+    *cache = Some(sftp.clone());
+    Ok(sftp)
+}
+
+/// 另开一条 exec 通道采集远程主机基本信息，连接期间周期回传状态栏需要刷新的指标。
 ///
-/// 探测失败（远端禁用 exec、通道打不开、命令超时无输出）只记日志，
-/// 不影响已建立的交互会话。
+/// 单条通道里循环执行探测脚本（每次输出以 `end` 行收尾），避免每隔几秒新建通道；
+/// 探测失败（远端禁用 exec、通道打不开、首次输出超时）只记日志，不影响交互会话。
 async fn probe_remote_info(
     handle: &Handle<SshTerminalHandler>,
     side: SideChannels,
-    info_tx: oneshot::Sender<RemoteInfo>,
+    info_tx: mpsc::UnboundedSender<RemoteInfo>,
 ) {
     let Ok(probe) = handle.channel_open_session().await else {
         log::debug!("无法开启远程信息探测通道");
@@ -1024,62 +1174,99 @@ async fn probe_remote_info(
     };
     side.add(probe.id());
     let (mut read, write) = probe.split();
-    if write
-        .exec(false, PROBE_CMD.as_bytes().to_vec())
-        .await
-        .is_err()
-    {
+    let command = format!(
+        "while :; do {PROBE_CMD}; printf 'end\\n'; sleep {}; done",
+        PROBE_INTERVAL.as_secs()
+    );
+    if write.exec(false, command.into_bytes()).await.is_err() {
         log::debug!("远程信息探测命令下发失败");
         return;
     }
 
     tokio::spawn(async move {
-        let collected = tokio::time::timeout(PROBE_TIMEOUT, async {
-            let mut buf = Vec::new();
-            while let Some(msg) = read.wait().await {
-                match msg {
-                    ChannelMsg::Data { data } | ChannelMsg::ExtendedData { data, .. } => {
-                        buf.extend_from_slice(&data);
+        let mut pending: Vec<u8> = Vec::new();
+        let mut block: Vec<u8> = Vec::new();
+        let mut first = true;
+        loop {
+            // 只给首块限时：连上后远端明明能跑脚本却一直没输出，才当作探测不可用。
+            let msg = if first {
+                match tokio::time::timeout(PROBE_TIMEOUT, read.wait()).await {
+                    Ok(msg) => msg,
+                    Err(_) => {
+                        log::debug!("远程信息探测超时，跳过状态栏展示");
+                        break;
                     }
-                    ChannelMsg::Eof | ChannelMsg::Close => break,
-                    _ => {}
                 }
-            }
-            String::from_utf8_lossy(&buf).into_owned()
-        })
-        .await;
-        let _ = write.close().await;
-
-        match collected {
-            Ok(raw) => {
-                let info = RemoteInfo::parse(&raw);
-                if !info.is_empty() {
-                    let _ = info_tx.send(info);
+            } else {
+                read.wait().await
+            };
+            let Some(msg) = msg else { break };
+            match msg {
+                ChannelMsg::Data { data } | ChannelMsg::ExtendedData { data, .. } => {
+                    pending.extend_from_slice(&data);
+                    let mut start = 0;
+                    while let Some(offset) = pending[start..].iter().position(|&b| b == b'\n') {
+                        let line = &pending[start..start + offset];
+                        start += offset + 1;
+                        if String::from_utf8_lossy(line).trim() == "end" {
+                            if !block.is_empty() {
+                                let info = RemoteInfo::parse(&String::from_utf8_lossy(&block));
+                                block.clear();
+                                if info.is_empty() || info_tx.send(info).is_err() {
+                                    // UI 已不再需要（标签关闭）或远端什么都没给：停止轮询。
+                                    let _ = write.close().await;
+                                    return;
+                                }
+                                first = false;
+                            }
+                        } else {
+                            block.extend_from_slice(line);
+                            block.push(b'\n');
+                        }
+                    }
+                    pending.drain(..start);
                 }
+                ChannelMsg::Eof | ChannelMsg::Close => break,
+                _ => {}
             }
-            Err(_) => log::debug!("远程信息探测超时，跳过状态栏展示"),
         }
+        let _ = write.close().await;
     });
 }
 
-/// 终端 → 远端：按键字节写通道，尺寸变化发 window_change。
+/// 终端 → 远端：按键字节写通道，尺寸变化发 window_change；
+/// 另有原始字节通道给 lrzsz 上传直接写协议帧。
 async fn forward_uplink(
     channel: SessionChannel,
     mut ui_rx: mpsc::UnboundedReceiver<PtyBoundMessage>,
+    mut raw_rx: mpsc::UnboundedReceiver<Vec<u8>>,
 ) {
-    while let Some(message) = ui_rx.recv().await {
-        let sent = match message {
-            PtyBoundMessage::Input(bytes) => channel.data_bytes(Bytes::from(bytes)).await,
-            PtyBoundMessage::Resize(size) => {
-                channel
-                    .window_change(
-                        u32::from(size.num_cols),
-                        u32::from(size.num_lines),
-                        u32::from(size.cell_width) * u32::from(size.num_cols),
-                        u32::from(size.cell_height) * u32::from(size.num_lines),
-                    )
-                    .await
+    loop {
+        let sent = tokio::select! {
+            maybe = ui_rx.recv() => {
+                let Some(message) = maybe else {
+                    return;
+                };
+                match message {
+                    PtyBoundMessage::Input(bytes) => {
+                        channel.data_bytes(Bytes::from(bytes)).await
+                    }
+                    PtyBoundMessage::Resize(size) => {
+                        channel
+                            .window_change(
+                                u32::from(size.num_cols),
+                                u32::from(size.num_lines),
+                                u32::from(size.cell_width) * u32::from(size.num_cols),
+                                u32::from(size.cell_height) * u32::from(size.num_lines),
+                            )
+                            .await
+                    }
+                }
             }
+            Some(bytes) = raw_rx.recv() => {
+                channel.data_bytes(Bytes::from(bytes)).await
+            }
+            else => return,
         };
         if sent.is_err() {
             log::debug!("上行通道已失效，结束转发");

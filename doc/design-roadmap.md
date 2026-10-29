@@ -1,8 +1,8 @@
-# RuLink 设计目标与开发路线图
+# RuTerm 设计目标与开发路线图
 
-> 本文件是 RuLink 的功能设计总纲：**列出目标 → 完成一项勾选一项**。
+> 本文件是 RuTerm 的功能设计总纲：**列出目标 → 完成一项勾选一项**。
 > 勾选图例：`[x]` 已完成 · `[~]` 进行中/部分完成 · `[ ]` 待办。
-> 品牌定位与分阶段愿景见同目录 `rulink.txt`。
+> 品牌定位与分阶段愿景见同目录 `ruterm.txt`。
 
 ## 一、当前进度快照
 
@@ -20,9 +20,9 @@
 | 侧边栏主机列表 | `[x]` | 分组（文件夹）树：折叠三角 + 文件夹/认证方式图标 + 组名 + 数量，★ 收藏置顶；**组内可手动排序**（右键上移/下移/移到最前）；组与归属、折叠态、排序存加密库 `settings` 表 `sidebar` 键（JSON，不动 `hosts` 表结构）。新建/编辑/删除/移动/分组管理全部收进右键菜单，顶部不再放常驻大按钮；支持从 `~/.ssh/config` 一键导入（见 §二.7）。 |
 | CLI 快速连接 | `[x]` | 带参数一次性连接；密码仅走环境变量 / GUI 临时输入 |
 | 主题 | `[x]` | 明 / 暗切换（配色走 `cx.theme()` 语义色，与按钮/状态栏统一），标题栏「外观」菜单（当前项打勾）+ `Ctrl+T`，选择持久化到加密库 `settings` 表 |
-| 底部状态栏 | `[x]` | 已实现并验证渲染（左"就绪"/地址/认证/远程信息，右"会话 N"）；远程基本信息经 exec 探测通道填充，显示哪些条目可在「状态栏」分页勾选 |
-| 凭据持久化 | `[x]` | 主机配置、应用设置、known_hosts 三类数据合并入**单个加密文件** `rulink.db`（toasty 0.11 ORM + turso 0.7 AEGIS-256 页级加密，`hosts.password` 列再叠 **AES-256-GCM 字段加密**），全局模式位于 `~/.rulink/`、便携模式位于 exe 旁 `data/`；解锁两档并存：默认 keyring 随机 32 字节主密钥（零输入），或用户**主密码**（argon2id 派生，可带往他机解锁）。库不可用时降级旧 `sessions.json` 且禁用密码保存，见 §四 |
-| 便携 / 全局双模式 | `[x]` | 启动时只探测不创建：exe 同目录存在 `data/` → 便携模式（数据随 exe 走），否则全局模式 `~/.rulink`；主密码为可选项（设置 / 更换 / 取消均在设置里），见 §四 |
+| 底部状态栏 | `[x]` | 已实现并验证渲染（左"就绪"/地址/认证/远程信息，右"会话 N"）；连接成功后状态切到「已连接 地址」，远程基本信息经 exec 探测通道**每 5 秒刷新**，显示哪些条目可在「状态栏」分页勾选 |
+| 凭据持久化 | `[x]` | 主机配置、应用设置、known_hosts 三类数据合并入**单个加密文件** `ruterm.db`（toasty 0.11 ORM + turso 0.7 AEGIS-256 页级加密，`hosts.password` 列再叠 **AES-256-GCM 字段加密**），全局模式位于 `~/.ruterm/`、便携模式位于 exe 旁 `data/`；解锁两档并存：默认 keyring 随机 32 字节主密钥（零输入），或用户**主密码**（argon2id 派生，可带往他机解锁）。库不可用时降级旧 `sessions.json` 且禁用密码保存，见 §四 |
+| 便携 / 全局双模式 | `[x]` | 启动时只探测不创建：exe 同目录存在 `data/` → 便携模式（数据随 exe 走），否则全局模式 `~/.ruterm`；主密码为可选项（设置 / 更换 / 取消均在设置里），见 §四 |
 | 自定义标题栏 | `[x]` | 应用自绘顶栏：品牌标识 + 「会话 / 凭据 / 外观 / 帮助」多级菜单（有快捷键的项右侧自动显示按键徽标）+ 右侧「⇅ 传输」「⇆ 转发 N」与口令档的 🔑/🔒 + 系统窗口控件；设置 / 侧栏折叠的常驻按钮已撤掉（走菜单与快捷键）；拖拽与窗口控制走 `WindowControlArea` 命中区，交互控件排在 Drag 区之外 |
 | 设置界面 | `[x]` | 「会话 → 设置…」/「外观」菜单各分页入口打开设置弹窗（固定 640×470，切分页尺寸不变），**左侧竖排分页导航**（凭据库与主密码 / 外观 / 状态栏 / 终端 / 会话）+ 右侧定高滚动内容区，新设置项继续追加分页 |
 | 品牌图标 | `[x]` | 从展示板切分 6 图标变体 + logo + 多尺寸 `.ico`；`build.rs`+winresource 嵌入 exe（任务栏/标题栏） |
@@ -49,10 +49,15 @@
 
 ### 1. 状态栏增强
 - `[x]` 底部常驻状态栏：整体状态 + 活动会话地址 / 认证方式 + 会话计数。
+  连接成功后整体状态从「正在连接 地址…」切到「已连接 地址」（只在文案没被别的提示覆盖时替换）。
 - `[x]` 连接后展示**远程服务器基本信息**：主机名、操作系统及版本、内存使用、磁盘空间、uptime。
   - 实现：`src/remote.rs`（探测脚本 + `RemoteInfo` 解析/摘要，含单测）、`src/session.rs`
-    （shell 启动后另开一条 **exec 通道**一次性跑探测脚本，8s 超时，摘要经 `oneshot` 回传写入
+    （shell 启动后另开一条 **exec 通道**常驻跑 `while :; do <探测脚本>; printf 'end\n'; sleep 5; done`，
+    8s 首块超时，客户端按 `end` 行切块解析，摘要经 `mpsc` 流式回传给 UI 写入
     `SessionTab.remote_info`）、`src/ssh.rs`（`SideChannels` 旁路通道集合）。
+  - 刷新周期 `PROBE_INTERVAL = 5s`：只探一次会让负载 / 内存 / 磁盘永远显示连接那一刻的值
+    （已实测：本地按 3× `yes` 压 CPU，状态栏负载从 0.03 涨到 1.24，`pkill yes` 后回落）。
+    流中断或探测失败即停止刷新，已显示的条目保持最后一次的值。
   - 关键坑：russh 会把客户端自开通道（exec）的字节**同时**投递给 `Channel` 接收端与
     `Handler::data/extended_data/channel_close/exit_status`，不过滤就会把探测输出灌进终端、
     并在探测通道关闭时误判"远端退出"结束整个会话；故非 PTY 通道一律登记进 `SideChannels` 跳过。
@@ -104,6 +109,7 @@
       子项是探测到的每个本机 shell（PowerShell 7 / Windows PowerShell / Git Bash / 命令提示符 / WSL），
       每项左边是该 exe 的**系统默认图标**，点一下直接开对应终端标签。
       它不入凭据库，故不参与分组/收藏/删除；搜索按「本地终端」与各 shell 名匹配，命中即展开只留有命中的子项。
+      折叠态存进 `sidebar` 键的 `local_collapsed` 字段，收起来后重启仍是收起的。
       右键菜单：一键扫描本机 shell… / 新建主机… / 新建分组…；「会话」菜单 → 本地终端（`Ctrl+Shift+T`）开列表第一项。
 - `[x]` **新建入口收敛**：侧边栏顶部常驻的「+ 新建主机」大按钮已去掉，顶部空间整块留给列表；
       新建走**主机行 / 分组行 / 列表空白处**右键菜单，或标题栏「会话」菜单「新建主机…」（`Ctrl+N`）。
@@ -151,7 +157,7 @@
       「外观」（暗色 / 亮色打勾单选 + 切换明暗主题 `Ctrl+T` · 外观设置 · 状态栏显示项 · 终端外观分页入口）·
       「帮助」（只留版本号）。
       菜单用 `Button::dropdown_menu` + `PopupMenu`，构建器是 `Fn`，实体句柄需在闭包内重新 `clone` 再交给各项 `on_click`。
-- `[x]` **快捷键随菜单项原生显示**：带键的命令声明为 action（`actions!(rulink, [ToggleSidebar, ToggleTheme, NewHost, NewLocalTerminal, OpenSettings, OpenTransfer, OpenForward, NextTab, PrevTab])`），
+- `[x]` **快捷键随菜单项原生显示**：带键的命令声明为 action（`actions!(ruterm, [ToggleSidebar, ToggleTheme, NewHost, NewLocalTerminal, OpenSettings, OpenTransfer, OpenForward, NextTab, PrevTab])`），
       `main()` 里 `cx.bind_keys` 绑定 `Ctrl+B` / `Ctrl+T` / `Ctrl+N` / `Ctrl+Shift+T` / `Ctrl+,` /
       `Ctrl+Shift+U` / `Ctrl+Shift+F` / `Ctrl+Tab` / `Ctrl+Shift+Tab`，根元素用 `.on_action(cx.listener(...))` 接收；
       菜单项改挂 `.action(Box::new(X))`，rgpui 的 `PopupMenu::render_key_binding` 会按该 action 的键绑定
@@ -225,6 +231,8 @@
       Future 消费）；`transfer.rs` 负责 64 KiB 分块搬运、~10 次/秒进度节流、`~` 展开与「上传到目录
       自动补文件名」，下载失败删除残缺本地文件；SFTP 通道 id 登记进 `SideChannels`，字节与控制消息
       不会被灌进终端。弹窗显示字节进度条与百分比，错误同时写弹窗与状态栏；关标签时弹窗一起关闭。
+      `client_config()` 把在途写入提到 32 个 × 64 KiB 分片（读取并发 8），吃满 OpenSSH 默认 2 MiB
+      通道窗口；单请求超时 120 秒，超时报错点名该请求，不再退化成含糊的「传输失败」。
       余量：目录浏览 / 递归传输、断点续传、传输队列与速度限制。
 - `[x]` **端口转发（-L / -R / -D，规则可保存）**：标题栏「⇆ 转发」按钮（也可走「会话」菜单 / `Ctrl+Shift+F`）打开弹窗。
       WindTerm 式的「先保存、再开关」：弹窗默认只列「已保存的转发」，点底部「设置…」才展开新增 / 编辑表单
@@ -278,13 +286,13 @@
 - `[x]` 托盘菜单动态列出当前活动会话，点击可跳转到对应标签：`sync_tray` 在标签新增 / 关闭 / 切换时重建菜单，
       条目形如 `● user@host`（活动）/ `○ user@host`（其它），id 为 `tab:<id>`；点击后先 `activate_window()`
       再 `activate_tab()`，窗口隐藏时也能一步回到目标会话。
-- `[x]` 托盘图标 tooltip 反映会话数：无会话时为 `RuLink 拾连`，有会话时 `RuLink 拾连 · N 个会话`。
+- `[x]` 托盘图标 tooltip 反映会话数：无会话时为 `RuTerm 拾连`，有会话时 `RuTerm 拾连 · N 个会话`。
 
 ---
 
 ## 三、架构基座复用（来自 rgpui）
 
-RuLink 不自造 UI 轮子，优先复用 rgpui 现成子系统：
+RuTerm 不自造 UI 轮子，优先复用 rgpui 现成子系统：
 
 | 需求 | 复用组件 |
 |------|----------|
@@ -303,7 +311,7 @@ RuLink 不自造 UI 轮子，优先复用 rgpui 现成子系统：
 | 国际化 | `i18n::I18nManager` |
 | 命令注册 / 快捷键 | `actions!` 声明动作 + `cx.bind_keys`（App 级 `KeyBinding`）+ 根元素 `.on_action(cx.listener(...))`；`commands::CommandRegistry`、`key_context` 备用。局部覆盖用 `KeyBinding::new("tab", NoAction {}, Some("Terminal"))`：`Keymap::bindings_for_input` 按上下文深度降序解析，遇到 `NoAction` 即 `break`，可截掉框架在 `Root` 上下文里对同一按键的绑定（终端 Tab 补全即此法恢复） |
 | 标签栏配色 | 主题语义色 `tab_bar` / `tab_active` / `tab_active_foreground` / `tab_foreground`（明暗两套自带区分），活动标签顶部叠 2px `primary` 强调线（不再整圈描边）；不硬编码颜色 |
-| 主机行 / 分组行 / 空白处右键菜单 | `menu::context_menu::{ContextMenuExt::context_menu, PopupMenu, PopupMenuItem}`：包装器把元素转 `relative` 并在 `deferred(anchored().snap_to_window_with_margin(8px).with_priority(1))` 的**独立图层**渲染菜单。手搭 `absolute` 浮层不可行——它留在普通图层，被后画兄弟节点压住 hitbox，菜单项只吃得到 hover 吃不到 mouse-up。`context_menu` 要求元素同时是 `InteractiveElement + ParentElement + Styled`，ElementId 由内层 `.id()` 派生；包装器的 hitbox 注册在子节点**之后**，故两层菜单不能嵌套（一次右键弹两个），空白区菜单须作行的兄弟节点。`PopupMenuItem::on_click` 的闭包要求 `Send + Sync`，捕获 `Entity<T>` 后 `entity.update(cx, ..)` 即可拿到 `&mut RuLinkApp`（`Entity` 恒 `Send + Sync`，内部是 `PhantomData<fn(T)->T>`） |
+| 主机行 / 分组行 / 空白处右键菜单 | `menu::context_menu::{ContextMenuExt::context_menu, PopupMenu, PopupMenuItem}`：包装器把元素转 `relative` 并在 `deferred(anchored().snap_to_window_with_margin(8px).with_priority(1))` 的**独立图层**渲染菜单。手搭 `absolute` 浮层不可行——它留在普通图层，被后画兄弟节点压住 hitbox，菜单项只吃得到 hover 吃不到 mouse-up。`context_menu` 要求元素同时是 `InteractiveElement + ParentElement + Styled`，ElementId 由内层 `.id()` 派生；包装器的 hitbox 注册在子节点**之后**，故两层菜单不能嵌套（一次右键弹两个），空白区菜单须作行的兄弟节点。`PopupMenuItem::on_click` 的闭包要求 `Send + Sync`，捕获 `Entity<T>` 后 `entity.update(cx, ..)` 即可拿到 `&mut RuTermApp`（`Entity` 恒 `Send + Sync`，内部是 `PhantomData<fn(T)->T>`） |
 | 布局约束范式 | `examples/showcase/src/bin/app_suite.rs`（flex_grow + min_h(0) 有界布局范式，状态栏布局修复即据此） |
 | exe 的系统默认图标 | 无现成组件：`SHGetFileInfoW(SHGFI_ICON \| SHGFI_LARGEICON)` 取 `HICON` → `GetIconInfo` + `CreateDIBSection`（32bpp 顶向下）+ `DrawIconEx(DI_NORMAL)` → BGRA 转 RGBA（`alpha == 0` 的 RGB 归零）→ `png::Encoder` → `rgpui::Image::from_bytes(ImageFormat::Png, ..)`。`windows 0.62`（`Win32_UI_Shell` / `Win32_Storage_FileSystem` / `Win32_Graphics_Gdi` / `Win32_UI_WindowsAndMessaging`）+ `png 0.18`，无新增大件。另注：`extract_icon` 在 rsproxy 镜像上不可得，故手写 |
 | 后台阻塞任务（扫描 shell） | **不能用 `tokio::task::spawn_blocking`**：rgpui 的 `cx.spawn` 跑在它自己的执行器上，没有 tokio reactor，直接 panic「there is no reactor running」。正确写法是先 `let runtime = rgpui::tokio::Tokio::handle(cx);` 拿到 `tokio::runtime::Handle`，再 `runtime.spawn_blocking(f).await` |
@@ -314,15 +322,15 @@ RuLink 不自造 UI 轮子，优先复用 rgpui 现成子系统：
 
 ### 目标
 - `[x]` 主机配置、用户名、私钥路径、（可选）密码迁入**结构化存储**：**toasty 0.11 ORM**
-      （声明式 `#[derive(Model)]`）+ 底层 turso 0.7 页级加密，单文件 `rulink.db`；
+      （声明式 `#[derive(Model)]`）+ 底层 turso 0.7 页级加密，单文件 `ruterm.db`；
       表 `hosts(id, name, host, port, user, auth, key_path, favorite, password)`、
       `settings(name, value)`、`known_hosts(host_port, fingerprint, algorithm)`。
       分组、备注、备份恢复为后续增量。
 - `[x]` **一个文件装下所有本地数据**：`settings.json`（主题等）与 `known_hosts` 文本文件
-      全部并入同一加密库；`.rulink` 目录不再有第三个业务文件。
+      全部并入同一加密库；`.ruterm` 目录不再有第三个业务文件。
 - `[x]` **便携 / 全局双模式**（`src/paths.rs`）：启动时 `StorageMode::detect()` 只看 exe 同目录
       `data/` 是否存在（**只探测不创建**，绝不往别人机器的工作目录落文件）→ 存在即便携模式
-      （数据全在 `data/rulink.db`，随 exe 拷贝）；否则全局模式（`~/.rulink/rulink.db`）。
+      （数据全在 `data/ruterm.db`，随 exe 拷贝）；否则全局模式（`~/.ruterm/ruterm.db`）。
 - `[x]` **解锁两档并存**：
       - *keyring 档*（默认）：`getrandom` 生成 32 字节主密钥存系统凭据管理器，
         启动零输入、开箱即用（全局与便携皆同，便携状态下状态栏提示"建议设置主密码"但不拦路）。
@@ -331,11 +339,11 @@ RuLink 不自造 UI 轮子，优先复用 rgpui 现成子系统：
         口令档下每次启动输入口令解锁，库文件可凭同一口令带往其他机器。已设主密码时标题栏出现
         🔒，一键锁定凭据库（丢弃库句柄与内存密钥，回到解锁弹窗）。
       - *换密钥*：turso 无 rekey 能力，故实现为**新建加密库全量搬迁**——内存导出
-        → 以新密钥打开暂存库 `rulink.db.new` → 导入 → 旧库改名 `rulink.db.keyring-bak`
+        → 以新密钥打开暂存库 `ruterm.db.new` → 导入 → 旧库改名 `ruterm.db.keyring-bak`
         （占用则带时间戳）→ 换名上岗 → 写盐与 `unlock.txt` 后端标记 → 重开句柄校验主机数，
         确认数据完整才清理备份；任一步失败则旧库原样放回、盐还原。
 - `[x]` **密码列二次加密（字段级）**：`hosts.password` 不再直接依赖页级加密，入库前用
-      **AES-256-GCM**（`aes-gcm`）逐字段密封，字段密钥 = `SHA-256(主密钥 ‖ "rulink-field-key-v1")`
+      **AES-256-GCM**（`aes-gcm`）逐字段密封，字段密钥 = `SHA-256(主密钥 ‖ "ruterm-field-key-v1")`
       域分离派生，密文格式 `base64(nonce12 ‖ 密文 ‖ tag16)`，每次写入随机 nonce（同一口令两次密文不同）。
       读取时密钥不符 / 标签校验失败一律报错，**绝不降级返回原样**；导出转储同样只输出明文之外的密文。
       好处：库文件即便被离线复制，攻击者仍需同时破解页级 AEGIS 与字段级 GCM 才拿得到口令。
@@ -365,7 +373,7 @@ RuLink 不自造 UI 轮子，优先复用 rgpui 现成子系统：
       不含 PEM 明文标记）；主密钥只在内存与
       系统凭据管理器 / 弹窗输入之间流动，从不写入文件、从不作为命令行参数传递。
 - `[x]` keyring 档：主密钥经 **keyring** 对接操作系统凭据库（Windows Credential Manager，
-      `service=rulink / account=vault-key`），库文件与密钥分离，单独拷贝 `rulink.db` 无法解密；
+      `service=ruterm / account=vault-key`），库文件与密钥分离，单独拷贝 `ruterm.db` 无法解密；
       条目内容非法时**拒绝自动覆盖**，以防旧库被锁死。
 - `[x]` 主密码档：argon2id 派生，强度**取决于口令本身**；一旦忘记主密码，数据**不可恢复**
       （Argon2 无任何后门）——解锁弹窗与 README 均已明示。便携库可带往其他机器，
@@ -392,7 +400,7 @@ RuLink 不自造 UI 轮子，优先复用 rgpui 现成子系统：
 
 ## 五、本地终端（系统 Shell 会话）
 
-> RuLink 目前是纯 SSH 客户端。目标是同时成为**本地 + 远程统一终端**：
+> RuTerm 目前是纯 SSH 客户端。目标是同时成为**本地 + 远程统一终端**：
 > 一个应用里既能开 SSH 会话，也能开本机 shell 标签。
 > 基座已具备：`rgpui-term` 除外接 IO 后端（`TerminalBuilder::new_external`）外，
 > 还有本地 PTY 后端 `TerminalBuilder::new(working_directory, shell, env, max_scroll_history_lines, window_id, cx)`，
@@ -488,7 +496,7 @@ RuLink 不自造 UI 轮子，优先复用 rgpui 现成子系统：
    条目多寡在设置「状态栏」分页勾选，见 §二.1）。
 2. ~~侧边栏折叠 + 主题切换~~（已完成：`Ctrl+B` 折叠、`Ctrl+T` / 标题栏「外观」菜单明暗切换）。
 3. ~~凭据 SQLite + keyring（安全核心，尽早定型，越晚迁移成本越高）~~（已完成：toasty ORM 单文件加密库
-   `rulink.db`（hosts/settings/known_hosts 三表）+ keyring 或 argon2 主密码双档解锁 + 便携/全局双模式
+   `ruterm.db`（hosts/settings/known_hosts 三表）+ keyring 或 argon2 主密码双档解锁 + 便携/全局双模式
    + 旧文件一次性迁移，见 §四；分组偏好亦已入 `settings` 表 `sidebar` 键（见 §二.2）；余量：备注、导入导出界面、备份恢复）。
 4. ~~自定义标题栏~~（已完成：自绘顶栏 + 多级菜单（快捷键徽标）+ 窗口控件，见 §二.5；会话标签经用户确认
    保留在主区标签栏）+ ~~分屏~~（已完成：窗口级两标签 `SplitPane` 左右/上下分屏、点击切焦点、可拖分隔条，

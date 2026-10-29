@@ -1,4 +1,4 @@
-//! 主机账号管理：本地持久化的会话列表（~/.rulink/sessions.json）。
+//! 主机账号管理：本地持久化的会话列表（~/.ruterm/sessions.json）。
 //!
 //! 凭据策略：密码不入库，连接时临时输入；私钥只存路径。
 
@@ -121,7 +121,7 @@ pub struct SessionStore {
 }
 
 impl SessionStore {
-    /// 按存储模式构造旧 JSON 仓库（便携=data/，全局=~/.rulink；降级路径保留）。
+    /// 按存储模式构造旧 JSON 仓库（便携=data/，全局=~/.ruterm；降级路径保留）。
     pub fn new(mode: &crate::paths::StorageMode) -> Self {
         let dir = mode.dir();
         Self {

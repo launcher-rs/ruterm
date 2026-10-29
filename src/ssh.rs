@@ -1,5 +1,5 @@
 //! SSH 引擎：russh 客户端事件处理与主机指纹校验（TOFU，正常记录存加密库
-//! known_hosts 表；降级模式回退 `~/.rulink/known_hosts` 文件）。
+//! known_hosts 表；降级模式回退 `~/.ruterm/known_hosts` 文件）。
 //!
 //! 本模块只认识"字节"，不认识终端 UI：下行字节全部灌入
 //! [`rgpui_term::FeedHandle`]，会话终止信号（EOF/关闭/退出码）折算成
@@ -49,6 +49,17 @@ impl SideChannels {
     }
 }
 
+/// ZMODEM（lrzsz）拖拽上传期间的下行接管点。
+///
+/// 安装时终端通道的输出不再喂给终端视图，而是转交上传任务（`rz` 的
+/// ZRINIT/ZDATA 应答都在这条流里）；上传结束必须置回 None 恢复终端。
+pub type ZmodemSink = Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>>>;
+
+/// 新建一个未安装的接管点。
+pub fn zmodem_sink() -> ZmodemSink {
+    Arc::new(Mutex::new(None))
+}
+
 /// 降级模式（无加密库）使用的旧 known_hosts 文件路径。
 pub fn legacy_known_hosts_path() -> PathBuf {
     StorageMode::detect().legacy_path(crate::paths::LEGACY_KNOWN_HOSTS_FILE)
@@ -88,6 +99,8 @@ pub struct SshTerminalHandler {
     ended: tokio::sync::mpsc::UnboundedSender<()>,
     /// 远程转发通道交给会话任务统一接本地目标（Handler 里不放业务状态）。
     forwarded: tokio::sync::mpsc::UnboundedSender<ForwardedTcpip>,
+    /// 安装后终端通道的下行字节转交 lrzsz 上传任务（见 [`ZmodemSink`]）。
+    zmodem: Option<ZmodemSink>,
 }
 
 impl SshTerminalHandler {
@@ -100,6 +113,7 @@ impl SshTerminalHandler {
         vault: Option<Arc<Vault>>,
         ended: tokio::sync::mpsc::UnboundedSender<()>,
         forwarded: tokio::sync::mpsc::UnboundedSender<ForwardedTcpip>,
+        zmodem: Option<ZmodemSink>,
     ) -> Self {
         Self {
             feed,
@@ -109,6 +123,7 @@ impl SshTerminalHandler {
             vault,
             ended,
             forwarded,
+            zmodem,
         }
     }
 
@@ -136,7 +151,7 @@ impl SshTerminalHandler {
 
         if has_entry_for_host {
             eprintln!(
-                "[rulink] 警告: {} 的主机密钥指纹与 known_hosts 不符，拒绝连接（可能是中间人攻击）",
+                "[ruterm] 警告: {} 的主机密钥指纹与 known_hosts 不符，拒绝连接（可能是中间人攻击）",
                 entry_host
             );
             return false;
@@ -147,7 +162,7 @@ impl SshTerminalHandler {
             && let Err(error) = std::fs::create_dir_all(parent)
         {
             eprintln!(
-                "[rulink] 无法创建 {} 目录（{error}），拒绝连接",
+                "[ruterm] 无法创建 {} 目录（{error}），拒绝连接",
                 parent.display()
             );
             return false;
@@ -161,20 +176,39 @@ impl SshTerminalHandler {
             Ok(file) => file,
             Err(error) => {
                 // 写盘失败不能降级为"不校验"，直接拒绝更安全。
-                eprintln!("[rulink] 无法写入 known_hosts（{error}），拒绝连接");
+                eprintln!("[ruterm] 无法写入 known_hosts（{error}），拒绝连接");
                 return false;
             }
         };
         if file.write_all(entry.as_bytes()).is_err() {
-            eprintln!("[rulink] known_hosts 写入失败，拒绝连接");
+            eprintln!("[ruterm] known_hosts 写入失败，拒绝连接");
             return false;
         }
         eprintln!(
-            "[rulink] 首次连接 {}，主机指纹已记入 {}",
+            "[ruterm] 首次连接 {}，主机指纹已记入 {}",
             entry_host,
             path.display()
         );
         true
+    }
+}
+
+impl SshTerminalHandler {
+    /// 终端通道的下行字节若正被 lrzsz 上传接管，就转交上传任务。
+    ///
+    /// 接收端已消失（上传任务结束/失败）时返回 false，让字节照常进终端，
+    /// 避免把 shell 输出永久吞掉。
+    fn divert_zmodem(&self, data: &[u8]) -> bool {
+        let Some(sink) = self.zmodem.as_ref() else {
+            return false;
+        };
+        let guard = sink
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(sender) = guard.as_ref() else {
+            return false;
+        };
+        sender.send(data.to_vec()).is_ok()
     }
 }
 
@@ -201,7 +235,7 @@ impl client::Handler for SshTerminalHandler {
                     Ok(Trust::Matched) => Ok(true),
                     Ok(Trust::New) => {
                         self.feed.feed(
-                            format!("\r\n[rulink] 首次连接 {entry_host}，主机指纹已记入加密库\r\n")
+                            format!("\r\n[ruterm] 首次连接 {entry_host}，主机指纹已记入加密库\r\n")
                                 .into_bytes(),
                         );
                         Ok(true)
@@ -209,7 +243,7 @@ impl client::Handler for SshTerminalHandler {
                     Ok(Trust::Mismatch) => {
                         self.feed.feed(
                             format!(
-                                "\r\n[rulink] 警告: {entry_host} 的主机密钥指纹与加密库记录不符，拒绝连接（可能是中间人攻击）\r\n"
+                                "\r\n[ruterm] 警告: {entry_host} 的主机密钥指纹与加密库记录不符，拒绝连接（可能是中间人攻击）\r\n"
                             )
                             .into_bytes(),
                         );
@@ -218,7 +252,7 @@ impl client::Handler for SshTerminalHandler {
                     Err(error) => {
                         self.feed.feed(
                             format!(
-                                "\r\n[rulink] 加密库 known_hosts 不可用（{error}），拒绝连接\r\n"
+                                "\r\n[ruterm] 加密库 known_hosts 不可用（{error}），拒绝连接\r\n"
                             )
                             .into_bytes(),
                         );
@@ -228,7 +262,7 @@ impl client::Handler for SshTerminalHandler {
             }
             PublicKeyOrCertificate::Certificate(_) => {
                 // 证书认证属于后续能力（见首发清单"安全与密钥"），首版一律拒绝。
-                eprintln!("[rulink] 暂不支持 SSH 证书主机认证，拒绝连接");
+                eprintln!("[ruterm] 暂不支持 SSH 证书主机认证，拒绝连接");
                 Ok(false)
             }
         }
@@ -240,7 +274,7 @@ impl client::Handler for SshTerminalHandler {
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
         self.feed
-            .feed(format!("\r\n[rulink] {banner}\r\n").into_bytes());
+            .feed(format!("\r\n[ruterm] {banner}\r\n").into_bytes());
         Ok(())
     }
 
@@ -279,7 +313,9 @@ impl client::Handler for SshTerminalHandler {
         if self.side.contains(channel) {
             return Ok(());
         }
-        self.feed.feed(data.to_vec());
+        if !self.divert_zmodem(data) {
+            self.feed.feed(data.to_vec());
+        }
         Ok(())
     }
 
@@ -294,7 +330,9 @@ impl client::Handler for SshTerminalHandler {
             return Ok(());
         }
         // stderr 与 stdout 在远端 PTY 下本就是同一条流，统一灌入终端。
-        self.feed.feed(data.to_vec());
+        if !self.divert_zmodem(data) {
+            self.feed.feed(data.to_vec());
+        }
         Ok(())
     }
 

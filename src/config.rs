@@ -17,7 +17,7 @@ pub struct SshTarget {
     pub key_path: Option<PathBuf>,
     /// 内嵌私钥的 PEM 文本（取自加密库，仅内存持有；优先于 `key_path`）
     pub key_data: Option<String>,
-    /// 密码（来自环境变量 RULINK_PASSWORD 或 GUI 临时输入/加密库）
+    /// 密码（来自环境变量 RUTERM_PASSWORD 或 GUI 临时输入/加密库）
     pub password: Option<String>,
     /// 加密私钥的口令（仅私钥认证且密钥有口令时使用；绝不入命令行）
     pub passphrase: Option<String>,
@@ -31,8 +31,8 @@ pub struct SshTarget {
 impl SshTarget {
     /// 从命令行参数解析连接目标。
     ///
-    /// 用法：`rulink [user@]host[:port] [-i keyfile]`
-    /// 密码经 `RULINK_PASSWORD` 环境变量传入。
+    /// 用法：`ruterm [user@]host[:port] [-i keyfile]`
+    /// 密码经 `RUTERM_PASSWORD` 环境变量传入。
     pub fn from_args() -> anyhow::Result<Self> {
         let mut positional: Option<String> = None;
         let mut key_path: Option<PathBuf> = None;
@@ -47,7 +47,7 @@ impl SshTarget {
                 }
                 "-h" | "--help" => {
                     anyhow::bail!(
-                        "用法: rulink [user@]host[:port] [-i keyfile]\n密码通过环境变量 RULINK_PASSWORD 提供"
+                        "用法: ruterm [user@]host[:port] [-i keyfile]\n密码通过环境变量 RUTERM_PASSWORD 提供"
                     );
                 }
                 other => {
@@ -64,7 +64,7 @@ impl SshTarget {
 
         let raw = positional.ok_or_else(|| {
             anyhow::anyhow!(
-                "用法: rulink [user@]host[:port] [-i keyfile]（密码经 RULINK_PASSWORD）"
+                "用法: ruterm [user@]host[:port] [-i keyfile]（密码经 RUTERM_PASSWORD）"
             )
         })?;
 
@@ -96,7 +96,7 @@ impl SshTarget {
             key_data: None,
             passphrase: None,
             jump: None,
-            password: std::env::var("RULINK_PASSWORD")
+            password: std::env::var("RUTERM_PASSWORD")
                 .ok()
                 .filter(|s| !s.is_empty()),
         })

@@ -2,7 +2,7 @@
 //! （toasty ORM + turso 页级加密 AEGIS-256）。
 //!
 //! 密码列另有**应用层字段加密**（AES-256-GCM）：密钥由主密钥域分离派生
-//! （`SHA-256(主密钥 ‖ "rulink-field-key-v1")`），每条密码随机 12 字节 nonce，
+//! （`SHA-256(主密钥 ‖ "ruterm-field-key-v1")`），每条密码随机 12 字节 nonce，
 //! 列内存 `base64(nonce ‖ 密文 ‖ 标签)`。即使库文件页级加密被绕过或某个页面
 //! 被明文导出，密码列依然是不可读的密文；库级加密负责整体防护，字段加密
 //! 负责"最敏感的那一列"。
@@ -35,7 +35,7 @@ use tokio::sync::Mutex;
 use turso::{Builder, Value};
 
 /// 凭据管理器中的服务名与账户名（keyring 档主密钥条目）。
-const KEYRING_SERVICE: &str = "rulink";
+const KEYRING_SERVICE: &str = "ruterm";
 const KEYRING_ACCOUNT: &str = "vault-key";
 
 /// 内嵌私钥的存储位：settings 表里的一行 JSON（host_id → 字段加密的 PEM）。
@@ -173,7 +173,7 @@ mod field {
     use sha2::{Digest as _, Sha256};
 
     /// 派生字段密钥用的域分离标签（改动它等于换了一把钥匙，旧密文将解不开）。
-    const FIELD_KEY_INFO: &[u8] = b"rulink-field-key-v1";
+    const FIELD_KEY_INFO: &[u8] = b"ruterm-field-key-v1";
 
     /// GCM nonce 长度（字节）。
     const NONCE_LEN: usize = 12;
@@ -245,7 +245,7 @@ pub fn load_or_create_master_key() -> Result<String> {
     match entry.get_password() {
         Ok(hex) if valid_hex_key(&hex) => Ok(hex),
         Ok(_) => anyhow::bail!(
-            "系统凭据管理器中的 rulink 主密钥条目格式无效，为避免旧库无法解密，已拒绝自动覆盖"
+            "系统凭据管理器中的 ruterm 主密钥条目格式无效，为避免旧库无法解密，已拒绝自动覆盖"
         ),
         Err(keyring::Error::NoEntry) => {
             let mut buf = [0u8; 32];
@@ -367,7 +367,7 @@ impl Vault {
         })
     }
 
-    /// 在指定文件路径打开加密库（更换主密码的暂存库 `rulink.db.new` 用）。
+    /// 在指定文件路径打开加密库（更换主密码的暂存库 `ruterm.db.new` 用）。
     pub async fn open_at(path: &str, hexkey: String, rt: tokio::runtime::Handle) -> Result<Self> {
         anyhow::ensure!(
             valid_hex_key(&hexkey),
@@ -1202,7 +1202,7 @@ mod tests {
         let mut suffix = [0u8; 8];
         getrandom::fill(&mut suffix).unwrap();
         let dir = std::env::temp_dir().join(format!(
-            "rulink-vault-test-{}",
+            "ruterm-vault-test-{}",
             suffix
                 .iter()
                 .map(|b| format!("{b:02x}"))
@@ -1289,7 +1289,7 @@ mod tests {
     /// 主机、已存密码、设置与 known_hosts 必须一项不少——曾出现"设置主密码后主机消失"。
     #[tokio::test]
     async fn rekey_file_swap_preserves_everything() {
-        let dir = temp_dir("rulink-rekey-test");
+        let dir = temp_dir("ruterm-rekey-test");
         let mode = StorageMode::Global(dir.clone());
         let rt = tokio::runtime::Handle::current();
         let vault = Vault::open(&mode, "0a".repeat(32), rt.clone())
@@ -1321,7 +1321,7 @@ mod tests {
 
         let dump = vault.export_all().await.unwrap();
         let db_path = mode.db_path();
-        let staging = db_path.with_file_name("rulink.db.new");
+        let staging = db_path.with_file_name("ruterm.db.new");
         remove_db_bundle(&staging);
         let fresh = Vault::open_at(&staging.to_string_lossy(), "7d".repeat(32), rt.clone())
             .await
@@ -1330,7 +1330,7 @@ mod tests {
         drop(fresh);
         drop(vault);
 
-        let backup = db_path.with_file_name("rulink.db.keyring-bak");
+        let backup = db_path.with_file_name("ruterm.db.keyring-bak");
         rename_db_bundle(&rt, db_path.clone(), backup.clone(), 100)
             .await
             .expect("旧库让位失败");
@@ -1420,7 +1420,7 @@ mod tests {
         let mut suffix = [0u8; 8];
         getrandom::fill(&mut suffix).unwrap();
         let tag: String = suffix.iter().map(|b| format!("{b:02x}")).collect();
-        let dir = std::env::temp_dir().join(format!("rulink-offrt-test-{tag}"));
+        let dir = std::env::temp_dir().join(format!("ruterm-offrt-test-{tag}"));
         let mode = StorageMode::Global(dir.clone());
         let host = HostConfig {
             id: 1,
@@ -1474,7 +1474,7 @@ mod tests {
         let mut suffix = [0u8; 8];
         getrandom::fill(&mut suffix).unwrap();
         let tag: String = suffix.iter().map(|b| format!("{b:02x}")).collect();
-        let dir = std::env::temp_dir().join(format!("rulink-mig-test-{tag}"));
+        let dir = std::env::temp_dir().join(format!("ruterm-mig-test-{tag}"));
         std::fs::create_dir_all(&dir).unwrap();
         let mode = StorageMode::Global(dir.clone());
         let hexkey = "0c".repeat(32);
@@ -1631,7 +1631,7 @@ mod tests {
     /// 端到端：口令列落库的是密文，读出来的是明文；换主密钥搬迁后依旧如此。
     #[tokio::test]
     async fn password_column_never_holds_plaintext() {
-        let dir = temp_dir("rulink-field-test");
+        let dir = temp_dir("ruterm-field-test");
         let mode = StorageMode::Global(dir.clone());
         let rt = tokio::runtime::Handle::current();
         let old_key = "11".repeat(32);
@@ -1666,7 +1666,7 @@ mod tests {
         // 换主密钥 = 换字段密钥：必须解密后重新加密，旧密文带到新库解不开。
         let dump = vault.export_all().await.unwrap();
         let new_key = "22".repeat(32);
-        let staging = mode.db_path().with_file_name("rulink.db.new");
+        let staging = mode.db_path().with_file_name("ruterm.db.new");
         remove_db_bundle(&staging);
         let fresh = Vault::open_at(&staging.to_string_lossy(), new_key.clone(), rt.clone())
             .await
@@ -1687,7 +1687,7 @@ mod tests {
     /// 内嵌私钥：读写往返、库里只有密文、标记随库回填、删除主机连带清除。
     #[tokio::test]
     async fn inline_key_roundtrip_never_plaintext() {
-        let dir = temp_dir("rulink-inline-key-test");
+        let dir = temp_dir("ruterm-inline-key-test");
         let mode = StorageMode::Global(dir.clone());
         let rt = tokio::runtime::Handle::current();
         let vault = Vault::open(&mode, "0b".repeat(32), rt.clone())

@@ -6204,35 +6204,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rulink"
-version = "0.1.0"
-dependencies = [
- "aes-gcm 0.11.1",
- "anyhow",
- "argon2 0.5.3",
- "base64 0.23.1",
- "bytes",
- "getrandom 0.4.3",
- "keyring",
- "log",
- "png",
- "rgpui",
- "rgpui-platform",
- "rgpui-term",
- "russh",
- "russh-sftp",
- "serde",
- "serde_json",
- "sha2 0.11.1",
- "toasty",
- "toasty-driver-turso",
- "tokio",
- "turso",
- "windows 0.62.2",
- "winresource",
-]
-
-[[package]]
 name = "russh"
 version = "0.64.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6462,6 +6433,36 @@ name = "rustversion"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
+
+[[package]]
+name = "ruterm"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm 0.11.1",
+ "anyhow",
+ "argon2 0.5.3",
+ "base64 0.23.1",
+ "bytes",
+ "getrandom 0.4.3",
+ "keyring",
+ "log",
+ "png",
+ "rgpui",
+ "rgpui-platform",
+ "rgpui-term",
+ "russh",
+ "russh-sftp",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "toasty",
+ "toasty-driver-turso",
+ "tokio",
+ "turso",
+ "windows 0.62.2",
+ "winresource",
+ "zmodem2",
+]
 
 [[package]]
 name = "ryu"
@@ -9666,6 +9667,17 @@ name = "zmij"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
+
+[[package]]
+name = "zmodem2"
+version = "0.7.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2a4c6cda9d8fd2379ce54d171a1a3a387ff6789b4c9de140586b91a217749ff1"
+dependencies = [
+ "bitflags 2.13.2",
+ "hex",
+ "thiserror 1.0.69",
+]
 
 [[package]]
 name = "zune-core"
