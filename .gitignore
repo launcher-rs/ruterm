@@ -1,2 +1,4 @@
 /target
 /temp
+# 本地 AI 助手的工作记忆（项目约定 / 日志），只留在本机
+/.workbuddy-ai
