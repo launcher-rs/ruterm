@@ -128,7 +128,7 @@ pub fn normalize_trigger(raw: &str) -> Result<Option<String>, String> {
 
 /// 触发键的存储形态：修饰键按固定顺序 + 小写键名（`Keystroke` 的 Display
 /// 会按展示习惯把键名大写，不能当存储串用）。
-fn canonical_trigger(keystroke: &Keystroke) -> String {
+pub fn canonical_trigger(keystroke: &Keystroke) -> String {
     let mut parts: Vec<&str> = Vec::new();
     if keystroke.modifiers.control {
         parts.push("ctrl");
@@ -251,7 +251,7 @@ mod tests {
         assert_eq!(from_json("{ not json"), Vec::new());
         let legacy: Vec<KeyMacro> =
             serde_json::from_str(r#"[{"name":"x"}]"#).expect("缺省字段应可解析");
-        assert_eq!(legacy[0].enabled, true);
+        assert!(legacy[0].enabled);
         assert_eq!(legacy[0].trigger, None);
         assert!(legacy[0].steps.is_empty());
     }

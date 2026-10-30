@@ -4,9 +4,12 @@
 //! 点击账号即连接；密码认证的账号在连接时临时输入密码（绝不落盘），私钥/Agent
 //! 认证直接连接。仍兼容一次性命令行快速连接（带目标参数时首启动即连上该主机）。
 
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod app;
 mod config;
 mod i18n;
+mod instance;
 mod local_shell;
 mod macros;
 mod paths;
@@ -21,17 +24,16 @@ mod transfer;
 mod vault;
 mod zmodem;
 
-
 use rgpui::prelude::*;
 use rgpui::{
-    App, Bounds, Icon, IconNamed, IntoElement, KeyBinding, NoAction, SharedString, TrayIconEvent, Window, WindowBounds, WindowOptions, actions, icon_named, px,
-    size,
+    App, Bounds, Icon, IconNamed, IntoElement, KeyBinding, NoAction, SharedString, TrayIconEvent,
+    Window, WindowBounds, WindowOptions, actions, icon_named, px, size,
 };
 
+use crate::app::RuTermApp;
 use crate::config::SshTarget;
 use crate::paths::StorageMode;
 use crate::sessions::SessionStore;
-use crate::app::RuTermApp;
 
 // 文件面板自己的图标（来自 lucide，ISC 许可）：rgpui 内置集合里没有合适的
 // 「定位」「跟随」语义。`icon_named!` 会把 assets/lucide 下的 SVG 编译进二进制。
@@ -88,6 +90,14 @@ fn main() {
     } else {
         None
     };
+
+    // 单实例：关窗口只是隐藏到托盘，再双击 exe 会又起一个进程读写同一个加密库。
+    // 抢不到锁的这次启动负责把主实例的窗口带回前台，然后自己退出。
+    let claim = instance::claim();
+    if let instance::Claim::Activated = claim {
+        println!("RuTerm 已在运行（可能藏在系统托盘里），已把它的窗口带到前台。");
+        return;
+    }
 
     let app = rgpui_platform::application();
     app.run(move |cx| {
@@ -192,6 +202,28 @@ fn main() {
         };
         cx.activate(true);
 
+        // 单实例锁的持有侧：后来的进程敲门 → 把主窗口带回前台。
+        // 收敲门必须跑在 tokio 线程池上（rgpui 的前台执行器没有 IO reactor），
+        // 因此用通道把事件递回主线程，再在应用上下文里激活窗口。
+        if let instance::Claim::Primary(listener) = claim {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let knock_loop = rgpui::tokio::Tokio::spawn(
+                cx,
+                instance::serve(listener, move || {
+                    let _ = tx.send(());
+                }),
+            );
+            let handle = window_handle;
+            cx.spawn(async move |cx| {
+                while rx.recv().await.is_some() {
+                    handle.update(cx, |_, window, _| window.activate_window()).ok();
+                }
+                // 守活 knock_loop：Task 被丢弃会连带取消 tokio 侧的监听。
+                drop(knock_loop.await);
+            })
+            .detach();
+        }
+
         // 系统托盘：品牌图标 + 悬停提示 + 右键菜单（活动会话 / 显示主界面 / 退出），
         // 左键单击图标直接恢复主窗口（Windows 后端左键不弹菜单，菜单仅右键弹出）。
         // 图标以 32px PNG 内嵌，Windows 走 image 解码路径最稳；不依赖运行时文件路径。
@@ -229,4 +261,3 @@ fn main() {
         });
     });
 }
-

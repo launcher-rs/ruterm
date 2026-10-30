@@ -7,12 +7,13 @@
 
 use std::time::Duration;
 
+use rgpui::components::hotkey_input::{HotkeyInput, HotkeyInputState, HotkeyValue};
 use rgpui::input_ui::{Input, InputEvent, InputState};
 use rgpui::prelude::*;
 use rgpui::{
-    AnyElement, Button, ButtonVariants, Context, Disableable, Entity, FontWeight, InteractiveElement,
-    IntoElement, ParentElement, ScrollableElement, SharedString, Styled, Window, div, h_flex, px,
-    v_flex,
+    AnyElement, Button, ButtonVariants, Context, Disableable, Entity, FontWeight,
+    InteractiveElement, IntoElement, Keystroke, ParentElement,
+    ScrollableElement, SharedString, Styled, Window, div, h_flex, px, v_flex,
 };
 
 use crate::macros::{KeyMacro, MacroStep};
@@ -20,6 +21,16 @@ use crate::tr;
 use crate::{CloseMacroManager, MacroManager as OpenMacroManager};
 
 use super::*;
+
+/// 录好的组合键 → 存储串；与手输走同一条 `canonical_trigger` 规则。
+fn hotkey_trigger(hotkey: &HotkeyValue) -> String {
+    let keystroke = Keystroke {
+        modifiers: hotkey.modifiers,
+        key: hotkey.key.clone(),
+        key_char: None,
+    };
+    crate::macros::canonical_trigger(&keystroke)
+}
 
 /// 键宏管理器弹窗状态：列表 ⇄ 编辑表单二选一。
 pub(super) struct MacroManager {
@@ -35,7 +46,8 @@ pub(super) struct MacroEdit {
     /// 正在编辑的宏下标；None = 新建。
     pub(super) index: Option<usize>,
     pub(super) name: Entity<InputState>,
-    pub(super) trigger: Entity<InputState>,
+    /// 触发键用录制组件：点一下再按组合键即可，Esc 取消录制，× 清空＝不绑键。
+    pub(super) trigger: Entity<HotkeyInputState>,
     pub(super) error: Option<SharedString>,
     pub(super) steps: Vec<MacroStepEdit>,
 }
@@ -111,6 +123,24 @@ impl RuTermApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // 触发键正在录制：`intercept_keystrokes` 早于动作分发，在这里吞掉按键
+        // 既保住 Ctrl+T 之类的全局快捷键不被误触发，也让 Esc 只取消录制、不关弹窗。
+        let recording = self
+            .macro_manager
+            .as_ref()
+            .and_then(|manager| manager.editing.as_ref())
+            .map(|edit| edit.trigger.read(cx).is_recording())
+            .unwrap_or(false);
+        if recording {
+            let keystroke = event.keystroke.clone();
+            if let Some(edit) = self.macro_manager.as_ref().and_then(|m| m.editing.as_ref()) {
+                edit.trigger
+                    .update(cx, |state, cx| state.capture_keystroke(&keystroke, cx));
+            }
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
         if self.macros.is_empty() || self.overlay_open() {
             return;
         }
@@ -211,10 +241,17 @@ impl RuTermApp {
         cx: &mut Context<Self>,
     ) -> MacroEdit {
         let name_input = cx.new(|cx| InputState::new(window, cx).default_value(name.to_string()));
-        let trigger_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .default_value(trigger.to_string())
-                .placeholder(tr!(cx, "留空 = 不绑键，例：ctrl-alt-1"))
+        // 存的是 canonical 串（ctrl-alt-1），解析回 HotkeyValue 才能显示在录入框里。
+        let hotkey = if trigger.is_empty() {
+            None
+        } else {
+            Keystroke::parse(trigger)
+                .ok()
+                .map(|keystroke| HotkeyValue::new(keystroke.key, keystroke.modifiers))
+        };
+        let trigger_input = cx.new(|cx| match hotkey {
+            Some(hotkey) => HotkeyInputState::with_hotkey(cx, hotkey),
+            None => HotkeyInputState::new(cx),
         });
         let mut step_edits = Vec::new();
         for step in steps {
@@ -342,7 +379,12 @@ impl RuTermApp {
         let Some(edit) = manager.editing.as_ref() else {
             return;
         };
-        let trigger_raw = edit.trigger.read(cx).value().to_string();
+        let trigger_raw = edit
+            .trigger
+            .read(cx)
+            .hotkey()
+            .map(hotkey_trigger)
+            .unwrap_or_default();
         let trigger = match crate::macros::normalize_trigger(&trigger_raw) {
             Ok(trigger) => trigger,
             Err(reason) => {
@@ -801,11 +843,22 @@ impl RuTermApp {
                 &edit.name,
                 pal,
             ))
-            .child(labeled_field(
-                "触发键（如 ctrl-alt-1，可留空）",
-                &edit.trigger,
-                pal,
-            ))
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(pal.muted)
+                            .child(tr!(cx, "触发键（点一下再按下组合键，× 清空＝不绑键）")),
+                    )
+                    .child(
+                        HotkeyInput::new(edit.trigger.clone())
+                            .w_full()
+                            .placeholder(tr!(cx, "未绑触发键"))
+                            .recording_text(tr!(cx, "请按下组合键…")),
+                    ),
+            )
             .child(
                 v_flex()
                     .gap_1()
