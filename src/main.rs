@@ -53,6 +53,7 @@ actions!(
     [
         ToggleSidebar,
         ToggleFilePanel,
+        ToggleLocalPanel,
         ToggleTheme,
         NewHost,
         NewLocalTerminal,
@@ -127,6 +128,8 @@ fn main() {
             KeyBinding::new("ctrl-b", ToggleSidebar, None),
             // 文件面板：与「会话」菜单里的“远端文件面板”同一条路径。
             KeyBinding::new("ctrl-shift-b", ToggleFilePanel, None),
+            // 本机文件页：远端面板是 ctrl-shift-b，本机加一个 L（local）。
+            KeyBinding::new("ctrl-shift-l", ToggleLocalPanel, None),
             KeyBinding::new("ctrl-t", ToggleTheme, None),
             KeyBinding::new("ctrl-n", NewHost, None),
             KeyBinding::new("ctrl-shift-t", NewLocalTerminal, None),

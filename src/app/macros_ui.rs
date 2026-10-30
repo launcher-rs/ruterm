@@ -366,7 +366,9 @@ impl RuTermApp {
         if let Some(manager) = self.macro_manager.as_mut()
             && let Some(edit) = manager.editing.as_mut()
         {
-            edit.error = Some(SharedString::from(reason));
+            // 校验文案出自 `src/macros.rs`（拿不到 cx，只能给中文原文），
+            // 落进表单前在这里过一次词条表，英文用户才看得到英文。
+            edit.error = Some(crate::i18n::translate(cx, &reason, &[]).into());
         }
         cx.notify();
     }

@@ -86,6 +86,8 @@ pub(super) const FILE_COL_MIN_W: f32 = 34.0;
 pub(super) const FILE_COL_MAX_W: f32 = 180.0;
 /// 行首图标 + 间距占位：让表头「名称」与行内文件名左对齐。
 pub(super) const FILE_ROW_LEAD_W: f32 = 20.0;
+/// 面板实测宽度低于此值算「窄栏」：隐掉修改时间与权限两列（见 [`RuTermApp::pane_narrow`]）。
+pub(super) const FILE_PANE_NARROW_W: f32 = 430.0;
 
 /// 远端修改时间（Unix 秒，UTC）→ `MM-DD HH:MM`（面板窄，省掉年份）。
 pub(super) fn format_remote_time_short(seconds: u32) -> String {
@@ -136,17 +138,27 @@ pub(super) enum FileSortKey {
     Permissions,
 }
 
-/// 列宽拖拽的载荷：`tab_id` 保证拖拽期间切换标签不会改错表。
+/// 文件表格的数据源：远端某个标签的 SFTP 目录，或本机磁盘目录。
+///
+/// 两套面板共用同一张表（表头、排序、列宽、单元格），差别只在数据住在哪、
+/// 以及各自行菜单能动谁。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum PaneTarget {
+    Remote(usize),
+    Local,
+}
+
+/// 列宽拖拽的载荷：`target` 保证拖拽期间切换标签 / 面板不会改错表。
 #[derive(Clone, Copy)]
 pub(super) struct ColumnDrag {
-    pub(super) tab_id: usize,
+    pub(super) target: PaneTarget,
     pub(super) col: usize,
 }
 
 /// 列宽拖拽起点：按下时的指针 x 与当时的列宽。
 #[derive(Clone, Copy)]
 pub(super) struct ColumnDragState {
-    pub(super) tab_id: usize,
+    pub(super) target: PaneTarget,
     pub(super) col: usize,
     pub(super) start_x: f32,
     pub(super) start_w: f32,
@@ -209,33 +221,41 @@ impl Default for FileBrowser {
 }
 
 impl FileBrowser {
-    /// 按当前排序状态重排条目：目录恒在前，其余按所选列比较，同值回落到名称。
+    /// 按当前排序状态重排条目。
     pub(super) fn sort_entries(&mut self) {
-        let key = self.sort;
-        let desc = self.sort_desc;
-        self.entries.sort_by(|left, right| {
-            let by_dir = right.is_dir.cmp(&left.is_dir);
-            if by_dir != Ordering::Equal {
-                return by_dir;
-            }
-            let by_key = match key {
-                // 名称列作为主键参与升降序；其余列同值时再回落到名称（恒升序）。
-                FileSortKey::Name => left
-                    .name
-                    .to_lowercase()
-                    .cmp(&right.name.to_lowercase())
-                    .then_with(|| left.name.cmp(&right.name)),
-                FileSortKey::Kind => kind_rank(left).cmp(&kind_rank(right)),
-                FileSortKey::Size => left.size.cmp(&right.size),
-                FileSortKey::Modified => left.modified.cmp(&right.modified),
-                FileSortKey::Permissions => left.permissions.cmp(&right.permissions),
-            };
-            let by_key = if desc { by_key.reverse() } else { by_key };
-            by_key
-                .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
-                .then_with(|| left.name.cmp(&right.name))
-        });
+        sort_entries(&mut self.entries, self.sort, self.sort_desc);
     }
+}
+
+/// 排序规则本体：目录恒在前，其余按所选列比较，同值回落到名称。
+/// 写成自由函数是因为远端与本机两套面板共用同一份规则。
+pub(super) fn sort_entries(
+    entries: &mut Vec<crate::remote_fs::Entry>,
+    key: FileSortKey,
+    desc: bool,
+) {
+    entries.sort_by(|left, right| {
+        let by_dir = right.is_dir.cmp(&left.is_dir);
+        if by_dir != Ordering::Equal {
+            return by_dir;
+        }
+        let by_key = match key {
+            // 名称列作为主键参与升降序；其余列同值时再回落到名称（恒升序）。
+            FileSortKey::Name => left
+                .name
+                .to_lowercase()
+                .cmp(&right.name.to_lowercase())
+                .then_with(|| left.name.cmp(&right.name)),
+            FileSortKey::Kind => kind_rank(left).cmp(&kind_rank(right)),
+            FileSortKey::Size => left.size.cmp(&right.size),
+            FileSortKey::Modified => left.modified.cmp(&right.modified),
+            FileSortKey::Permissions => left.permissions.cmp(&right.permissions),
+        };
+        let by_key = if desc { by_key.reverse() } else { by_key };
+        by_key
+            .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+            .then_with(|| left.name.cmp(&right.name))
+    });
 }
 
 /// 类型排序次序：目录（已单独置顶）< 链接 < 普通文件。
@@ -404,13 +424,10 @@ impl RuTermApp {
 
 
     /// 点击路径栏：激活编辑模式，输入框预填当前路径。
-    pub(super) fn start_path_edit(&mut self, tab_id: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let current = self
-            .tabs
-            .iter()
-            .find(|tab| tab.id == tab_id)
-            .and_then(|tab| tab.files.path.clone())
-            .unwrap_or_default();
+    ///
+    /// 新框要自己抢焦点并全选——点路径栏的人是想换一条路径，不是想在末尾续字。
+    pub(super) fn start_path_edit(&mut self, target: PaneTarget, window: &mut Window, cx: &mut Context<Self>) {
+        let current = self.pane_path(target);
         let input = cx.new(|cx| InputState::new(window, cx).default_value(&current));
         cx.subscribe(&input, |this, _, event: &InputEvent, cx| {
             if matches!(event, InputEvent::PressEnter { .. }) {
@@ -418,24 +435,29 @@ impl RuTermApp {
             }
         })
         .detach();
-        self.path_edit = Some(input);
+        input.update(cx, |state, cx| {
+            let len = state.text().len();
+            state.set_selected_range(0..len, cx);
+            state.focus(window, cx);
+        });
+        self.path_edit = Some((target, input));
         cx.notify();
     }
 
 
     /// 回车提交路径：跳转到输入的目录。
     pub(super) fn commit_path_edit(&mut self, cx: &mut Context<Self>) {
-        let Some(input) = self.path_edit.take() else {
+        let Some((target, input)) = self.path_edit.take() else {
             return;
         };
-        let tab_id = self.active_tab;
-        let target = input.read(cx).text().to_string().trim().to_string();
-        if target.is_empty() {
+        let text = input.read(cx).text().to_string().trim().to_string();
+        if text.is_empty() {
             cx.notify();
             return;
         }
-        if let Some(tab_id) = tab_id {
-            self.load_files(tab_id, Some(target), cx);
+        match target {
+            PaneTarget::Remote(tab_id) => self.load_files(tab_id, Some(text), cx),
+            PaneTarget::Local => self.local_load(Some(PathBuf::from(text)), cx),
         }
         cx.notify();
     }
@@ -812,7 +834,7 @@ impl RuTermApp {
             };
             let _ = cx.with_window(entity_id, move |_window, cx| {
                 entity.update(cx, move |this, cx| {
-                    this.start_download(tab_id, path, remote, cx);
+                    this.start_download(tab_id, path, remote, false, cx);
                 });
             });
         })
@@ -820,12 +842,44 @@ impl RuTermApp {
     }
 
 
+    /// 行菜单「下载到本机面板」：直接落到「本机」页当前目录，省掉保存对话框。
+    ///
+    /// 落点就是本机页顶部那条路径，看得见才敢写；本机页还没目录时菜单项是灰的。
+    pub(super) fn download_to_local_pane(
+        &mut self,
+        tab_id: usize,
+        name: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(local_dir) = self.local.path.clone() else {
+            return;
+        };
+        let Some(remote_dir) = self
+            .tabs
+            .iter()
+            .find(|tab| tab.id == tab_id)
+            .and_then(|tab| tab.files.path.clone())
+        else {
+            return;
+        };
+        let Some(safe) = safe_local_name(&name) else {
+            self.file_error(tab_id, "文件名不合法，无法在本机保存", cx);
+            return;
+        };
+        let remote = crate::remote_fs::child(&remote_dir, &name);
+        self.start_download(tab_id, local_dir.join(safe), remote, true, cx);
+    }
+
+
     /// 单个文件下载：进度写在面板底栏，完成后提示结果。
+    ///
+    /// `refresh_local_pane` 给「下载到本机面板」用：文件落盘后本机页要能立刻看见它。
     pub(super) fn start_download(
         &mut self,
         tab_id: usize,
         local: PathBuf,
         remote: String,
+        refresh_local_pane: bool,
         cx: &mut Context<Self>,
     ) {
         let name = Path::new(&remote)
@@ -909,6 +963,7 @@ impl RuTermApp {
                     Some(format!("下载失败：{error}")),
                 ),
             };
+            let downloaded = error.is_none();
             let _ = this.update(cx, |this, cx| {
                 if let Some(tab) = this.tabs.iter_mut().find(|tab| tab.id == tab_id) {
                     tab.files.busy = None;
@@ -916,6 +971,9 @@ impl RuTermApp {
                     tab.files.error = error.map(Into::into);
                 }
                 this.status = message.into();
+                if refresh_local_pane && downloaded {
+                    this.local_refresh(cx);
+                }
                 cx.notify();
             });
         })
@@ -1296,6 +1354,7 @@ impl RuTermApp {
     /// 文件列表表头的一格：点击切换排序；已排序列高亮并显示 ↑ / ↓。
     ///
     /// `width` 为 `Some((列下标, 宽度))` 时右边缘带拖拽手柄；名称列传 `None`，占剩余宽度。
+    /// `target` 决定这份排序 / 列宽记在谁身上（远端标签或本机面板）。
     pub(super) fn file_sort_header(
         &self,
         id: &'static str,
@@ -1303,15 +1362,13 @@ impl RuTermApp {
         key: FileSortKey,
         width: Option<(usize, f32)>,
         right_align: bool,
+        target: Option<PaneTarget>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let pal = self.palette(cx);
-        let state = self
-            .active_tab
-            .and_then(|id| self.tabs.iter().find(|tab| tab.id == id))
-            .map(|tab| (tab.files.sort, tab.files.sort_desc));
+        let state = target.and_then(|pane| self.pane_sort(pane));
         let active = state.is_some_and(|(sort, _)| sort == key);
-        let desc = state.is_some_and(|(sort, desc)| sort == key && desc);
+        let desc = state.is_some_and(|(sort, d)| sort == key && d);
 
         let text = if active {
             format!("{label}{}", if desc { "↓" } else { "↑" })
@@ -1329,28 +1386,17 @@ impl RuTermApp {
         if width.is_none() {
             cell = cell.flex_1().min_w(px(48.0)).text_ellipsis();
         }
-        let cell = cell
-            .child(text)
-            .on_click(cx.listener(move |this, _, _, cx| {
-                let Some(tab_id) = this.active_tab else {
-                    return;
-                };
-                let Some(tab) = this.tabs.iter_mut().find(|tab| tab.id == tab_id) else {
-                    return;
-                };
-                if tab.files.sort == key {
-                    tab.files.sort_desc = !tab.files.sort_desc;
-                } else {
-                    tab.files.sort = key;
-                    tab.files.sort_desc = false;
-                }
-                tab.files.sort_entries();
-                cx.notify();
-            }));
+        let cell = match target {
+            Some(pane) => cell.child(text).on_click(cx.listener(move |this, _, _, cx| {
+                this.set_pane_sort(pane, key, cx);
+            })),
+            // 没有可操作的面板（会话断了 / 还没连上）：表头照常显示，点了没反应。
+            None => cell.child(text),
+        };
         let Some((col, width)) = width else {
             return cell.into_any_element();
         };
-        let Some(tab_id) = self.active_tab else {
+        let Some(pane) = target else {
             return div()
                 .w(px(width))
                 .flex_shrink_0()
@@ -1371,14 +1417,14 @@ impl RuTermApp {
                 MouseButton::Left,
                 cx.listener(move |this, event: &MouseDownEvent, _, _| {
                     this.col_drag = Some(ColumnDragState {
-                        tab_id,
+                        target: pane,
                         col,
                         start_x: event.position.x.as_f32(),
                         start_w: width,
                     });
                 }),
             )
-            .on_drag(ColumnDrag { tab_id, col }, |_, _, _, cx| {
+            .on_drag(ColumnDrag { target: pane, col }, |_, _, _, cx| {
                 cx.new(|_| ColumnDragGhost)
             });
         div()
@@ -1388,6 +1434,171 @@ impl RuTermApp {
             .child(cell.w_full())
             .child(grip)
             .into_any_element()
+    }
+
+
+    /// 某面板当前的排序状态；面板还没打开过（远端标签已不存在）时为 None。
+    pub(super) fn pane_sort(&self, target: PaneTarget) -> Option<(FileSortKey, bool)> {
+        match target {
+            PaneTarget::Remote(tab_id) => self
+                .tabs
+                .iter()
+                .find(|tab| tab.id == tab_id)
+                .map(|tab| (tab.files.sort, tab.files.sort_desc)),
+            PaneTarget::Local => Some((self.local.sort, self.local.sort_desc)),
+        }
+    }
+
+
+    /// 某面板当前的目录字符串（路径栏与弹窗都用它）；还没打开过时为空串。
+    pub(super) fn pane_path(&self, target: PaneTarget) -> String {
+        match target {
+            PaneTarget::Remote(tab_id) => self
+                .tabs
+                .iter()
+                .find(|tab| tab.id == tab_id)
+                .and_then(|tab| tab.files.path.clone())
+                .unwrap_or_default(),
+            PaneTarget::Local => self
+                .local
+                .path
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        }
+    }
+
+
+    /// 点列名：同一列翻转升降序，换列则从升序开始；排完立刻重绘。
+    pub(super) fn set_pane_sort(&mut self, target: PaneTarget, key: FileSortKey, cx: &mut Context<Self>) {
+        match target {
+            PaneTarget::Remote(tab_id) => {
+                let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) else {
+                    return;
+                };
+                if tab.files.sort == key {
+                    tab.files.sort_desc = !tab.files.sort_desc;
+                } else {
+                    tab.files.sort = key;
+                    tab.files.sort_desc = false;
+                }
+                tab.files.sort_entries();
+            }
+            PaneTarget::Local => {
+                if self.local.sort == key {
+                    self.local.sort_desc = !self.local.sort_desc;
+                } else {
+                    self.local.sort = key;
+                    self.local.sort_desc = false;
+                }
+                self.local.sort_entries();
+            }
+        }
+        cx.notify();
+    }
+
+
+    /// 列宽拖拽落到哪张表上：远端各标签独立记忆，本机一份全局记忆。返回是否真的改了宽度。
+    pub(super) fn set_pane_col(&mut self, target: PaneTarget, col: usize, width: f32) -> bool {
+        let cols = match target {
+            PaneTarget::Remote(tab_id) => {
+                match self.tabs.iter_mut().find(|tab| tab.id == tab_id) {
+                    Some(tab) => &mut tab.files.cols,
+                    None => return false,
+                }
+            }
+            PaneTarget::Local => &mut self.local.cols,
+        };
+        if (cols[col] - width).abs() <= 0.5 {
+            return false;
+        }
+        cols[col] = width;
+        true
+    }
+
+
+    /// 窄栏判定：边栏面板实测宽度不够摆五列时，整列隐掉时间和权限，
+    /// 名称列才有地方喘气（列名与单元格都得跟着少两格）。
+    pub(super) fn pane_narrow(&self, cx: &App) -> bool {
+        let width = self.split_width.get() * self.panel_ratio(cx);
+        width > 0.0 && width < FILE_PANE_NARROW_W
+    }
+
+
+    /// 一行的可视部分：图标 + 名称 + 类型 / 大小 /（宽栏再加）修改时间 / 权限。
+    ///
+    /// 返回子元素列表而不是整行，行本身的 id、悬停、拖放与右键菜单由各自的
+    /// 面板决定——远端行能上传、本机行不能。
+    pub(super) fn file_row_children(
+        entry: &crate::remote_fs::Entry,
+        cols: [f32; 4],
+        narrow: bool,
+        pal: Palette,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let is_dir = entry.is_dir;
+        let mtime = entry
+            .modified
+            .map(format_remote_time_short)
+            .unwrap_or_else(|| "—".to_string());
+        let size_text = if is_dir {
+            "—".to_string()
+        } else {
+            crate::transfer::format_bytes(entry.size)
+        };
+        let kind_text = crate::i18n::translate(cx, entry.kind_text(), &[]);
+        let mut cells = vec![
+            Icon::new(if is_dir {
+                IconName::FolderOpen
+            } else {
+                IconName::File
+            })
+            .small()
+            .flex_shrink_0()
+            .text_color(if is_dir { pal.link } else { pal.muted })
+            .into_any_element(),
+            div()
+                .flex_1()
+                .min_w(px(48.0))
+                .text_ellipsis()
+                .text_sm()
+                .child(entry.name.clone())
+                .into_any_element(),
+            div()
+                .w(px(cols[0]))
+                .flex_shrink_0()
+                .text_xs()
+                .text_color(pal.muted)
+                .child(kind_text)
+                .into_any_element(),
+            div()
+                .w(px(cols[1]))
+                .flex_shrink_0()
+                .text_xs()
+                .text_right()
+                .text_color(pal.muted)
+                .child(size_text)
+                .into_any_element(),
+        ];
+        if !narrow {
+            cells.extend([
+                div()
+                    .w(px(cols[2]))
+                    .flex_shrink_0()
+                    .text_xs()
+                    .text_color(pal.muted)
+                    .child(mtime)
+                    .into_any_element(),
+                div()
+                    .w(px(cols[3]))
+                    .flex_shrink_0()
+                    .text_xs()
+                    .text_color(pal.muted)
+                    .child(entry.permissions_text())
+                    .into_any_element(),
+            ]);
+        }
+        cells
     }
 
 
@@ -1420,7 +1631,16 @@ impl RuTermApp {
         ]);
 
         let up_enabled = path.as_deref().and_then(crate::remote_fs::parent_of).is_some();
-        let path_edit = self.path_edit.clone();
+        // 表格状态记在面板上，路径栏编辑框也按面板认领：本机页与远端页互不打架。
+        let pane = live.map(PaneTarget::Remote);
+        // 「本机」页有没有目录，决定远端行的「下载到本机面板」能不能用。
+        let local_pane_ready = self.local.path.is_some();
+        let narrow = self.pane_narrow(cx);
+        let editing = self
+            .path_edit
+            .as_ref()
+            .filter(|(target, _)| Some(*target) == pane)
+            .map(|(_, input)| input.clone());
         let mut path_row = h_flex()
             .w_full()
             .flex_shrink_0()
@@ -1430,7 +1650,7 @@ impl RuTermApp {
             .items_center()
             .border_b_1()
             .border_color(pal.border);
-        if let Some(input) = path_edit {
+        if let Some(input) = editing {
             path_row = path_row.child(
                 div()
                     .flex_1()
@@ -1438,7 +1658,7 @@ impl RuTermApp {
                     .child(styled_input(Input::new(&input).text_xs(), &pal)),
             );
         } else {
-            let tab_id_for_edit = live;
+            let pane_for_edit = pane;
             path_row = path_row.child(
                 div()
                     .flex_1()
@@ -1450,8 +1670,8 @@ impl RuTermApp {
                     .text_color(pal.muted)
                     .child(path.clone().unwrap_or_else(|| "—".to_string()))
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        if let Some(id) = tab_id_for_edit {
-                            this.start_path_edit(id, window, cx);
+                        if let Some(pane) = pane_for_edit {
+                            this.start_path_edit(pane, window, cx);
                         }
                     })),
             );
@@ -1610,17 +1830,7 @@ impl RuTermApp {
                 .children(entries.into_iter().map(|entry| {
                     let name = entry.name.clone();
                     let is_dir = entry.is_dir;
-                    let mtime = entry
-                        .modified
-                        .map(format_remote_time_short)
-                        .unwrap_or_else(|| "—".to_string());
-                    let size_text = if is_dir {
-                        "—".to_string()
-                    } else {
-                        crate::transfer::format_bytes(entry.size)
-                    };
-                    let kind_text = crate::i18n::translate(cx, entry.kind_text(), &[]);
-                    let perm_text = entry.permissions_text();
+                    let cells = Self::file_row_children(&entry, cols, narrow, pal, cx);
                     let row_id = SharedString::from(format!(
                         "file-row-{}-{}-{}",
                         tab_id.unwrap_or_default(),
@@ -1668,62 +1878,7 @@ impl RuTermApp {
                             this.open_file_entry(id, &opening_name, is_dir, cx);
                         }));
                     }
-                    let row = row
-                        .child(
-                            Icon::new(if is_dir {
-                                IconName::FolderOpen
-                            } else {
-                                IconName::File
-                            })
-                            .small()
-                            .flex_shrink_0()
-                            .text_color(if is_dir {
-                                pal.link
-                            } else {
-                                pal.muted
-                            }),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w(px(48.0))
-                                .text_ellipsis()
-                                .text_sm()
-                                .child(name.clone()),
-                        )
-                        .child(
-                            div()
-                                .w(px(cols[0]))
-                                .flex_shrink_0()
-                                .text_xs()
-                                .text_color(pal.muted)
-                                .child(kind_text),
-                        )
-                        .child(
-                            div()
-                                .w(px(cols[1]))
-                                .flex_shrink_0()
-                                .text_xs()
-                                .text_right()
-                                .text_color(pal.muted)
-                                .child(size_text),
-                        )
-                        .child(
-                            div()
-                                .w(px(cols[2]))
-                                .flex_shrink_0()
-                                .text_xs()
-                                .text_color(pal.muted)
-                                .child(mtime),
-                        )
-                        .child(
-                            div()
-                                .w(px(cols[3]))
-                                .flex_shrink_0()
-                                .text_xs()
-                                .text_color(pal.muted)
-                                .child(perm_text),
-                        );
+                    let row = row.children(cells);
                     let Some(id) = live else {
                         return row.into_any_element();
                     };
@@ -1736,6 +1891,11 @@ impl RuTermApp {
                         tr!(cx, "打开")
                     };
                     let download_label = tr!(cx, "下载到…");
+                    let to_local_label = if local_pane_ready {
+                        tr!(cx, "下载到本机面板")
+                    } else {
+                        tr!(cx, "下载到本机面板（先在「本机」页打开一个目录）")
+                    };
                     let rename_label = tr!(cx, "重命名…");
                     let delete_label = tr!(cx, "删除");
                     let refresh_label = tr!(cx, "刷新");
@@ -1754,13 +1914,28 @@ impl RuTermApp {
                         } else {
                             let downloading = menu_entity.clone();
                             let download_name = name.clone();
-                            menu.item(PopupMenuItem::new(download_label.clone()).on_click(
+                            let menu = menu.item(PopupMenuItem::new(download_label.clone()).on_click(
                                 move |_, _, cx| {
                                     downloading.update(cx, |this, cx| {
                                         this.download_file(id, download_name.clone(), cx);
                                     });
                                 },
-                            ))
+                            ));
+                            let to_local = menu_entity.clone();
+                            let to_local_name = name.clone();
+                            menu.item(
+                                PopupMenuItem::new(to_local_label.clone())
+                                    .disabled(!local_pane_ready)
+                                    .on_click(move |_, _, cx| {
+                                        to_local.update(cx, |this, cx| {
+                                            this.download_to_local_pane(
+                                                id,
+                                                to_local_name.clone(),
+                                                cx,
+                                            );
+                                        });
+                                    }),
+                            )
                         };
                         let renaming = menu_entity.clone();
                         let rename_name = name.clone();
@@ -1859,6 +2034,7 @@ impl RuTermApp {
                 FileSortKey::Name,
                 None,
                 false,
+                pane,
                 cx,
             ))
             .child(self.file_sort_header(
@@ -1867,6 +2043,7 @@ impl RuTermApp {
                 FileSortKey::Kind,
                 Some((0, cols[0])),
                 false,
+                pane,
                 cx,
             ))
             .child(self.file_sort_header(
@@ -1875,24 +2052,30 @@ impl RuTermApp {
                 FileSortKey::Size,
                 Some((1, cols[1])),
                 true,
+                pane,
                 cx,
             ))
-            .child(self.file_sort_header(
-                "files-sort-time",
-                head_labels.3.clone(),
-                FileSortKey::Modified,
-                Some((2, cols[2])),
-                false,
-                cx,
-            ))
-            .child(self.file_sort_header(
-                "files-sort-perm",
-                head_labels.4,
-                FileSortKey::Permissions,
-                Some((3, cols[3])),
-                false,
-                cx,
-            ))
+            // 窄栏时时间与权限整列隐掉（行内同样少这两格），名称列才有地方喘气。
+            .when(!narrow, |this| {
+                this.child(self.file_sort_header(
+                    "files-sort-time",
+                    head_labels.3.clone(),
+                    FileSortKey::Modified,
+                    Some((2, cols[2])),
+                    false,
+                    pane,
+                    cx,
+                ))
+                .child(self.file_sort_header(
+                    "files-sort-perm",
+                    head_labels.4.clone(),
+                    FileSortKey::Permissions,
+                    Some((3, cols[3])),
+                    false,
+                    pane,
+                    cx,
+                ))
+            })
             // 拖拽列宽：监听整行，指针离开手柄也不中断；释放时清掉起点状态。
             .on_drag_move::<ColumnDrag>(cx.listener(
                 |this, event: &DragMoveEvent<ColumnDrag>, _, cx| {
@@ -1900,15 +2083,12 @@ impl RuTermApp {
                     let Some(start) = this.col_drag else {
                         return;
                     };
-                    if start.tab_id != drag.tab_id || start.col != drag.col {
+                    if start.target != drag.target || start.col != drag.col {
                         return;
                     }
                     let width = (start.start_w + (event.event.position.x.as_f32() - start.start_x))
                         .clamp(FILE_COL_MIN_W, FILE_COL_MAX_W);
-                    if let Some(tab) = this.tabs.iter_mut().find(|tab| tab.id == drag.tab_id)
-                        && (tab.files.cols[drag.col] - width).abs() > 0.5
-                    {
-                        tab.files.cols[drag.col] = width;
+                    if this.set_pane_col(drag.target, drag.col, width) {
                         cx.notify();
                     }
                 },

@@ -7,6 +7,7 @@ mod files;
 mod forwards;
 mod host_form;
 mod hosts;
+mod local_files;
 mod local_shells;
 mod macros_ui;
 mod prefs;
@@ -24,6 +25,7 @@ use files::*;
 use forwards::*;
 use host_form::*;
 use hosts::*;
+use local_files::*;
 use local_shells::*;
 use macros_ui::*;
 use prefs::*;
@@ -129,16 +131,19 @@ pub(crate) struct RuTermApp {
     unlock: Option<UnlockState>,
     /// 设置弹窗（主密码管理、主题、锁定）。
     settings: Option<SettingsState>,
-    /// 边栏当前页面（主机 / 文件 / 转发）。
+    /// 边栏当前页面（主机 / 文件 / 本机 / 转发）。
     sidebar_page: SidebarPage,
+    /// 本机文件页的浏览状态（当前目录、条目、排序与列宽、隐藏文件开关）。
+    local: LocalBrowser,
     /// 正在拖拽的文件列宽（起点指针位置 + 起始宽度）。
     col_drag: Option<ColumnDragState>,
     /// 文件面板的新建目录 / 重命名弹窗。
     file_prompt: Option<FilePrompt>,
     /// 文件面板删除确认。
     file_confirm: Option<FileConfirm>,
-    /// 文件面板路径编辑输入框（点击路径栏时激活）。
-    path_edit: Option<Entity<InputState>>,
+    /// 文件面板路径编辑输入框（点击路径栏时激活）：连同它归属的面板一起存，
+    /// 本机页和远端页各自认领，不会在 A 页输入、回车却跳到 B 页。
+    path_edit: Option<(PaneTarget, Entity<InputState>)>,
     /// 边栏分隔条拖拽起点（指针 x、起点面板占比）。
     split_drag: Option<(f32, f32)>,
     /// 分隔容器宽度（canvas 回填）：拖拽时把指针位移换算成占比。
@@ -263,6 +268,7 @@ impl RuTermApp {
         let jumps = JumpPrefs::from_json(&settings.jumps);
         let protocols = ProtocolPrefs::from_json(&settings.protocols);
         let macros = crate::macros::from_json(&settings.macros);
+        let local_files = LocalFilesPrefs::from_json(&settings.local_files);
         // 终端配色预设管理器：全局一份，`TerminalView::set_theme` 与自建样式都从这里取。
         if !cx.has_global::<ThemeManager>() {
             cx.set_global(ThemeManager::new(None));
@@ -356,6 +362,7 @@ impl RuTermApp {
             file_prompt: None,
             file_confirm: None,
             path_edit: None,
+            local: LocalBrowser::from_prefs(&local_files),
             split_drag: None,
             split_width: Rc::new(Cell::new(0.0)),
             forward: None,
@@ -753,6 +760,20 @@ impl RuTermApp {
                     cx.notify();
                 }
             });
+            // 本机文件页偏好同样以库内为准：还没列过目录时才回填上次停留的目录，
+            // 别把用户已经翻进去的目录覆盖掉。
+            if let Ok(Some(json)) = vault.setting("local_files").await {
+                let prefs = LocalFilesPrefs::from_json(&json);
+                let _ = this.update(cx, |this, cx| {
+                    if !this.local.listed && this.local.path.is_none() {
+                        this.local.path = prefs.path.as_deref().map(std::path::PathBuf::from);
+                    }
+                    if this.local.show_hidden != prefs.show_hidden {
+                        this.local.show_hidden = prefs.show_hidden;
+                        cx.notify();
+                    }
+                });
+            }
             // 键宏同样以库内为准（触发键每次按键才解析，无需额外回填）。
             if let Ok(Some(json)) = vault.setting("macros").await {
                 let macros = crate::macros::from_json(&json);
@@ -1120,6 +1141,7 @@ impl Render for RuTermApp {
             .text_color(pal.text)
             .on_action(cx.listener(Self::toggle_sidebar))
             .on_action(cx.listener(Self::toggle_file_panel_action))
+            .on_action(cx.listener(Self::toggle_local_panel))
             .on_action(cx.listener(Self::toggle_theme_action))
             .on_action(cx.listener(Self::new_host))
             .on_action(cx.listener(Self::new_local_terminal))
