@@ -925,7 +925,9 @@ impl RuTermApp {
             .bg(pal.card_bg)
             .child(div().text_sm().child(hint))
             .child(styled_input(
-                Input::new(&pending.password).content_type(InputContentType::Password),
+                Input::new(&pending.password)
+                    .content_type(InputContentType::Password)
+                    .mask_toggle(),
                 &pal,
             ))
             .children(save_row)

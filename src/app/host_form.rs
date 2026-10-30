@@ -1024,7 +1024,10 @@ impl RuTermApp {
                                     )
                                     .child(styled_input(
                                         Input::new(&form.passphrase)
-                                            .content_type(InputContentType::Password),
+                                            // 口令长且没有回显机会，给就地显隐切换；掩码状态记在
+                                            // 这个 InputState 上，表单关掉即重置。
+                                            .content_type(InputContentType::Password)
+                                            .mask_toggle(),
                                         &pal,
                                     )),
                             ),
