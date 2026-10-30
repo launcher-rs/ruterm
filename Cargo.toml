@@ -46,7 +46,7 @@ winresource = "0.1"
 # release 优化
 # 日常发版用 thin LTO（构建快）；打安装包用下面的 size 档（体积最小）。
 [profile.release]
-# 最高优化等级，图片编解码与标注烧录受益明显。
+# 最高优化等级，热路径都在 CPU 侧：终端逐帧解析与重绘、russh 加解密、SFTP / ZMODEM 分块搬运。
 opt-level = 3
 # 跨 crate 内联 + 死代码消除，增量代价可接受（rgpui 体积指南 §2.1）。
 lto = "thin"
