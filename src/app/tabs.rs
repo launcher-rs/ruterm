@@ -6,7 +6,7 @@ use rgpui::components::split_pane::{SplitDirection, SplitPaneState};
 use rgpui::input_ui::{Input, InputEvent, InputState};
 use rgpui::prelude::*;
 use rgpui::{
-    AnyElement, Button, ButtonVariants, Context, Disableable, Entity,
+    AnyElement, Button, ButtonVariants, ClipboardItem, Context, Disableable, Entity,
     ExternalPaths, Focusable, FontWeight, Hsla, Icon, IconName, InteractiveElement, IntoElement, MouseButton, ParentElement, SharedString,
     StatefulInteractiveElement, Styled, TrayMenuItem, Window, div, h_flex, px, v_flex,
 };
@@ -44,6 +44,8 @@ pub(super) struct SessionTab {
     pub(super) ended: bool,
     /// 结束原因是失败（连接失败 / 异常中断）：状态栏文案由失败路径负责，不被"已断开"覆盖。
     pub(super) failed: bool,
+    /// 失败原文（russh / IO 错误串）：横幅就地显示摘要并据此「复制错误」，重连成功后清空。
+    pub(super) last_error: Option<SharedString>,
     /// 重连所需参数；本地终端没有会话概念，为 None。
     pub(super) resume: Option<Resume>,
     /// 主动断开当前 SSH 会话（关闭标签时发送；本地终端为 None）。
@@ -174,6 +176,7 @@ impl RuTermApp {
             tab.failed = true;
             // 失败也按"已结束"落标签：终端事件可能迟到，横幅与重连入口要立刻可用。
             tab.ended = true;
+            tab.last_error = Some(message.clone());
             had_forwards = !tab.forwards.is_empty();
             // 连接没了，本地监听端口随会话任务一起释放。
             tab.forwards.clear();
@@ -1002,22 +1005,21 @@ impl RuTermApp {
         } else {
             tr!(cx, "会话已断开连接。")
         };
+        // 错误原文压成一行（换行只当空格）；太长仍要截断，完整内容靠「复制错误」进剪贴板。
+        let error_line = tab
+            .last_error
+            .as_ref()
+            .map(|err| flatten_error_text(err.as_ref(), 220));
+        let copy_error_label = tr!(cx, "复制错误");
+        let copy_error_tip = tr!(cx, "把断开原因原文复制到剪贴板，方便贴给别人排查");
+        let copied_status = tr!(cx, "错误已复制到剪贴板");
+        let error_text = tab.last_error.clone();
         let cancel_retry_label = tr!(cx, "取消自动重连");
         let reconnect_label = tr!(cx, "重新连接");
-        h_flex()
-            .id(SharedString::from(format!("ended-banner-{id}")))
-            .absolute()
-            .top(px(8.0))
-            .left(px(8.0))
-            .right(px(8.0))
-            .px_3()
-            .py_2()
+        // 一行装不下：标题/入口在第一行，错误原文单独一行，否则长错误会把按钮挤出窗口。
+        let head_row = h_flex()
             .gap_2()
             .items_center()
-            .rounded(px(6.0))
-            .bg(theme.warning)
-            .text_color(fg)
-            .shadow_md()
             .child(
                 div()
                     .text_sm()
@@ -1027,6 +1029,20 @@ impl RuTermApp {
             .child(div().text_sm().child(reason))
             .child(div().flex_1())
             .child(div().text_xs().child(hint))
+            .when_some(error_text, |this, err| {
+                this.child(
+                    Button::new(SharedString::from(format!("copy-error-{id}")))
+                        .label(copy_error_label)
+                        .ghost()
+                        .compact()
+                        .tooltip(copy_error_tip)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(err.to_string()));
+                            this.status = copied_status.clone();
+                            cx.notify();
+                        })),
+                )
+            })
             .when(pending, |this| {
                 this.child(
                     Button::new(SharedString::from(format!("cancel-retry-{id}")))
@@ -1063,8 +1079,36 @@ impl RuTermApp {
                         this.close_tab(id, cx);
                     })),
             )
+            .into_any_element();
+        v_flex()
+            .id(SharedString::from(format!("ended-banner-{id}")))
+            .absolute()
+            .top(px(8.0))
+            .left(px(8.0))
+            .right(px(8.0))
+            .px_3()
+            .py_2()
+            .gap_1()
+            .rounded(px(6.0))
+            .bg(theme.warning)
+            .text_color(fg)
+            .shadow_md()
+            .child(head_row)
+            .when_some(error_line, |this, line| {
+                this.child(div().text_xs().child(line))
+            })
             .into_any_element()
     }
 
 
+}
+
+/// 把多行错误压成一行并按字符数截断：横幅宽度有限，完整原文交给「复制错误」。
+fn flatten_error_text(text: &str, max_chars: usize) -> SharedString {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut out: String = flat.chars().take(max_chars).collect();
+    if flat.chars().count() > max_chars {
+        out.push('…');
+    }
+    SharedString::from(out)
 }

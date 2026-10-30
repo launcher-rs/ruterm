@@ -463,6 +463,7 @@ impl RuTermApp {
             terminal_view: terminal_view.clone(),
             ended: false,
             failed: false,
+            last_error: None,
             resume: Some(resume),
             disconnect: Some(disconnect),
             commands: Some(commands),
@@ -576,7 +577,8 @@ impl RuTermApp {
                     let message = if shell_started {
                         format!("连接中断：{addr}（{}）", crate::session::error_summary(&error))
                     } else {
-                        format!("连接失败：{addr}")
+                        // 建连阶段失败同样带上原因：横幅的「复制错误」要有内容可复制。
+                        format!("连接失败：{addr}（{}）", crate::session::error_summary(&error))
                     };
                     this.fail_session_tab(id, message.into(), shell_started, cx);
                 });
@@ -745,6 +747,7 @@ impl RuTermApp {
             terminal_view: terminal_view.clone(),
             ended: false,
             failed: false,
+            last_error: None,
             resume: Some(resume),
             disconnect: Some(disconnect),
             commands: None,
@@ -814,7 +817,10 @@ impl RuTermApp {
                             crate::session::error_summary(&error)
                         )
                     } else {
-                        format!("连接失败：Telnet {addr}")
+                        format!(
+                            "连接失败：Telnet {addr}（{}）",
+                            crate::session::error_summary(&error)
+                        )
                     };
                     this.fail_session_tab(id, message.into(), started, cx);
                 });

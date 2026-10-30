@@ -544,6 +544,7 @@ impl RuTermApp {
             terminal_view,
             ended: false,
             failed: false,
+            last_error: None,
             resume: None,
             disconnect: None,
             commands: None,
