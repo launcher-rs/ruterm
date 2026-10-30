@@ -78,7 +78,6 @@ impl RuTermApp {
             cx.notify();
             return;
         }
-        rdlog("find_in_terminal OPEN");
         self.find.visible = true;
         self.find.input.update(cx, |state, cx| {
             let len = state.value().len();

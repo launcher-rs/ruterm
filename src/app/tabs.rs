@@ -401,27 +401,24 @@ impl RuTermApp {
 
 
     /// 双击标签：把标题换成输入框就地改名。只影响这条会话，不落库。
-    pub(super) fn begin_rename(&mut self, tab_id: usize, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn begin_rename(
+        &mut self,
+        tab_id: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(tab) = self.tabs.iter().find(|tab| tab.id == tab_id) else {
             return;
         };
         let initial = tab.title.to_string();
-        rdlog(&format!("begin_rename tab={tab_id} initial={initial:?}"));
         let input = cx.new(|cx| InputState::new(window, cx).default_value(initial));
         cx.subscribe(&input, move |this, input, event: &InputEvent, cx| {
-            rdlog(&format!(
-                "input event {} attached={} value={:?}",
-                match event {
-                    InputEvent::Change => "Change",
-                    InputEvent::PressEnter { .. } => "PressEnter",
-                    InputEvent::Focus => "Focus",
-                    InputEvent::Blur => "Blur",
-                },
-                this.renaming.as_ref().is_some_and(|(_, state)| state == &input),
-                input.read(cx).value()
-            ));
             // 输入框可能已随上一次提交销毁，只认当前挂着的那个。
-            if !this.renaming.as_ref().is_some_and(|(_, state)| state == &input) {
+            if !this
+                .renaming
+                .as_ref()
+                .is_some_and(|(_, state)| state == &input)
+            {
                 return;
             }
             match event {
@@ -434,16 +431,10 @@ impl RuTermApp {
             state.focus(window, cx);
             let len = state.value().len();
             state.set_selected_range(0..len, cx);
-            rdlog(&format!(
-                "  after setup value={:?} focused={}",
-                state.value(),
-                Focusable::focus_handle(state, cx).is_focused(window)
-            ));
         });
         self.renaming = Some((tab_id, input));
         cx.notify();
     }
-
 
     /// 提交就地改名：空标题当作撤销，交还给终端上报的标题或默认名。
     pub(super) fn commit_rename(&mut self, cx: &mut Context<Self>) {
@@ -451,7 +442,6 @@ impl RuTermApp {
             return;
         };
         let text = input.read(cx).value().trim().to_string();
-        rdlog(&format!("commit_rename tab={tab_id} text={text:?}"));
         let Some(index) = self.tabs.iter().position(|tab| tab.id == tab_id) else {
             cx.notify();
             return;

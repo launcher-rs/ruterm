@@ -1013,10 +1013,12 @@ impl RuTermApp {
                                 })
                                 .child(match self.renaming.as_ref() {
                                     // 就地改名：标题位置换成输入框，回车/失焦提交，Esc 取消。
+                                    // 宽度要给死值：标签栏是横向滚动容器，主轴空间无限，
+                                    // `flex_1` 的输入框会算成 0 宽，文字全被裁掉。
                                     Some((renaming_id, state)) if *renaming_id == id => div()
                                         .key_context("TabRename")
-                                        .flex_1()
-                                        .min_w_0()
+                                        .w(px(180.0))
+                                        .flex_shrink_0()
                                         .child(styled_input(Input::new(state).text_xs(), &pal)),
                                     _ => div()
                                         .flex_1()

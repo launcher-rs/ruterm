@@ -48,18 +48,6 @@ pub(super) fn labeled_field(
 }
 
 /// 统一输入框外观：随主题取底色/文字/边框，保证未聚焦时文字与边框都清晰可辨。
-/// TEMP 调试：就地改名链路追踪。
-pub(super) fn rdlog(msg: &str) {
-    use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("temp/rename-debug.log")
-    {
-        let _ = writeln!(f, "{msg}");
-    }
-}
-
 pub(super) fn styled_input(input: Input, pal: &Palette) -> Input {
     input
         .bg(pal.input_bg)
