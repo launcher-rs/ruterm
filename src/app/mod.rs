@@ -111,6 +111,10 @@ pub(crate) struct RuTermApp {
     tab_scroll: ScrollHandle,
     /// 正在就地重命名的标签（标签 id + 输入框）；回车或失焦提交，Esc 取消。
     renaming: Option<(usize, Entity<InputState>)>,
+    /// 文件拖放的落点提示（目标目录 + 文件数）。由 `drag_over` 回调在 paint 阶段写、
+    /// 渲染阶段取走：paint 总在 render 之后，所以光标一离开落点，下一帧提示就消失，
+    /// 不用额外清理。用 `Cell` 是因为文件页渲染只借到 `&self`。
+    drop_hint: Cell<Option<(SharedString, usize)>>,
     /// 侧边栏分组（文件夹）偏好，随加密库 / settings.json 双层持久化。
     sidebar: SidebarPrefs,
     /// 主机 → 跳板机映射（host id → jump id），双层持久化。
@@ -339,6 +343,7 @@ impl RuTermApp {
             shell_prompt: None,
             tab_scroll: ScrollHandle::new(),
             renaming: None,
+            drop_hint: Cell::new(None),
             sidebar,
             jumps,
             protocols,

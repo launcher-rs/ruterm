@@ -99,6 +99,7 @@
  "扫描中…": "Scanning…",
  "折叠 / 展开侧栏面板": "Collapse / expand the sidebar panel",
  "拖入文件即可上传": "Drop files to upload",
+ "松开即上传 {count} 个文件到 {dir}": "Release to upload {count} file(s) to {dir}",
  "按回车重新连接": "Press Enter to reconnect",
  "按键正在同步到所有会话，点击关闭": "Keys are syncing to every session — click to stop",
  "搜索主机…": "Search hosts…",

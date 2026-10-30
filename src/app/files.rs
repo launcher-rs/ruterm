@@ -1519,6 +1519,8 @@ impl RuTermApp {
         }
 
         let dir = path.clone().unwrap_or_default();
+        // 上一帧 paint 写下的落点；取走即清，本帧若仍悬停在落点上会被重新写入。
+        let drop_hint = self.drop_hint.take();
         let count = entries.len();
         let total: u64 = entries
             .iter()
@@ -1639,14 +1641,24 @@ impl RuTermApp {
                     if is_dir {
                         // 拖到文件夹行上＝上传到该文件夹；其余行交给父级列表处理。
                         let target = dir_row.clone();
+                        let hint_target = dir_row.clone();
+                        let hint_entity = entity.clone();
                         row = row
-                            .drag_over::<ExternalPaths>(move |style, _, _, _| {
+                            .drag_over::<ExternalPaths>(move |style, paths, _, cx| {
+                                // 行比父容器后画，所以悬停在文件夹上时提示的是这个子目录。
+                                hint_entity.update(cx, |this, _| {
+                                    this.drop_hint.set(Some((
+                                        hint_target.clone().into(),
+                                        paths.paths().len(),
+                                    )));
+                                });
                                 style.bg(pal.card_hover).border_1().border_color(pal.accent)
                             })
                             .on_drop(cx.listener(move |this, paths: &ExternalPaths, _, cx| {
                                 let Some(id) = live else {
                                     return;
                                 };
+                                this.drop_hint.set(None);
                                 this.upload_paths(id, target.clone(), paths.paths().to_vec(), cx);
                             }));
                     }
@@ -1797,21 +1809,31 @@ impl RuTermApp {
                 .into_any_element()
         };
 
-        let list = div()
-            .id("file-list")
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scrollbar()
-            .drag_over::<ExternalPaths>(move |style, _, _, _| {
+        let hint_entity = entity.clone();
+        let hint_dir = dir.clone();
+        let list = div().id("file-list").flex_1().min_h_0().overflow_y_scrollbar();
+        // 没有活的 SFTP 会话就不接拖放：落点提示得有目标目录才有意义。
+        let list = if live.is_some() {
+            list.drag_over::<ExternalPaths>(move |style, paths, _, cx| {
+                hint_entity.update(cx, |this, _| {
+                    this.drop_hint.set(Some((
+                        hint_dir.clone().into(),
+                        paths.paths().len(),
+                    )));
+                });
                 style.bg(pal.card_hover).border_1().border_color(pal.accent)
             })
             .on_drop(cx.listener(move |this, paths: &ExternalPaths, _, cx| {
                 let Some(id) = live else {
                     return;
                 };
+                this.drop_hint.set(None);
                 this.upload_paths(id, dir.clone(), paths.paths().to_vec(), cx);
             }))
-            .child(list_body);
+        } else {
+            list
+        };
+        let list = list.child(list_body);
 
         // 表头：列宽与行内固定列共用常量；点击列名排序，再点切换升降序。
         let head_labels = (
@@ -2049,6 +2071,7 @@ impl RuTermApp {
 
         v_flex()
             .id("files-section")
+            .relative()
             .flex_1()
             .min_h_0()
             .w_full()
@@ -2056,6 +2079,30 @@ impl RuTermApp {
             .child(head_row)
             .child(list)
             .child(footer)
+            // 落点说清楚：拖到面板上时，就地浮一条「松开即上传到 <目录>」，
+            // 目录跟着光标所在行变（文件夹行＝该子目录，其余＝当前目录）。
+            .when_some(drop_hint, |this, (target, count)| {
+                this.child(
+                    h_flex()
+                        .absolute()
+                        .left_2()
+                        .right_2()
+                        .bottom(px(40.0))
+                        .justify_center()
+                        .px_2()
+                        .py_1()
+                        .rounded(px(4.0))
+                        .bg(pal.accent)
+                        .text_color(cx.theme().primary_foreground)
+                        .text_xs()
+                        .child(tr!(
+                            cx,
+                            "松开即上传 {count} 个文件到 {dir}",
+                            count = count,
+                            dir = target
+                        )),
+                )
+            })
             .into_any_element()
     }
 
