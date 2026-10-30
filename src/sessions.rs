@@ -139,6 +139,9 @@ pub struct Settings {
     /// 主机 → 协议映射（序列化成 JSON 字符串，键是主机 id；只记录非 SSH 的项）。
     #[serde(default)]
     pub protocols: String,
+    /// 键宏（名称 / 触发键 / 步骤序列，序列化成 JSON 数组）。
+    #[serde(default)]
+    pub macros: String,
 }
 
 impl Settings {
@@ -251,6 +254,12 @@ impl SessionStore {
     pub fn save_protocols(&self, json: &str) {
         let json = json.to_string();
         self.update_settings(|settings| settings.protocols = json);
+    }
+
+    /// 降级模式（无加密库）下保存键宏列表。
+    pub fn save_macros(&self, json: &str) {
+        let json = json.to_string();
+        self.update_settings(|settings| settings.macros = json);
     }
 
     /// 读取界面语言启动镜像；缺失或值不认识时按中文（界面原文语言）。

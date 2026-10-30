@@ -54,6 +54,12 @@ GUI 会话管理器形态：左侧持久化的主机账号列表，点账号即�
   （至少两个可用会话才能打开），状态栏右侧亮起「同步输入」指示，点它即可关闭；会话落到不足两个时自动关。
   「命令发到所有会话…」弹出一条命令，勾选确认后以回车写入每个可用会话（已结束 / 连接失败的跳过），
   弹窗里列清目标会话名。粘贴在镜像前会还原成纯文本，避免 bracketed-paste 转义串进没开该模式的会话。
+- **键宏**：「会话」菜单 →「键宏…」（`Ctrl+Shift+M`）打开管理器：每行一条宏（启用开关 / 名称 /
+  触发键 / 步数 / 使用次数），带搜索与 ▶ 执行 / 编辑 / 两步确认删除；编辑表单可加多步「发送内容 + 步后延迟」，
+  转义 `\n` 回车、`\t` Tab、`\e` ESC、`\\` 反斜杠，其余按字面发送。触发键带 Ctrl / Alt（或 F1–F12），
+  只在终端持有焦点时拦截，命中即吞掉按键（不会再把 Ctrl+字母当控制字符送进 shell）；
+  发送复用同步输入的同一条写入通道（Programmatic 来源，不回流镜像）。列表支持 JSON 导入 / 导出，
+  数据存加密库 `settings` 表 `macros` 键。
 - **断线自动重连**：连接意外中断（断网 / 服务端掉线）后按 1 / 2 / 5 / 10 / 20 秒退避自动重连，最多连续 5 次，
   横幅显示「第几次、几秒后」并可随时取消；会话稳定运行 30 秒后计数重置。远端主动 `exit` 与首次连接失败不触发自动重连。
   建连（DNS / TCP / 握手 / 认证 / 开 shell）有可配置超时（默认 15 秒），超时即结束本次尝试。
@@ -124,7 +130,7 @@ GUI 会话管理器形态：左侧持久化的主机账号列表，点账号即�
   设置与侧边栏折叠的常驻按钮已撤掉：前者收进「会话 → 设置…」与「外观」各分页，后者走菜单 / `Ctrl+B`。
   拖拽与窗口控件走 `WindowControlArea` 命中区，
   交互控件排在 Drag 区**之外**（Windows 的 `WM_NCHITTEST` 只认第一个命中的控制区，父级 Drag 会吞掉栏内按钮点击）。
-  菜单项挂的是 rgpui **action**，有快捷键的项右侧自动渲染按键徽标（`Ctrl+N` / `Ctrl+Shift+T` / `Ctrl+B` / `Ctrl+,` / `Ctrl+T`），
+  菜单项挂的是 rgpui **action**，有快捷键的项右侧自动渲染按键徽标（`Ctrl+N` / `Ctrl+Shift+T` / `Ctrl+B` / `Ctrl+,` / `Ctrl+T` / `Ctrl+Shift+M`），
   标签里不再手写快捷键文字，「帮助」菜单只留版本号。
 - **设置界面**：「会话 → 设置…」（`Ctrl+,`）或「外观」菜单中的各分页入口打开，**左侧竖排分页导航**——「凭据库与主密码」/「外观」/「状态栏」/「终端」/「会话」，右侧为当前分页内容；
   弹窗固定大小，切分页不会忽大忽小，内容超出时分页自身滚动，后续设置项继续加分页即可。
@@ -175,6 +181,7 @@ GUI 会话管理器形态：左侧持久化的主机账号列表，点账号即�
 | `Ctrl+Shift+F` | 切到边栏「转发」页 |
 | `Ctrl+Shift+D` | 左右分屏（再次按下退出，`Ctrl+Shift+E` 换向） |
 | `Ctrl+Shift+E` | 上下分屏 |
+| `Ctrl+Shift+M` | 键宏管理器（Esc 关闭） |
 | `Ctrl+F` | 终端内查找（回车 / Shift+回车 上下跳转，Esc 关闭） |
 | `Ctrl+T` | 切换明暗主题 |
 | `Ctrl+,` | 打开设置 |
@@ -252,7 +259,12 @@ rgpui 三个 crate 走 crates.io 正式版本。本地联调 rgpui 时可在 `[p
 
 ```
 src/
-  main.rs       # UI：RuTermApp（边栏、标签栏、终端、状态栏、托盘）+ 解锁弹窗 + 设置弹窗（主密码、主题、边栏位置、状态栏显示项、终端外观）+ 边栏（主机 / 文件 / 转发页）+ 应用入口
+  main.rs       # 应用入口：动作定义（actions!）、全局快捷键绑定、建窗 + 系统托盘
+  app/          # 应用层按功能拆分（mod.rs 持有 RuTermApp 状态与根渲染调度，其余为同功能 impl 块）
+    tabs.rs / connect.rs / hosts.rs / host_form.rs / files.rs / forwards.rs / local_shells.rs
+    settings.rs（含偏好类型 prefs.rs、外观 appearance.rs）/ sidebar.rs / status_bar.rs
+    terminal_ops.rs / title_bar.rs / vault_ui.rs / macros_ui.rs（键宏管理器）/ widgets.rs
+  macros.rs     # 键宏：触发键校验与规范化、步骤转义、JSON 序列化（含单测）
   session.rs    # 会话桥接：rgpui-term 外接 IO ⇄ russh 双向字节流（上行泵线程 + 转发任务）+ 跳板机链式建连 + exec 远程信息探测 + SFTP 传输 / 端口转发（含 SOCKS5 握手）指令调度
   ssh.rs        # SSH 引擎：russh client::Handler、指纹校验（优先查加密库，降级回文本文件）、旁路通道过滤
   telnet.rs     # Telnet 会话：tokio TCP + 最小 IAC 协商（ECHO/SGA 接受、NAWS 上报、子协商丢弃、上行 0xFF 双写），灌同一个外接 IO 后端（含单测）
@@ -275,6 +287,10 @@ src/
 
 近期重点：
 
+- ~~**键宏**~~：已完成 —— 组合键 → 多步字节流（每步可带延迟），「会话」菜单「键宏…」/ `Ctrl+Shift+M`
+  打开管理器：列表含启用开关 / 触发键 / 步数 / 使用次数与搜索，▶执行 / 编辑 / 两步确认删除，
+  支持 JSON 导入导出；触发键走 `App::intercept_keystrokes`（动作分发前）只拦终端聚焦时的按键，
+  发送复用同步输入的写入通道；模型与单测在 `src/macros.rs`，数据存加密库 `settings.macros`。
 - ~~**本地终端（系统 Shell）**~~：已完成 —— `TerminalBuilder::new` 直连 rgpui-term 本地 PTY（ConPTY），
   Windows / Linux / macOS 探测 `pwsh` → `powershell` → `%COMSPEC%` → `$SHELL`，Git Bash 与 WSL 亦已探测
   （`src/local_shell.rs`）；侧边栏树顶「本地终端」分组逐条列出各 shell（系统默认图标），点一下即开会话，

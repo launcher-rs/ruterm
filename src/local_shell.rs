@@ -548,7 +548,7 @@ unsafe fn icon_to_png(hicon: windows::Win32::UI::WindowsAndMessaging::HICON) -> 
 #[cfg(windows)]
 fn encode_png(bgra: &[u8], width: i32, height: i32) -> Option<Vec<u8>> {
     let mut rgba = Vec::with_capacity(bgra.len());
-    for chunk in bgra.chunks_exact(4) {
+    for chunk in bgra.as_chunks::<4>().0 {
         let (blue, green, red, alpha) = (chunk[0], chunk[1], chunk[2], chunk[3]);
         if alpha == 0 {
             rgba.extend_from_slice(&[0, 0, 0, 0]);

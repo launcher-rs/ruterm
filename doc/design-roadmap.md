@@ -17,6 +17,7 @@
 | 主机指纹校验 | `[x]` | TOFU known_hosts **存入加密库**（`known_hosts` 表），不匹配 / 写入失败 / 查询失败一律拒绝（fail-closed，防 MITM） |
 | 会话标签页 | `[x]` | 多标签、关闭、激活切换；标签栏在主区顶部（44px 栏高、160px 最小标签宽），**只放标签**，传输 / 转发入口在标题栏；**平铺式标签**：不描边、标签之间不留缝，活动标签用主题语义色 `tab_active` 打底 + 顶部 2px 强调线，非活动标签不显示 `×`（切过去再关）；**横向滚动**并把活动标签自动滚进可视区，`Ctrl+Tab` / `Ctrl+Shift+Tab` / `Ctrl+PageDown` / `Ctrl+PageUp` 循环切换；标签可**拖动排序**（阈值触发、缩略标签跟随光标、落点标签高亮，落到空白处＝移至最末） |
 | 分屏 | `[x]` | 窗口级两标签配对：`Ctrl+Shift+D` 左右、`Ctrl+Shift+E` 上下（「会话」菜单同入口），同方向再按退出、反方向换向；点击任一侧即切换活动标签并聚焦终端；分隔条可拖拽、两侧最小 240px；切到配对外标签或关闭任一侧自动退出（见 §二.6） |
+| 键宏 | `[x]` | 「会话」菜单「键宏…」/ `Ctrl+Shift+M` 打开管理器：每行一条宏（启用开关 / 名称 / 触发键 / 步数 / 使用次数）、搜索过滤、▶执行 / 编辑 / 两步确认删除；编辑表单按「名称 / 触发键 / 步骤（发送内容 + 步后延迟）」排布，转义 `\n` `\t` `\e` `\\`，底部可「导入… / 导出…」JSON。触发键只在终端聚焦且无浮层时拦截（`intercept_keystrokes`，早于动作分发），命中后按步写入活动会话（复用同步输入的 Programmatic 通道，不回流镜像）；存加密库 `settings.macros`（见 §二.7） |
 | 侧边栏主机列表 | `[x]` | 分组（文件夹）树：折叠三角 + 文件夹/认证方式图标 + 组名 + 数量，★ 收藏置顶；**组内可手动排序**（右键上移/下移/移到最前）；组与归属、折叠态、排序存加密库 `settings` 表 `sidebar` 键（JSON，不动 `hosts` 表结构）。新建/编辑/删除/移动/分组管理全部收进右键菜单，顶部不再放常驻大按钮；支持从 `~/.ssh/config` 一键导入（见 §二.7）。 |
 | CLI 快速连接 | `[x]` | 带参数一次性连接；密码仅走环境变量 / GUI 临时输入 |
 | 主题 | `[x]` | 明 / 暗切换（配色走 `cx.theme()` 语义色，与按钮/状态栏统一），标题栏「外观」菜单（当前项打勾）+ `Ctrl+T`，选择持久化到加密库 `settings` 表 |
@@ -37,6 +38,7 @@
 | 设置 | 「会话」菜单 → 设置… · `Ctrl+,`；「外观」菜单可直达外观 / 状态栏 / 终端分页 |
 | 折叠 / 展开侧栏面板 | 「会话」菜单 · `Ctrl+B`（标题栏不再放该按钮；最外缘的图标轨始终保留） |
 | 左右 / 上下分屏 | 「会话」菜单 → 左右分屏 / 上下分屏 · `Ctrl+Shift+D` / `Ctrl+Shift+E`（再次触发退出或换向） |
+| 键宏 | 「会话」菜单 → 键宏… · `Ctrl+Shift+M`（Esc 关闭） |
 | 明暗主题 | 「外观」菜单 · `Ctrl+T` |
 | 解锁 / 锁定凭据库 | 「凭据」菜单；口令档未解锁时标题栏出现 🔑，已解锁时显示 🔒 |
 
@@ -67,7 +69,7 @@
 - `[x]` **可配置显示项**：设置弹窗新增「状态栏」分页（入口：设置 → 状态栏，或「外观」菜单 → 状态栏显示项…），
       分「会话信息」（连接地址 / 认证方式）与「远程主机信息」（系统 / 内存 / 磁盘 / 负载 / 运行）两组勾选，
       取消勾选即从状态栏移除，改动即时生效。
-  - 实现：`StatusBarPrefs`（`src/main.rs`，`metrics` 用 `HashMap<id, bool>`，缺省视为显示，
+  - 实现：`StatusBarPrefs`（`src/app/prefs.rs`，`metrics` 用 `HashMap<id, bool>`，缺省视为显示，
     新增指标不必迁移旧数据）+ `Metric` 枚举（`src/remote.rs`，`id` 兼作持久化键与条目 id，
     `label` 供设置界面与状态栏共用）；`render_status_bar` 按勾选拼装，`RemoteInfo::item(metric)`
     缺项返回 `None` 时继续跳过。
@@ -98,7 +100,7 @@
 - `[x]` **分组（文件夹）树**：主机列表按分组树组织（折叠三角 + 文件夹图标 + 组名 + 数量），
       右键可**新建分组… / 重命名分组… / 删除分组**，主机行右键「移动到分组」子项带 ✓ 当前归属；
       删除分组只退回归属到「未分组」，**绝不删主机**。折叠态、组顺序、归属均持久化。
-  - 实现：`SidebarPrefs`（`src/main.rs`：`groups` 顺序 + `collapsed` + `assign: HashMap<host_id, group>`，
+  - 实现：`SidebarPrefs`（`src/app/prefs.rs`：`groups` 顺序 + `collapsed` + `assign: HashMap<host_id, group>`，
     含 `add/rename/remove/toggle/assign_to/group_of/forget` 与 JSON 往返单测）；`rename` 同步改写归属，
     `group_of` 校验组仍存在（悬空归属视为未分组），`remove` 只清归属。
   - 持久化刻意**不给 `hosts` 表加列**：整体序列化成 JSON 存加密库 `settings` 表 `sidebar` 键
@@ -136,7 +138,7 @@
       经 `TerminalThemeConfig::to_theme` 注册成 `ThemeManager` 的「自定义」方案；
       编辑器 18 个十六进制输入框实时预览色块并即时刷到已开终端，非法格式不提交、
       「恢复 One Dark」一键复位；旧版 JSON 缺 `custom` 时按 One Dark 补齐，坏值由 `clamp` 修复。
-      实现见 `src/main.rs` 的 `render_custom_colors` / `commit_custom_color` / `register_custom_theme`。
+      实现见 `src/app/appearance.rs` 的 `render_custom_colors` / `commit_custom_color` / `register_custom_theme`。
 - `[~]` 终端字号（10–32 px）与行高（1.0–2.0）步进调节，与配色同分页、同持久化；
       新建终端经 `TerminalView::new_with_style` 取当前偏好，已开的经 `text_style_mut()` 原地刷新。
       终端字体族沿用默认等宽（`FiraCode Nerd Font` + 平台回退），UI 字号未开放。
@@ -214,11 +216,21 @@
       最多连续 5 次，横幅显示进度并可取消；会话稳定 30 秒后计数重置；远端主动 `exit`、首次连接失败、
       凭据被拒均不自动重连（避免把写错的地址或坏凭据反复重试）。建连 → 认证 → 开 shell 整体有
       **连接超时**（默认 15 秒，设置「会话」分页可调 5–120 秒），超时明确报错而不是无限等待。
-  - 实现：`SessionPrefs`（`src/main.rs`：`auto_reconnect` + `connect_timeout`，双层持久化到
+  - 实现：`SessionPrefs`（`src/app/prefs.rs`：`auto_reconnect` + `connect_timeout`，双层持久化到
     加密库 `settings` 表 `session` 键 / 降级 `settings.json`，越界值夹回区间并有单测）；
     `session.rs` 用 `tokio::time::timeout` 包住建连与认证，shell 开启时经 `ready` oneshot 通知 UI
     记录 `connected_at`；`SessionTab` 记录 `auto_retry_attempt / auto_retry_pending / connected_at`，
     到点任务用 `background_executor().timer` 等待，并以终端实体身份 + `ended` 校验防止迟到任务误重连。
+- `[x]` **键宏**：「会话」菜单「键宏…」/ `Ctrl+Shift+M` 打开管理器（列表 ⇄ 编辑表单，640×500 居中弹窗）。
+      列表每行：启用开关、名称（留空显示「未命名宏」）、`触发 ctrl-alt-1 · N 步 · 用 M 次`，右侧 ▶执行 / 编辑 /
+      两步确认删除；顶部搜索框按名称与触发键过滤，底部「导入… / 导出…」走系统文件选择器（默认 `ruterm-macros.json`）。
+      编辑表单：名称 / 触发键（可留空＝不绑键）/ 步骤列表（发送内容 + 步后延迟毫秒，可增删），
+      转义 `\n` 回车、`\t` Tab、`\e` ESC、`\\` 反斜杠。触发键要求带 Ctrl / Alt 或为 F1–F12，
+      规范化成小写 canonical 串再存，保留键表（应用快捷键与终端控制字符）与重键在保存时拒绝并就地报错。
+      触发走 `App::intercept_keystrokes`（在动作分发之前），仅当活动终端持有焦点且无浮层时命中；
+      命中后 `stop_propagation` 并按步 `Terminal::input`（与同步输入同一条 Programmatic 通道，不回流镜像），
+      步间用后台定时器等待延迟。模型与单测在 `src/macros.rs`，界面在 `src/app/macros_ui.rs`，数据存加密库
+      `settings.macros`（降级 `settings.json`）。已知边界：暂不支持录制、循环、条件与按会话绑定。
 - `[ ]` 命令片段库、快捷命令、多主机同时执行。
 - `[ ]` 终端日志记录与导出、会话保存 / 恢复。
 - `[x]` `~/.ssh/config` 导入与解析：`src/ssh_config.rs` 逐行读 `Host` 块，取 `HostName` / `User` / `Port` /

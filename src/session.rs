@@ -1348,11 +1348,10 @@ impl CwdKeystrokes {
                     {
                         log::debug!("[CwdKeystrokes] 检测到 cd: {}", arg);
                         done = Some(arg);
-                    } else if !self.skip {
-                        if let Ok(line) = std::str::from_utf8(&self.buf) {
+                    } else if !self.skip
+                        && let Ok(line) = std::str::from_utf8(&self.buf) {
                             log::debug!("[CwdKeystrokes] 行结束但未检测到 cd: {:?}", line);
                         }
-                    }
                     self.buf.clear();
                     self.skip = false;
                 }
@@ -1727,7 +1726,7 @@ async fn authenticate(handle: &mut Handle<SshTerminalHandler>, target: &SshTarge
             return Ok(());
         }
     }
-    return Err(anyhow::anyhow!("SSH Agent 中的密钥均被服务器拒绝").context(SecretRejected));
+    Err(anyhow::anyhow!("SSH Agent 中的密钥均被服务器拒绝").context(SecretRejected))
 }
 
 /// 用已加载的私钥完成公钥认证（文件私钥与内嵌私钥共用）。

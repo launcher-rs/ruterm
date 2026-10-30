@@ -323,7 +323,7 @@ impl client::Handler for SshTerminalHandler {
                 let fp = fingerprint_hex(key);
                 // fail-closed：库查询/写入任何失败都拒绝连接，绝不降级放行。
                 match vault
-                    .check_or_record_known_host(&entry_host, &fp, &key.algorithm().to_string())
+                    .check_or_record_known_host(&entry_host, &fp, key.algorithm().as_ref())
                     .await
                 {
                     Ok(Trust::Matched) => Ok(true),
