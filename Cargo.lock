@@ -6443,6 +6443,7 @@ dependencies = [
  "argon2 0.5.3",
  "base64 0.23.1",
  "bytes",
+ "des",
  "getrandom 0.4.3",
  "keyring",
  "log",

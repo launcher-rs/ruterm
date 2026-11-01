@@ -26,6 +26,8 @@ getrandom = "0.4.3"
 aes-gcm = { version = "0.11", default-features = false, features = ["aes", "alloc"] }
 sha2 = "0.11"
 base64 = "0.23"
+# VNC 认证（RFB 的 VNC Authentication 是 DES-ECB 挑战应答，安全性由协议决定）。
+des = "0.9"
 
 [target.'cfg(windows)'.dependencies]
 # 提取 shell 可执行文件的系统图标：Win32 取 HICON，png 编成 rgpui 能直接吃的字节。

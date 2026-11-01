@@ -8,6 +8,7 @@
 
 mod app;
 mod config;
+mod desktop;
 mod i18n;
 mod instance;
 mod local_shell;
