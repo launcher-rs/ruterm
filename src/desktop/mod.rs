@@ -1,4 +1,4 @@
-//! 远程桌面：VNC 先落地，RDP / SPICE 后续接入同一个标签骨架。
+//! 远程桌面：VNC 与 RDP 共用同一套标签骨架与帧管道。
 //!
 //! 约定（与终端一致）：网络 IO 全在 tokio 侧，UI 线程只收发消息与贴图。
 //! 帧以「整帧 BGRA 快照」交给界面：界面自己按刷新节奏取，取走了才再产一帧，
@@ -13,6 +13,8 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 pub mod keysym;
+pub mod rdp;
+pub mod scancode;
 pub mod vnc;
 
 /// 建连（DNS + TCP）的等待上限。
@@ -22,14 +24,38 @@ const FRAME_INTERVAL: Duration = Duration::from_millis(33);
 /// 统计窗口：每秒汇报一次实际帧率。
 const STATS_INTERVAL: Duration = Duration::from_secs(1);
 
+/// 远程桌面协议。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Protocol {
+    Vnc,
+    Rdp,
+}
+
+impl Protocol {
+    /// 表单切换协议时预填的默认端口。
+    pub fn default_port(self) -> u16 {
+        match self {
+            Protocol::Vnc => 5900,
+            Protocol::Rdp => 3389,
+        }
+    }
+}
+
 /// 一次连接参数。密码只在握手时用，连接建立后不保留。
 #[derive(Clone, Debug)]
 pub struct Config {
+    pub protocol: Protocol,
     pub host: String,
     pub port: u16,
     pub password: Option<String>,
     /// 是否与其它客户端共享桌面（VNC 的 shared 标志）。
     pub shared: bool,
+    /// RDP 账号；VNC 不用。
+    pub username: Option<String>,
+    /// RDP 域（可留空）；VNC 不用。
+    pub domain: Option<String>,
+    /// RDP 请求的桌面尺寸（远端会按这个分辨率建会话）。
+    pub size: (u16, u16),
 }
 
 impl Config {
@@ -39,13 +65,47 @@ impl Config {
     }
 }
 
+/// 一次按键在两种协议下的编码。
+///
+/// VNC 只认 X11 keysym；RDP 优先扫描码，查不到时用 Unicode 字符。
+/// 两边都取不到（纯修饰组合之类）时 `keysym` 为 0，由协议层自己跳过。
+#[derive(Clone, Copy, Debug)]
+pub struct KeyInput {
+    pub keysym: u32,
+    pub scancode: Option<u16>,
+    pub ch: Option<char>,
+}
+
+impl KeyInput {
+    /// rgpui 的按键事件 → 协议无关编码。
+    pub fn from_event(key: &str, key_char: Option<&str>) -> Option<Self> {
+        let keysym = keysym::event_keysym(key, key_char);
+        let scancode = scancode::event_scancode(key, key_char);
+        let ch = if scancode.is_none() {
+            scancode::event_char(key, key_char)
+        } else {
+            None
+        };
+        if keysym.is_none() && scancode.is_none() && ch.is_none() {
+            return None;
+        }
+        Some(Self {
+            keysym: keysym.unwrap_or(0),
+            scancode,
+            ch,
+        })
+    }
+}
+
 /// 界面发给会话的指令。
 #[derive(Debug)]
 pub enum Command {
     /// 指针位置与按钮位图（bit0 左键、bit1 中键、bit2 右键）。
     Pointer { x: u16, y: u16, buttons: u8 },
-    /// 按键（X11 keysym）。
-    Key { keysym: u32, down: bool },
+    /// 按键。`down` 区分按下与抬起。
+    Key { key: KeyInput, down: bool },
+    /// 滚轮（远端像素坐标；向上为 `up`）。VNC 由协议层翻成 4/5 号按钮。
+    Wheel { x: u16, y: u16, up: bool, buttons: u8 },
     /// 本地剪贴板 → 远端。
     Clipboard(String),
     /// 请求一次增量更新（正常由会话自己排，界面基本不用发）。
@@ -86,10 +146,18 @@ pub struct Session {
     pub events: UnboundedReceiver<Event>,
 }
 
-/// 连上服务器并起收发两个任务。
+/// 按协议连上服务器，交出统一的事件与指令通道。
 ///
 /// 必须在 tokio 运行时里调用（界面侧走 `background_spawn`）。
 pub async fn connect(config: Config) -> Result<Session> {
+    match config.protocol {
+        Protocol::Vnc => connect_vnc(config).await,
+        Protocol::Rdp => rdp::connect(config).await,
+    }
+}
+
+/// VNC（RFB 3.8）：握手 → 起收发两个任务。
+async fn connect_vnc(config: Config) -> Result<Session> {
     let mut stream = tokio::time::timeout(
         CONNECT_TIMEOUT,
         TcpStream::connect((config.host.as_str(), config.port)),
@@ -139,7 +207,24 @@ pub async fn connect(config: Config) -> Result<Session> {
             let (width, height) = *writer_size.lock().unwrap();
             let bytes = match command {
                 Command::Pointer { x, y, buttons } => vnc::pointer_message(x, y, buttons),
-                Command::Key { keysym, down } => vnc::key_message(keysym, down),
+                Command::Key { key, down } => {
+                    if key.keysym == 0 {
+                        continue;
+                    }
+                    vnc::key_message(key.keysym, down)
+                }
+                // VNC 没有滚轮事件：上/下滚就是滚轮按钮（4/5）的按下与释放。
+                Command::Wheel {
+                    x,
+                    y,
+                    up,
+                    buttons,
+                } => {
+                    let wheel = if up { 4 } else { 5 };
+                    let mut bytes = vnc::pointer_message(x, y, buttons | wheel);
+                    bytes.extend_from_slice(&vnc::pointer_message(x, y, buttons));
+                    bytes
+                }
                 Command::Clipboard(text) => vnc::clipboard_message(&text),
                 Command::Refresh => vnc::update_request_message(true, width, height),
                 Command::RequestFull => vnc::update_request_message(false, width, height),

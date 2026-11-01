@@ -19,7 +19,7 @@
 | 中英文界面 | i18n 静态词典 + 语言切换 | 简中 / English 即时切换 | **已补** |
 | 键宏 | 组合键 → 字节流，导入导出 | 管理器：触发键 + 多步序列 / 延迟、导入导出 | **已补** |
 | 本地文件页 | 单栏本机目录浏览器 | 只有远端 SFTP | 补 |
-| 远程桌面 | VNC / RDP / SPICE 真实实现 | VNC 标签（RFB 3.3/3.8 + Raw/CopyRect/Hextile） | VNC **已补**；RDP / SPICE 依赖受阻（见 P2） |
+| 远程桌面 | VNC / RDP / SPICE 真实实现 | VNC 标签（RFB 3.3/3.8 + Raw/CopyRect/Hextile） | VNC / RDP **已补**（RDP 实机待复核）；SPICE 依赖受阻（见 P2） |
 | 加密凭据库 | 明文 `sessions.json` | 加密库 + 字段加密 | **我们领先** |
 | 主机指纹 | TOFU（known_hosts 文本） | TOFU 入库、跳板逐跳校验 | **我们领先** |
 | 端口转发 | 仅本机 TCP 直连中转 | -L / -R / -D（SOCKS5） | **我们领先** |
@@ -41,7 +41,7 @@
 | ⑤ | 拖拽落点说清楚 | 文件悬停面板时浮层写「松开即上传到 /path」 | 面板底部浮一条「松开即上传 N 个文件到 <目录>」，悬在文件夹行上目录换成该子目录 | 已完成（P1）：落点由 `drag_over` 在 paint 阶段写、渲染阶段取走，光标离开落点下一帧即消失，不用额外清理。文案与位置在运行中的界面核对过；**脚本发起的 OLE 拖拽进不到本窗口**（发起侧没跑通，不代表真实拖拽无效），悬停是否随光标换目录待一次资源管理器手动拖拽确认 |
 | ⑥ | 错误就地给动作 | 工具条直接显示错误 + 「复制」「重试」 | 横幅第二行显示断开原因，「复制错误」把全文送剪贴板，「重新连接」就是重试 | 已完成（P1）：建连失败的消息原来只带地址，复制过去是一句没原因的「连接失败」，现补进 `error_summary` 原因链；原因此前只在状态栏一闪，现在与按钮同屏 |
 | ⑦ | 宏管理器的信息架构 | 名称 / 触发方式 / 步数 / 使用次数 / 启用 + 搜索排序 + ▶执行 / 删除 + 每步延迟 + 导入导出 | 已按此实现（触发键改为按键录制，无宏内容录制按钮） | 已完成（P1 键宏）：列表含开关 / 名称 / 触发键 / 步数 / 次数与搜索，▶执行 / 编辑 / 两步确认删除，编辑表单含逐步延迟与导入导出 |
-| ⑧ | 远程桌面工具条 | 标签内就地连接表单；「断开 / 自适应 / 缩放 / 捕获键盘 / 剪贴板」+ 右侧 `WxH Nfps`；失败就地复制 / 重试 | 已按此实现（VNC）：就地表单（地址 / 端口 / 密文密码 + 「只在内存、不保存」说明）、工具条六项 + `WxH · N fps`（悬停显示服务器桌面名）、失败卡片「复制错误 / 修改参数 / 重试」、标签栏加类型图标 | 已完成（P2 第一段）：Esc 释放键盘捕获、未捕获时画面顶部浮一条「点击画面捕获键盘」提示；密码只在 `DesktopTab` 内存里，关标签即丢弃 |
+| ⑧ | 远程桌面工具条 | 标签内就地连接表单；「断开 / 自适应 / 缩放 / 捕获键盘 / 剪贴板」+ 右侧 `WxH Nfps`；失败就地复制 / 重试 | 已按此实现（VNC / RDP）：就地表单（协议切换 + 地址 / 端口 / 密文密码，RDP 另有用户名 / 域 + 「只在内存、不保存」说明）、工具条六项 + `WxH · N fps`（悬停显示远端名称）、失败卡片「复制错误 / 修改参数 / 重试」、标签栏加类型图标 | 已完成（P2）：Esc 释放键盘捕获、未捕获时画面顶部浮一条「点击画面捕获键盘」提示；密码 / RDP 账号只在 `DesktopTab` 内存里，关标签即丢弃；RDP 的「剪贴板」按钮改为状态栏提示暂不支持 |
 | ⑨ | 密码可见切换 | 输入框旁眼睛按钮，按框独立记忆 | 一律密文（`InputContentType::Password`），无切换 | 已完成（P1）：主机表单「私钥口令」与连接时的密码/口令面板用框架自带的 `Input::mask_toggle()`（`eye.svg`/`eye-off.svg` 图标，`InputState.masked` 按框记忆，表单关掉即复位）；**解锁弹窗按约定不做**，主密码框不回显 |
 
 **查找条的取值边界**：rgpui-term 只给 `SearchStatus { Idle, Invalid, NotFound, Matched }`
@@ -167,22 +167,28 @@
   实测：协议层单测（握手 / 认证 / 三种编码 / 尺寸变更）全绿，全套 `cargo test` 通过；
   **实机画面与输入转发待复核**——本次开发期间按用户要求未启动 ruterm 窗口，
   下次开机补一次对测试 VNC 服务器（TigerVNC / x11vnc）的连接、缩放、捕获与断开截图。
-- [ ] **远程桌面：RDP → SPICE** — `XL` — **依赖受阻，暂缓**
-  标签骨架已经就绪（VNC 走的就是它）：补上 `Event::Connected / FrameReady / Fps / Clipboard / Closed`
-  与 `Command` 集合即可接第二个协议。2026-11 实测两条依赖路线都卡在项目外部条件上：
-  - **RDP**：crates.io 上 ironrdp 0.17 / ironrdp-client 0.1 全家族（connector 0.1–0.12）都依赖
-    picky `7.0.0-rc.x`，而这些 rc 用 `=` 精确锁死 RustCrypto 预发布版
-    （`curve25519-dalek =5.0.0-rc.1`、`aes-gcm =0.11.0-rc.4`、`rsa =0.10.0-rc.18` …）；
-    本项目与 russh 0.64 用的是已发布版（`curve25519-dalek 5.0.0`、`aes-gcm 0.11.1`、`sha2 0.11.1`）。
-    Cargo 不允同一 semver 兼容区间同时存在两个版本，`cargo fetch` 直接报
-    `failed to select a version for curve25519-dalek`（`=5.0.0-rc.1` 与 `^5 → 5.0.0` 冲突）。
-    可选出路按代价排序：① 等 picky 7.0 正式版改回已发布加密库（最省事，只需升级依赖）；
-    ② vendor picky + sspi 并改写锁定的加密库版本（要处理 RustCrypto 预发布 → 正式版的 API 漂移）；
-    ③ 把 RDP 放进独立子进程（自带 Cargo.lock、独享一份依赖树，ruterm 用 stdin/stdout 帧协议驱动）——
-    可行，但要多一套打包与联调面，等能开图形界面联调时再评估。
-  - **SPICE**：原型依赖的 capsaicin 未发布到 crates.io（仓库里也没有 vendor 副本，无法构建）；
-    crates.io 上的 `spice-client` 0.2 是 **GPL-3.0**，本项目 Apache-2.0，许可不兼容，不能引入。
-  参考：`temp/RustTerm-Egui/src/remote/*`（原型带 vendor 版 ironrdp / capsaicin，本仓库没有 vendor）。
+- [x] **远程桌面：RDP** — `XL` — 已完成（协议 + 界面，实机待复核）
+  与 VNC 共用同一套标签骨架、帧槽位与工具条；协议层在 `src/desktop/rdp.rs`，按键编码在
+  `src/desktop/scancode.rs`。
+  - **依赖对齐**（2026-11）：ironrdp 0.17 / ironrdp-client 0.1 要 picky `=7.0.0-rc.25` 与 sspi `^0.21`，
+    上游把这些 RustCrypto 依赖（curve25519-dalek、ed25519-dalek、ecdsa、p256/384/521、primeorder）
+    锁在预发布版，与 russh 0.64 已解析的正式版落在同一 semver 区间而无法共存。按「预发布版本就行」
+    采用 vendor 路线：`vendor/picky`（rc.25）与 `vendor/sspi`（0.21.3）只把这些 pin 跟到已发布版本、
+    裁掉用不到的 jose / pkcs12 默认特性，其余源码原样；`[patch.crates-io]` 注释写明原因，
+    sspi 另加直接依赖 `=0.21.3` 让 patch 生效。`cargo fetch` 与 `cargo check --all-targets` 通过。
+  - **协议**：独立线程 + current-thread tokio 运行时（`RdpClient::run` 的 future 不是 `Send`），
+    与界面用 tokio 通道 + 单帧槽位对接；TLS + CredSSP（NLA），32 位色，请求 1280×800；
+    键盘按 US 布局扫描码（含 `0xE0xx` 扩展键）发送，查不到的中文 / 改键字符 / Shift 符号走 Unicode 通道；
+    指针按钮与滚轮走 IronRDP `Database` 的状态机；画面 `0x00RRGGBB` 转 BGRA 后走同一条贴图路径。
+  - **限制**：构建时未开 `clipboard` / `sound` / `rdpdr` 特性，RDP 没有双向剪贴板、音频与文件重定向；
+    请求分辨率固定 1280×800（尚未做随窗口 resize）；只走 CredSSP（NLA），不支持关掉 NLA 的旧服务器；
+    服务器证书不校验（IronRDP 默认 TLS 后端 `danger_accept_invalid_certs`，CredSSP 仍做凭据认证）。
+  - **验证**：`cargo test` 108 项全绿（含扫描码映射单测）；**RDP 实机连接待复核**——开发期间
+    用户在用电脑，未启动 ruterm 窗口，下次开机补一次真实 Windows 主机的连接、键盘、鼠标与断开截图。
+- [ ] **远程桌面：SPICE** — `XL` — **依赖受阻，暂缓**
+  原型依赖的 capsaicin 未发布到 crates.io（仓库里也没有 vendor 副本，无法构建）；
+  crates.io 上的 `spice-client` 0.2 是 **GPL-3.0**，本项目 Apache-2.0，许可不兼容，不能引入。
+  参考：`temp/RustTerm-Egui/src/remote/*`（原型带 vendor 版 capsaicin，本仓库没有 vendor）。
 - [x] **网络诊断标签（Ping / Traceroute）** — `S` — 已完成
   主机行右键「Ping」/「路由追踪」，在本地 PTY 里跑 `cmd /k ping -t <host>` / `tracert <host>`，
   输出即终端内容；`/k` 让命令跑完停在提示符，不会被「本地 shell 退出即收标签」规则关掉。

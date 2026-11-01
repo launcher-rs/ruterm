@@ -18,7 +18,7 @@ use rgpui::{
     Tooltip, Window, canvas, div, h_flex, point, px, v_flex,
 };
 
-use crate::desktop::{Command, Event, Session, Snapshot};
+use crate::desktop::{Command, Event, KeyInput, Protocol, Session, Snapshot};
 use crate::tr;
 
 use super::*;
@@ -36,15 +36,24 @@ pub(super) struct DesktopTab {
     /// 最近一次连接的地址参数（重试与工具条展示用）。
     pub(super) host: String,
     pub(super) port: u16,
-    /// VNC 密码：只存活在内存，标签关闭即丢弃；绝不写库 / 写日志。
+    /// 表单里选的协议（VNC / RDP）。
+    pub(super) protocol: Protocol,
+    /// 远程桌面密码：只存活在内存，标签关闭即丢弃；绝不写库 / 写日志。
     pub(super) password: String,
+    /// RDP 账号与域（VNC 不用）：同样只留在内存。
+    pub(super) username: String,
+    pub(super) domain: String,
+    /// RDP 请求的桌面尺寸（远端按这个分辨率建会话）。
+    pub(super) request_size: (u16, u16),
     /// 共享桌面（VNC shared 标志）。
     pub(super) shared: bool,
     pub(super) phase: DesktopPhase,
-    /// 标签内连接表单的三个输入框。
+    /// 标签内连接表单的输入框。
     pub(super) form_host: Entity<InputState>,
     pub(super) form_port: Entity<InputState>,
     pub(super) form_password: Entity<InputState>,
+    pub(super) form_username: Entity<InputState>,
+    pub(super) form_domain: Entity<InputState>,
     /// 画面焦点：点击画面后键盘事件走这个句柄。
     pub(super) focus: FocusHandle,
     /// 当前帧（BGRA）。换帧时旧图进 `drop_queue`，在下一次 render 里交给窗口释放。
@@ -104,10 +113,22 @@ impl RuTermApp {
                 .placeholder("5900")
         });
         let form_password = cx.new(|cx| {
-            InputState::new(window, cx).placeholder(tr!(cx, "VNC 密码（可留空）"))
+            InputState::new(window, cx).placeholder(tr!(cx, "密码（可留空）"))
+        });
+        let form_username = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(tr!(cx, "用户名"))
+        });
+        let form_domain = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(tr!(cx, "域（可留空）"))
         });
         // 表单里按回车直接开连，省一次鼠标。
-        for input in [&form_host, &form_port, &form_password] {
+        for input in [
+            &form_host,
+            &form_port,
+            &form_password,
+            &form_username,
+            &form_domain,
+        ] {
             let connect_id = id;
             cx.subscribe(input, move |this, _, event: &InputEvent, cx| {
                 if matches!(event, InputEvent::PressEnter { .. }) {
@@ -118,13 +139,19 @@ impl RuTermApp {
         }
         let desktop = DesktopTab {
             host: String::new(),
-            port: 5900,
+            port: Protocol::Vnc.default_port(),
+            protocol: Protocol::Vnc,
             password: String::new(),
+            username: String::new(),
+            domain: String::new(),
+            request_size: (1280, 800),
             shared: true,
             phase: DesktopPhase::Form,
             form_host,
             form_port,
             form_password,
+            form_username,
+            form_domain,
             focus: cx.focus_handle(),
             image: None,
             drop_queue: Vec::new(),
@@ -182,6 +209,9 @@ impl RuTermApp {
         let raw = desktop.form_host.read(cx).value().trim().to_string();
         let port_text = desktop.form_port.read(cx).value().trim().to_string();
         let password = desktop.form_password.read(cx).value().to_string();
+        let username = desktop.form_username.read(cx).value().trim().to_string();
+        let domain = desktop.form_domain.read(cx).value().trim().to_string();
+        let protocol = desktop.protocol;
         let (host, port) = normalize_address(&raw, &port_text);
         if host.is_empty() {
             self.status = tr!(cx, "远程桌面：请填写主机地址").into();
@@ -193,7 +223,52 @@ impl RuTermApp {
             cx.notify();
             return;
         };
-        self.open_desktop_session(id, host, port, password, desktop.shared, cx);
+        if protocol == Protocol::Rdp && username.is_empty() {
+            self.status = tr!(cx, "RDP：请填写用户名").into();
+            cx.notify();
+            return;
+        }
+        if let Some(desktop) = self
+            .tabs
+            .iter_mut()
+            .find(|tab| tab.id == id)
+            .and_then(|tab| tab.desktop.as_mut())
+        {
+            desktop.username = username;
+            desktop.domain = domain;
+        }
+        self.open_desktop_session(id, host, port, password, cx);
+    }
+
+    /// 表单里切换协议：端口还是上一个协议的默认值（或为空）时顺手换成新默认端口。
+    pub(super) fn set_desktop_protocol(
+        &mut self,
+        id: usize,
+        protocol: Protocol,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(desktop) = self
+            .tabs
+            .iter_mut()
+            .find(|tab| tab.id == id)
+            .and_then(|tab| tab.desktop.as_mut())
+        else {
+            return;
+        };
+        if desktop.protocol == protocol {
+            return;
+        }
+        let previous = desktop.protocol.default_port().to_string();
+        desktop.protocol = protocol;
+        let port = desktop.form_port.read(cx).value().trim().to_string();
+        if port.is_empty() || port == previous {
+            let next = protocol.default_port().to_string();
+            desktop
+                .form_port
+                .update(cx, |state, cx| state.set_value(next, window, cx));
+        }
+        cx.notify();
     }
 
     /// 连接中「取消」：令牌加一让在途的建连结果作废，回到就地表单。
@@ -230,13 +305,12 @@ impl RuTermApp {
             self.set_desktop_form(id, cx);
             return;
         }
-        let (host, port, password, shared) = (
+        let (host, port, password) = (
             desktop.host.clone(),
             desktop.port,
             desktop.password.clone(),
-            desktop.shared,
         );
-        self.open_desktop_session(id, host, port, password, shared, cx);
+        self.open_desktop_session(id, host, port, password, cx);
     }
 
     /// 失败横幅的「改参数」：回到就地表单。
@@ -258,7 +332,6 @@ impl RuTermApp {
         host: String,
         port: u16,
         password: String,
-        shared: bool,
         cx: &mut Context<Self>,
     ) {
         let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) else {
@@ -272,7 +345,6 @@ impl RuTermApp {
         desktop.host = host.clone();
         desktop.port = port;
         desktop.password = password.clone();
-        desktop.shared = shared;
         desktop.phase = DesktopPhase::Connecting;
         desktop.command = None;
         desktop.latest = None;
@@ -296,10 +368,14 @@ impl RuTermApp {
             self.status = tr!(cx, "正在连接远程桌面 {addr}…", addr = addr);
         }
         let config = crate::desktop::Config {
+            protocol: desktop.protocol,
             host,
             port,
             password: (!password.is_empty()).then_some(password),
-            shared,
+            shared: desktop.shared,
+            username: (!desktop.username.is_empty()).then(|| desktop.username.clone()),
+            domain: (!desktop.domain.is_empty()).then(|| desktop.domain.clone()),
+            size: desktop.request_size,
         };
         let handle = rgpui::tokio::Tokio::handle(cx);
         cx.spawn(async move |this, cx| {
@@ -642,18 +718,11 @@ impl RuTermApp {
         let Some((x, y)) = remote_point(rect, desktop.size, position) else {
             return;
         };
-        // VNC 没有滚轮事件：上/下滚就是滚轮按钮（4/5）的按下与释放。
-        let button = if up { 4 } else { 5 };
-        let base = desktop.buttons;
-        desktop.send(Command::Pointer {
+        desktop.send(Command::Wheel {
             x,
             y,
-            buttons: base | button,
-        });
-        desktop.send(Command::Pointer {
-            x,
-            y,
-            buttons: base,
+            up,
+            buttons: desktop.buttons,
         });
         let _ = cx;
     }
@@ -670,11 +739,8 @@ impl RuTermApp {
         if !desktop.capture_keys {
             return;
         }
-        if let Some(keysym) = crate::desktop::keysym::event_keysym(
-            &event.key,
-            event.key_char.as_deref(),
-        ) {
-            desktop.send(Command::Key { keysym, down });
+        if let Some(key) = KeyInput::from_event(&event.key, event.key_char.as_deref()) {
+            desktop.send(Command::Key { key, down });
         }
         let _ = cx;
     }
@@ -739,6 +805,17 @@ impl RuTermApp {
 
     /// 工具条：把本地剪贴板文本发给远端。
     fn send_clipboard_to_desktop(&mut self, id: usize, cx: &mut Context<Self>) {
+        let protocol = self
+            .tabs
+            .iter()
+            .find(|tab| tab.id == id)
+            .and_then(|tab| tab.desktop.as_ref())
+            .map(|desktop| desktop.protocol);
+        if protocol == Some(Protocol::Rdp) {
+            self.status = tr!(cx, "RDP 会话暂不支持剪贴板").into();
+            cx.notify();
+            return;
+        }
         let text = cx.read_from_clipboard().and_then(|item| {
             item.entries.into_iter().find_map(|entry| match entry {
                 ClipboardEntry::String(text) => Some(text.text),
@@ -1022,6 +1099,11 @@ impl RuTermApp {
         } else {
             desktop.name.clone()
         };
+        let clipboard_tip = if desktop.protocol == Protocol::Rdp {
+            tr!(cx, "RDP 会话暂不支持剪贴板")
+        } else {
+            tr!(cx, "把本地剪贴板文本发送到远端")
+        };
         h_flex()
             .flex_shrink_0()
             .h(px(38.0))
@@ -1117,7 +1199,7 @@ impl RuTermApp {
                     .label(tr!(cx, "剪贴板"))
                     .ghost()
                     .compact()
-                    .tooltip(tr!(cx, "把本地剪贴板文本发送到远端"))
+                    .tooltip(clipboard_tip)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.send_clipboard_to_desktop(id, cx);
                     })),
@@ -1136,13 +1218,19 @@ impl RuTermApp {
 
     fn render_desktop_form(&self, tab_id: usize, desktop: &DesktopTab, cx: &mut Context<Self>) -> AnyElement {
         let pal = self.palette(cx);
+        let is_rdp = desktop.protocol == Protocol::Rdp;
+        let title = if is_rdp {
+            tr!(cx, "远程桌面（RDP）")
+        } else {
+            tr!(cx, "远程桌面（VNC）")
+        };
         v_flex()
             .size_full()
             .items_center()
             .justify_center()
             .child(
                 v_flex()
-                    .w(px(380.0))
+                    .w(px(400.0))
                     .gap_3()
                     .p_4()
                     .rounded(px(8.0))
@@ -1150,10 +1238,53 @@ impl RuTermApp {
                     .border_1()
                     .border_color(pal.border)
                     .child(
-                        div()
-                            .text_base()
-                            .font_weight(rgpui::FontWeight(600.0))
-                            .child(tr!(cx, "远程桌面（VNC）")),
+                        h_flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_base()
+                                    .font_weight(rgpui::FontWeight(600.0))
+                                    .child(title),
+                            )
+                            .child(
+                                h_flex()
+                                    .gap_1()
+                                    .child(
+                                        Button::new(SharedString::from(format!(
+                                            "rd-proto-vnc-{tab_id}"
+                                        )))
+                                        .label("VNC")
+                                        .ghost()
+                                        .compact()
+                                        .selected(!is_rdp)
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.set_desktop_protocol(
+                                                tab_id,
+                                                Protocol::Vnc,
+                                                window,
+                                                cx,
+                                            );
+                                        })),
+                                    )
+                                    .child(
+                                        Button::new(SharedString::from(format!(
+                                            "rd-proto-rdp-{tab_id}"
+                                        )))
+                                        .label("RDP")
+                                        .ghost()
+                                        .compact()
+                                        .selected(is_rdp)
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.set_desktop_protocol(
+                                                tab_id,
+                                                Protocol::Rdp,
+                                                window,
+                                                cx,
+                                            );
+                                        })),
+                                    ),
+                            ),
                     )
                     .child(
                         v_flex()
@@ -1175,6 +1306,30 @@ impl RuTermApp {
                                     ),
                             ),
                     )
+                    .when(is_rdp, |this| {
+                        this.child(
+                            v_flex()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(pal.muted)
+                                        .child(tr!(cx, "用户名")),
+                                )
+                                .child(styled_input(Input::new(&desktop.form_username), &pal)),
+                        )
+                        .child(
+                            v_flex()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(pal.muted)
+                                        .child(tr!(cx, "域（可留空）")),
+                                )
+                                .child(styled_input(Input::new(&desktop.form_domain), &pal)),
+                        )
+                    })
                     .child(
                         v_flex()
                             .gap_1()
