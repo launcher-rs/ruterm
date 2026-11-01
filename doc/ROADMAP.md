@@ -15,11 +15,11 @@
 |---|---|---|---|
 | 终端内查找 | Ctrl+F 高亮 + 上/下跳转 | Ctrl+F 查找条（字面量 / 正则） | **已补** |
 | 多终端联动 | 批量执行 + 同步输入 | 同步输入 + 命令广播（菜单 + 二次确认） | **已补** |
-| Telnet / Ping | 原始 TCP + 最小 IAC；PTY 跑 ping | Telnet 会话（最小 IAC + NAWS）已通 | 补（Telnet）**已补** /缓（Ping） |
+| Telnet / Ping | 原始 TCP + 最小 IAC；PTY 跑 ping | Telnet 会话（最小 IAC + NAWS）、主机右键 Ping / 路由追踪 | **已补** |
 | 中英文界面 | i18n 静态词典 + 语言切换 | 简中 / English 即时切换 | **已补** |
 | 键宏 | 组合键 → 字节流，导入导出 | 管理器：触发键 + 多步序列 / 延迟、导入导出 | **已补** |
 | 本地文件页 | 单栏本机目录浏览器 | 只有远端 SFTP | 补 |
-| 远程桌面 | VNC / RDP / SPICE 真实实现 | VNC 标签（RFB 3.3/3.8 + Raw/CopyRect/Hextile） | VNC **已补**；RDP / SPICE 分阶段补 |
+| 远程桌面 | VNC / RDP / SPICE 真实实现 | VNC 标签（RFB 3.3/3.8 + Raw/CopyRect/Hextile） | VNC **已补**；RDP / SPICE 依赖受阻（见 P2） |
 | 加密凭据库 | 明文 `sessions.json` | 加密库 + 字段加密 | **我们领先** |
 | 主机指纹 | TOFU（known_hosts 文本） | TOFU 入库、跳板逐跳校验 | **我们领先** |
 | 端口转发 | 仅本机 TCP 直连中转 | -L / -R / -D（SOCKS5） | **我们领先** |
@@ -167,12 +167,22 @@
   实测：协议层单测（握手 / 认证 / 三种编码 / 尺寸变更）全绿，全套 `cargo test` 通过；
   **实机画面与输入转发待复核**——本次开发期间按用户要求未启动 ruterm 窗口，
   下次开机补一次对测试 VNC 服务器（TigerVNC / x11vnc）的连接、缩放、捕获与断开截图。
-- [ ] **远程桌面：RDP → SPICE** — `XL`
-  RDP 用 ironrdp（CredSSP 依赖 picky/sspi 版本要与 russh 对齐，见原型 `vendor/README.md`）；
-  SPICE 最后做（原型依赖的 capsaicin 未随仓库提供，本机无法构建，仅作参考）。
-  两者复用同一标签骨架：实现 `remote` 会话的 `Event::Connected / FrameReady / Fps / Clipboard / Closed`
-  与 `Command` 集合即可接上界面。
-  参考：`temp/RustTerm-Egui/src/remote/*`、`src/rdp.rs`。
+- [ ] **远程桌面：RDP → SPICE** — `XL` — **依赖受阻，暂缓**
+  标签骨架已经就绪（VNC 走的就是它）：补上 `Event::Connected / FrameReady / Fps / Clipboard / Closed`
+  与 `Command` 集合即可接第二个协议。2026-11 实测两条依赖路线都卡在项目外部条件上：
+  - **RDP**：crates.io 上 ironrdp 0.17 / ironrdp-client 0.1 全家族（connector 0.1–0.12）都依赖
+    picky `7.0.0-rc.x`，而这些 rc 用 `=` 精确锁死 RustCrypto 预发布版
+    （`curve25519-dalek =5.0.0-rc.1`、`aes-gcm =0.11.0-rc.4`、`rsa =0.10.0-rc.18` …）；
+    本项目与 russh 0.64 用的是已发布版（`curve25519-dalek 5.0.0`、`aes-gcm 0.11.1`、`sha2 0.11.1`）。
+    Cargo 不允同一 semver 兼容区间同时存在两个版本，`cargo fetch` 直接报
+    `failed to select a version for curve25519-dalek`（`=5.0.0-rc.1` 与 `^5 → 5.0.0` 冲突）。
+    可选出路按代价排序：① 等 picky 7.0 正式版改回已发布加密库（最省事，只需升级依赖）；
+    ② vendor picky + sspi 并改写锁定的加密库版本（要处理 RustCrypto 预发布 → 正式版的 API 漂移）；
+    ③ 把 RDP 放进独立子进程（自带 Cargo.lock、独享一份依赖树，ruterm 用 stdin/stdout 帧协议驱动）——
+    可行，但要多一套打包与联调面，等能开图形界面联调时再评估。
+  - **SPICE**：原型依赖的 capsaicin 未发布到 crates.io（仓库里也没有 vendor 副本，无法构建）；
+    crates.io 上的 `spice-client` 0.2 是 **GPL-3.0**，本项目 Apache-2.0，许可不兼容，不能引入。
+  参考：`temp/RustTerm-Egui/src/remote/*`（原型带 vendor 版 ironrdp / capsaicin，本仓库没有 vendor）。
 - [x] **网络诊断标签（Ping / Traceroute）** — `S` — 已完成
   主机行右键「Ping」/「路由追踪」，在本地 PTY 里跑 `cmd /k ping -t <host>` / `tracert <host>`，
   输出即终端内容；`/k` 让命令跑完停在提示符，不会被「本地 shell 退出即收标签」规则关掉。
