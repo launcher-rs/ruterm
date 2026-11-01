@@ -11,6 +11,7 @@ mod local_files;
 mod local_shells;
 mod macros_ui;
 mod prefs;
+mod remote_desktop;
 mod settings;
 mod sidebar;
 mod status_bar;
@@ -29,6 +30,7 @@ use local_files::*;
 use local_shells::*;
 use macros_ui::*;
 use prefs::*;
+use remote_desktop::*;
 use settings::*;
 use sidebar::*;
 use status_bar::*;
@@ -47,7 +49,7 @@ use rgpui::input_ui::{Input, InputEvent, InputState};
 use rgpui::prelude::*;
 use rgpui::tabs::tab_drag::TabDragData;
 use rgpui::{
-    AnyElement, App, Button, ButtonVariants, ClickEvent, Context, Entity, FocusHandle, Focusable, Hsla, Image, InteractiveElement, IntoElement, MouseButton, ParentElement, Point,
+    AnyElement, App, Button, ButtonVariants, ClickEvent, Context, Entity, FocusHandle, Focusable, Hsla, Icon, IconName, Image, InteractiveElement, IntoElement, MouseButton, ParentElement, Point,
     Render, ScrollHandle, SharedString,
     StatefulInteractiveElement, Styled, Tooltip, Window, canvas, div, h_flex, px, relative, v_flex,
 };
@@ -1037,6 +1039,15 @@ impl RuTermApp {
                                             .bg(pal.danger),
                                     )
                                 })
+                                // 远程桌面标签与终端标签同栏排列，靠图标区分类型。
+                                .when(tab.desktop.is_some(), |this| {
+                                    this.child(
+                                        Icon::new(IconName::Frame)
+                                            .small()
+                                            .flex_shrink_0()
+                                            .text_color(pal.muted),
+                                    )
+                                })
                                 .child(match self.renaming.as_ref() {
                                     // 就地改名：标题位置换成输入框，回车/失焦提交，Esc 取消。
                                     // 宽度要给死值：标签栏是横向滚动容器，主轴空间无限，
@@ -1130,6 +1141,8 @@ impl RuTermApp {
 
 impl Render for RuTermApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // 换下来的远程桌面旧帧在这里释放：精灵图集按图像 id 缓存，不释放会越积越多。
+        self.drop_desktop_images(window, cx);
         let pal = self.palette(cx);
         v_flex()
             .id("ruterm-root")
@@ -1145,6 +1158,7 @@ impl Render for RuTermApp {
             .on_action(cx.listener(Self::toggle_theme_action))
             .on_action(cx.listener(Self::new_host))
             .on_action(cx.listener(Self::new_local_terminal))
+            .on_action(cx.listener(Self::new_desktop))
             .on_action(cx.listener(Self::next_tab))
             .on_action(cx.listener(Self::prev_tab))
             .on_action(cx.listener(Self::close_active_tab))

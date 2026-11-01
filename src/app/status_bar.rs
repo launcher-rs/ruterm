@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use rgpui::components::status_bar::{StatusBar, StatusBarItem};
 use rgpui::{
-    App, Context, Entity, IconName, SharedString,
+    App, Context, Entity, IconName, SharedString,
 };
 use rgpui_term::Terminal;
 
@@ -102,8 +102,10 @@ impl RuTermApp {
             }
             // 终端读数取自终端上一帧同步好的渲染内容，本地读取、不碰 PTY。
             if self.status_bar.readout.any()
-                && let Some(readout) =
-                    StatusReadout::capture(tab.terminal_view.read(cx).terminal(), cx)
+                && let Some(readout) = tab
+                    .terminal_view
+                    .as_ref()
+                    .and_then(|view| StatusReadout::capture(view.read(cx).terminal(), cx))
             {
                 left.extend(self.readout_items(readout, cx));
             }
@@ -202,7 +204,9 @@ impl RuTermApp {
                     let next = active
                         .and_then(|id| this.tabs.iter().find(|tab| tab.id == id))
                         .and_then(|tab| {
-                            StatusReadout::capture(tab.terminal_view.read(cx).terminal(), cx)
+                            tab.terminal_view
+                                .as_ref()
+                                .and_then(|view| StatusReadout::capture(view.read(cx).terminal(), cx))
                         });
                     if next == this.readout_seen {
                         return;

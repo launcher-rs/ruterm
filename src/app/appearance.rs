@@ -125,10 +125,12 @@ impl RuTermApp {
     pub(super) fn apply_terminal_style(&self, style: &TextStyle, cx: &mut App) {
         for tab in &self.tabs {
             let style = style.clone();
-            tab.terminal_view.update(cx, |view, cx| {
-                *view.text_style_mut() = style;
-                cx.notify();
-            });
+            if let Some(view) = tab.terminal_view.as_ref() {
+                view.update(cx, |view, cx| {
+                    *view.text_style_mut() = style;
+                    cx.notify();
+                });
+            }
         }
     }
 

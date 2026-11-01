@@ -10,7 +10,7 @@ use rgpui::{
 };
 
 use crate::MacroManager as OpenMacroManager;
-use crate::{ToggleSidebar, ToggleFilePanel, ToggleLocalPanel, ToggleTheme, NewHost, NewLocalTerminal, NextTab, PrevTab, CloseTab, OpenSettings, OpenForward, SplitRight, SplitDown, CloseSplit, FindInTerminal, ToggleSyncInput, BroadcastCommand};
+use crate::{ToggleSidebar, ToggleFilePanel, ToggleLocalPanel, ToggleTheme, NewHost, NewLocalTerminal, NewRemoteDesktop, NextTab, PrevTab, CloseTab, OpenSettings, OpenForward, SplitRight, SplitDown, CloseSplit, FindInTerminal, ToggleSyncInput, BroadcastCommand};
 use crate::tr;
 
 use super::*;
@@ -146,6 +146,7 @@ impl RuTermApp {
                     );
                 }
                 menu.item(PopupMenuItem::new(tr!(cx, "本地终端…")).action(Box::new(NewLocalTerminal)))
+                    .item(PopupMenuItem::new(tr!(cx, "远程桌面…")).action(Box::new(NewRemoteDesktop)))
                     .separator()
                     .item(PopupMenuItem::new(tr!(cx, "设置…")).action(Box::new(OpenSettings)))
                     .item(

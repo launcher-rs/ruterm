@@ -100,8 +100,6 @@ pub struct ServerInit {
     pub height: u16,
     pub name: String,
     pub pixel_format: PixelFormat,
-    /// 协商下来的版本，调试与文案用。
-    pub version: (u8, u8),
 }
 
 /// 客户端侧需要跨消息保留的状态。
@@ -228,7 +226,6 @@ where
         height,
         name,
         pixel_format,
-        version: (3, minor),
     })
 }
 
@@ -799,7 +796,6 @@ mod tests {
             height: 16,
             name: "t".into(),
             pixel_format: bgra_pf(),
-            version: (3, 8),
         };
         let mut state = ClientState::new(init).unwrap();
         // 一个块：bg 已指定 + fg 已指定 + 1 个非彩色子矩形（坐标 0,0 尺寸 2×2）

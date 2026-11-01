@@ -119,7 +119,7 @@ impl RuTermApp {
         self.tabs
             .iter()
             .find(|tab| tab.id == id)
-            .map(|tab| tab.terminal_view.clone())
+            .and_then(|tab| tab.terminal_view.clone())
     }
 
 
@@ -170,11 +170,11 @@ impl RuTermApp {
     }
 
 
-    /// 可接收输入的会话数（不含已结束 / 连接失败的标签）。
+    /// 可接收输入的会话数（不含已结束 / 连接失败的标签；远程桌面没有终端输入通道）。
     pub(super) fn live_tab_count(&self) -> usize {
         self.tabs
             .iter()
-            .filter(|tab| !tab.ended && !tab.failed)
+            .filter(|tab| !tab.ended && !tab.failed && tab.terminal_view.is_some())
             .count()
     }
 
@@ -238,7 +238,10 @@ impl RuTermApp {
             if tab.id == source || tab.ended || tab.failed {
                 continue;
             }
-            let terminal = tab.terminal_view.read(cx).terminal().clone();
+            let Some(view) = tab.terminal_view.as_ref() else {
+                continue;
+            };
+            let terminal = view.read(cx).terminal().clone();
             // 走 `input()`＝Programmatic 来源，中间件不再镜像，避免回流。
             terminal.update(cx, |terminal, _| terminal.input(payload.clone()));
         }
@@ -325,7 +328,10 @@ impl RuTermApp {
             if tab.ended || tab.failed {
                 continue;
             }
-            let terminal = tab.terminal_view.read(cx).terminal().clone();
+            let Some(view) = tab.terminal_view.as_ref() else {
+                continue;
+            };
+            let terminal = view.read(cx).terminal().clone();
             terminal.update(cx, |terminal, _| terminal.input(bytes.clone()));
             targets += 1;
         }

@@ -460,7 +460,8 @@ impl RuTermApp {
             addr: addr.clone().into(),
             auth: Some(auth),
             remote_info: None,
-            terminal_view: terminal_view.clone(),
+            terminal_view: Some(terminal_view.clone()),
+            desktop: None,
             ended: false,
             failed: false,
             last_error: None,
@@ -495,7 +496,7 @@ impl RuTermApp {
                 let current = this
                     .tabs
                     .iter_mut()
-                    .find(|tab| tab.id == id && tab.terminal_view == ready_view);
+                    .find(|tab| tab.id == id && tab.terminal_view.as_ref() == Some(&ready_view));
                 if let Some(tab) = current {
                     tab.connected_at = Some(Instant::now());
                     tab.auto_retry_pending = false;
@@ -593,7 +594,7 @@ impl RuTermApp {
                     if let Some(tab) = this
                         .tabs
                         .iter_mut()
-                        .find(|tab| tab.id == id && tab.terminal_view == info_view)
+                        .find(|tab| tab.id == id && tab.terminal_view.as_ref() == Some(&info_view))
                     {
                         tab.remote_info = Some(info);
                         cx.notify();
@@ -612,7 +613,7 @@ impl RuTermApp {
                     let Some(pos) = this
                         .tabs
                         .iter()
-                        .position(|tab| tab.id == id && tab.terminal_view == cwd_view)
+                        .position(|tab| tab.id == id && tab.terminal_view.as_ref() == Some(&cwd_view))
                     else {
                         log::debug!("[cwd_events] 未找到对应标签");
                         return;
@@ -744,7 +745,8 @@ impl RuTermApp {
             addr: addr.clone().into(),
             auth: None,
             remote_info: None,
-            terminal_view: terminal_view.clone(),
+            terminal_view: Some(terminal_view.clone()),
+            desktop: None,
             ended: false,
             failed: false,
             last_error: None,
@@ -777,7 +779,7 @@ impl RuTermApp {
                 let Some(tab) = this
                     .tabs
                     .iter_mut()
-                    .find(|tab| tab.id == id && tab.terminal_view == ready_view)
+                    .find(|tab| tab.id == id && tab.terminal_view.as_ref() == Some(&ready_view))
                 else {
                     return;
                 };
@@ -853,9 +855,8 @@ impl RuTermApp {
         let reconnectable = tab.ended && tab.resume.is_some();
         let terminal_focused = tab
             .terminal_view
-            .read(cx)
-            .focus_handle(cx)
-            .is_focused(window);
+            .as_ref()
+            .is_some_and(|view| view.read(cx).focus_handle(cx).is_focused(window));
         if !reconnectable || !terminal_focused {
             return;
         }

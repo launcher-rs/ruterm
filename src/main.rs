@@ -58,6 +58,7 @@ actions!(
         ToggleTheme,
         NewHost,
         NewLocalTerminal,
+        NewRemoteDesktop,
         NextTab,
         PrevTab,
         CloseTab,
@@ -134,6 +135,8 @@ fn main() {
             KeyBinding::new("ctrl-t", ToggleTheme, None),
             KeyBinding::new("ctrl-n", NewHost, None),
             KeyBinding::new("ctrl-shift-t", NewLocalTerminal, None),
+            // 远程桌面（VNC）：R 取 remote，与本地终端的 T 相邻。
+            KeyBinding::new("ctrl-shift-r", NewRemoteDesktop, None),
             // 标签多到溢出后光靠鼠标滚动不够快，配上循环切换。
             KeyBinding::new("ctrl-tab", NextTab, None),
             KeyBinding::new("ctrl-shift-tab", PrevTab, None),

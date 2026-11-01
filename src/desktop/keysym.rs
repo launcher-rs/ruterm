@@ -62,66 +62,27 @@ pub fn named_keysym(name: &str) -> Option<u32> {
     Some(keysym)
 }
 
-/// 一次按键要发的事件序列 `(keysym, 是否按下)`。
+/// 真实按下 / 抬起事件 → keysym（修饰键由服务端按事件顺序自己维护）。
 ///
-/// 修饰键必须显式按下再松开，服务端才会把 Ctrl / Alt 算进组合键；
-/// `key_char` 与 `key` 只差大小写时按 Shift 组合发，其它情况（输入法字符、
-/// 非拉丁字符）直接发该字符的 keysym，避免多按一个 Shift 把字符打歪。
-pub fn keystroke_keysyms(
-    key: &str,
-    key_char: Option<&str>,
-    ctrl: bool,
-    alt: bool,
-    shift: bool,
-    platform: bool,
-) -> Vec<(u32, bool)> {
-    let lowered = key.to_ascii_lowercase();
-    let mut typed: Option<u32> = None;
-    let mut shifted = shift;
-    if let Some(text) = key_char.and_then(|text| text.chars().next()) {
-        if lowered.len() == 1 && text.to_ascii_lowercase().to_string() == lowered {
-            shifted |= text.is_uppercase();
-            typed = Some(char_keysym(text.to_ascii_lowercase()));
-        } else {
-            // 输入法 / 组合字符：直接发这个字符，Shift 不再叠加。
-            shifted = false;
-            typed = Some(char_keysym(text));
+/// 只翻译当前这一个键：上下行是一一对应的真实事件，不合成修饰键的按下 / 抬起来回。
+pub fn event_keysym(key: &str, key_char: Option<&str>) -> Option<u32> {
+    if let Some(keysym) = named_keysym(key) {
+        return Some(keysym);
+    }
+    if let Some(ch) = key_char.and_then(|text| text.chars().next()) {
+        // 与 key 只差大小写的字符按未按 Shift 的 keysym 发：Shift 的按下事件
+        // 已经真实发过去了，服务端自己合成大小写；其余（输入法字符）原样发。
+        let lowered = key.to_ascii_lowercase();
+        if lowered.len() == 1 && ch.to_ascii_lowercase().to_string() == lowered {
+            return Some(char_keysym(ch.to_ascii_lowercase()));
         }
+        return Some(char_keysym(ch));
     }
-    let keysym = typed
-        .or_else(|| {
-            let mut chars = key.chars();
-            match (chars.next(), chars.next()) {
-                (Some(ch), None) => Some(char_keysym(ch)),
-                _ => named_keysym(key),
-            }
-        })
-        .unwrap_or_else(|| char_keysym(key.chars().next().unwrap_or(' ')));
-
-    let mut modifiers = Vec::new();
-    if ctrl {
-        modifiers.push(CONTROL_L);
+    let mut chars = key.chars();
+    match (chars.next(), chars.next()) {
+        (Some(ch), None) if !ch.is_control() => Some(char_keysym(ch)),
+        _ => None,
     }
-    if alt {
-        modifiers.push(ALT_L);
-    }
-    if platform {
-        modifiers.push(SUPER_L);
-    }
-    if shifted {
-        modifiers.push(SHIFT_L);
-    }
-
-    let mut events = Vec::with_capacity(modifiers.len() * 2 + 2);
-    for keysym in &modifiers {
-        events.push((*keysym, true));
-    }
-    events.push((keysym, true));
-    events.push((keysym, false));
-    for keysym in modifiers.iter().rev() {
-        events.push((*keysym, false));
-    }
-    events
 }
 
 #[cfg(test)]
@@ -149,34 +110,13 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_combo_presses_and_releases_modifier_around_key() {
-        let events = keystroke_keysyms("c", Some("c"), true, false, false, false);
-        assert_eq!(
-            events,
-            vec![(CONTROL_L, true), (0x63, true), (0x63, false), (CONTROL_L, false)]
-        );
-    }
-
-    #[test]
-    fn uppercase_char_implies_shift_without_double_shift() {
-        let events = keystroke_keysyms("a", Some("A"), false, false, true, false);
-        assert_eq!(
-            events,
-            vec![(SHIFT_L, true), (0x61, true), (0x61, false), (SHIFT_L, false)]
-        );
-    }
-
-    #[test]
-    fn ime_char_is_sent_directly() {
-        let events = keystroke_keysyms("中", Some("中"), false, false, false, false);
-        assert_eq!(events, vec![(0x0100_4e2d, true), (0x0100_4e2d, false)]);
-    }
-
-    #[test]
-    fn named_key_without_char() {
-        assert_eq!(
-            keystroke_keysyms("enter", None, false, false, false, false),
-            vec![(0xff0d, true), (0xff0d, false)]
-        );
+    fn event_keysym_prefers_named_then_typed_char() {
+        assert_eq!(event_keysym("shift", None), Some(SHIFT_L));
+        assert_eq!(event_keysym("escape", None), Some(0xff1b));
+        // Shift 的真实按下事件已经发过，这里发未 Shift 的 keysym，避免双 Shift。
+        assert_eq!(event_keysym("a", Some("A")), Some(0x61));
+        assert_eq!(event_keysym("a", None), Some(0x61));
+        assert_eq!(event_keysym("中", Some("中")), Some(0x0100_4e2d));
+        assert_eq!(event_keysym("", None), None);
     }
 }

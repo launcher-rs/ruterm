@@ -6445,6 +6445,7 @@ dependencies = [
  "bytes",
  "des",
  "getrandom 0.4.3",
+ "image",
  "keyring",
  "log",
  "png",
