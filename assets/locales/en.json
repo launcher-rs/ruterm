@@ -306,5 +306,7 @@
  "键宏…": "Macros…",
  "键盘已捕获（Esc 释放）": "Keyboard captured (Esc to release)",
  "隐藏到托盘": "Hide to tray",
- "首次连接就失败（地址写错、端口不通）不自动重试；断线后最多连续重试 {max} 次，退避 1 / 2 / 5 / 10 / 20 秒，会话稳定运行 30 秒后重新计数。等待期间可在横幅里取消或按回车立即重连。": "A first connection that fails outright (wrong address, unreachable port) is not retried; after a drop there are at most {max} consecutive retries with 1 / 2 / 5 / 10 / 20 second backoff, and the counter resets once the session has run steadily for 30 seconds. While waiting you can cancel in the banner or press Enter to reconnect now."
+ "首次连接就失败（地址写错、端口不通）不自动重试；断线后最多连续重试 {max} 次，退避 1 / 2 / 5 / 10 / 20 秒，会话稳定运行 30 秒后重新计数。等待期间可在横幅里取消或按回车立即重连。": "A first connection that fails outright (wrong address, unreachable port) is not retried; after a drop there are at most {max} consecutive retries with 1 / 2 / 5 / 10 / 20 second backoff, and the counter resets once the session has run steadily for 30 seconds. While waiting you can cancel in the banner or press Enter to reconnect now.",
+ "网络诊断：主机名含不支持的字符": "Network diagnostics: the host name contains unsupported characters",
+ "网络诊断目前只在 Windows 上提供": "Network diagnostics are currently Windows-only"
 }

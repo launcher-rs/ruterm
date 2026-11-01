@@ -173,8 +173,13 @@
   两者复用同一标签骨架：实现 `remote` 会话的 `Event::Connected / FrameReady / Fps / Clipboard / Closed`
   与 `Command` 集合即可接上界面。
   参考：`temp/RustTerm-Egui/src/remote/*`、`src/rdp.rs`。
-- [ ] **网络诊断标签（Ping / Traceroute）** — `S`
-  PTY 跑系统命令，输出即终端内容；价值一般，排在远程桌面之后。
+- [x] **网络诊断标签（Ping / Traceroute）** — `S` — 已完成
+  主机行右键「Ping」/「路由追踪」，在本地 PTY 里跑 `cmd /k ping -t <host>` / `tracert <host>`，
+  输出即终端内容；`/k` 让命令跑完停在提示符，不会被「本地 shell 退出即收标签」规则关掉。
+  主机名先过白名单（字母数字与 `.-:_`，IPv6 方括号去掉）再拼命令行，空白 / 引号 / 管道一律拒绝；
+  非 Windows 的 PTY 后端传不了参数，点了只给状态栏提示。
+  单测覆盖 `sanitize_host` 的注入面与 `diagnostic_profile` 的参数拼装；界面点击待复核（同 VNC，
+  本次未启动 ruterm 窗口）。
 
 ## 非目标（明确不做）
 

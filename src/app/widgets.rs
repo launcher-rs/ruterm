@@ -7,6 +7,7 @@ use rgpui::{
     Styled, Window, div, px, v_flex,
 };
 
+use crate::local_shell::NetTool;
 use crate::sessions::AuthMethod;
 use crate::tr;
 
@@ -115,6 +116,33 @@ impl RuTermApp {
                     false,
                     false,
                     move |this, _, cx| this.reorder_host(index, ReorderAction::Top, cx),
+                ))
+                .separator()
+                .item(Self::menu_item(
+                    entity.clone(),
+                    "Ping",
+                    None,
+                    false,
+                    false,
+                    move |this, _, cx| {
+                        let Some(host) = this.hosts.get(index).map(|host| host.host.clone()) else {
+                            return;
+                        };
+                        this.open_network_tool(&host, NetTool::Ping, cx);
+                    },
+                ))
+                .item(Self::menu_item(
+                    entity.clone(),
+                    "路由追踪",
+                    None,
+                    false,
+                    false,
+                    move |this, _, cx| {
+                        let Some(host) = this.hosts.get(index).map(|host| host.host.clone()) else {
+                            return;
+                        };
+                        this.open_network_tool(&host, NetTool::TraceRoute, cx);
+                    },
                 ))
                 .separator()
             }

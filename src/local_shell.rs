@@ -56,6 +56,66 @@ impl ShellProfile {
     }
 }
 
+/// 网络诊断工具：在本地 PTY 里跑系统命令，输出即终端内容。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NetTool {
+    Ping,
+    TraceRoute,
+}
+
+impl NetTool {
+    /// 标签名与菜单里用的工具名。
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Ping => "Ping",
+            Self::TraceRoute => "路由追踪",
+        }
+    }
+}
+
+/// 主机名只留安全字符：命令要拼进 `cmd /k`，空白 / 引号 / 管道都会变成注入面。
+///
+/// IPv6 字面量两侧的方括号顺手去掉——`ping ::1` 与 `ping [::1]` 都能跑，
+/// 但前者不必依赖各版本工具对括号的处理。
+pub fn sanitize_host(raw: &str) -> Option<String> {
+    let host = raw
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim();
+    if host.is_empty() || host.len() > 255 {
+        return None;
+    }
+    host.chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | ':' | '_'))
+        .then(|| host.to_string())
+}
+
+/// 诊断命令的启动档案。
+///
+/// Windows 用 `cmd /k`：命令跑完窗口留在提示符上，追踪结果不会一闪而过就被
+/// 「本地 shell 退出即收标签」的规则关掉；`ping -t` 持续跑，Ctrl+C 停下后同样回到提示符。
+/// 非 Windows 的 PTY 后端只收单个可执行文件路径、传不了参数，故暂不提供。
+#[cfg(windows)]
+pub fn diagnostic_profile(tool: NetTool, host: &str) -> Option<ShellProfile> {
+    let command = match tool {
+        NetTool::Ping => format!("ping -t {host}"),
+        NetTool::TraceRoute => format!("tracert {host}"),
+    };
+    Some(ShellProfile {
+        name: format!("{} {host}", tool.label()),
+        program: std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string()),
+        args: vec!["/k".to_string(), command],
+        kind: ShellKind::Other,
+    })
+}
+
+/// 非 Windows：见 [`diagnostic_profile`] 的说明。
+#[cfg(not(windows))]
+pub fn diagnostic_profile(_tool: NetTool, _host: &str) -> Option<ShellProfile> {
+    None
+}
+
 /// 交给 PTY 后端的 shell 字符串。
 ///
 /// Windows 后端把 `shell` 原样拼进 `CreateProcessW` 的命令行（`escape_args=false`），
@@ -761,5 +821,33 @@ mod tests {
             .join("cmd.exe");
         let png = icon_png(&exe.display().to_string()).expect("cmd.exe 应有系统图标");
         assert_eq!(&png[1..4], b"PNG", "返回的应是 PNG 字节");
+    }
+
+    #[test]
+    fn sanitize_host_keeps_hostnames_and_strips_ipv6_brackets() {
+        assert_eq!(sanitize_host(" example.com ").as_deref(), Some("example.com"));
+        assert_eq!(sanitize_host("127.0.0.1").as_deref(), Some("127.0.0.1"));
+        assert_eq!(sanitize_host("[::1]").as_deref(), Some("::1"));
+        assert_eq!(sanitize_host("fe80::1%eth0"), None, "% 不在白名单里");
+        // 注入面：空白能把后面的参数拆成新命令，管道 / 引号同理。
+        assert_eq!(sanitize_host("example.com & calc"), None);
+        assert_eq!(sanitize_host("example.com|calc"), None);
+        assert_eq!(sanitize_host("example.com\" x"), None);
+        assert_eq!(sanitize_host(""), None);
+        assert_eq!(sanitize_host("[]"), None);
+        assert_eq!(sanitize_host(&"a".repeat(256)), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn diagnostic_profile_runs_ping_and_tracert_under_cmd() {
+        let ping = diagnostic_profile(NetTool::Ping, "example.com").unwrap();
+        assert_eq!(ping.name, "Ping example.com");
+        assert!(ping.program.to_lowercase().ends_with("cmd.exe"));
+        // `cmd /k` 让命令跑完留在提示符上，标签不会被"shell 退出"规则收掉。
+        assert_eq!(ping.args, vec!["/k".to_string(), "ping -t example.com".into()]);
+        let trace = diagnostic_profile(NetTool::TraceRoute, "10.0.0.1").unwrap();
+        assert_eq!(trace.name, "路由追踪 10.0.0.1");
+        assert_eq!(trace.args, vec!["/k".to_string(), "tracert 10.0.0.1".into()]);
     }
 }

@@ -14,7 +14,7 @@ use rgpui_term::{
     Event as TerminalEvent, TerminalBuilder, TerminalView,
 };
 
-use crate::local_shell::ShellProfile;
+use crate::local_shell::{NetTool, ShellProfile};
 use crate::{NewLocalTerminal};
 use crate::tr;
 
@@ -444,6 +444,24 @@ impl RuTermApp {
     /// Ctrl+Shift+T / 菜单项：新开一个本地终端标签。
     pub(super) fn new_local_terminal(&mut self, _: &NewLocalTerminal, _: &mut Window, cx: &mut Context<Self>) {
         self.open_local_terminal(None, cx);
+    }
+
+
+    /// 主机右键菜单「Ping」/「路由追踪」：在本地 PTY 里跑系统命令。
+    ///
+    /// 主机名先过白名单再拼命令行：空白 / 引号 / 管道会经 `cmd /k` 变成注入面。
+    pub(super) fn open_network_tool(&mut self, host: &str, tool: NetTool, cx: &mut Context<Self>) {
+        let Some(host) = crate::local_shell::sanitize_host(host) else {
+            self.status = tr!(cx, "网络诊断：主机名含不支持的字符");
+            cx.notify();
+            return;
+        };
+        let Some(profile) = crate::local_shell::diagnostic_profile(tool, &host) else {
+            self.status = tr!(cx, "网络诊断目前只在 Windows 上提供");
+            cx.notify();
+            return;
+        };
+        self.open_local_terminal(Some(&profile), cx);
     }
 
 
