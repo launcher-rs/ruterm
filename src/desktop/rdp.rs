@@ -12,6 +12,12 @@ use ironrdp::client::rdp::{RdpClient, RdpInputEvent, RdpOutputEvent};
 use ironrdp::input::{Database, MouseButton, MousePosition, Operation, Scancode, WheelRotations};
 use ironrdp::pdu::rdp::capability_sets::MajorPlatformType;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+#[cfg(windows)]
+use windows::Win32::System::Ole::{OleInitialize, OleUninitialize};
+#[cfg(windows)]
+use windows::Win32::UI::WindowsAndMessaging::{
+    DispatchMessageW, MSG, PM_REMOVE, PeekMessageW, TranslateMessage,
+};
 
 use super::{Command, Config, Event, KeyInput, Session, Snapshot};
 
@@ -21,6 +27,8 @@ const CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
 const FPS_INTERVAL: Duration = Duration::from_secs(1);
 /// 快照发布的最小间隔：RDP 的增量更新很密，整帧转换与纹理上传不必跟着每个包走。
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
+/// 剪贴板监听窗口的 Win32 消息泵间隔（见 `pump_messages`）。
+const PUMP_INTERVAL: Duration = Duration::from_millis(10);
 
 /// 连上服务器：建好客户端配置后把会话交给专用线程。
 pub async fn connect(config: Config) -> Result<Session> {
@@ -66,7 +74,7 @@ fn build_client_config(config: &Config) -> Result<ironrdp::client::config::Confi
         .with_tls(true)
         .with_autologon(true)
         .with_compression(true)
-        // Windows 后端直接挂系统剪贴板，文本双向自动同步。
+        // Windows 后端直接挂系统剪贴板：文本与文件（CF_HDROP / 文件流）双向同步。
         .with_clipboard(ironrdp::client::config::ClipboardType::Enable);
     if let Some(domain) = config.domain.as_deref().map(str::trim).filter(|text| !text.is_empty()) {
         builder = builder.with_domain(domain);
@@ -86,6 +94,10 @@ fn run_session(
         .enable_all()
         .build()
         .context("创建 RDP 运行时失败")?;
+    // IronRDP 的剪贴板监听窗口在本线程创建，Win32 消息也只能在本线程泵；
+    // 先把线程挂到 OLE STA，远端复制的文件才能作为数据对象放进本机剪贴板。
+    #[cfg(windows)]
+    let _com = ComApartment::new();
     runtime.block_on(async {
         let (output_tx, mut output_rx) = tokio::sync::mpsc::channel::<RdpOutputEvent>(1);
         let client = RdpClient::new(client_config, output_tx);
@@ -105,6 +117,10 @@ fn run_session(
             .checked_sub(FRAME_INTERVAL)
             .unwrap_or_else(Instant::now);
         let mut pending_at: Option<Instant> = None;
+        // 持续存在的计时器：select! 每轮都会重建其它 future，用 sleep 会在密集帧
+        // 期间被反复重置而饿死消息泵。
+        let mut pump = tokio::time::interval(PUMP_INTERVAL);
+        pump.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
             tokio::select! {
@@ -170,11 +186,55 @@ fn run_session(
                 }, if close_at.is_some() => {
                     return;
                 }
+                // 剪贴板监听窗口与 OLE 的跨线程调用都靠本线程泵消息。
+                _ = pump.tick() => {
+                    pump_messages();
+                }
             }
         }
     });
     Ok(())
 }
+
+/// 会话线程的 OLE 单线程套间；线程退出时在同一线程卸载。
+#[cfg(windows)]
+struct ComApartment(bool);
+
+#[cfg(windows)]
+impl ComApartment {
+    fn new() -> Self {
+        // SAFETY: 会话线程新建，尚未初始化 COM；卸载在 Drop 里同线程完成。
+        Self(unsafe { OleInitialize(None) }.is_ok())
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ComApartment {
+    fn drop(&mut self) {
+        if self.0 {
+            // SAFETY: 与 `OleInitialize` 在同一线程配对。
+            unsafe { OleUninitialize() };
+        }
+    }
+}
+
+/// 泵一轮本线程的 Win32 消息（空窗口句柄＝只取本线程的）。
+#[cfg(windows)]
+fn pump_messages() {
+    let mut message = MSG::default();
+    // SAFETY: 标准的线程消息泵。
+    while unsafe { PeekMessageW(&mut message, None, 0, 0, PM_REMOVE) }.as_bool() {
+        // SAFETY: 消息由 `PeekMessageW` 取到，按常规分发。
+        unsafe {
+            let _ = TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+    }
+}
+
+/// 非 Windows 没有剪贴板监听窗口，无需泵消息。
+#[cfg(not(windows))]
+fn pump_messages() {}
 
 /// 一条服务器输出对会话的影响。
 enum Output {
@@ -333,7 +393,7 @@ fn handle_command(
             });
             false
         }
-        // 剪贴板由 WinClipboard 后端直接挂系统剪贴板，文本已自动双向同步；
+        // 剪贴板由 WinClipboard 后端直接挂系统剪贴板（文本与文件都自动双向同步）；
         // 界面侧再发一遍会覆盖远端刚复制的内容，这里忽略。
         Command::Clipboard(_) => false,
         // RDP 只在画面变化时推帧；界面要整帧时把最后一帧再放回槽位。

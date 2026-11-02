@@ -53,6 +53,10 @@ picky = { path = "vendor/picky" }
 # 同理：sspi 的 macOS / iOS 目标依赖钉了 curve25519-dalek / ed25519-dalek 的
 # 预发布版（Windows 构建根本不编译那段），本地副本只把这行跟到已发布版本。
 sspi = { path = "vendor/sspi" }
+# IronRDP 0.17 的剪贴板后端钉在 cliprdr 0.7，而上游原生后端 0.7 只有文本；
+# 本地副本移植上游 0.9 的 Windows 文件剪贴板实现（CF_HDROP / 文件流），
+# 只保留 Windows 后端，Linux 继续走 stub。
+ironrdp-cliprdr-native = { path = "vendor/cliprdr-native" }
 
 [target.'cfg(windows)'.dependencies]
 # 提取 shell 可执行文件的系统图标：Win32 取 HICON，png 编成 rgpui 能直接吃的字节。
@@ -60,6 +64,7 @@ windows = { version = "0.62", default-features = false, features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
     "Win32_Storage_FileSystem",
+    "Win32_System_Ole",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }

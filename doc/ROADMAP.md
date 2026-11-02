@@ -19,7 +19,7 @@
 | 中英文界面 | i18n 静态词典 + 语言切换 | 简中 / English 即时切换 | **已补** |
 | 键宏 | 组合键 → 字节流，导入导出 | 管理器：触发键 + 多步序列 / 延迟、导入导出 | **已补** |
 | 本地文件页 | 单栏本机目录浏览器 | 只有远端 SFTP | 补 |
-| 远程桌面 | VNC / RDP / SPICE 真实实现 | VNC / RDP 标签，可存为常用主机；RDP 含双向剪贴板与动态分辨率 | VNC / RDP **已补**（RDP 实机待复核）；SPICE 依赖受阻（见 P2） |
+| 远程桌面 | VNC / RDP / SPICE 真实实现 | VNC / RDP 标签，可存为常用主机；RDP 含文本 / 文件双向剪贴板与动态分辨率 | VNC / RDP **已补**（RDP 实机待复核）；SPICE 依赖受阻（见 P2） |
 | 局域网发现 | 无 | 按需扫私有网段，列出开放 22/23/3389/5900 的主机 | **我们领先** |
 | 加密凭据库 | 明文 `sessions.json` | 加密库 + 字段加密 | **我们领先** |
 | 主机指纹 | TOFU（known_hosts 文本） | TOFU 入库、跳板逐跳校验 | **我们领先** |
@@ -193,10 +193,13 @@
     键盘按 US 布局扫描码（含 `0xE0xx` 扩展键）发送，查不到的中文 / 改键字符 / Shift 符号走 Unicode 通道；
     指针按钮与滚轮走 IronRDP `Database` 的状态机；画面 `0x00RRGGBB` 转 BGRA 后走同一条贴图路径。
   - **剪贴板 / 分辨率**：开 `client-clipboard` 特性，`ironrdp-cliprdr-native::WinClipboard` 直接挂系统剪贴板，
-    文本双向自动同步（应用侧不再自己编剪贴板消息）；`RdpInputEvent::Resize` 支持「匹配窗口」按当前窗口重建桌面。
+    文本与文件都双向自动同步（应用侧不再自己编剪贴板消息）。文件走 CLIPRDR 文件流：本地复制文件即可在远端
+    粘贴，远端复制的文件也能贴回资源管理器。上游原生后端 0.9 才有文件支持，而 ironrdp 0.17 钉在 cliprdr 0.7，
+    因此用 `vendor/cliprdr-native` 把 0.9 的 Windows 后端移植到 0.7；会话线程初始化为 OLE STA 并每 10ms 泵
+    Win32 消息，剪贴板监听窗口与 OLE 数据对象才能工作。`RdpInputEvent::Resize` 支持「匹配窗口」按当前窗口重建桌面。
     帧在协议层按 16ms 合并后整帧发布（空闲时立即发、结束前补发最后一帧），避免连续小更新逐条重绘。
-  - **限制**：未开 `sound` / `rdpdr` 特性，RDP 没有音频与文件重定向；只走 CredSSP（NLA），
-    不支持关掉 NLA 的旧服务器；服务器证书不校验
+  - **限制**：未开 `sound` / `rdpdr` 特性，RDP 没有音频与 RDPDR 文件重定向（文件互传走剪贴板文件流，
+    见下一条）；只走 CredSSP（NLA），不支持关掉 NLA 的旧服务器；服务器证书不校验
     （IronRDP 默认 TLS 后端 `danger_accept_invalid_certs`，CredSSP 仍做凭据认证）。
   - **验证**：`cargo test` 114 项全绿（含扫描码映射与局域网解析单测）；**RDP 实机连接待复核**——开发期间
     用户在用电脑，未启动 ruterm 窗口，下次开机补一次真实 Windows 主机的连接、键盘、鼠标、剪贴板与断开截图。
@@ -206,6 +209,21 @@
   本进程的 `password_cache` 里（键 `user@host:port`，锁库时随 SSH 密码一起清空），再点同一主机不再追问。
   新桌面 / 发现的预填入口与「修改参数」仍走完整表单。
   验证：缓存键与 RDP / VNC 认证判定单测通过，`cargo test` 114 项全绿；**点击直连、密码卡与回车提交待实机复核**。
+- [x] **远程桌面与主机的文件互传** — `M` — 已完成（实机待复核）
+  - **RDP 剪贴板文件**：本地复制文件（资源管理器里 Ctrl+C）后，在远端桌面 Ctrl+V 即可粘贴；
+    远端复制的文件也能在本机资源管理器粘贴。走 CLIPRDR 文件流（`FileGroupDescriptorW` +
+    `FileContentsRequest/Response`），不是 RDPDR 共享盘。实现见 `vendor/cliprdr-native`：
+    上游 0.9 的 Windows 后端移植回 cliprdr 0.7，`WinClipboard::new` 默认开启文件传输。
+  - **会话线程的 Win32 消息泵**：剪贴板监听窗口与 OLE 数据对象都创建在 RDP 会话线程上，
+    `src/desktop/rdp.rs` 把该线程初始化为 OLE STA，并在事件循环里每 10ms 泵一次消息；
+    否则收不到剪贴板更新，远端文件也贴不回资源管理器。
+  - **VNC / 无文件通道时的拖放**：把本地文件拖到远程桌面标签，会查找同一主机（按 SSH 连接目标，
+    不区分大小写）的已连接 SSH 会话，经它的 SFTP 传到该会话文件面板的当前目录（面板未加载时为登录主目录）。
+    没有匹配的 SSH 会话时状态栏就地提示先开一条，不偷偷新建连接。
+  - **限制**：VNC 协议本身没有文件剪贴板；桌面标签拖放依赖同主机 SSH 会话。远端复制的文件在
+    资源管理器粘贴时按需下载，不支持在 Explorer 里直接拖出的自定义拖放。
+  - **验证**：`cargo check --all-targets` / `cargo clippy --all-targets` / `cargo test`（114 项）通过；
+    **RDP 文件剪贴板与桌面标签拖放待真实 Windows 主机复核**（需要两端各复制一次文件、双向往返）。
 - [ ] **远程桌面：SPICE** — `XL` — **依赖受阻，暂缓**
   原型依赖的 capsaicin 未发布到 crates.io（仓库里也没有 vendor 副本，无法构建）；
   crates.io 上的 `spice-client` 0.2 是 **GPL-3.0**，本项目 Apache-2.0，许可不兼容，不能引入。

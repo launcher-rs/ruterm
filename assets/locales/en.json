@@ -340,8 +340,10 @@
  "已填入主机信息，输入密码后点「连接」": "Host details filled in; enter the password and click Connect",
  "已取消远程桌面": "Remote desktop cancelled",
  "RDP 认证失败：请检查用户名、域和密码后重试": "RDP authentication failed: check the username, domain and password, then retry",
- "RDP 剪贴板已随系统自动同步，直接在远端按 Ctrl+V 即可": "The RDP clipboard syncs via the system clipboard automatically — just press Ctrl+V on the remote",
- "RDP 剪贴板随系统自动同步（文本），直接 Ctrl+C / Ctrl+V 即可": "The RDP clipboard syncs via the system clipboard automatically (text); use Ctrl+C / Ctrl+V directly",
+ "RDP 剪贴板已随系统自动同步，直接在远端按 Ctrl+V 即可（文件也可直接粘贴）": "The RDP clipboard syncs via the system clipboard automatically — press Ctrl+V on the remote (files can be pasted too)",
+ "RDP 剪贴板随系统自动同步（文本与文件），直接 Ctrl+C / Ctrl+V 即可": "The RDP clipboard syncs via the system clipboard automatically (text and files); use Ctrl+C / Ctrl+V directly",
+ "远程桌面：先填写主机地址后再拖入文件": "Remote desktop: enter a host address before dropping files",
+ "远程桌面不能直接收文件：请先给同一主机开一个 SSH 会话，拖入的文件会经 SFTP 传到该会话的当前目录": "A remote desktop can't receive files directly: open an SSH session to the same host first — dropped files are uploaded via SFTP to that session's current directory",
  "让远端把桌面分辨率调整为当前窗口大小": "Ask the remote to resize its desktop to this window",
  "匹配窗口": "Match window",
  "正在把远端桌面调整为 {width}×{height}…": "Resizing the remote desktop to {width}×{height}…"

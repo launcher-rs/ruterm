@@ -847,16 +847,18 @@ impl RuTermApp {
                     }
                 }),
             )
-            // 本地文件拖到终端＝用 lrzsz 传到 shell 当前目录（落点由远端决定）。
-            // 远程桌面标签没有 shell，不接这个落点。
-            .when(!desktop, |this| {
-                this.drag_over::<ExternalPaths>(move |style, _, _, _| {
-                    style.border_1().border_color(pal.accent)
-                })
-                .on_drop(cx.listener(move |this, paths: &ExternalPaths, _, cx| {
-                    this.upload_via_terminal(id, paths.paths().to_vec(), cx);
-                }))
+            // 本地文件拖进标签：终端走 lrzsz；远程桌面没有 shell，改经同一主机的 SSH
+            // 会话走 SFTP（见 `desktop_drop_paths`）。
+            .drag_over::<ExternalPaths>(move |style, _, _, _| {
+                style.border_1().border_color(pal.accent)
             })
+            .on_drop(cx.listener(move |this, paths: &ExternalPaths, _, cx| {
+                if this.tabs.iter().any(|tab| tab.id == id && tab.desktop.is_some()) {
+                    this.desktop_drop_paths(id, paths.paths().to_vec(), cx);
+                } else {
+                    this.upload_via_terminal(id, paths.paths().to_vec(), cx);
+                }
+            }))
             .when(active && self.find.visible && !desktop, |this| {
                 this.child(self.render_find_bar(tab, cx))
             })

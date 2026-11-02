@@ -5,6 +5,7 @@
 //! 不落盘、不进日志、不进命令行。
 
 use std::cell::Cell;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
@@ -1105,6 +1106,60 @@ impl RuTermApp {
         cx.notify();
     }
 
+    /// 拖文件到远程桌面标签：桌面协议本身没有通用的文件通道，改走同一主机的
+    /// SSH 会话经 SFTP 上传到该会话的当前目录。
+    ///
+    /// 匹配按 SSH 连接目标的主机名（不区分大小写），优先用已连接的会话；
+    /// 没有这样的会话时就地提示，不偷偷新建连接。
+    pub(super) fn desktop_drop_paths(
+        &mut self,
+        id: usize,
+        paths: Vec<PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(host) = self
+            .tabs
+            .iter()
+            .find(|tab| tab.id == id)
+            .and_then(|tab| tab.desktop.as_ref())
+            .map(|desktop| desktop.host.trim().to_string())
+        else {
+            return;
+        };
+        if host.is_empty() {
+            self.status = tr!(cx, "远程桌面：先填写主机地址后再拖入文件");
+            cx.notify();
+            return;
+        }
+        let ssh = self
+            .tabs
+            .iter()
+            .find(|tab| {
+                tab.desktop.is_none()
+                    && tab.commands.is_some()
+                    && !tab.ended
+                    && matches!(
+                        tab.resume.as_ref(),
+                        Some(Resume::Ssh { target, .. }) if target.host.eq_ignore_ascii_case(&host)
+                    )
+            })
+            .map(|tab| {
+                (
+                    tab.id,
+                    tab.files.path.clone().unwrap_or_else(|| ".".to_string()),
+                )
+            });
+        let Some((ssh_id, dir)) = ssh else {
+            self.status = tr!(
+                cx,
+                "远程桌面不能直接收文件：请先给同一主机开一个 SSH 会话，拖入的文件会经 SFTP 传到该会话的当前目录"
+            );
+            cx.notify();
+            return;
+        };
+        self.upload_paths(ssh_id, dir, paths, cx);
+    }
+
     fn close_desktop(&mut self, id: usize, cx: &mut Context<Self>) {
         let Some(desktop) = self
             .tabs
@@ -1292,10 +1347,11 @@ impl RuTermApp {
             .and_then(|tab| tab.desktop.as_ref())
             .map(|desktop| desktop.protocol);
         if protocol == Some(Protocol::Rdp) {
-            // IronRDP 的 WinClipboard 后端直接挂系统剪贴板，文本在会话期间自动双向同步；
+            // IronRDP 的 WinClipboard 后端直接挂系统剪贴板，文本与文件在会话期间自动双向同步；
             // 这里再手工发一遍反而会覆盖远端刚复制的内容。
             self.status =
-                tr!(cx, "RDP 剪贴板已随系统自动同步，直接在远端按 Ctrl+V 即可").into();
+                tr!(cx, "RDP 剪贴板已随系统自动同步，直接在远端按 Ctrl+V 即可（文件也可直接粘贴）")
+                    .into();
             cx.notify();
             return;
         }
@@ -1623,7 +1679,7 @@ impl RuTermApp {
             desktop.name.clone()
         };
         let clipboard_tip = if desktop.protocol == Protocol::Rdp {
-            tr!(cx, "RDP 剪贴板随系统自动同步（文本），直接 Ctrl+C / Ctrl+V 即可")
+            tr!(cx, "RDP 剪贴板随系统自动同步（文本与文件），直接 Ctrl+C / Ctrl+V 即可")
         } else {
             tr!(cx, "把本地剪贴板文本发送到远端")
         };
