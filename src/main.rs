@@ -8,6 +8,7 @@
 
 mod app;
 mod config;
+mod desktop;
 mod i18n;
 mod instance;
 mod local_shell;
@@ -53,9 +54,11 @@ actions!(
     [
         ToggleSidebar,
         ToggleFilePanel,
+        ToggleLocalPanel,
         ToggleTheme,
         NewHost,
         NewLocalTerminal,
+        NewRemoteDesktop,
         NextTab,
         PrevTab,
         CloseTab,
@@ -127,9 +130,13 @@ fn main() {
             KeyBinding::new("ctrl-b", ToggleSidebar, None),
             // 文件面板：与「会话」菜单里的“远端文件面板”同一条路径。
             KeyBinding::new("ctrl-shift-b", ToggleFilePanel, None),
+            // 本机文件页：远端面板是 ctrl-shift-b，本机加一个 L（local）。
+            KeyBinding::new("ctrl-shift-l", ToggleLocalPanel, None),
             KeyBinding::new("ctrl-t", ToggleTheme, None),
             KeyBinding::new("ctrl-n", NewHost, None),
             KeyBinding::new("ctrl-shift-t", NewLocalTerminal, None),
+            // 远程桌面（VNC）：R 取 remote，与本地终端的 T 相邻。
+            KeyBinding::new("ctrl-shift-r", NewRemoteDesktop, None),
             // 标签多到溢出后光靠鼠标滚动不够快，配上循环切换。
             KeyBinding::new("ctrl-tab", NextTab, None),
             KeyBinding::new("ctrl-shift-tab", PrevTab, None),

@@ -6,7 +6,7 @@ use rgpui::components::split_pane::{SplitDirection, SplitPaneState};
 use rgpui::input_ui::{Input, InputEvent, InputState};
 use rgpui::prelude::*;
 use rgpui::{
-    AnyElement, Button, ButtonVariants, Context, Disableable, Entity,
+    AnyElement, Button, ButtonVariants, ClipboardItem, Context, Disableable, Entity,
     ExternalPaths, Focusable, FontWeight, Hsla, Icon, IconName, InteractiveElement, IntoElement, MouseButton, ParentElement, SharedString,
     StatefulInteractiveElement, Styled, TrayMenuItem, Window, div, h_flex, px, v_flex,
 };
@@ -15,6 +15,7 @@ use rgpui_term::{
 };
 
 use crate::config::SshTarget;
+use crate::desktop::Command;
 use crate::remote::RemoteInfo;
 use crate::sessions::{AuthMethod, HostConfig, ProtocolKind};
 use crate::{CancelRename, CloseTab, SplitRight, SplitDown, CloseSplit, NextTab, PrevTab};
@@ -38,12 +39,16 @@ pub(super) struct SessionTab {
     pub(super) auth: Option<AuthMethod>,
     /// 远程服务器基本信息（连接后经 exec 探测异步填充，探测失败保持 None）。
     pub(super) remote_info: Option<RemoteInfo>,
-    /// 渲染用终端视图。
-    pub(super) terminal_view: Entity<TerminalView>,
+    /// 渲染用终端视图；远程桌面标签为 None。
+    pub(super) terminal_view: Option<Entity<TerminalView>>,
+    /// 远程桌面标签的状态（连接表单 / 帧 / 输入转发）；终端标签为 None。
+    pub(super) desktop: Option<DesktopTab>,
     /// 会话已结束（远端 exit / 断线 / 连接失败）。标签保留终端内容并显示重连条。
     pub(super) ended: bool,
     /// 结束原因是失败（连接失败 / 异常中断）：状态栏文案由失败路径负责，不被"已断开"覆盖。
     pub(super) failed: bool,
+    /// 失败原文（russh / IO 错误串）：横幅就地显示摘要并据此「复制错误」，重连成功后清空。
+    pub(super) last_error: Option<SharedString>,
     /// 重连所需参数；本地终端没有会话概念，为 None。
     pub(super) resume: Option<Resume>,
     /// 主动断开当前 SSH 会话（关闭标签时发送；本地终端为 None）。
@@ -108,7 +113,7 @@ impl RuTermApp {
     pub(super) fn tab_is_current(&self, id: usize, view: &Entity<TerminalView>) -> bool {
         self.tabs
             .iter()
-            .any(|tab| tab.id == id && tab.terminal_view == *view)
+            .any(|tab| tab.id == id && tab.terminal_view.as_ref() == Some(view))
     }
 
 
@@ -174,6 +179,7 @@ impl RuTermApp {
             tab.failed = true;
             // 失败也按"已结束"落标签：终端事件可能迟到，横幅与重连入口要立刻可用。
             tab.ended = true;
+            tab.last_error = Some(message.clone());
             had_forwards = !tab.forwards.is_empty();
             // 连接没了，本地监听端口随会话任务一起释放。
             tab.forwards.clear();
@@ -193,12 +199,13 @@ impl RuTermApp {
                 && tab.resume.is_some()
                 && (shell_started || in_streak)
                 && tab.auto_retry_attempt < AUTO_RECONNECT_MAX
+                && let Some(view) = tab.terminal_view.clone()
             {
                 let attempt = tab.auto_retry_attempt + 1;
                 let delay = auto_reconnect_delay(attempt);
                 tab.auto_retry_attempt = attempt;
                 tab.auto_retry_pending = true;
-                schedule = Some((attempt, delay, tab.terminal_view.clone()));
+                schedule = Some((attempt, delay, view));
             }
             cx.notify();
         }
@@ -239,7 +246,7 @@ impl RuTermApp {
                 entity.update(cx, move |this, cx| {
                     let still_pending = this.tabs.iter().any(|tab| {
                         tab.id == id
-                            && tab.terminal_view == view
+                            && tab.terminal_view.as_ref() == Some(&view)
                             && tab.auto_retry_pending
                             && tab.ended
                     });
@@ -401,27 +408,24 @@ impl RuTermApp {
 
 
     /// 双击标签：把标题换成输入框就地改名。只影响这条会话，不落库。
-    pub(super) fn begin_rename(&mut self, tab_id: usize, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn begin_rename(
+        &mut self,
+        tab_id: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(tab) = self.tabs.iter().find(|tab| tab.id == tab_id) else {
             return;
         };
         let initial = tab.title.to_string();
-        rdlog(&format!("begin_rename tab={tab_id} initial={initial:?}"));
         let input = cx.new(|cx| InputState::new(window, cx).default_value(initial));
         cx.subscribe(&input, move |this, input, event: &InputEvent, cx| {
-            rdlog(&format!(
-                "input event {} attached={} value={:?}",
-                match event {
-                    InputEvent::Change => "Change",
-                    InputEvent::PressEnter { .. } => "PressEnter",
-                    InputEvent::Focus => "Focus",
-                    InputEvent::Blur => "Blur",
-                },
-                this.renaming.as_ref().is_some_and(|(_, state)| state == &input),
-                input.read(cx).value()
-            ));
             // 输入框可能已随上一次提交销毁，只认当前挂着的那个。
-            if !this.renaming.as_ref().is_some_and(|(_, state)| state == &input) {
+            if !this
+                .renaming
+                .as_ref()
+                .is_some_and(|(_, state)| state == &input)
+            {
                 return;
             }
             match event {
@@ -434,16 +438,10 @@ impl RuTermApp {
             state.focus(window, cx);
             let len = state.value().len();
             state.set_selected_range(0..len, cx);
-            rdlog(&format!(
-                "  after setup value={:?} focused={}",
-                state.value(),
-                Focusable::focus_handle(state, cx).is_focused(window)
-            ));
         });
         self.renaming = Some((tab_id, input));
         cx.notify();
     }
-
 
     /// 提交就地改名：空标题当作撤销，交还给终端上报的标题或默认名。
     pub(super) fn commit_rename(&mut self, cx: &mut Context<Self>) {
@@ -451,7 +449,6 @@ impl RuTermApp {
             return;
         };
         let text = input.read(cx).value().trim().to_string();
-        rdlog(&format!("commit_rename tab={tab_id} text={text:?}"));
         let Some(index) = self.tabs.iter().position(|tab| tab.id == tab_id) else {
             cx.notify();
             return;
@@ -460,11 +457,9 @@ impl RuTermApp {
             self.tabs[index].custom_title = None;
             let osc = self.tabs[index]
                 .terminal_view
-                .read(cx)
-                .terminal()
-                .read(cx)
-                .breadcrumb_text
-                .clone();
+                .as_ref()
+                .map(|view| view.read(cx).terminal().read(cx).breadcrumb_text.clone())
+                .unwrap_or_default();
             self.apply_osc_title(tab_id, &osc, cx);
         } else {
             let title = SharedString::from(text);
@@ -508,6 +503,17 @@ impl RuTermApp {
             && let Some(disconnect) = tab.disconnect.take()
         {
             let _ = disconnect.send(());
+        }
+        // 远程桌面标签：通知协议层收尾，并把残留帧从图集里释放掉。
+        if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id)
+            && let Some(desktop) = tab.desktop.as_mut()
+        {
+            desktop.send(Command::Close);
+            let mut frames: Vec<_> = desktop.drop_queue.drain(..).collect();
+            frames.extend(desktop.image.take());
+            for image in frames {
+                cx.drop_image(image, None);
+            }
         }
         self.tabs.retain(|tab| tab.id != id);
         if self.tabs.len() == before {
@@ -582,8 +588,17 @@ impl RuTermApp {
         }
         if let Some(ix) = self.tabs.iter().position(|tab| tab.id == id) {
             self.tab_scroll.scroll_to_item(ix);
-            let focus = self.tabs[ix].terminal_view.read(cx).focus_handle(cx);
-            focus.focus(window, cx);
+            if let Some(view) = self.tabs[ix].terminal_view.clone() {
+                let focus = view.read(cx).focus_handle(cx);
+                focus.focus(window, cx);
+            } else if let Some(desktop) = self.tabs[ix].desktop.as_ref() {
+                // 切回桌面标签时补一次整帧：后台期间可能漏掉了增量更新。
+                if matches!(desktop.phase, DesktopPhase::Live) {
+                    desktop.send(Command::RequestFull);
+                }
+                let focus = desktop.focus.clone();
+                focus.focus(window, cx);
+            }
         }
         // 查找条只作用于活动终端：切标签后把同一关键词带到新终端并跳首个匹配。
         if self.find.visible {
@@ -807,14 +822,14 @@ impl RuTermApp {
     ) -> AnyElement {
         let pal = self.palette(cx);
         let id = tab.id;
+        let desktop = tab.desktop.is_some();
         div()
             .flex_1()
             .min_w_0()
             .min_h_0()
             .overflow_hidden()
             .bg(terminal_bg)
-            .px_3()
-            .py_2()
+            .when(!desktop, |this| this.px_3().py_2())
             .when(highlight && active, |this| {
                 this.border_1().border_color(pal.accent)
             })
@@ -829,17 +844,26 @@ impl RuTermApp {
                 }),
             )
             // 本地文件拖到终端＝用 lrzsz 传到 shell 当前目录（落点由远端决定）。
-            .drag_over::<ExternalPaths>(move |style, _, _, _| {
-                style.border_1().border_color(pal.accent)
+            // 远程桌面标签没有 shell，不接这个落点。
+            .when(!desktop, |this| {
+                this.drag_over::<ExternalPaths>(move |style, _, _, _| {
+                    style.border_1().border_color(pal.accent)
+                })
+                .on_drop(cx.listener(move |this, paths: &ExternalPaths, _, cx| {
+                    this.upload_via_terminal(id, paths.paths().to_vec(), cx);
+                }))
             })
-            .on_drop(cx.listener(move |this, paths: &ExternalPaths, _, cx| {
-                this.upload_via_terminal(id, paths.paths().to_vec(), cx);
-            }))
-            .when(active && self.find.visible, |this| {
+            .when(active && self.find.visible && !desktop, |this| {
                 this.child(self.render_find_bar(tab, cx))
             })
-            .child(tab.terminal_view.clone())
-            .when(tab.ended, |this| {
+            .when_some(tab.terminal_view.clone(), |this, view| {
+                this.child(view)
+            })
+            .when_some(tab.desktop.as_ref(), |this, desktop| {
+                this.child(self.render_desktop_pane(tab, desktop, cx))
+            })
+            // 远程桌面有自己的失败横幅（含重连），不叠一层终端横幅。
+            .when(tab.ended && tab.desktop.is_none(), |this| {
                 this.child(self.render_ended_banner(tab, cx))
             })
             .when_some(tab.zmodem.clone(), |this, text| {
@@ -898,7 +922,10 @@ impl RuTermApp {
     /// 所以用状态文案（正则无效 / 未找到）代替计数。
     pub(super) fn render_find_bar(&self, tab: &SessionTab, cx: &mut Context<Self>) -> AnyElement {
         let pal = self.palette(cx);
-        let status = tab.terminal_view.read(cx).search_status(cx);
+        let Some(view) = tab.terminal_view.as_ref() else {
+            return div().into_any_element();
+        };
+        let status = view.read(cx).search_status(cx);
         let (hint, hint_color) = match status {
             SearchStatus::Invalid => ("正则无效", pal.danger),
             SearchStatus::NotFound => ("未找到", pal.muted),
@@ -1012,22 +1039,21 @@ impl RuTermApp {
         } else {
             tr!(cx, "会话已断开连接。")
         };
+        // 错误原文压成一行（换行只当空格）；太长仍要截断，完整内容靠「复制错误」进剪贴板。
+        let error_line = tab
+            .last_error
+            .as_ref()
+            .map(|err| flatten_error_text(err.as_ref(), 220));
+        let copy_error_label = tr!(cx, "复制错误");
+        let copy_error_tip = tr!(cx, "把断开原因原文复制到剪贴板，方便贴给别人排查");
+        let copied_status = tr!(cx, "错误已复制到剪贴板");
+        let error_text = tab.last_error.clone();
         let cancel_retry_label = tr!(cx, "取消自动重连");
         let reconnect_label = tr!(cx, "重新连接");
-        h_flex()
-            .id(SharedString::from(format!("ended-banner-{id}")))
-            .absolute()
-            .top(px(8.0))
-            .left(px(8.0))
-            .right(px(8.0))
-            .px_3()
-            .py_2()
+        // 一行装不下：标题/入口在第一行，错误原文单独一行，否则长错误会把按钮挤出窗口。
+        let head_row = h_flex()
             .gap_2()
             .items_center()
-            .rounded(px(6.0))
-            .bg(theme.warning)
-            .text_color(fg)
-            .shadow_md()
             .child(
                 div()
                     .text_sm()
@@ -1037,6 +1063,20 @@ impl RuTermApp {
             .child(div().text_sm().child(reason))
             .child(div().flex_1())
             .child(div().text_xs().child(hint))
+            .when_some(error_text, |this, err| {
+                this.child(
+                    Button::new(SharedString::from(format!("copy-error-{id}")))
+                        .label(copy_error_label)
+                        .ghost()
+                        .compact()
+                        .tooltip(copy_error_tip)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(err.to_string()));
+                            this.status = copied_status.clone();
+                            cx.notify();
+                        })),
+                )
+            })
             .when(pending, |this| {
                 this.child(
                     Button::new(SharedString::from(format!("cancel-retry-{id}")))
@@ -1073,8 +1113,36 @@ impl RuTermApp {
                         this.close_tab(id, cx);
                     })),
             )
+            .into_any_element();
+        v_flex()
+            .id(SharedString::from(format!("ended-banner-{id}")))
+            .absolute()
+            .top(px(8.0))
+            .left(px(8.0))
+            .right(px(8.0))
+            .px_3()
+            .py_2()
+            .gap_1()
+            .rounded(px(6.0))
+            .bg(theme.warning)
+            .text_color(fg)
+            .shadow_md()
+            .child(head_row)
+            .when_some(error_line, |this, line| {
+                this.child(div().text_xs().child(line))
+            })
             .into_any_element()
     }
 
 
+}
+
+/// 把多行错误压成一行并按字符数截断：横幅宽度有限，完整原文交给「复制错误」。
+fn flatten_error_text(text: &str, max_chars: usize) -> SharedString {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut out: String = flat.chars().take(max_chars).collect();
+    if flat.chars().count() > max_chars {
+        out.push('…');
+    }
+    SharedString::from(out)
 }

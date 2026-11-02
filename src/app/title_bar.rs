@@ -10,7 +10,7 @@ use rgpui::{
 };
 
 use crate::MacroManager as OpenMacroManager;
-use crate::{ToggleSidebar, ToggleFilePanel, ToggleTheme, NewHost, NewLocalTerminal, NextTab, PrevTab, CloseTab, OpenSettings, OpenForward, SplitRight, SplitDown, CloseSplit, FindInTerminal, ToggleSyncInput, BroadcastCommand};
+use crate::{ToggleSidebar, ToggleFilePanel, ToggleLocalPanel, ToggleTheme, NewHost, NewLocalTerminal, NewRemoteDesktop, NextTab, PrevTab, CloseTab, OpenSettings, OpenForward, SplitRight, SplitDown, CloseSplit, FindInTerminal, ToggleSyncInput, BroadcastCommand};
 use crate::tr;
 
 use super::*;
@@ -89,6 +89,7 @@ impl RuTermApp {
         let sidebar_open = self.sidebar_visible(cx);
         let hosts_open = sidebar_open && self.sidebar_page == SidebarPage::Hosts;
         let file_panel_open = sidebar_open && self.sidebar_page == SidebarPage::Files;
+        let local_panel_open = sidebar_open && self.sidebar_page == SidebarPage::Local;
         // 菜单打开时把最近连接的 id 解析成当前列表里的条目（主机可能已删除或重排）。
         let recent_items: Vec<(usize, SharedString)> = self
             .recent_hosts
@@ -145,6 +146,7 @@ impl RuTermApp {
                     );
                 }
                 menu.item(PopupMenuItem::new(tr!(cx, "本地终端…")).action(Box::new(NewLocalTerminal)))
+                    .item(PopupMenuItem::new(tr!(cx, "远程桌面…")).action(Box::new(NewRemoteDesktop)))
                     .separator()
                     .item(PopupMenuItem::new(tr!(cx, "设置…")).action(Box::new(OpenSettings)))
                     .item(
@@ -178,6 +180,11 @@ impl RuTermApp {
                     PopupMenuItem::new(tr!(cx, "文件浏览器"))
                         .checked(file_panel_open)
                         .action(Box::new(ToggleFilePanel)),
+                )
+                .item(
+                    PopupMenuItem::new(tr!(cx, "本机文件页"))
+                        .checked(local_panel_open)
+                        .action(Box::new(ToggleLocalPanel)),
                 )
                 // 只折叠面板，最外缘的图标栏始终留着（RustRover 的工具窗口栏）。
                 .item(

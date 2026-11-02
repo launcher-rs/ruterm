@@ -29,11 +29,12 @@ impl Render for SplitDividerDrag {
     }
 }
 
-/// 边栏页面：主机列表、文件浏览器、端口转发共用同一条边栏。
+/// 边栏页面：主机列表、远端文件、本机文件、端口转发共用同一条边栏。
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum SidebarPage {
     Hosts,
     Files,
+    Local,
     Forward,
 }
 
@@ -81,6 +82,7 @@ impl RuTermApp {
         match page {
             SidebarPage::Hosts => {}
             SidebarPage::Files => self.ensure_files_shown(cx),
+            SidebarPage::Local => self.ensure_local_shown(cx),
             SidebarPage::Forward => self.open_forward(window, cx),
         }
         cx.notify();
@@ -287,6 +289,12 @@ impl RuTermApp {
                 IconName::FolderOpen,
             ),
             (
+                SidebarPage::Local,
+                "rail-local",
+                tr!(cx, "本机"),
+                IconName::HardDrive,
+            ),
+            (
                 SidebarPage::Forward,
                 "rail-forward",
                 tr!(cx, "转发"),
@@ -405,6 +413,7 @@ impl RuTermApp {
         let content = match self.sidebar_page {
             SidebarPage::Hosts => self.render_hosts_page(cx),
             SidebarPage::Files => self.render_files_section(cx),
+            SidebarPage::Local => self.render_local_section(cx),
             SidebarPage::Forward => self.render_forward_section(cx),
         };
         // 页面内容需要在竖向 flex 里拿满高度：块级容器会让 flex_1 的子元素塌成 0。

@@ -26,6 +26,31 @@ getrandom = "0.4.3"
 aes-gcm = { version = "0.11", default-features = false, features = ["aes", "alloc"] }
 sha2 = "0.11"
 base64 = "0.23"
+# VNC 认证（RFB 的 VNC Authentication 是 DES-ECB 挑战应答，安全性由协议决定）。
+des = "0.9"
+# 远程桌面帧：把 VNC 的 BGRA 快照包成 rgpui `RenderImage` 的帧（与 rgpui 同版本）。
+image = { version = "0.25.10", default-features = false }
+# RDP 客户端（IronRDP）。只用客户端 + 输入 + 协议层，服务端 / 剪贴板 / 音频不拉进来。
+ironrdp = { version = "0.17", default-features = false, features = [
+    "client",
+    "input",
+    "core",
+    "pdu",
+    "native-tls",
+] }
+# 间接依赖，只为钉版本：ironrdp-connector 要 `sspi ^0.21`，0.21.0 钉了
+# curve25519-dalek 的预发布版（与 russh 已解析的 5.0.0 冲突）；0.21.3 没有这个问题。
+sspi = "=0.21.3"
+
+[patch.crates-io]
+# ironrdp-connector 的 CredSSP 唯一用到的是 `picky::key::PrivateKey`。上游
+# 7.0.0-rc.25 把 curve25519-dalek 等钉在预发布版，与 russh 已解析的 5.0.0 /
+# 3.0.0 落在同一兼容区间而无法共存；本地副本只把几个 RustCrypto 依赖跟到
+# 已发布版本，并裁掉不需要的 jose / pkcs12 默认特性，其余代码原样。
+picky = { path = "vendor/picky" }
+# 同理：sspi 的 macOS / iOS 目标依赖钉了 curve25519-dalek / ed25519-dalek 的
+# 预发布版（Windows 构建根本不编译那段），本地副本只把这行跟到已发布版本。
+sspi = { path = "vendor/sspi" }
 
 [target.'cfg(windows)'.dependencies]
 # 提取 shell 可执行文件的系统图标：Win32 取 HICON，png 编成 rgpui 能直接吃的字节。

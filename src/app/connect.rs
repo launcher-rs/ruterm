@@ -460,9 +460,11 @@ impl RuTermApp {
             addr: addr.clone().into(),
             auth: Some(auth),
             remote_info: None,
-            terminal_view: terminal_view.clone(),
+            terminal_view: Some(terminal_view.clone()),
+            desktop: None,
             ended: false,
             failed: false,
+            last_error: None,
             resume: Some(resume),
             disconnect: Some(disconnect),
             commands: Some(commands),
@@ -494,7 +496,7 @@ impl RuTermApp {
                 let current = this
                     .tabs
                     .iter_mut()
-                    .find(|tab| tab.id == id && tab.terminal_view == ready_view);
+                    .find(|tab| tab.id == id && tab.terminal_view.as_ref() == Some(&ready_view));
                 if let Some(tab) = current {
                     tab.connected_at = Some(Instant::now());
                     tab.auto_retry_pending = false;
@@ -576,7 +578,8 @@ impl RuTermApp {
                     let message = if shell_started {
                         format!("连接中断：{addr}（{}）", crate::session::error_summary(&error))
                     } else {
-                        format!("连接失败：{addr}")
+                        // 建连阶段失败同样带上原因：横幅的「复制错误」要有内容可复制。
+                        format!("连接失败：{addr}（{}）", crate::session::error_summary(&error))
                     };
                     this.fail_session_tab(id, message.into(), shell_started, cx);
                 });
@@ -591,7 +594,7 @@ impl RuTermApp {
                     if let Some(tab) = this
                         .tabs
                         .iter_mut()
-                        .find(|tab| tab.id == id && tab.terminal_view == info_view)
+                        .find(|tab| tab.id == id && tab.terminal_view.as_ref() == Some(&info_view))
                     {
                         tab.remote_info = Some(info);
                         cx.notify();
@@ -610,7 +613,7 @@ impl RuTermApp {
                     let Some(pos) = this
                         .tabs
                         .iter()
-                        .position(|tab| tab.id == id && tab.terminal_view == cwd_view)
+                        .position(|tab| tab.id == id && tab.terminal_view.as_ref() == Some(&cwd_view))
                     else {
                         log::debug!("[cwd_events] 未找到对应标签");
                         return;
@@ -742,9 +745,11 @@ impl RuTermApp {
             addr: addr.clone().into(),
             auth: None,
             remote_info: None,
-            terminal_view: terminal_view.clone(),
+            terminal_view: Some(terminal_view.clone()),
+            desktop: None,
             ended: false,
             failed: false,
+            last_error: None,
             resume: Some(resume),
             disconnect: Some(disconnect),
             commands: None,
@@ -774,7 +779,7 @@ impl RuTermApp {
                 let Some(tab) = this
                     .tabs
                     .iter_mut()
-                    .find(|tab| tab.id == id && tab.terminal_view == ready_view)
+                    .find(|tab| tab.id == id && tab.terminal_view.as_ref() == Some(&ready_view))
                 else {
                     return;
                 };
@@ -814,7 +819,10 @@ impl RuTermApp {
                             crate::session::error_summary(&error)
                         )
                     } else {
-                        format!("连接失败：Telnet {addr}")
+                        format!(
+                            "连接失败：Telnet {addr}（{}）",
+                            crate::session::error_summary(&error)
+                        )
                     };
                     this.fail_session_tab(id, message.into(), started, cx);
                 });
@@ -847,9 +855,8 @@ impl RuTermApp {
         let reconnectable = tab.ended && tab.resume.is_some();
         let terminal_focused = tab
             .terminal_view
-            .read(cx)
-            .focus_handle(cx)
-            .is_focused(window);
+            .as_ref()
+            .is_some_and(|view| view.read(cx).focus_handle(cx).is_focused(window));
         if !reconnectable || !terminal_focused {
             return;
         }
@@ -919,7 +926,9 @@ impl RuTermApp {
             .bg(pal.card_bg)
             .child(div().text_sm().child(hint))
             .child(styled_input(
-                Input::new(&pending.password).content_type(InputContentType::Password),
+                Input::new(&pending.password)
+                    .content_type(InputContentType::Password)
+                    .mask_toggle(),
                 &pal,
             ))
             .children(save_row)

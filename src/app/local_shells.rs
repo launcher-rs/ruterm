@@ -14,7 +14,7 @@ use rgpui_term::{
     Event as TerminalEvent, TerminalBuilder, TerminalView,
 };
 
-use crate::local_shell::ShellProfile;
+use crate::local_shell::{NetTool, ShellProfile};
 use crate::{NewLocalTerminal};
 use crate::tr;
 
@@ -447,6 +447,24 @@ impl RuTermApp {
     }
 
 
+    /// 主机右键菜单「Ping」/「路由追踪」：在本地 PTY 里跑系统命令。
+    ///
+    /// 主机名先过白名单再拼命令行：空白 / 引号 / 管道会经 `cmd /k` 变成注入面。
+    pub(super) fn open_network_tool(&mut self, host: &str, tool: NetTool, cx: &mut Context<Self>) {
+        let Some(host) = crate::local_shell::sanitize_host(host) else {
+            self.status = tr!(cx, "网络诊断：主机名含不支持的字符");
+            cx.notify();
+            return;
+        };
+        let Some(profile) = crate::local_shell::diagnostic_profile(tool, &host) else {
+            self.status = tr!(cx, "网络诊断目前只在 Windows 上提供");
+            cx.notify();
+            return;
+        };
+        self.open_local_terminal(Some(&profile), cx);
+    }
+
+
     /// 打开本地终端（路线图 §五 一期）：交给 rgpui-term 的本地 PTY 后端拉起选定 shell。
     /// 不指定档案时取列表第一项（`detect()` 把 PowerShell 7 排最前）。
     /// 进程拉起与通道握手是异步的：建好才落标签，失败只写状态栏，不留空标签。
@@ -541,9 +559,11 @@ impl RuTermApp {
             addr,
             auth: None,
             remote_info: None,
-            terminal_view,
+            terminal_view: Some(terminal_view),
+            desktop: None,
             ended: false,
             failed: false,
+            last_error: None,
             resume: None,
             disconnect: None,
             commands: None,
