@@ -41,6 +41,11 @@ impl RuTermApp {
         let Some(host) = self.hosts.get(index).cloned() else {
             return;
         };
+        // 桌面主机（RDP / VNC）：开桌面标签直接建连，缺密码时只问密码（不入库）。
+        if host.protocol.is_desktop() {
+            self.open_desktop_for_saved(&host, window, cx);
+            return;
+        }
         // Telnet 是明文 TCP，没有认证材料可问，直接建连。
         if host.protocol == ProtocolKind::Telnet {
             self.connect_telnet(&host, window, cx);

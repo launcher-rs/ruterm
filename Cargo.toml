@@ -30,9 +30,11 @@ base64 = "0.23"
 des = "0.9"
 # 远程桌面帧：把 VNC 的 BGRA 快照包成 rgpui `RenderImage` 的帧（与 rgpui 同版本）。
 image = { version = "0.25.10", default-features = false }
-# RDP 客户端（IronRDP）。只用客户端 + 输入 + 协议层，服务端 / 剪贴板 / 音频不拉进来。
+# RDP 客户端（IronRDP）。客户端 + 输入 + 协议层 + 剪贴板重定向；服务端 / 音频不拉进来。
+# 剪贴板在 Windows 上由 ironrdp-cliprdr-native 直接挂系统剪贴板，文本双向自动同步。
 ironrdp = { version = "0.17", default-features = false, features = [
     "client",
+    "client-clipboard",
     "input",
     "core",
     "pdu",

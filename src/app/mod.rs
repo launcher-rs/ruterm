@@ -107,6 +107,16 @@ pub(crate) struct RuTermApp {
     shell_icons: HashMap<String, Arc<Image>>,
     /// 扫描进行中：按钮禁用 + 状态栏提示，避免连点起多个 wsl.exe。
     scanning_shells: bool,
+    /// 局域网扫描到的主机（不落库；加入列表由用户点选）。
+    discovered: Vec<crate::discovery::DiscoveredHost>,
+    /// 正在扫描局域网。
+    discovering: bool,
+    /// 至少完成过一次扫描（决定空结果是否给提示）。
+    discovery_scanned: bool,
+    /// 扫描失败原因（没有私有网段、系统命令不可用等）。
+    discovery_error: Option<SharedString>,
+    /// 「局域网发现」弹窗是否打开（入口在「会话」菜单）。
+    show_discovery: bool,
     /// 本机 shell 的自定义展示名，随加密库 / settings.json 双层持久化。
     local_shell_prefs: LocalShellPrefs,
     /// 本地 shell 重命名弹窗。
@@ -347,6 +357,11 @@ impl RuTermApp {
             local_shells: crate::local_shell::detect(),
             shell_icons: HashMap::new(),
             scanning_shells: false,
+            discovered: Vec::new(),
+            discovering: false,
+            discovery_scanned: false,
+            discovery_error: None,
+            show_discovery: false,
             local_shell_prefs,
             shell_prompt: None,
             tab_scroll: ScrollHandle::new(),
@@ -678,6 +693,11 @@ impl RuTermApp {
                     }
                 });
             }
+            // 托盘开关：启动时读 settings.json；库内若有更新值（换机器等）在此补齐。
+            if let Ok(Some(value)) = vault.setting("tray").await {
+                let enabled = value == "1" || value.eq_ignore_ascii_case("true");
+                let _ = this.update(cx, |this, cx| this.set_tray_enabled(enabled, cx));
+            }
             // 侧边栏分组同样以库内为准。
             if let Ok(Some(json)) = vault.setting("sidebar").await {
                 let prefs = SidebarPrefs::from_json(&json);
@@ -805,6 +825,7 @@ impl RuTermApp {
             || self.shell_prompt.is_some()
             || self.pending.is_some()
             || self.macro_manager.is_some()
+            || self.show_discovery
     }
 
     /// 窗口级浮层：删除二次确认、主机表单、分组新建/重命名等居中模态。
@@ -908,6 +929,10 @@ impl RuTermApp {
         // 新建/编辑主机：居中模态弹窗（不再挤占侧边栏窄面板）。
         if self.new_host.is_some() {
             return self.render_form_dialog(window, cx);
+        }
+        // 局域网发现：小工具弹窗，列表只在需要时出现，不占主机列表。
+        if self.show_discovery {
+            return self.render_discovery_dialog(cx);
         }
         // 分组新建 / 重命名：同名模态，宽度固定，避免列表内联编辑误丢内容。
         if self.group_prompt.is_some() {

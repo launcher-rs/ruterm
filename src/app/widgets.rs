@@ -11,6 +11,8 @@ use crate::local_shell::NetTool;
 use crate::sessions::AuthMethod;
 use crate::tr;
 
+use crate::desktop::Protocol;
+
 use super::*;
 
 /// 认证方式的展示名（"SSH Agent" 是产品名，两种语言都原样显示）。
@@ -72,6 +74,11 @@ impl RuTermApp {
         menu: PopupMenu,
     ) -> PopupMenu {
         let menu = menu.min_w(px(168.0));
+        // 主机行右键「远程桌面…」：用该行地址预填；空白 / 分组处则打开空表单。
+        let host_index = match &target {
+            MenuTarget::Host(index) => Some(*index),
+            _ => None,
+        };
         // 「新建主机…」落在右键目标所在的分组：分组上直接进该组，
         // 主机上沿用该主机的组，空白处则是未分组。
         let target_group = match &target {
@@ -157,6 +164,32 @@ impl RuTermApp {
                 false,
                 move |this, window, cx| {
                     this.open_form_in_group(target_group.clone(), window, cx);
+                },
+            ))
+            .item(Self::menu_item(
+                entity.clone(),
+                "远程桌面…",
+                Some(IconName::Frame),
+                false,
+                false,
+                move |this, window, cx| match host_index {
+                    Some(index) => {
+                        let Some(host) = this.hosts.get(index).cloned() else {
+                            return;
+                        };
+                        if host.protocol.is_desktop() {
+                            this.open_desktop_for_saved(&host, window, cx);
+                        } else {
+                            this.open_desktop_prefilled(
+                                Protocol::Vnc,
+                                host.host,
+                                Protocol::Vnc.default_port(),
+                                window,
+                                cx,
+                            );
+                        }
+                    }
+                    None => this.new_desktop_with(None, window, cx),
                 },
             ))
             .item(Self::menu_item(

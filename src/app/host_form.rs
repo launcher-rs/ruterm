@@ -70,11 +70,35 @@ impl RuTermApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.open_form_with(edit_index, None, group, window, cx);
+    }
+
+    /// 从局域网发现新建主机：协议 / 地址 / 端口预填，认证方式留给表单里的用户。
+    pub(super) fn open_form_prefilled(
+        &mut self,
+        protocol: ProtocolKind,
+        host: String,
+        port: u16,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_form_with(None, Some((protocol, host, port)), None, window, cx);
+    }
+
+    fn open_form_with(
+        &mut self,
+        edit_index: Option<usize>,
+        seed: Option<(ProtocolKind, String, u16)>,
+        group: Option<SharedString>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let existing = edit_index.and_then(|index| self.hosts.get(index).cloned());
         let editing = existing.is_some();
         let protocol = existing
             .as_ref()
             .map(|host| host.protocol)
+            .or_else(|| seed.as_ref().map(|(protocol, _, _)| *protocol))
             .unwrap_or_default();
         let auth = existing
             .as_ref()
@@ -107,14 +131,17 @@ impl RuTermApp {
                 let input = InputState::new(window, cx).placeholder(tr!(cx, "host 或 IP"));
                 match &existing {
                     Some(host) => input.default_value(host.host.clone()),
-                    None => input,
+                    None => match &seed {
+                        Some((_, host, _)) => input.default_value(host.clone()),
+                        None => input,
+                    },
                 }
             }),
             port: cx.new(|cx| {
-                let default_port = match protocol {
-                    ProtocolKind::Ssh => "22",
-                    ProtocolKind::Telnet => "23",
-                };
+                let default_port = seed
+                    .as_ref()
+                    .map(|(_, _, port)| port.to_string())
+                    .unwrap_or_else(|| protocol.default_port().to_string());
                 let input = InputState::new(window, cx).default_value(default_port);
                 match &existing {
                     Some(host) => InputState::new(window, cx).default_value(host.port.to_string()),
@@ -179,22 +206,22 @@ impl RuTermApp {
         };
         let editing = form.editing;
         let protocol = form.protocol;
-        // Telnet 不使用 SSH 认证材料：认证方式与私钥字段一律归零，
-        // 避免把旧 SSH 主机的私钥配置带到明文会话里。
-        let auth = if protocol == ProtocolKind::Telnet {
-            AuthMethod::Agent
-        } else {
+        // 只有 SSH 使用认证材料：Telnet / 桌面协议一律归零，
+        // 避免把旧 SSH 主机的私钥配置带到别的会话里。
+        let auth = if protocol == ProtocolKind::Ssh {
             form.auth
+        } else {
+            AuthMethod::Agent
         };
         let passphrase = form.passphrase.read(cx).value().trim().to_string();
         let save_secret = form.save_secret;
         let group = form.group.clone();
-        // Telnet 没有 SSH 跳板机的概念：表单切到 Telnet 时连同旧值一起清掉，
-        // 避免之后被当成 SSH 跳板机去连接一个明文端口。
-        let jump = if protocol == ProtocolKind::Telnet {
-            None
-        } else {
+        // 跳板机是 SSH 专属：切到其它协议时连同旧值一起清掉，
+        // 避免之后被当成 SSH 跳板机去连接一个非 SSH 端口。
+        let jump = if protocol == ProtocolKind::Ssh {
             form.jump
+        } else {
+            None
         };
         let key_inline = protocol == ProtocolKind::Ssh && form.key_inline;
         let key_data = form.key_data.clone();
@@ -211,10 +238,7 @@ impl RuTermApp {
                 .value()
                 .trim()
                 .parse::<u16>()
-                .unwrap_or(match protocol {
-                    ProtocolKind::Ssh => 22,
-                    ProtocolKind::Telnet => 23,
-                }),
+                .unwrap_or_else(|_| protocol.default_port()),
             user: form.user.read(cx).value().trim().to_string(),
             auth,
             key_path: if key_inline { String::new() } else { key_path },
@@ -608,9 +632,14 @@ impl RuTermApp {
                             .max_h(fields_max_height)
                             .overflow_y_scrollbar()
                             .child({
-                                // 协议分段：SSH 与 Telnet 共用同一张连接卡片。
+                                // 协议分段：终端（SSH / Telnet）与远程桌面（RDP / VNC）共用同一张卡片。
                                 // 切换时若端口仍是旧协议的默认值，顺带换成新协议默认端口。
-                                let options = [ProtocolKind::Ssh, ProtocolKind::Telnet];
+                                let options = [
+                                    ProtocolKind::Ssh,
+                                    ProtocolKind::Telnet,
+                                    ProtocolKind::Rdp,
+                                    ProtocolKind::Vnc,
+                                ];
                                 v_flex().gap_1().child(div().text_sm().child("协议")).child(
                                     h_flex().gap_2().children(options.into_iter().map(|option| {
                                         let is_selected = form.protocol == option;
@@ -645,10 +674,9 @@ impl RuTermApp {
                                                 if form.protocol == option {
                                                     return;
                                                 }
-                                                let (previous, next) = match option {
-                                                    ProtocolKind::Ssh => ("23", "22"),
-                                                    ProtocolKind::Telnet => ("22", "23"),
-                                                };
+                                                let previous =
+                                                    form.protocol.default_port().to_string();
+                                                let next = option.default_port().to_string();
                                                 let port_now =
                                                     form.port.read(cx).value().trim().to_string();
                                                 form.protocol = option;
@@ -672,14 +700,17 @@ impl RuTermApp {
                                             .flex_1()
                                             .child(labeled_field("端口", &form.port, &pal)),
                                     )
-                                    // Telnet 的用户名在会话内交互输入，表单里没有对应字段。
-                                    .when(protocol == ProtocolKind::Ssh, |this| {
-                                        this.child(div().flex_1().child(labeled_field(
-                                            "用户名",
-                                            &form.user,
-                                            &pal,
-                                        )))
-                                    }),
+                                    // Telnet / VNC 的登录名在会话内交互输入，表单里没有对应字段。
+                                    .when(
+                                        matches!(protocol, ProtocolKind::Ssh | ProtocolKind::Rdp),
+                                        |this| {
+                                            this.child(div().flex_1().child(labeled_field(
+                                                "用户名",
+                                                &form.user,
+                                                &pal,
+                                            )))
+                                        },
+                                    ),
                             )
                             // 分组 / 跳板机并排一行：两项都是可选的下拉，各占一半宽度，
                             // 省下的竖向空间留给私钥字段。

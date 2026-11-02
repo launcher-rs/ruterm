@@ -8,6 +8,7 @@ use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
+use rgpui::components::Select;
 use rgpui::input_ui::{Input, InputContentType, InputEvent, InputState};
 use rgpui::prelude::*;
 use rgpui::{
@@ -19,6 +20,7 @@ use rgpui::{
 };
 
 use crate::desktop::{Command, Event, KeyInput, Protocol, Session, Snapshot};
+use crate::sessions::{AuthMethod, HostConfig, ProtocolKind};
 use crate::tr;
 
 use super::*;
@@ -26,9 +28,24 @@ use super::*;
 /// 远程桌面会话阶段：表单 → 连接中 → 已连接；失败保留标签以便原地重试。
 pub(super) enum DesktopPhase {
     Form,
+    /// 已保存主机直连时缺密码：只问密码，不展示完整表单。
+    NeedPassword,
     Connecting,
     Live,
     Failed { message: SharedString },
+}
+
+/// 打开桌面表单时预填的参数（来自已保存主机或局域网发现）。
+pub(super) struct DesktopPrefill {
+    pub(super) protocol: Protocol,
+    pub(super) host: String,
+    pub(super) port: u16,
+    pub(super) username: String,
+    pub(super) domain: String,
+    /// 来源已保存主机 id：保存时原位更新，避免重复建条目。
+    pub(super) saved_host: Option<i64>,
+    /// 打开即连接（已保存主机），不再停在完整表单。
+    pub(super) auto_connect: bool,
 }
 
 /// 远程桌面标签的全部状态。
@@ -38,6 +55,14 @@ pub(super) struct DesktopTab {
     pub(super) port: u16,
     /// 表单里选的协议（VNC / RDP）。
     pub(super) protocol: Protocol,
+    /// 来源已保存主机 id（右键「编辑」/主机行点开时回填），保存时原位更新。
+    pub(super) saved_host: Option<i64>,
+    /// 从已保存主机点开：直接连接，缺密码时只问密码。
+    pub(super) direct: bool,
+    /// 本次连接参数的缓存键（`user@host:port`），成功后密码按它留在内存里。
+    pub(super) cache_key: Option<String>,
+    /// 保存到哪个分组；None＝未分组。打开已保存主机时回填原归属。
+    pub(super) group: Option<SharedString>,
     /// 远程桌面密码：只存活在内存，标签关闭即丢弃；绝不写库 / 写日志。
     pub(super) password: String,
     /// RDP 账号与域（VNC 不用）：同样只留在内存。
@@ -54,6 +79,8 @@ pub(super) struct DesktopTab {
     pub(super) form_password: Entity<InputState>,
     pub(super) form_username: Entity<InputState>,
     pub(super) form_domain: Entity<InputState>,
+    /// 表单内的校验 / 认证失败提示（错误只留在标签里，不弹系统对话框）。
+    pub(super) form_error: Option<SharedString>,
     /// 画面焦点：点击画面后键盘事件走这个句柄。
     pub(super) focus: FocusHandle,
     /// 当前帧（BGRA）。换帧时旧图进 `drop_queue`，在下一次 render 里交给窗口释放。
@@ -61,6 +88,8 @@ pub(super) struct DesktopTab {
     pub(super) drop_queue: Vec<Arc<RenderImage>>,
     /// 画面实际绘制区域（窗口坐标），由画布 prepaint 回填，指针坐标据此反算远端像素。
     pub(super) draw_rect: Rc<Cell<Option<Bounds<Pixels>>>>,
+    /// 画面可用区域（整块画布，窗口坐标），「匹配窗口」据此算目标分辨率。
+    pub(super) screen_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     /// 远端桌面尺寸（像素）。
     pub(super) size: (u16, u16),
     /// 服务器名（ServerInit 里的桌面名），工具条悬停提示用。
@@ -101,25 +130,129 @@ impl RuTermApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.new_desktop_with(None, window, cx);
+    }
+
+    /// 从局域网发现 / 主机右键打开远程桌面：地址 / 端口预填，凭据仍由用户输入。
+    pub(super) fn open_desktop_prefilled(
+        &mut self,
+        protocol: Protocol,
+        host: String,
+        port: u16,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.new_desktop_with(
+            Some(DesktopPrefill {
+                protocol,
+                host,
+                port,
+                username: String::new(),
+                domain: String::new(),
+                saved_host: None,
+                auto_connect: false,
+            }),
+            window,
+            cx,
+        );
+    }
+
+    /// 点开列表里已保存的远程桌面主机：直接连接；缺密码时只弹密码问一次。
+    pub(super) fn open_desktop_for_saved(
+        &mut self,
+        host: &HostConfig,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let protocol = match host.protocol {
+            ProtocolKind::Rdp => Protocol::Rdp,
+            ProtocolKind::Vnc => Protocol::Vnc,
+            _ => return,
+        };
+        // 表单用户名可能是保存时合并的 `DOMAIN\user`，打开时拆成两个字段。
+        let (domain, username) = match host.user.split_once('\\') {
+            Some((domain, user)) => (domain.to_string(), user.to_string()),
+            None => (String::new(), host.user.clone()),
+        };
+        self.new_desktop_with(
+            Some(DesktopPrefill {
+                protocol,
+                host: host.host.clone(),
+                port: host.port,
+                username,
+                domain,
+                // 降级模式没有稳定主键（全为 0），不按 id 回写，避免更新错行。
+                saved_host: (host.id != 0).then_some(host.id),
+                auto_connect: true,
+            }),
+            window,
+            cx,
+        );
+    }
+
+    pub(super) fn new_desktop_with(
+        &mut self,
+        prefill: Option<DesktopPrefill>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let id = self.next_id;
         self.next_id += 1;
         self.view_split = None;
+        let protocol = prefill
+            .as_ref()
+            .map(|prefill| prefill.protocol)
+            .unwrap_or(Protocol::Vnc);
+        let prefilled_host = prefill.as_ref().map(|prefill| prefill.host.clone());
+        let port_text = prefill
+            .as_ref()
+            .map(|prefill| prefill.port.to_string())
+            .unwrap_or_else(|| protocol.default_port().to_string());
+        let prefilled_username = prefill
+            .as_ref()
+            .map(|prefill| prefill.username.clone())
+            .unwrap_or_default();
+        let prefilled_domain = prefill
+            .as_ref()
+            .map(|prefill| prefill.domain.clone())
+            .unwrap_or_default();
+        let saved_host = prefill.as_ref().and_then(|prefill| prefill.saved_host);
+        let auto_connect = prefill.as_ref().is_some_and(|prefill| prefill.auto_connect);
+        // 已保存主机回填原分组；新建默认未分组。
+        let group = saved_host
+            .and_then(|id| self.sidebar.group_of(id))
+            .map(SharedString::from);
         let form_host = cx.new(|cx| {
-            InputState::new(window, cx).placeholder(tr!(cx, "主机或 IP（可写 host:port）"))
+            let input =
+                InputState::new(window, cx).placeholder(tr!(cx, "主机或 IP（可写 host:port）"));
+            match &prefilled_host {
+                Some(host) => input.default_value(host.clone()),
+                None => input,
+            }
         });
         let form_port = cx.new(|cx| {
             InputState::new(window, cx)
-                .default_value("5900")
-                .placeholder("5900")
+                .default_value(port_text.clone())
+                .placeholder(port_text.clone())
         });
         let form_password = cx.new(|cx| {
             InputState::new(window, cx).placeholder(tr!(cx, "密码（可留空）"))
         });
         let form_username = cx.new(|cx| {
-            InputState::new(window, cx).placeholder(tr!(cx, "用户名"))
+            let input = InputState::new(window, cx).placeholder(tr!(cx, "用户名"));
+            if prefilled_username.is_empty() {
+                input
+            } else {
+                input.default_value(prefilled_username.clone())
+            }
         });
         let form_domain = cx.new(|cx| {
-            InputState::new(window, cx).placeholder(tr!(cx, "域（可留空）"))
+            let input = InputState::new(window, cx).placeholder(tr!(cx, "域（可留空）"));
+            if prefilled_domain.is_empty() {
+                input
+            } else {
+                input.default_value(prefilled_domain.clone())
+            }
         });
         // 表单里按回车直接开连，省一次鼠标。
         for input in [
@@ -132,18 +265,27 @@ impl RuTermApp {
             let connect_id = id;
             cx.subscribe(input, move |this, _, event: &InputEvent, cx| {
                 if matches!(event, InputEvent::PressEnter { .. }) {
-                    this.begin_desktop_connect(connect_id, cx);
+                    if auto_connect {
+                        // 直连标签只显示密码框，回车＝提交密码。
+                        this.submit_desktop_password(connect_id, cx);
+                    } else {
+                        this.begin_desktop_connect(connect_id, cx);
+                    }
                 }
             })
             .detach();
         }
         let desktop = DesktopTab {
-            host: String::new(),
-            port: Protocol::Vnc.default_port(),
-            protocol: Protocol::Vnc,
+            host: prefilled_host.clone().unwrap_or_default(),
+            port: port_text.parse::<u16>().unwrap_or(protocol.default_port()),
+            protocol,
+            saved_host,
+            direct: auto_connect,
+            cache_key: None,
+            group,
             password: String::new(),
-            username: String::new(),
-            domain: String::new(),
+            username: prefilled_username,
+            domain: prefilled_domain,
             request_size: (1280, 800),
             shared: true,
             phase: DesktopPhase::Form,
@@ -152,10 +294,12 @@ impl RuTermApp {
             form_password,
             form_username,
             form_domain,
+            form_error: None,
             focus: cx.focus_handle(),
             image: None,
             drop_queue: Vec::new(),
             draw_rect: Rc::new(Cell::new(None)),
+            screen_bounds: Rc::new(Cell::new(None)),
             size: (0, 0),
             name: String::new(),
             zoom: 0.0,
@@ -166,10 +310,25 @@ impl RuTermApp {
             fps: 0.0,
             token: 0,
         };
+        // 直连标签开局就带地址，别在等密码时还写着泛泛的「远程桌面」。
+        let initial_title = if auto_connect {
+            prefilled_host
+                .as_deref()
+                .filter(|host| !host.is_empty())
+                .map(|host| {
+                    SharedString::from(host_port(
+                        host,
+                        port_text.parse::<u16>().unwrap_or(protocol.default_port()),
+                    ))
+                })
+                .unwrap_or_else(|| tr!(cx, "远程桌面"))
+        } else {
+            tr!(cx, "远程桌面")
+        };
         self.tabs.push(SessionTab {
             id,
-            title: tr!(cx, "远程桌面"),
-            base_title: tr!(cx, "远程桌面"),
+            title: initial_title.clone(),
+            base_title: initial_title,
             custom_title: None,
             addr: SharedString::default(),
             auth: None,
@@ -193,9 +352,85 @@ impl RuTermApp {
         });
         self.active_tab = Some(id);
         self.activate_tab(id, window, cx);
-        self.status = tr!(cx, "填写地址后按回车或点「连接」");
+        if !auto_connect {
+            self.status = if saved_host.is_some() {
+                tr!(cx, "已填入主机信息，输入密码后点「连接」")
+            } else if prefilled_host.as_deref().is_some_and(|host| !host.is_empty()) {
+                tr!(cx, "已填入发现的地址，填写凭据后点「连接」")
+            } else {
+                tr!(cx, "填写地址后按回车或点「连接」")
+            };
+        }
         self.sync_tray(cx);
         cx.notify();
+        if auto_connect {
+            self.auto_connect_desktop(id, window, cx);
+        }
+    }
+
+    /// 已保存主机的直连入口：有本次会话缓存就用缓存密码，RDP 缺密码先问，
+    /// VNC 先试无密码（服务端可能根本没开认证）。
+    fn auto_connect_desktop(&mut self, id: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(desktop) = self
+            .tabs
+            .iter()
+            .find(|tab| tab.id == id)
+            .and_then(|tab| tab.desktop.as_ref())
+        else {
+            return;
+        };
+        let (host, port, protocol, username, domain) = (
+            desktop.host.clone(),
+            desktop.port,
+            desktop.protocol,
+            desktop.username.clone(),
+            desktop.domain.clone(),
+        );
+        if host.is_empty() {
+            self.set_desktop_form(id, cx);
+            self.desktop_form_error(id, tr!(cx, "远程桌面：请填写主机地址"), cx);
+            return;
+        }
+        let key = desktop_cache_key(&host, port, &username, &domain);
+        if let Some(password) = self.password_cache.get(&key).cloned() {
+            if let Some(desktop) = self
+                .tabs
+                .iter_mut()
+                .find(|tab| tab.id == id)
+                .and_then(|tab| tab.desktop.as_mut())
+            {
+                desktop
+                    .form_password
+                    .update(cx, |state, cx| state.set_value(password.clone(), window, cx));
+            }
+            self.open_desktop_session(id, host, port, password, cx);
+            return;
+        }
+        if protocol == Protocol::Rdp {
+            // 缺账号就只能回完整表单；账号齐全才走「只问密码」。
+            if username.is_empty() {
+                self.set_desktop_form(id, cx);
+                self.desktop_form_error(id, tr!(cx, "RDP：请填写用户名"), cx);
+                return;
+            }
+            if let Some(desktop) = self
+                .tabs
+                .iter_mut()
+                .find(|tab| tab.id == id)
+                .and_then(|tab| tab.desktop.as_mut())
+            {
+                desktop.phase = DesktopPhase::NeedPassword;
+                desktop.form_error = None;
+                let focus = desktop.form_password.read(cx).focus_handle(cx);
+                focus.focus(window, cx);
+            }
+            if self.active_tab == Some(id) {
+                self.status = tr!(cx, "请输入远程桌面密码后连接");
+            }
+            cx.notify();
+            return;
+        }
+        self.open_desktop_session(id, host, port, String::new(), cx);
     }
 
     /// 表单「连接」：读参数 → 进入连接中 → 后台建连。
@@ -214,18 +449,16 @@ impl RuTermApp {
         let protocol = desktop.protocol;
         let (host, port) = normalize_address(&raw, &port_text);
         if host.is_empty() {
-            self.status = tr!(cx, "远程桌面：请填写主机地址").into();
-            cx.notify();
+            self.desktop_form_error(id, tr!(cx, "远程桌面：请填写主机地址"), cx);
             return;
         }
         let Some(port) = port else {
-            self.status = tr!(cx, "远程桌面：端口无效").into();
-            cx.notify();
+            self.desktop_form_error(id, tr!(cx, "远程桌面：端口无效"), cx);
             return;
         };
+        // RDP 需要 Windows 账户名；密码允许留空，由服务器判定（认证失败会回到表单）。
         if protocol == Protocol::Rdp && username.is_empty() {
-            self.status = tr!(cx, "RDP：请填写用户名").into();
-            cx.notify();
+            self.desktop_form_error(id, tr!(cx, "RDP：请填写用户名"), cx);
             return;
         }
         if let Some(desktop) = self
@@ -236,8 +469,171 @@ impl RuTermApp {
         {
             desktop.username = username;
             desktop.domain = domain;
+            desktop.form_error = None;
         }
         self.open_desktop_session(id, host, port, password, cx);
+    }
+
+    /// 直连标签的密码提交：只看密码框（可留空），地址与账号沿用已保存主机。
+    pub(super) fn submit_desktop_password(&mut self, id: usize, cx: &mut Context<Self>) {
+        let Some(desktop) = self
+            .tabs
+            .iter()
+            .find(|tab| tab.id == id)
+            .and_then(|tab| tab.desktop.as_ref())
+        else {
+            return;
+        };
+        let password = desktop.form_password.read(cx).value().to_string();
+        let (host, port) = (desktop.host.clone(), desktop.port);
+        let missing_user = desktop.protocol == Protocol::Rdp && desktop.username.is_empty();
+        if host.is_empty() {
+            self.set_desktop_form(id, cx);
+            self.desktop_form_error(id, tr!(cx, "远程桌面：请填写主机地址"), cx);
+            return;
+        }
+        if missing_user {
+            self.set_desktop_form(id, cx);
+            self.desktop_form_error(id, tr!(cx, "RDP：请填写用户名"), cx);
+            return;
+        }
+        if let Some(desktop) = self
+            .tabs
+            .iter_mut()
+            .find(|tab| tab.id == id)
+            .and_then(|tab| tab.desktop.as_mut())
+        {
+            desktop.password = password.clone();
+            desktop.form_error = None;
+        }
+        self.open_desktop_session(id, host, port, password, cx);
+    }
+
+    /// 表单校验失败的统一出口：错误同时进表单与状态栏，标签不离开表单。
+    fn desktop_form_error(&mut self, id: usize, message: SharedString, cx: &mut Context<Self>) {
+        if let Some(desktop) = self
+            .tabs
+            .iter_mut()
+            .find(|tab| tab.id == id)
+            .and_then(|tab| tab.desktop.as_mut())
+        {
+            desktop.form_error = Some(message.clone());
+        }
+        if self.active_tab == Some(id) {
+            self.status = message;
+        }
+        cx.notify();
+    }
+
+    /// 表单「取消」：直接关掉这个桌面标签（尚未建连，不算断开）。
+    pub(super) fn cancel_desktop_form(&mut self, tab_id: usize, cx: &mut Context<Self>) {
+        self.close_tab(tab_id, cx);
+        self.status = tr!(cx, "已取消远程桌面").into();
+    }
+
+    /// 表单「保存」：把地址 / 端口 / 协议 / 用户名存成常用主机（密码仍只在内存）。
+    pub(super) fn save_desktop_host(&mut self, tab_id: usize, cx: &mut Context<Self>) {
+        let Some(desktop) = self
+            .tabs
+            .iter()
+            .find(|tab| tab.id == tab_id)
+            .and_then(|tab| tab.desktop.as_ref())
+        else {
+            return;
+        };
+        let address = desktop.form_host.read(cx).value().trim().to_string();
+        let port_text = desktop.form_port.read(cx).value().trim().to_string();
+        let protocol = match desktop.protocol {
+            Protocol::Rdp => ProtocolKind::Rdp,
+            Protocol::Vnc => ProtocolKind::Vnc,
+        };
+        let username = desktop.form_username.read(cx).value().trim().to_string();
+        let domain = desktop.form_domain.read(cx).value().trim().to_string();
+        let saved_id = desktop.saved_host;
+        let group = desktop.group.clone();
+        if address.is_empty() {
+            self.desktop_form_error(tab_id, tr!(cx, "请填写主机地址"), cx);
+            return;
+        }
+        let Some(port) = port_text.parse::<u16>().ok().filter(|port| *port > 0) else {
+            self.desktop_form_error(tab_id, tr!(cx, "端口无效"), cx);
+            return;
+        };
+        // 域并进用户名（`DOMAIN\user`）：库表没有单独的域列，Windows 本身也认这种写法。
+        let user = if domain.is_empty() || username.contains('\\') || username.contains('@') {
+            username
+        } else if username.is_empty() {
+            domain
+        } else {
+            format!("{domain}\\{username}")
+        };
+        let existing = saved_id.and_then(|id| {
+            self.hosts
+                .iter()
+                .position(|host| host.id == id)
+        });
+        let mut host = match existing {
+            Some(index) => {
+                let mut host = self.hosts[index].clone();
+                host.protocol = protocol;
+                host.host = address;
+                host.port = port;
+                host.user = user;
+                // 桌面主机不使用 SSH 认证材料；跳板机同样不适用。
+                host.auth = AuthMethod::Agent;
+                host.key_path.clear();
+                host.key_inline = false;
+                host.proxy_jump = None;
+                host
+            }
+            None => HostConfig {
+                protocol,
+                id: 0,
+                name: String::new(),
+                host: address,
+                port,
+                user,
+                auth: AuthMethod::Agent,
+                key_path: String::new(),
+                key_inline: false,
+                favorite: false,
+                proxy_jump: None,
+            },
+        };
+        if let Some(error) = host.validate() {
+            self.desktop_form_error(
+                tab_id,
+                SharedString::from(format!("保存失败：{error}")),
+                cx,
+            );
+            return;
+        }
+        let label = format!("{}:{}", host.host, host.port);
+        let group_note = group
+            .as_deref()
+            .map(|name| format!("（分组：{name}）"))
+            .unwrap_or_default();
+        match existing {
+            Some(index) => {
+                self.hosts[index] = host.clone();
+                self.persist_host(&host, cx);
+                self.note_protocol(&host, cx);
+            }
+            None => {
+                if self.vault.is_some() {
+                    host.id = self.hosts.iter().map(|item| item.id).max().unwrap_or(0) + 1;
+                }
+                self.hosts.push(host.clone());
+                self.persist_host(&host, cx);
+                self.note_protocol(&host, cx);
+            }
+        }
+        self.apply_form_group(&host, group, cx);
+        // 保存＝创建/更新完成：关掉这张表单标签，回到列表（要连接再点该主机）。
+        self.close_tab(tab_id, cx);
+        self.status = SharedString::from(format!("已保存主机 {label}{group_note}"));
+        self.sync_tray(cx);
+        cx.notify();
     }
 
     /// 表单里切换协议：端口还是上一个协议的默认值（或为空）时顺手换成新默认端口。
@@ -261,6 +657,7 @@ impl RuTermApp {
         }
         let previous = desktop.protocol.default_port().to_string();
         desktop.protocol = protocol;
+        desktop.form_error = None;
         let port = desktop.form_port.read(cx).value().trim().to_string();
         if port.is_empty() || port == previous {
             let next = protocol.default_port().to_string();
@@ -280,7 +677,12 @@ impl RuTermApp {
             .and_then(|tab| tab.desktop.as_mut())
         {
             desktop.token += 1;
-            desktop.phase = DesktopPhase::Form;
+            // 直连标签取消后回到密码框，而不是完整表单。
+            desktop.phase = if desktop.direct {
+                DesktopPhase::NeedPassword
+            } else {
+                DesktopPhase::Form
+            };
             desktop.command = None;
             desktop.latest = None;
             desktop.clear_buttons();
@@ -322,6 +724,8 @@ impl RuTermApp {
             .and_then(|tab| tab.desktop.as_mut())
         {
             desktop.phase = DesktopPhase::Form;
+            // 「修改参数」进入完整表单：之后保存 / 连接都按表单语义走。
+            desktop.direct = false;
             cx.notify();
         }
     }
@@ -344,6 +748,12 @@ impl RuTermApp {
         let token = desktop.token;
         desktop.host = host.clone();
         desktop.port = port;
+        desktop.cache_key = Some(desktop_cache_key(
+            &host,
+            port,
+            &desktop.username,
+            &desktop.domain,
+        ));
         desktop.password = password.clone();
         desktop.phase = DesktopPhase::Connecting;
         desktop.command = None;
@@ -423,6 +833,12 @@ impl RuTermApp {
         desktop.latest = Some(latest.clone());
         desktop.phase = DesktopPhase::Live;
         desktop.capture_keys = true;
+        // 连接成功才缓存密码（只在本进程内存里），下次点同一主机不再追问。
+        let cached_password = if desktop.password.is_empty() {
+            None
+        } else {
+            desktop.cache_key.clone().map(|key| (key, desktop.password.clone()))
+        };
         tab.ended = false;
         tab.failed = false;
         tab.last_error = None;
@@ -431,6 +847,9 @@ impl RuTermApp {
             let title = SharedString::from(host_port(&desktop.host, desktop.port));
             tab.title = title.clone();
             tab.base_title = title;
+        }
+        if let Some((key, password)) = cached_password {
+            self.password_cache.insert(key, password);
         }
         self.status = tr!(cx, "已连接远程桌面");
         self.sync_tray(cx);
@@ -452,8 +871,8 @@ impl RuTermApp {
                             .and_then(|mut slot| slot.take());
                         match snapshot {
                             Some(snapshot) => {
-                                let image = snapshot_to_image(&snapshot);
                                 let size = (snapshot.width, snapshot.height);
+                                let image = snapshot_to_image(snapshot);
                                 this.update(cx, |this, cx| {
                                     this.apply_desktop_frame(id, token, image, size, cx);
                                 })
@@ -586,19 +1005,46 @@ impl RuTermApp {
         if desktop.token != token {
             return;
         }
+        // 认证类失败直接回输入处：直连标签回密码框，表单标签回完整表单，
+        // 用户改密码就能重试，不必去失败卡片上找「修改参数」。
+        let auth_failure = desktop_auth_failure(desktop.protocol, &message);
         let message = SharedString::from(message);
-        desktop.phase = DesktopPhase::Failed {
-            message: message.clone(),
-        };
         desktop.command = None;
         desktop.latest = None;
         desktop.capture_keys = false;
         desktop.clear_buttons();
-        tab.ended = true;
-        tab.failed = true;
+        if auth_failure {
+            desktop.phase = if desktop.direct {
+                DesktopPhase::NeedPassword
+            } else {
+                DesktopPhase::Form
+            };
+            desktop.form_error = Some(if desktop.direct {
+                tr!(cx, "认证失败：请重新输入密码后重试（可留空再试）")
+            } else if desktop.protocol == Protocol::Rdp {
+                tr!(cx, "RDP 认证失败：请检查用户名、域和密码后重试")
+            } else {
+                tr!(cx, "VNC 认证失败：请检查密码后重试")
+            });
+            tab.ended = false;
+            tab.failed = false;
+        } else {
+            desktop.phase = DesktopPhase::Failed {
+                message: message.clone(),
+            };
+            tab.ended = true;
+            tab.failed = true;
+        }
         tab.last_error = Some(message.clone());
         if self.active_tab == Some(id) {
-            self.status = message;
+            self.status = if auth_failure {
+                desktop
+                    .form_error
+                    .clone()
+                    .unwrap_or_else(|| message.clone())
+            } else {
+                message
+            };
         }
         self.sync_tray(cx);
         cx.notify();
@@ -615,19 +1061,45 @@ impl RuTermApp {
         if desktop.token != token {
             return;
         }
+        // 认证失败有时是连上后立刻被服务器掐断（而不是建连报错）：同样退回表单，
+        // 让用户改密码重试，而不是停在失败卡片上。
+        let auth_failure = desktop_auth_failure(desktop.protocol, &reason);
         let reason = SharedString::from(reason);
-        desktop.phase = DesktopPhase::Failed {
-            message: reason.clone(),
-        };
         desktop.command = None;
         desktop.latest = None;
         desktop.capture_keys = false;
         desktop.clear_buttons();
-        tab.ended = true;
+        if auth_failure {
+            desktop.phase = if desktop.direct {
+                DesktopPhase::NeedPassword
+            } else {
+                DesktopPhase::Form
+            };
+            desktop.form_error = Some(if desktop.direct {
+                tr!(cx, "认证失败：请重新输入密码后重试（可留空再试）")
+            } else if desktop.protocol == Protocol::Rdp {
+                tr!(cx, "RDP 认证失败：请检查用户名、域和密码后重试")
+            } else {
+                tr!(cx, "VNC 认证失败：请检查密码后重试")
+            });
+            tab.ended = false;
+        } else {
+            desktop.phase = DesktopPhase::Failed {
+                message: reason.clone(),
+            };
+            tab.ended = true;
+        }
         tab.failed = false;
         tab.last_error = Some(reason.clone());
         if self.active_tab == Some(id) {
-            self.status = reason;
+            self.status = if auth_failure {
+                desktop
+                    .form_error
+                    .clone()
+                    .unwrap_or_else(|| reason.clone())
+            } else {
+                reason
+            };
         }
         self.sync_tray(cx);
         cx.notify();
@@ -778,6 +1250,14 @@ impl RuTermApp {
             cx.notify();
             return;
         }
+        // VNC 没有原生剪贴板同步之外的手工通道：按 Ctrl+V 时先把本地文本推过去，
+        // 再把按键原样转发，远端粘贴到的就是刚复制的内容。
+        let vnc_paste = desktop.protocol == Protocol::Vnc
+            && event.keystroke.key.eq_ignore_ascii_case("v")
+            && event.keystroke.modifiers.control;
+        if vnc_paste {
+            self.sync_vnc_clipboard(id, cx);
+        }
         self.desktop_key(id, &event.keystroke, true, cx);
     }
 
@@ -812,17 +1292,25 @@ impl RuTermApp {
             .and_then(|tab| tab.desktop.as_ref())
             .map(|desktop| desktop.protocol);
         if protocol == Some(Protocol::Rdp) {
-            self.status = tr!(cx, "RDP 会话暂不支持剪贴板").into();
+            // IronRDP 的 WinClipboard 后端直接挂系统剪贴板，文本在会话期间自动双向同步；
+            // 这里再手工发一遍反而会覆盖远端刚复制的内容。
+            self.status =
+                tr!(cx, "RDP 剪贴板已随系统自动同步，直接在远端按 Ctrl+V 即可").into();
             cx.notify();
             return;
         }
+        self.sync_vnc_clipboard(id, cx);
+    }
+
+    /// 把本地剪贴板文本推给 VNC 会话（工具条按钮与 Ctrl+V 共用）。
+    fn sync_vnc_clipboard(&mut self, id: usize, cx: &mut Context<Self>) {
         let text = cx.read_from_clipboard().and_then(|item| {
             item.entries.into_iter().find_map(|entry| match entry {
                 ClipboardEntry::String(text) => Some(text.text),
                 _ => None,
             })
         });
-        let Some(text) = text else {
+        let Some(text) = text.filter(|text| !text.is_empty()) else {
             self.status = tr!(cx, "剪贴板里没有文本").into();
             cx.notify();
             return;
@@ -850,6 +1338,38 @@ impl RuTermApp {
             desktop.send(Command::RequestFull);
         }
         let _ = cx;
+    }
+
+    /// 让 RDP 把远端桌面分辨率改成当前窗口大小（内置远程桌面的默认行为）。
+    fn match_desktop_window(&mut self, id: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(desktop) = self
+            .tabs
+            .iter_mut()
+            .find(|tab| tab.id == id)
+            .and_then(|tab| tab.desktop.as_mut())
+        else {
+            return;
+        };
+        let Some(bounds) = desktop.screen_bounds.get() else {
+            self.status = tr!(cx, "窗口还没完成布局，稍后再试").into();
+            cx.notify();
+            return;
+        };
+        let scale = window.scale_factor().max(1.0);
+        // 远端按物理像素建会话；偶数宽高避免缩放时半像素发虚。
+        let width = ((bounds.size.width.as_f32() * scale).round() as u32).clamp(200, 8192) as u16;
+        let height = ((bounds.size.height.as_f32() * scale).round() as u32).clamp(200, 8192) as u16;
+        let (width, height) = (width & !1, height & !1);
+        desktop.zoom = 0.0;
+        // 记住这次尺寸：断线重连时按同一个分辨率建会话，少一次二次 resize。
+        desktop.request_size = (width, height);
+        desktop.send(Command::Resize {
+            width,
+            height,
+            scale_factor: (scale * 100.0).round() as u32,
+        });
+        self.status = tr!(cx, "正在把远端桌面调整为 {width}×{height}…", width = width, height = height);
+        cx.notify();
     }
 
     fn set_desktop_zoom(&mut self, id: usize, zoom: f32, cx: &mut Context<Self>) {
@@ -895,6 +1415,7 @@ impl RuTermApp {
     ) -> AnyElement {
         match &desktop.phase {
             DesktopPhase::Form => self.render_desktop_form(tab.id, desktop, cx),
+            DesktopPhase::NeedPassword => self.render_desktop_password(tab.id, desktop, cx),
             DesktopPhase::Connecting => {
                 let pal = self.palette(cx);
                 let id = tab.id;
@@ -948,6 +1469,7 @@ impl RuTermApp {
         let capture = desktop.capture_keys;
         let image = desktop.image.clone();
         let draw_sink = desktop.draw_rect.clone();
+        let bounds_sink = desktop.screen_bounds.clone();
         let remote = desktop.size;
         let zoom = desktop.zoom;
         let focus = desktop.focus.clone();
@@ -1034,6 +1556,7 @@ impl RuTermApp {
                     move |bounds, _window, _cx| {
                         let rect = desktop_draw_rect(bounds, remote, zoom);
                         draw_sink.set(Some(rect));
+                        bounds_sink.set(Some(bounds));
                         rect
                     },
                     move |_bounds, rect, window, _cx| {
@@ -1100,7 +1623,7 @@ impl RuTermApp {
             desktop.name.clone()
         };
         let clipboard_tip = if desktop.protocol == Protocol::Rdp {
-            tr!(cx, "RDP 会话暂不支持剪贴板")
+            tr!(cx, "RDP 剪贴板随系统自动同步（文本），直接 Ctrl+C / Ctrl+V 即可")
         } else {
             tr!(cx, "把本地剪贴板文本发送到远端")
         };
@@ -1131,6 +1654,18 @@ impl RuTermApp {
                         this.request_desktop_full(id, cx);
                     })),
             )
+            .when(desktop.protocol == Protocol::Rdp, |this| {
+                this.child(
+                    Button::new(SharedString::from(format!("rd-match-{id}")))
+                        .label(tr!(cx, "匹配窗口"))
+                        .ghost()
+                        .compact()
+                        .tooltip(tr!(cx, "让远端把桌面分辨率调整为当前窗口大小"))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.match_desktop_window(id, window, cx);
+                        })),
+                )
+            })
             .child(
                 Button::new(SharedString::from(format!("rd-zoom-out-{id}")))
                     .label("−")
@@ -1330,6 +1865,51 @@ impl RuTermApp {
                                 .child(styled_input(Input::new(&desktop.form_domain), &pal)),
                         )
                     })
+                    .child({
+                        // 保存到哪个分组：新建默认未分组，打开已保存主机时回填原归属。
+                        let mut options: Vec<SharedString> = vec![SharedString::from(UNGROUPED)];
+                        options.extend(
+                            self.sidebar
+                                .names()
+                                .map(|name| SharedString::from(name.to_string())),
+                        );
+                        let selected = desktop
+                            .group
+                            .as_ref()
+                            .and_then(|group| {
+                                options.iter().position(|option| option == group)
+                            })
+                            .or(Some(0));
+                        let change_options = options.clone();
+                        let entity = cx.entity();
+                        v_flex()
+                            .gap_1()
+                            .child(div().text_xs().text_color(pal.muted).child(tr!(cx, "分组")))
+                            .child(
+                                Select::new(options)
+                                    .id("desktop-group")
+                                    .selected(selected)
+                                    .w_full()
+                                    .on_change(move |index, _name, _window, cx| {
+                                        let group = if index == 0 {
+                                            None
+                                        } else {
+                                            change_options.get(index).cloned()
+                                        };
+                                        entity.update(cx, |this, cx| {
+                                            if let Some(desktop) = this
+                                                .tabs
+                                                .iter_mut()
+                                                .find(|tab| tab.id == tab_id)
+                                                .and_then(|tab| tab.desktop.as_mut())
+                                            {
+                                                desktop.group = group;
+                                                cx.notify();
+                                            }
+                                        });
+                                    }),
+                            )
+                    })
                     .child(
                         v_flex()
                             .gap_1()
@@ -1349,19 +1929,165 @@ impl RuTermApp {
                                 div()
                                     .text_xs()
                                     .text_color(pal.muted)
-                                    .child(tr!(cx, "密码只在本次连接的内存里使用，不会保存")),
+                                    .child(tr!(
+                                        cx,
+                                        "保存主机只记地址与用户名；密码只在本次连接的内存里使用"
+                                    )),
                             ),
                     )
+                    .when_some(desktop.form_error.clone(), |this, error| {
+                        this.child(
+                            div()
+                                .text_xs()
+                                .font_weight(rgpui::FontWeight(500.0))
+                                .text_color(pal.danger)
+                                .child(error),
+                        )
+                    })
                     .child(
                         h_flex()
                             .gap_2()
                             .justify_end()
+                            .child(
+                                Button::new(SharedString::from(format!("rd-cancel-{tab_id}")))
+                                    .label(tr!(cx, "取消"))
+                                    .ghost()
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.cancel_desktop_form(tab_id, cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new(SharedString::from(format!("rd-save-{tab_id}")))
+                                    .label(if desktop.saved_host.is_some() {
+                                        tr!(cx, "保存修改")
+                                    } else {
+                                        tr!(cx, "保存")
+                                    })
+                                    .secondary()
+                                    .outline()
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.save_desktop_host(tab_id, cx);
+                                    })),
+                            )
                             .child(
                                 Button::new(SharedString::from(format!("rd-connect-{tab_id}")))
                                     .label(tr!(cx, "连接"))
                                     .primary()
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.begin_desktop_connect(tab_id, cx);
+                                    })),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// 直连标签的密码卡：只问密码，地址 / 账号来自已保存主机，不再展示完整表单。
+    fn render_desktop_password(
+        &self,
+        tab_id: usize,
+        desktop: &DesktopTab,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let pal = self.palette(cx);
+        let title = if desktop.protocol == Protocol::Rdp {
+            tr!(cx, "远程桌面（RDP）")
+        } else {
+            tr!(cx, "远程桌面（VNC）")
+        };
+        let account = if desktop.protocol == Protocol::Rdp && !desktop.username.is_empty() {
+            if desktop.domain.is_empty() {
+                desktop.username.clone()
+            } else {
+                format!("{}\\{}", desktop.domain, desktop.username)
+            }
+        } else {
+            String::new()
+        };
+        v_flex()
+            .size_full()
+            .items_center()
+            .justify_center()
+            .child(
+                v_flex()
+                    .w(px(380.0))
+                    .gap_3()
+                    .p_4()
+                    .rounded(px(8.0))
+                    .bg(pal.card_bg)
+                    .border_1()
+                    .border_color(pal.border)
+                    .child(
+                        div()
+                            .text_base()
+                            .font_weight(rgpui::FontWeight(600.0))
+                            .child(title),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .text_xs()
+                            .text_color(pal.muted)
+                            .child(host_port(&desktop.host, desktop.port))
+                            .when(!account.is_empty(), |this| {
+                                this.child(div().child(format!("· {account}")))
+                            }),
+                    )
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .child(div().text_xs().text_color(pal.muted).child(tr!(cx, "密码")))
+                            .child(styled_input(
+                                Input::new(&desktop.form_password)
+                                    .content_type(InputContentType::Password)
+                                    .mask_toggle(),
+                                &pal,
+                            )),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(pal.muted)
+                            .child(tr!(cx, "密码只在本次连接的内存里使用；留空表示不带密码")),
+                    )
+                    .when_some(desktop.form_error.clone(), |this, error| {
+                        this.child(
+                            div()
+                                .text_xs()
+                                .font_weight(rgpui::FontWeight(500.0))
+                                .text_color(pal.danger)
+                                .child(error),
+                        )
+                    })
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .justify_end()
+                            .child(
+                                Button::new(SharedString::from(format!(
+                                    "rd-edit-form-{tab_id}"
+                                )))
+                                .label(tr!(cx, "修改参数"))
+                                .ghost()
+                                .compact()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.set_desktop_form(tab_id, cx);
+                                })),
+                            )
+                            .child(
+                                Button::new(SharedString::from(format!("rd-cancel-{tab_id}")))
+                                    .label(tr!(cx, "取消"))
+                                    .ghost()
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.cancel_desktop_form(tab_id, cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new(SharedString::from(format!("rd-connect-{tab_id}")))
+                                    .label(tr!(cx, "连接"))
+                                    .primary()
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.submit_desktop_password(tab_id, cx);
                                     })),
                             ),
                     ),
@@ -1558,11 +2284,60 @@ fn remote_point_clamped(
     (px_x.min(remote.0 - 1), px_y.min(remote.1 - 1))
 }
 
+/// 认证失败判定：RDP 看凭据类报错，VNC 看协议层「认证失败」文案。
+fn desktop_auth_failure(protocol: Protocol, message: &str) -> bool {
+    match protocol {
+        Protocol::Rdp => looks_like_auth_failure(message),
+        Protocol::Vnc => message.contains("认证失败"),
+    }
+}
+
+/// 桌面密码的进程内缓存键：账号 + 地址 + 端口，换账号不会误用旧密码。
+fn desktop_cache_key(host: &str, port: u16, username: &str, domain: &str) -> String {
+    let user = if username.is_empty() {
+        domain.to_string()
+    } else if domain.is_empty() {
+        username.to_string()
+    } else {
+        format!("{domain}\\{username}")
+    };
+    if user.is_empty() {
+        format!("{host}:{port}")
+    } else {
+        format!("{user}@{host}:{port}")
+    }
+}
+
+/// RDP 失败信息是否属于「凭据不对」：这类错误回表单让用户改密码，
+/// 比停在失败卡片上更接近系统远程桌面的体验。
+fn looks_like_auth_failure(message: &str) -> bool {
+    let text = message.to_lowercase();
+    [
+        "credssp",
+        "access denied",
+        "access_denied",
+        "logon failure",
+        "logon_failure",
+        "status_logon",
+        "0xc000006d",
+        "0xc000006a",
+        "password",
+        "authenticat",
+        "登录失败",
+        "用户名或密码",
+        "凭据",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
 /// BGRA 快照 → rgpui 纹理帧（`RenderImage` 的数据顺序就是 BGRA）。
-fn snapshot_to_image(snapshot: &Snapshot) -> Arc<RenderImage> {
+fn snapshot_to_image(mut snapshot: Snapshot) -> Arc<RenderImage> {
     let width = u32::from(snapshot.width);
     let height = u32::from(snapshot.height);
-    let buffer = image::RgbaImage::from_raw(width, height, snapshot.bgra.clone())
+    // 快照取走后就没人再用这块内存：直接移交所有权，省掉 1080p 下每帧 ~8MB 的拷贝。
+    let bgra = std::mem::take(&mut snapshot.bgra);
+    let buffer = image::RgbaImage::from_raw(width, height, bgra)
         .unwrap_or_else(|| image::RgbaImage::new(1, 1));
     Arc::new(RenderImage::new(vec![image::Frame::new(buffer)]))
 }
@@ -1592,6 +2367,35 @@ mod tests {
         // 展示时 IPv6 字面量补回方括号，IPv4 / 域名保持原样。
         assert_eq!(host_port("::1", 5902), "[::1]:5902");
         assert_eq!(host_port("example.com", 5900), "example.com:5900");
+    }
+
+    #[test]
+    fn desktop_password_cache_key_keys_by_account() {
+        assert_eq!(
+            desktop_cache_key("10.0.0.5", 3389, "alice", "CORP"),
+            "CORP\\alice@10.0.0.5:3389"
+        );
+        assert_eq!(
+            desktop_cache_key("10.0.0.5", 5900, "", ""),
+            "10.0.0.5:5900"
+        );
+        assert_eq!(
+            desktop_cache_key("10.0.0.5", 3389, "", "CORP"),
+            "CORP@10.0.0.5:3389"
+        );
+    }
+
+    #[test]
+    fn auth_failures_are_protocol_aware() {
+        assert!(desktop_auth_failure(
+            Protocol::Vnc,
+            "认证失败：too many attempts"
+        ));
+        assert!(!desktop_auth_failure(Protocol::Vnc, "connection reset"));
+        assert!(desktop_auth_failure(
+            Protocol::Rdp,
+            "CredSSP: STATUS_LOGON_FAILURE"
+        ));
     }
 
     #[test]

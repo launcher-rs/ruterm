@@ -509,7 +509,7 @@ impl RuTermApp {
             && let Some(desktop) = tab.desktop.as_mut()
         {
             desktop.send(Command::Close);
-            let mut frames: Vec<_> = desktop.drop_queue.drain(..).collect();
+            let mut frames: Vec<_> = std::mem::take(&mut desktop.drop_queue);
             frames.extend(desktop.image.take());
             for image in frames {
                 cx.drop_image(image, None);
@@ -722,6 +722,10 @@ impl RuTermApp {
 
     /// 把当前会话列表刷到托盘菜单与悬停提示（隐藏到托盘后也能直接跳回某个标签）。
     pub(crate) fn sync_tray(&self, cx: &mut Context<Self>) {
+        // 托盘关闭时不能碰：set_tray_menu / set_tooltip 会自动补建一个空图标。
+        if !crate::tray_enabled() {
+            return;
+        }
         let mut menu = Vec::with_capacity(self.tabs.len() + 4);
         for tab in &self.tabs {
             let marker = if Some(tab.id) == self.active_tab {

@@ -25,6 +25,10 @@ pub enum ProtocolKind {
     Ssh,
     /// Telnet：明文 TCP + 最小 IAC 协商，不做认证与加密。
     Telnet,
+    /// 远程桌面（RDP）：点开走桌面标签，不进终端。
+    Rdp,
+    /// 远程桌面（VNC）。
+    Vnc,
 }
 
 impl ProtocolKind {
@@ -32,7 +36,23 @@ impl ProtocolKind {
         match self {
             Self::Ssh => "SSH",
             Self::Telnet => "Telnet",
+            Self::Rdp => "RDP",
+            Self::Vnc => "VNC",
         }
+    }
+
+    pub fn default_port(self) -> u16 {
+        match self {
+            Self::Ssh => 22,
+            Self::Telnet => 23,
+            Self::Rdp => 3389,
+            Self::Vnc => 5900,
+        }
+    }
+
+    /// 桌面协议：点开主机行时走桌面标签，而不是终端会话。
+    pub fn is_desktop(self) -> bool {
+        matches!(self, Self::Rdp | Self::Vnc)
     }
 }
 
@@ -105,6 +125,10 @@ impl HostConfig {
                 return Some("请填写私钥路径，或改为内嵌私钥".to_string());
             }
         }
+        // RDP 必须带账户名（IronRDP 不会在会话里追问）；VNC 多数只需密码。
+        if self.protocol == ProtocolKind::Rdp && self.user.trim().is_empty() {
+            return Some("用户名不能为空".to_string());
+        }
         None
     }
 }
@@ -145,6 +169,9 @@ pub struct Settings {
     /// 本机文件页偏好（隐藏文件开关 + 上次停留的目录，序列化成 JSON 字符串）。
     #[serde(default)]
     pub local_files: String,
+    /// 是否启用系统托盘；缺省关闭（关窗即退出）。
+    #[serde(default)]
+    pub tray: bool,
 }
 
 impl Settings {
@@ -209,6 +236,11 @@ impl SessionStore {
         self.update_settings(|settings| {
             settings.theme = if dark { "dark" } else { "light" }.to_string();
         });
+    }
+
+    /// 保存托盘开关（启动时要读，统一放 settings.json）。
+    pub fn save_tray(&self, enabled: bool) {
+        self.update_settings(|settings| settings.tray = enabled);
     }
 
     /// 降级模式（无加密库）下保存状态栏偏好。

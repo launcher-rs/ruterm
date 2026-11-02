@@ -145,20 +145,32 @@ impl RuTermApp {
                         },
                     );
                 }
-                menu.item(PopupMenuItem::new(tr!(cx, "本地终端…")).action(Box::new(NewLocalTerminal)))
+                let menu = menu
+                    .item(PopupMenuItem::new(tr!(cx, "本地终端…")).action(Box::new(NewLocalTerminal)))
                     .item(PopupMenuItem::new(tr!(cx, "远程桌面…")).action(Box::new(NewRemoteDesktop)))
+                    .item(PopupMenuItem::new(tr!(cx, "局域网发现…")).on_click({
+                        let entity = menu_entity.clone();
+                        move |_, _, cx| {
+                            entity.update(cx, |this, cx| this.open_discovery(cx));
+                        }
+                    }))
                     .separator()
-                    .item(PopupMenuItem::new(tr!(cx, "设置…")).action(Box::new(OpenSettings)))
-                    .item(
+                    .item(PopupMenuItem::new(tr!(cx, "设置…")).action(Box::new(OpenSettings)));
+                // 托盘关闭时不给「隐藏到托盘」：窗口藏起来就再也点不回来。
+                let menu = if crate::tray_enabled() {
+                    menu.item(
                         PopupMenuItem::new(tr!(cx, "隐藏到托盘")).on_click(move |_, window, _| {
                             window.hide_window();
                         }),
                     )
-                    .item(
-                        PopupMenuItem::new(tr!(cx, "退出 RuTerm"))
-                            .danger(true)
-                            .on_click(move |_, _, cx| cx.quit()),
-                    )
+                } else {
+                    menu
+                };
+                menu.item(
+                    PopupMenuItem::new(tr!(cx, "退出 RuTerm"))
+                        .danger(true)
+                        .on_click(move |_, _, cx| cx.quit()),
+                )
             };
 
         let view_entity = entity.clone();

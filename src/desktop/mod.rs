@@ -112,6 +112,8 @@ pub enum Command {
     Refresh,
     /// 请求整帧（切回标签、自适应时用）。
     RequestFull,
+    /// 让远端把桌面改成指定像素尺寸（RDP 动态分辨率；VNC 忽略）。
+    Resize { width: u16, height: u16, scale_factor: u32 },
     /// 主动断开。
     Close,
 }
@@ -228,6 +230,8 @@ async fn connect_vnc(config: Config) -> Result<Session> {
                 Command::Clipboard(text) => vnc::clipboard_message(&text),
                 Command::Refresh => vnc::update_request_message(true, width, height),
                 Command::RequestFull => vnc::update_request_message(false, width, height),
+                // VNC 的动态分辨率要协商 ExtendedDesktopSize，这里不做；忽略即可。
+                Command::Resize { .. } => continue,
                 Command::Close => {
                     let _ = writer.shutdown().await;
                     break;

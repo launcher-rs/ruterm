@@ -19,6 +19,8 @@ use super::{Command, Config, Event, KeyInput, Session, Snapshot};
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
 /// 每秒汇报一次实际帧率。
 const FPS_INTERVAL: Duration = Duration::from_secs(1);
+/// 快照发布的最小间隔：RDP 的增量更新很密，整帧转换与纹理上传不必跟着每个包走。
+const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 
 /// 连上服务器：建好客户端配置后把会话交给专用线程。
 pub async fn connect(config: Config) -> Result<Session> {
@@ -63,7 +65,9 @@ fn build_client_config(config: &Config) -> Result<ironrdp::client::config::Confi
         .with_credssp(true)
         .with_tls(true)
         .with_autologon(true)
-        .with_compression(true);
+        .with_compression(true)
+        // Windows 后端直接挂系统剪贴板，文本双向自动同步。
+        .with_clipboard(ironrdp::client::config::ClipboardType::Enable);
     if let Some(domain) = config.domain.as_deref().map(str::trim).filter(|text| !text.is_empty()) {
         builder = builder.with_domain(domain);
     }
@@ -95,16 +99,27 @@ fn run_session(
         let mut frames = 0u32;
         let mut stats_at = Instant::now();
         let mut close_at: Option<Instant> = None;
+        // 上一帧发布时间与下一次允许发布的截止点：密集更新期间只保留最新整帧，
+        // 界面还没取走上一帧时也自然跳过（槽位非空）。
+        let mut last_publish = Instant::now()
+            .checked_sub(FRAME_INTERVAL)
+            .unwrap_or_else(Instant::now);
+        let mut pending_at: Option<Instant> = None;
 
         loop {
             tokio::select! {
                 _ = &mut session => {
                     // 收尾前排空队列：Terminated 往往就在里面等着。
                     while let Ok(event) = output_rx.try_recv() {
-                        if handle_output(event, event_tx, latest, &mut frame, &mut announced, &name, &mut frames) {
+                        if matches!(
+                            handle_output(event, event_tx, &mut frame, &mut announced, &name, &mut frames),
+                            Output::Ended
+                        ) {
                             return;
                         }
                     }
+                    // 最后一帧可能还在等节流窗口：结束前补发，别把画面停在上一帧。
+                    flush_frame(event_tx, latest, &frame, &mut last_publish);
                     let _ = event_tx.send(Event::Closed {
                         reason: "RDP 会话已结束".to_string(),
                     });
@@ -112,8 +127,17 @@ fn run_session(
                 }
                 event = output_rx.recv() => {
                     let Some(event) = event else { return };
-                    if handle_output(event, event_tx, latest, &mut frame, &mut announced, &name, &mut frames) {
-                        return;
+                    match handle_output(event, event_tx, &mut frame, &mut announced, &name, &mut frames) {
+                        Output::Ended => return,
+                        Output::Dirty => {
+                            if last_publish.elapsed() >= FRAME_INTERVAL {
+                                flush_frame(event_tx, latest, &frame, &mut last_publish);
+                                pending_at = None;
+                            } else {
+                                pending_at.get_or_insert(last_publish + FRAME_INTERVAL);
+                            }
+                        }
+                        Output::Alive => {}
                     }
                     report_fps(event_tx, &mut frames, &mut stats_at);
                 }
@@ -126,6 +150,16 @@ fn run_session(
                     if handle_command(command, &mut database, &input, latest, frame.as_ref()) {
                         close_at = Some(Instant::now() + CLOSE_TIMEOUT);
                     }
+                }
+                _ = async {
+                    if let Some(deadline) = pending_at {
+                        tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                }, if pending_at.is_some() => {
+                    flush_frame(event_tx, latest, &frame, &mut last_publish);
+                    pending_at = None;
                 }
                 _ = async {
                     if let Some(deadline) = close_at {
@@ -142,18 +176,42 @@ fn run_session(
     Ok(())
 }
 
+/// 一条服务器输出对会话的影响。
+enum Output {
+    /// 无需推帧（指针、心跳等）。
+    Alive,
+    /// 画面已更新，按节流规则决定何时发布。
+    Dirty,
+    /// 连接结束。
+    Ended,
+}
+
+/// 把 `frame` 里最新整帧转成快照发布（槽位已有帧时放弃这次）。
+fn flush_frame(
+    event_tx: &UnboundedSender<Event>,
+    latest: &Mutex<Option<Snapshot>>,
+    frame: &Option<Frame>,
+    last_publish: &mut Instant,
+) {
+    *last_publish = Instant::now();
+    if let Some(current) = frame.as_ref()
+        && publish_frame(latest, current)
+    {
+        let _ = event_tx.send(Event::FrameReady);
+    }
+}
+
 type Frame = (Vec<u32>, u16, u16);
 
 /// 处理一条服务器输出；返回 `true` 表示会话已结束。
 fn handle_output(
     event: RdpOutputEvent,
     event_tx: &UnboundedSender<Event>,
-    latest: &Mutex<Option<Snapshot>>,
     frame: &mut Option<Frame>,
     announced: &mut bool,
     name: &str,
     frames: &mut u32,
-) -> bool {
+) -> Output {
     match event {
         RdpOutputEvent::Image {
             buffer,
@@ -171,18 +229,13 @@ fn handle_output(
                 });
             }
             *frame = Some((buffer, width, height));
-            if let Some(current) = frame.as_ref()
-                && publish_frame(latest, current)
-            {
-                let _ = event_tx.send(Event::FrameReady);
-            }
-            false
+            Output::Dirty
         }
         RdpOutputEvent::ConnectionFailure(error) => {
             let _ = event_tx.send(Event::Closed {
                 reason: error.to_string(),
             });
-            true
+            Output::Ended
         }
         RdpOutputEvent::Terminated(result) => {
             let reason = match result {
@@ -190,13 +243,13 @@ fn handle_output(
                 Err(error) => error.to_string(),
             };
             let _ = event_tx.send(Event::Closed { reason });
-            true
+            Output::Ended
         }
         // 远端指针由服务端绘制在画面里；本机鼠标形状照旧，不用这些事件。
         RdpOutputEvent::PointerDefault
         | RdpOutputEvent::PointerHidden
         | RdpOutputEvent::PointerPosition { .. }
-        | RdpOutputEvent::PointerBitmap(_) => false,
+        | RdpOutputEvent::PointerBitmap(_) => Output::Alive,
     }
 }
 
@@ -219,12 +272,11 @@ fn publish_frame(latest: &Mutex<Option<Snapshot>>, frame: &Frame) -> bool {
         return false;
     }
     let (buffer, width, height) = frame;
-    let mut bgra = Vec::with_capacity(buffer.len() * 4);
-    for pixel in buffer {
-        bgra.push((pixel & 0xff) as u8);
-        bgra.push(((pixel >> 8) & 0xff) as u8);
-        bgra.push(((pixel >> 16) & 0xff) as u8);
-        bgra.push(0xff);
+    // 源像素是 0x00RRGGBB；补上不透明 alpha 后按小端写出的字节序正好是 B,G,R,A，
+    // 整块只需一次按 4 字节步进的拷贝，逐通道拆分的开销省掉。
+    let mut bgra = vec![0u8; buffer.len() * 4];
+    for (pixel, out) in buffer.iter().zip(bgra.as_chunks_mut::<4>().0) {
+        out.copy_from_slice(&(*pixel | 0xFF00_0000).to_le_bytes());
     }
     *slot = Some(Snapshot {
         width: *width,
@@ -268,7 +320,21 @@ fn handle_command(
             send_input(database, input, operations);
             false
         }
-        // 构建时没开 cliprdr：没有可转发的通道，安静忽略。
+        Command::Resize {
+            width,
+            height,
+            scale_factor,
+        } => {
+            let _ = input.send(RdpInputEvent::Resize {
+                width,
+                height,
+                scale_factor,
+                physical_size: None,
+            });
+            false
+        }
+        // 剪贴板由 WinClipboard 后端直接挂系统剪贴板，文本已自动双向同步；
+        // 界面侧再发一遍会覆盖远端刚复制的内容，这里忽略。
         Command::Clipboard(_) => false,
         // RDP 只在画面变化时推帧；界面要整帧时把最后一帧再放回槽位。
         Command::Refresh | Command::RequestFull => {

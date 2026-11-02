@@ -9,6 +9,7 @@
 mod app;
 mod config;
 mod desktop;
+mod discovery;
 mod i18n;
 mod instance;
 mod local_shell;
@@ -35,6 +36,20 @@ use crate::app::RuTermApp;
 use crate::config::SshTarget;
 use crate::paths::StorageMode;
 use crate::sessions::SessionStore;
+
+/// 系统托盘开关：启动前按 settings.json 设定，设置里改动即时生效。
+/// 关闭时连图标都不创建，关窗即退出；win32 没有可靠的「删除图标」接口，
+/// 运行中关闭只是把图标置空，完整移除要等下次启动。
+pub(crate) static TRAY_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// 托盘图标（32px PNG，内嵌避免依赖运行时路径）。
+pub(crate) const TRAY_ICON: &[u8] = include_bytes!("../assets/icons/tray-32.png");
+
+/// 当前是否启用托盘（窗口关闭回调与托盘同步都读这里）。
+pub(crate) fn tray_enabled() -> bool {
+    TRAY_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 // 文件面板自己的图标（来自 lucide，ISC 许可）：rgpui 内置集合里没有合适的
 // 「定位」「跟随」语义。`icon_named!` 会把 assets/lucide 下的 SVG 编译进二进制。
@@ -111,7 +126,10 @@ fn main() {
         // theme::init 默认切到亮色；库内主题要等开库后才能读到，这里先按
         // 旧 settings.json（降级/迁移前）或默认暗色起窗，避免闪一下亮色。
         let store = SessionStore::new(&StorageMode::detect());
-        let dark = store.load_settings().dark();
+        let settings = store.load_settings();
+        let dark = settings.dark();
+        // 托盘必须在建窗前决定：关闭时窗口直接退出，不留下后台进程。
+        TRAY_ENABLED.store(settings.tray, std::sync::atomic::Ordering::Relaxed);
         // 语言管理器同样必须在开窗前装好：首帧的标题栏菜单、侧栏与状态栏就要取词。
         // 读的是 locale.txt 镜像（不是 settings.json，见 SessionStore::locale_path）。
         i18n::install(&store.load_language(), cx);
@@ -191,11 +209,16 @@ fn main() {
             |window, cx| {
                 let quick = quick.clone();
                 let app = cx.new(|cx| RuTermApp::new(quick, window, cx));
-                // 关闭按钮改为隐藏到托盘：窗口不销毁，会话后台保活；
+                // 启用托盘时关闭按钮改为隐藏：窗口不销毁，会话后台保活；
                 // 返回 false 中断关闭，真正退出走托盘"退出"（cx.quit 直接投 WM_QUIT，不经此回调）。
+                // 未启用托盘则按普通窗口关闭，直接退出进程。
                 window.on_window_should_close(cx, |window, _cx| {
-                    window.hide_window();
-                    false
+                    if tray_enabled() {
+                        window.hide_window();
+                        false
+                    } else {
+                        true
+                    }
                 });
                 app
             },
@@ -233,11 +256,13 @@ fn main() {
 
         // 系统托盘：品牌图标 + 悬停提示 + 右键菜单（活动会话 / 显示主界面 / 退出），
         // 左键单击图标直接恢复主窗口（Windows 后端左键不弹菜单，菜单仅右键弹出）。
-        // 图标以 32px PNG 内嵌，Windows 走 image 解码路径最稳；不依赖运行时文件路径。
-        const TRAY_ICON: &[u8] = include_bytes!("../assets/icons/tray-32.png");
-        cx.set_tray_icon(Some(TRAY_ICON));
-        // 菜单与提示由应用按会话列表同步（隐藏到托盘后也能直接跳回某个标签）。
-        let _ = window_handle.update(cx, |app, _, cx| app.sync_tray(cx));
+        // 默认关闭：只有设置里启用过才创建图标，否则连回调都收不到事件。
+        if tray_enabled() {
+            cx.set_tray_icon(Some(TRAY_ICON));
+            // 菜单与提示由应用按会话列表同步（隐藏到托盘后也能直接跳回某个标签）。
+            let _ = window_handle.update(cx, |app, _, cx| app.sync_tray(cx));
+        }
+        // 回调始终登记：运行中在设置里启用托盘时，图标与菜单立刻可用。
         cx.on_tray_icon_event(move |event, cx| {
             if matches!(event, TrayIconEvent::LeftClick) {
                 window_handle

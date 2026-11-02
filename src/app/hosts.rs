@@ -5,10 +5,11 @@ use rgpui::input_ui::{Input, InputEvent, InputState};
 use rgpui::prelude::*;
 use rgpui::{
     AnyElement, Button, ButtonVariants, Context,
-    ContextMenuExt, Div, Entity, FontWeight, Icon, IconName, InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels, SharedString, Stateful,
+    ContextMenuExt, Div, Entity, FontWeight, Icon, IconName, InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels, ScrollableElement, SharedString, Stateful,
     StatefulInteractiveElement, Styled, Window, div, h_flex, px, v_flex,
 };
 
+use crate::desktop::Protocol;
 use crate::sessions::{AuthMethod, HostConfig, ProtocolKind};
 use crate::{NewHost, NewLocalTerminal};
 use crate::tr;
@@ -144,6 +145,288 @@ impl RuTermApp {
         cx.notify();
     }
 
+
+    /// 扫描局域网（「会话 → 局域网发现…」弹窗打开时触发，弹窗里可重扫）。
+    pub(super) fn start_discovery(&mut self, cx: &mut Context<Self>) {
+        if self.discovering {
+            return;
+        }
+        self.discovering = true;
+        self.discovery_error = None;
+        self.status = tr!(cx, "正在扫描局域网…");
+        cx.notify();
+        let handle = rgpui::tokio::Tokio::handle(cx);
+        cx.spawn(async move |this, cx| {
+            let result = handle
+                .spawn(async move { crate::discovery::scan_lan().await })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.discovering = false;
+                this.discovery_scanned = true;
+                match result {
+                    Ok(Ok(hosts)) => {
+                        let count = hosts.len();
+                        this.discovered = hosts;
+                        this.status = tr!(cx, "局域网发现 {count} 台主机", count = count);
+                    }
+                    Ok(Err(error)) => {
+                        this.discovered.clear();
+                        let message = format!("{error:#}");
+                        this.discovery_error = Some(SharedString::from(message.clone()));
+                        this.status = SharedString::from(format!("局域网扫描跳过：{message}"));
+                    }
+                    Err(error) => {
+                        this.discovered.clear();
+                        let message = format!("扫描任务失败：{error}");
+                        this.discovery_error = Some(SharedString::from(message.clone()));
+                        this.status = SharedString::from(message);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 打开「局域网发现」弹窗（入口在「会话」菜单）；每次打开都重扫一次。
+    pub(super) fn open_discovery(&mut self, cx: &mut Context<Self>) {
+        self.show_discovery = true;
+        self.start_discovery(cx);
+    }
+
+    /// 关闭弹窗；扫描继续进行，结果留在内存里供下次打开查看。
+    pub(super) fn close_discovery(&mut self, cx: &mut Context<Self>) {
+        self.show_discovery = false;
+        cx.notify();
+    }
+
+    /// 发现行按钮：按指定协议打开；打开即关闭弹窗，把位置让给表单 / 标签。
+    pub(super) fn open_discovered_as(
+        &mut self,
+        index: usize,
+        protocol: ProtocolKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(host) = self.discovered.get(index) else {
+            return;
+        };
+        let ip = host.ip.to_string();
+        let port = protocol.default_port();
+        self.show_discovery = false;
+        self.open_form_prefilled(protocol, ip, port, window, cx);
+    }
+
+    pub(super) fn open_discovered_desktop(
+        &mut self,
+        index: usize,
+        protocol: Protocol,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(host) = self.discovered.get(index) else {
+            return;
+        };
+        let port = protocol.default_port();
+        self.show_discovery = false;
+        self.open_desktop_prefilled(protocol, host.ip.to_string(), port, window, cx);
+    }
+
+    /// 「局域网发现」小工具弹窗：扫描状态 + 主机列表 + 每行按服务的打开按钮。
+    ///
+    /// 发现结果只是"临时线索"，所以不塞进主机列表、也不入库；
+    /// 需要长期保留时走 SSH / Telnet 表单保存成正式主机。
+    pub(super) fn render_discovery_dialog(&self, cx: &Context<Self>) -> AnyElement {
+        let pal = self.palette(cx);
+        let count = self.discovered.len();
+        let status: SharedString = if self.discovering {
+            tr!(cx, "扫描中…")
+        } else if let Some(error) = self.discovery_error.as_ref() {
+            error.clone()
+        } else if count == 0 && self.discovery_scanned {
+            tr!(cx, "未发现开放 22 / 23 / 3389 / 5900 的主机")
+        } else {
+            tr!(
+                cx,
+                "共 {count} 台主机，点服务按钮直接打开",
+                count = count
+            )
+        };
+        let mut rows = v_flex().id("discovery-list").gap_1().max_h(px(340.0)).overflow_y_scrollbar();
+        for (index, host) in self.discovered.iter().enumerate() {
+            let ip = host.ip.to_string();
+            let services = host.services();
+            let mut buttons = h_flex().flex_shrink_0().gap_1();
+            if host.rdp {
+                buttons = buttons.child(
+                    Button::new(SharedString::from(format!("disc-{ip}-rdp")))
+                        .label("RDP")
+                        .secondary()
+                        .outline()
+                        .compact()
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.open_discovered_desktop(index, Protocol::Rdp, window, cx);
+                        })),
+                );
+            }
+            if host.vnc {
+                buttons = buttons.child(
+                    Button::new(SharedString::from(format!("disc-{ip}-vnc")))
+                        .label("VNC")
+                        .secondary()
+                        .outline()
+                        .compact()
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.open_discovered_desktop(index, Protocol::Vnc, window, cx);
+                        })),
+                );
+            }
+            if host.ssh {
+                buttons = buttons.child(
+                    Button::new(SharedString::from(format!("disc-{ip}-ssh")))
+                        .label("SSH")
+                        .secondary()
+                        .outline()
+                        .compact()
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.open_discovered_as(index, ProtocolKind::Ssh, window, cx);
+                        })),
+                );
+            }
+            if host.telnet {
+                buttons = buttons.child(
+                    Button::new(SharedString::from(format!("disc-{ip}-telnet")))
+                        .label("Telnet")
+                        .secondary()
+                        .outline()
+                        .compact()
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.open_discovered_as(index, ProtocolKind::Telnet, window, cx);
+                        })),
+                );
+            }
+            rows = rows.child(
+                h_flex()
+                    .id(SharedString::from(format!("disc-row-{ip}")))
+                    .w_full()
+                    .gap_2()
+                    .items_center()
+                    .px_2()
+                    .py_1()
+                    .rounded(px(5.0))
+                    .hover(|style| style.bg(pal.card_hover))
+                    .child(Icon::new(IconName::Frame).small().text_color(pal.muted))
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .child(div().text_sm().text_ellipsis().child(ip))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_ellipsis()
+                                    .text_color(pal.muted)
+                                    .child(services),
+                            ),
+                    )
+                    .child(buttons),
+            );
+        }
+        v_flex()
+            .id("discovery-backdrop")
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .size_full()
+            .items_center()
+            .justify_center()
+            .bg(rgpui::hsla(0.0, 0.0, 0.0, 0.45))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.close_discovery(cx)),
+            )
+            .child(
+                v_flex()
+                    .id("discovery-dialog")
+                    .w(px(520.0))
+                    .gap_3()
+                    .p_5()
+                    .rounded(px(8.0))
+                    .bg(pal.card_bg)
+                    .border_1()
+                    .border_color(pal.border)
+                    .shadow_md()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                    )
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .items_center()
+                                    .child(
+                                        Icon::new(IconName::Network)
+                                            .small()
+                                            .text_color(pal.link),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_base()
+                                            .font_weight(rgpui::FontWeight(600.0))
+                                            .child(tr!(cx, "局域网发现")),
+                                    ),
+                            )
+                            .child(Button::new("close-discovery").label("×").ghost().on_click(
+                                cx.listener(|this, _, _, cx| this.close_discovery(cx)),
+                            )),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(pal.muted)
+                            .child(tr!(
+                                cx,
+                                "扫描本机各网段，探测 SSH / Telnet / RDP / VNC"
+                            )),
+                    )
+                    .child(div().text_sm().text_color(pal.muted).child(status))
+                    .when(!self.discovered.is_empty(), |this| this.child(rows))
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .justify_end()
+                            .child(
+                                Button::new("discovery-rescan")
+                                    .label(if self.discovering {
+                                        tr!(cx, "扫描中…")
+                                    } else {
+                                        tr!(cx, "重新扫描")
+                                    })
+                                    .secondary()
+                                    .outline()
+                                    .compact()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.start_discovery(cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("discovery-close")
+                                    .label(tr!(cx, "关闭"))
+                                    .primary()
+                                    .compact()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.close_discovery(cx);
+                                    })),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
 
     /// 右键菜单"删除"：进入二次确认，不直接动手。
     pub(super) fn ask_delete(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -378,6 +661,8 @@ impl RuTermApp {
     pub(super) fn host_icon(host: &HostConfig) -> IconName {
         match host.protocol {
             ProtocolKind::Telnet => IconName::Globe,
+            // 桌面协议共用「窗口」图标：当前图标集里没有显示器图标。
+            ProtocolKind::Rdp | ProtocolKind::Vnc => IconName::Frame,
             ProtocolKind::Ssh => match host.auth {
                 AuthMethod::Agent => IconName::Network,
                 AuthMethod::IdentityFile => IconName::File,
@@ -387,11 +672,13 @@ impl RuTermApp {
     }
 
 
-    /// 列表副标题：Telnet 前缀协议名，避免与 SSH 主机混淆。
+    /// 列表副标题：Telnet / 远程桌面前缀协议名，避免与 SSH 主机混淆。
     pub(super) fn host_subtitle(host: &HostConfig) -> String {
         match host.protocol {
             ProtocolKind::Ssh => host.addr(),
             ProtocolKind::Telnet => format!("Telnet · {}", host.addr()),
+            ProtocolKind::Rdp => format!("RDP · {}", host.addr()),
+            ProtocolKind::Vnc => format!("VNC · {}", host.addr()),
         }
     }
 
@@ -639,7 +926,7 @@ impl RuTermApp {
                 })
         };
         let searching = !query.is_empty();
-        // 搜索命中本机 shell 时，主机没有命中也不该再叠一句"无匹配主机"（看着像整体没结果）。
+        // 搜索命中本机 shell 时，主机没有命中也不该再叠一句"无匹配主机"。
         let local_hit = !local_rows.is_empty();
         let mut list = v_flex().gap_px().min_h_full().children(local_rows);
         for (name, rows) in &buckets {
@@ -661,7 +948,8 @@ impl RuTermApp {
         }
         // 树顶已有本机 shell 列表，首启动不再塞"暂无主机"那行大字（空着比提示好看）；
         // 只在搜索没命中时给一行反馈。
-        if searching && !local_hit {
+        let host_hit = buckets.iter().any(|(_, rows)| !rows.is_empty());
+        if searching && !local_hit && !host_hit {
             list = list.child(
                 div()
                     .px_2()

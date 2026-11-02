@@ -757,6 +757,7 @@ impl RuTermApp {
     /// 「会话」分页：断线自动重连与连接超时，改动即时生效并写入凭据库。
     pub(super) fn render_session_tab(&self, pal: &Palette, cx: &Context<Self>) -> AnyElement {
         let auto = cx.entity();
+        let tray = cx.entity();
         v_flex()
             .id("settings-tab-session")
             .gap_3()
@@ -819,6 +820,21 @@ impl RuTermApp {
                     .text_color(pal.muted)
                     .child(tr!(cx, "超时覆盖 DNS、TCP、握手、认证与开启 shell 的全过程；超时即结束本次尝试并报「连接超时」。")),
             )
+            .child(div().mt_2().h(px(1.0)).w_full().bg(pal.border))
+            .child(
+                Checkbox::new("session-tray")
+                    .label(tr!(cx, "启用系统托盘"))
+                    .checked(crate::tray_enabled())
+                    .on_change(move |value, _window, cx| {
+                        tray.update(cx, |this, cx| this.set_tray_enabled(value, cx));
+                    }),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(pal.muted)
+                    .child(tr!(cx, "开启后关闭窗口会隐藏到托盘，会话在后台保活；关闭（默认）则关窗直接退出。运行中关闭图标要等下次启动才完全移除。")),
+            )
             .into_any_element()
     }
 
@@ -848,6 +864,37 @@ impl RuTermApp {
         let mut prefs = self.session_prefs.clone();
         prefs.nudge_connect_timeout(steps);
         self.set_session_prefs(prefs, cx);
+    }
+
+
+    /// 开关系统托盘：立即创建 / 置空图标并写启动设置。
+    ///
+    /// 托盘必须在建窗前决定，所以进 settings.json 而不是库内 `settings` 表；
+    /// win32 后端没有删除图标的接口，运行中关闭只是把图标置空，完整移除靠下次启动。
+    pub(super) fn set_tray_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if crate::tray_enabled() == enabled {
+            return;
+        }
+        crate::TRAY_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
+        self.store.save_tray(enabled);
+        if let Some(vault) = self.vault.clone() {
+            let value = if enabled { "1" } else { "0" };
+            cx.spawn(async move |_, _| {
+                if let Err(error) = vault.set_setting("tray", value).await {
+                    log::warn!("写入库内托盘偏好失败: {error}");
+                }
+            })
+            .detach();
+        }
+        if enabled {
+            cx.set_tray_icon(Some(crate::TRAY_ICON));
+            self.sync_tray(cx);
+            self.status = "已启用系统托盘：关闭窗口将隐藏到托盘".into();
+        } else {
+            cx.set_tray_icon(None);
+            self.status = "已关闭系统托盘：之后关窗直接退出，图标在下次启动时完全移除".into();
+        }
+        cx.notify();
     }
 
 
