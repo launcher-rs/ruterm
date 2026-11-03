@@ -15,6 +15,9 @@ mod windows;
 #[cfg(windows)]
 pub use crate::windows::{HWND, WinClipboard, WinCliprdrError, WinCliprdrResult};
 
+/// 界面侧的上传进度登记（本机副本新增）：写剪贴板前登记，剪贴板线程办理时回报字节数。
+pub mod upload;
+
 mod stub;
 use std::sync::OnceLock;
 use std::time::Instant;

@@ -1,8 +1,8 @@
 //! 远程桌面标签：标签内就地连接表单、VNC 帧渲染、输入转发与工具条。
 //!
 //! 约定与终端一致：网络 IO 全在 tokio 侧（`crate::desktop`），这里只收发事件、
-//! 把整帧 BGRA 快照换成 `RenderImage` 贴到画布上。密码只留在本次会话的内存里，
-//! 不落盘、不进日志、不进命令行。
+//! 把整帧 BGRA 快照换成 `RenderImage` 贴到画布上。密码在加密库可用时随主机加密入库
+//! （与 SSH 密码同一套，随主库锁定），否则只留在内存；不进日志、不进命令行。
 
 use std::cell::Cell;
 use std::path::PathBuf;
@@ -15,18 +15,20 @@ use rgpui::prelude::*;
 use rgpui::{
     AnyElement, Bounds, Button, ButtonVariants, ClipboardEntry, ClipboardItem, Context, Corners,
     Entity, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, KeyUpEvent, Keystroke,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point,
-    RenderImage, ScrollDelta, ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled,
-    Tooltip, Window, canvas, div, h_flex, point, px, v_flex,
+    Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    ParentElement, Pixels, Point, RenderImage, ScrollDelta, ScrollWheelEvent, SharedString,
+    StatefulInteractiveElement, Styled, Tooltip, Window, canvas, div, h_flex, point, px, v_flex,
 };
 
 use crate::desktop::{Command, Event, KeyInput, Protocol, Session, Snapshot};
 use crate::sessions::{AuthMethod, HostConfig, ProtocolKind};
 use crate::tr;
+use crate::vault::Vault;
 
 use super::*;
 
 /// 远程桌面会话阶段：表单 → 连接中 → 已连接；失败保留标签以便原地重试。
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum DesktopPhase {
     Form,
     /// 已保存主机直连时缺密码：只问密码，不展示完整表单。
@@ -64,7 +66,7 @@ pub(super) struct DesktopTab {
     pub(super) cache_key: Option<String>,
     /// 保存到哪个分组；None＝未分组。打开已保存主机时回填原归属。
     pub(super) group: Option<SharedString>,
-    /// 远程桌面密码：只存活在内存，标签关闭即丢弃；绝不写库 / 写日志。
+    /// 远程桌面密码：标签关闭即从内存丢弃；保存主机或连接成功时加密写入凭据库。
     pub(super) password: String,
     /// RDP 账号与域（VNC 不用）：同样只留在内存。
     pub(super) username: String,
@@ -99,12 +101,20 @@ pub(super) struct DesktopTab {
     pub(super) zoom: f32,
     /// 捕获键盘：开启后按键转发到远端，Esc 释放。
     pub(super) capture_keys: bool,
+    /// 已转发到远端的修饰键状态。rgpui 对 Ctrl / Shift / Alt / Win 只发
+    /// `ModifiersChangedEvent`、不发 KeyDown / KeyUp，这里按差异补发按下 / 抬起，
+    /// 远端才认得 Ctrl+V 这类组合键。
+    pub(super) modifiers: Modifiers,
+    /// 上次看到的 CapsLock 状态：切换时补一次按下 + 抬起。
+    pub(super) capslock: bool,
     /// 当前按下的鼠标键位图（bit0 左 / bit1 中 / bit2 右）。
     pub(super) buttons: u8,
     /// 会话指令通道（断开 / 输入 / 剪贴板 / 请求整帧）。
     pub(super) command: Option<tokio::sync::mpsc::UnboundedSender<Command>>,
     /// 最新帧槽位：事件循环取走后协议层才产下一帧。
     pub(super) latest: Option<Arc<Mutex<Option<Snapshot>>>>,
+    /// 拖放上传进度（RDP 文件剪贴板）；没有传输时为 None。
+    pub(super) upload: Option<UploadStatus>,
     /// 实际帧率（每秒由协议层汇报）。
     pub(super) fps: f32,
     /// 连接代号：重连后旧事件循环的迟到事件按代号丢弃。
@@ -121,6 +131,13 @@ impl DesktopTab {
     fn clear_buttons(&mut self) {
         self.buttons = 0;
     }
+}
+
+/// 一次拖放上传的进度（进度条画在画面右下角）。
+pub(super) struct UploadStatus {
+    pub(super) done: u64,
+    pub(super) total: u64,
+    pub(super) files: u32,
 }
 
 impl RuTermApp {
@@ -305,9 +322,12 @@ impl RuTermApp {
             name: String::new(),
             zoom: 0.0,
             capture_keys: false,
+            modifiers: Modifiers::default(),
+            capslock: false,
             buttons: 0,
             command: None,
             latest: None,
+            upload: None,
             fps: 0.0,
             token: 0,
         };
@@ -369,8 +389,7 @@ impl RuTermApp {
         }
     }
 
-    /// 已保存主机的直连入口：有本次会话缓存就用缓存密码，RDP 缺密码先问，
-    /// VNC 先试无密码（服务端可能根本没开认证）。
+    /// 已保存主机的直连入口：本次内存缓存 → 加密库 → 按协议决定问密码还是免密试连。
     fn auto_connect_desktop(&mut self, id: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(desktop) = self
             .tabs
@@ -380,12 +399,13 @@ impl RuTermApp {
         else {
             return;
         };
-        let (host, port, protocol, username, domain) = (
+        let (host, port, protocol, username, domain, saved_host) = (
             desktop.host.clone(),
             desktop.port,
             desktop.protocol,
             desktop.username.clone(),
             desktop.domain.clone(),
+            desktop.saved_host,
         );
         if host.is_empty() {
             self.set_desktop_form(id, cx);
@@ -394,6 +414,88 @@ impl RuTermApp {
         }
         let key = desktop_cache_key(&host, port, &username, &domain);
         if let Some(password) = self.password_cache.get(&key).cloned() {
+            if let Some(desktop) = self
+                .tabs
+                .iter_mut()
+                .find(|tab| tab.id == id)
+                .and_then(|tab| tab.desktop.as_mut())
+            {
+                desktop
+                    .form_password
+                    .update(cx, |state, cx| state.set_value(password.clone(), window, cx));
+            }
+            self.open_desktop_session(id, host, port, password, cx);
+            return;
+        }
+        // 加密库里存过密码（保存主机或上次连接成功时写入）：读出来直接用，重启后也不再问。
+        if let (Some(vault), Some(host_id)) = (self.vault.clone(), saved_host.filter(|id| *id != 0)) {
+            if let Some(desktop) = self
+                .tabs
+                .iter_mut()
+                .find(|tab| tab.id == id)
+                .and_then(|tab| tab.desktop.as_mut())
+            {
+                // 读库是异步的：先停在「连接中」，别让完整表单闪一下。
+                desktop.phase = DesktopPhase::Connecting;
+            }
+            if self.active_tab == Some(id) {
+                self.status = tr!(cx, "正在读取已保存的密码…");
+            }
+            cx.notify();
+            let entity = cx.entity();
+            let entity_id = entity.entity_id();
+            cx.spawn(async move |_, cx| {
+                let saved = vault.password_of(host_id).await.ok().flatten();
+                let _ = cx.with_window(entity_id, move |window, cx| {
+                    entity.update(cx, move |this, cx| {
+                        this.finish_desktop_direct(
+                            id,
+                            host,
+                            port,
+                            protocol,
+                            username,
+                            saved.as_deref(),
+                            window,
+                            cx,
+                        );
+                    });
+                });
+            })
+            .detach();
+            return;
+        }
+        self.finish_desktop_direct(id, host, port, protocol, username, None, window, cx);
+    }
+
+    /// 直连收尾：有密码就带着连；没有则 RDP 只问密码，VNC 先试免密。
+    #[allow(clippy::too_many_arguments)]
+    fn finish_desktop_direct(
+        &mut self,
+        id: usize,
+        host: String,
+        port: u16,
+        protocol: Protocol,
+        username: String,
+        password: Option<&str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // 读库期间标签可能已关、或用户已手动发起连接：迟到的结果直接丢弃。
+        let ready = self
+            .tabs
+            .iter()
+            .find(|tab| tab.id == id)
+            .and_then(|tab| tab.desktop.as_ref())
+            .is_some_and(|desktop| {
+                desktop.direct
+                    && desktop.command.is_none()
+                    && matches!(desktop.phase, DesktopPhase::Form | DesktopPhase::Connecting)
+            });
+        if !ready {
+            return;
+        }
+        if let Some(password) = password.filter(|password| !password.is_empty()) {
+            let password = password.to_string();
             if let Some(desktop) = self
                 .tabs
                 .iter_mut()
@@ -532,7 +634,7 @@ impl RuTermApp {
         self.status = tr!(cx, "已取消远程桌面").into();
     }
 
-    /// 表单「保存」：把地址 / 端口 / 协议 / 用户名存成常用主机（密码仍只在内存）。
+    /// 表单「保存」：把地址 / 端口 / 协议 / 用户名存成常用主机；填了密码则连同加密入库。
     pub(super) fn save_desktop_host(&mut self, tab_id: usize, cx: &mut Context<Self>) {
         let Some(desktop) = self
             .tabs
@@ -542,8 +644,9 @@ impl RuTermApp {
         else {
             return;
         };
-        let address = desktop.form_host.read(cx).value().trim().to_string();
+        let raw = desktop.form_host.read(cx).value().trim().to_string();
         let port_text = desktop.form_port.read(cx).value().trim().to_string();
+        let password = desktop.form_password.read(cx).value().to_string();
         let protocol = match desktop.protocol {
             Protocol::Rdp => ProtocolKind::Rdp,
             Protocol::Vnc => ProtocolKind::Vnc,
@@ -552,11 +655,17 @@ impl RuTermApp {
         let domain = desktop.form_domain.read(cx).value().trim().to_string();
         let saved_id = desktop.saved_host;
         let group = desktop.group.clone();
+        if raw.is_empty() {
+            self.desktop_form_error(tab_id, tr!(cx, "请填写主机地址"), cx);
+            return;
+        }
+        // 地址里可能带着端口，落库前拆开，否则保存的 host 会变成 `host:port`。
+        let (address, parsed_port) = normalize_address(&raw, &port_text);
         if address.is_empty() {
             self.desktop_form_error(tab_id, tr!(cx, "请填写主机地址"), cx);
             return;
         }
-        let Some(port) = port_text.parse::<u16>().ok().filter(|port| *port > 0) else {
+        let Some(port) = parsed_port else {
             self.desktop_form_error(tab_id, tr!(cx, "端口无效"), cx);
             return;
         };
@@ -568,6 +677,15 @@ impl RuTermApp {
         } else {
             format!("{domain}\\{username}")
         };
+        // 保存时填的密码进内存缓存（本进程内点主机直接复用）；凭据库可用时还会加密入库。
+        // 键用合并后的 `user`，与打开已保存主机时拆分再合并的结果一致。
+        let has_password = !password.is_empty();
+        let cached = has_password.then(|| {
+            (
+                desktop_cache_key(&address, port, &user, ""),
+                password.clone(),
+            )
+        });
         let existing = saved_id.and_then(|id| {
             self.hosts
                 .iter()
@@ -630,9 +748,22 @@ impl RuTermApp {
             }
         }
         self.apply_form_group(&host, group, cx);
+        if let Some((key, password)) = cached {
+            self.password_cache.insert(key, password);
+        }
+        // 填了密码就加密写库：下次（包括重启后）点这台主机直接连，不再追问。
+        let stored = has_password
+            && store_desktop_secret_after_save(self.vault.clone(), host.clone(), &password, cx);
+        let password_note = if stored {
+            "（密码已加密入库）"
+        } else if has_password {
+            "（密码仅本次内存持有）"
+        } else {
+            ""
+        };
         // 保存＝创建/更新完成：关掉这张表单标签，回到列表（要连接再点该主机）。
         self.close_tab(tab_id, cx);
-        self.status = SharedString::from(format!("已保存主机 {label}{group_note}"));
+        self.status = SharedString::from(format!("已保存主机 {label}{group_note}{password_note}"));
         self.sync_tray(cx);
         cx.notify();
     }
@@ -834,12 +965,18 @@ impl RuTermApp {
         desktop.latest = Some(latest.clone());
         desktop.phase = DesktopPhase::Live;
         desktop.capture_keys = true;
-        // 连接成功才缓存密码（只在本进程内存里），下次点同一主机不再追问。
-        let cached_password = if desktop.password.is_empty() {
+        // 连接成功才缓存密码：内存里供本进程复用；已保存主机再加密写入凭据库，
+        // 重启后点同一主机也不用再问。
+        let connected_password = desktop.password.clone();
+        let cached_password = if connected_password.is_empty() {
             None
         } else {
-            desktop.cache_key.clone().map(|key| (key, desktop.password.clone()))
+            desktop
+                .cache_key
+                .clone()
+                .map(|key| (key, connected_password.clone()))
         };
+        let saved_host = desktop.saved_host;
         tab.ended = false;
         tab.failed = false;
         tab.last_error = None;
@@ -852,6 +989,7 @@ impl RuTermApp {
         if let Some((key, password)) = cached_password {
             self.password_cache.insert(key, password);
         }
+        store_desktop_secret(self.vault.clone(), saved_host, &connected_password, cx);
         self.status = tr!(cx, "已连接远程桌面");
         self.sync_tray(cx);
         cx.notify();
@@ -893,6 +1031,19 @@ impl RuTermApp {
                         .is_ok(),
                     Event::Fps { fps } => this
                         .update(cx, |this, cx| this.apply_desktop_fps(id, token, fps, cx))
+                        .is_ok(),
+                    Event::Upload {
+                        done,
+                        total,
+                        files,
+                        finished,
+                        failed,
+                    } => this
+                        .update(cx, |this, cx| {
+                            this.apply_desktop_upload(
+                                id, token, done, total, files, finished, failed, cx,
+                            );
+                        })
                         .is_ok(),
                     Event::Clipboard(text) => this
                         .update(cx, |this, cx| this.apply_desktop_clipboard(id, token, text, cx))
@@ -961,7 +1112,8 @@ impl RuTermApp {
         }
     }
 
-    fn apply_desktop_fps(&mut self, id: usize, token: u64, fps: f32, cx: &mut Context<Self>) {        if let Some(desktop) = self
+    fn apply_desktop_fps(&mut self, id: usize, token: u64, fps: f32, cx: &mut Context<Self>) {
+        if let Some(desktop) = self
             .tabs
             .iter_mut()
             .find(|tab| tab.id == id)
@@ -971,6 +1123,70 @@ impl RuTermApp {
             desktop.fps = fps;
             cx.notify();
         }
+    }
+
+    /// 拖放上传进度：传输中刷新进度条，结束（成功或中断）时收起。
+    fn apply_desktop_upload(
+        &mut self,
+        id: usize,
+        token: u64,
+        done: u64,
+        total: u64,
+        files: u32,
+        finished: bool,
+        failed: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(desktop) = self
+            .tabs
+            .iter_mut()
+            .find(|tab| tab.id == id)
+            .and_then(|tab| tab.desktop.as_mut())
+        else {
+            return;
+        };
+        if desktop.token != token {
+            return;
+        }
+        if finished {
+            desktop.upload = None;
+            if self.active_tab == Some(id) {
+                if failed {
+                    self.status = if total == 0 {
+                        tr!(
+                            cx,
+                            "文件粘贴未开始（本机剪贴板被占用或远端未接收文件列表），可稍后重试；远端内容就绪时可手动按 Ctrl+V"
+                        )
+                        .into()
+                    } else if done == 0 {
+                        // 远端收下了列表却一个字节都没读：最常见就是同名文件覆盖确认框在等人。
+                        tr!(
+                            cx,
+                            "远端还没开始接收：若弹出了同名文件覆盖确认，请在那个窗口里选「替换」，或先删掉远端同名文件"
+                        )
+                        .into()
+                    } else {
+                        format!(
+                            "{}：{} / {}",
+                            tr!(cx, "文件传输中断"),
+                            crate::transfer::format_bytes(done),
+                            crate::transfer::format_bytes(total)
+                        )
+                        .into()
+                    };
+                } else if total > 0 {
+                    self.status = tr!(
+                        cx,
+                        "文件已发送到远端：{size}",
+                        size = crate::transfer::format_bytes(total)
+                    )
+                    .into();
+                }
+            }
+        } else {
+            desktop.upload = Some(UploadStatus { done, total, files });
+        }
+        cx.notify();
     }
 
     fn apply_desktop_clipboard(
@@ -1015,6 +1231,13 @@ impl RuTermApp {
         desktop.capture_keys = false;
         desktop.clear_buttons();
         if auth_failure {
+            // 缓存里留下的若是旧密码，认证失败后必须清掉，否则下次点主机又拿它重试。
+            if let Some(key) = desktop.cache_key.take() {
+                self.password_cache.remove(&key);
+            }
+            // 库里存的同样作废，否则重启后会拿旧密码直连。
+            clear_desktop_secret(self.vault.clone(), desktop.saved_host, cx);
+            desktop.password.clear();
             desktop.phase = if desktop.direct {
                 DesktopPhase::NeedPassword
             } else {
@@ -1071,6 +1294,12 @@ impl RuTermApp {
         desktop.capture_keys = false;
         desktop.clear_buttons();
         if auth_failure {
+            // 同 fail_desktop：清掉失效的缓存密码，避免下次直连再拿旧密码重试。
+            if let Some(key) = desktop.cache_key.take() {
+                self.password_cache.remove(&key);
+            }
+            clear_desktop_secret(self.vault.clone(), desktop.saved_host, cx);
+            desktop.password.clear();
             desktop.phase = if desktop.direct {
                 DesktopPhase::NeedPassword
             } else {
@@ -1106,58 +1335,45 @@ impl RuTermApp {
         cx.notify();
     }
 
-    /// 拖文件到远程桌面标签：桌面协议本身没有通用的文件通道，改走同一主机的
-    /// SSH 会话经 SFTP 上传到该会话的当前目录。
+    /// 拖文件到远程桌面标签：RDP 走协议自带的文件剪贴板，不需要远端装 SSH。
     ///
-    /// 匹配按 SSH 连接目标的主机名（不区分大小写），优先用已连接的会话；
-    /// 没有这样的会话时就地提示，不偷偷新建连接。
+    /// 文件先放进本机剪贴板，剪贴板线程的监听窗口会把它报给远端；稍后会话替
+    /// 用户按一次 Ctrl+V，资源管理器就落到当前文件夹。VNC 的 RFB 没有文件通道，
+    /// 直接说明不支持，不再要求另开 SSH 会话。
     pub(super) fn desktop_drop_paths(
         &mut self,
         id: usize,
         paths: Vec<PathBuf>,
         cx: &mut Context<Self>,
     ) {
-        let Some(host) = self
+        let Some(desktop) = self
             .tabs
             .iter()
             .find(|tab| tab.id == id)
             .and_then(|tab| tab.desktop.as_ref())
-            .map(|desktop| desktop.host.trim().to_string())
         else {
             return;
         };
-        if host.is_empty() {
-            self.status = tr!(cx, "远程桌面：先填写主机地址后再拖入文件");
+        let protocol = desktop.protocol;
+        let live = desktop.phase == DesktopPhase::Live && desktop.command.is_some();
+        if protocol == Protocol::Vnc {
+            self.status = tr!(cx, "VNC 协议没有文件传输能力：需要传文件请改用 RDP 连接");
             cx.notify();
             return;
         }
-        let ssh = self
-            .tabs
-            .iter()
-            .find(|tab| {
-                tab.desktop.is_none()
-                    && tab.commands.is_some()
-                    && !tab.ended
-                    && matches!(
-                        tab.resume.as_ref(),
-                        Some(Resume::Ssh { target, .. }) if target.host.eq_ignore_ascii_case(&host)
-                    )
-            })
-            .map(|tab| {
-                (
-                    tab.id,
-                    tab.files.path.clone().unwrap_or_else(|| ".".to_string()),
-                )
-            });
-        let Some((ssh_id, dir)) = ssh else {
-            self.status = tr!(
-                cx,
-                "远程桌面不能直接收文件：请先给同一主机开一个 SSH 会话，拖入的文件会经 SFTP 传到该会话的当前目录"
-            );
+        if !live {
+            self.status = tr!(cx, "远程桌面还没连上：连上后再拖入文件");
             cx.notify();
             return;
-        };
-        self.upload_paths(ssh_id, dir, paths, cx);
+        }
+        let count = paths.len();
+        desktop.send(Command::PasteFiles(paths));
+        self.status = tr!(
+            cx,
+            "已把 {count} 个文件放进剪贴板并在远端粘贴到当前文件夹；没反应时在远端按 Ctrl+V",
+            count = count
+        );
+        cx.notify();
     }
 
     fn close_desktop(&mut self, id: usize, cx: &mut Context<Self>) {
@@ -1272,6 +1488,16 @@ impl RuTermApp {
         let _ = cx;
     }
 
+    /// 当前标签是否正在捕获键盘（活动标签是桌面、画面持有焦点且捕获已开启）。
+    ///
+    /// 用于全局按键拦截：捕获期间应用快捷键要让位给远端。
+    pub(super) fn desktop_capturing(&self, window: &Window) -> bool {
+        self.active_tab
+            .and_then(|id| self.tabs.iter().find(|tab| tab.id == id))
+            .and_then(|tab| tab.desktop.as_ref())
+            .is_some_and(|desktop| desktop.capture_keys && desktop.focus.is_focused(window))
+    }
+
     /// 键盘按下：捕获开启时全部转给远端，Esc 先用来释放捕获（不发给远端）。
     pub(super) fn desktop_key_down(
         &mut self,
@@ -1299,6 +1525,21 @@ impl RuTermApp {
                 .find(|tab| tab.id == id)
                 .and_then(|tab| tab.desktop.as_mut())
             {
+                // 释放捕获前把还按着的修饰键抬起来，否则远端会一直认为 Ctrl 没松。
+                let held = std::mem::take(&mut desktop.modifiers);
+                for (name, down) in [
+                    ("shift", held.shift),
+                    ("control", held.control),
+                    ("alt", held.alt),
+                    ("super", held.platform),
+                ] {
+                    if down {
+                        desktop.send(Command::Key {
+                            key: KeyInput::modifier(name),
+                            down: false,
+                        });
+                    }
+                }
                 desktop.capture_keys = false;
             }
             self.status = tr!(cx, "已释放键盘，点击画面可重新捕获").into();
@@ -1336,6 +1577,53 @@ impl RuTermApp {
         }
         cx.stop_propagation();
         self.desktop_key(id, &event.keystroke, false, cx);
+    }
+
+    /// 修饰键 / CapsLock 变化：按与上次的差异补发按下 / 抬起。
+    ///
+    /// rgpui（与 gpui 一致）不为 Ctrl / Shift / Alt / Win 发 KeyDown / KeyUp，
+    /// 只发这一个事件；不在这里转发，远端就永远收不到 Ctrl+V 的 Ctrl。
+    pub(super) fn desktop_modifiers_changed(
+        &mut self,
+        id: usize,
+        event: &ModifiersChangedEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(desktop) = self
+            .tabs
+            .iter_mut()
+            .find(|tab| tab.id == id)
+            .and_then(|tab| tab.desktop.as_mut())
+        else {
+            return;
+        };
+        if !desktop.capture_keys || !desktop.focus.is_focused(window) {
+            return;
+        }
+        cx.stop_propagation();
+        let next = event.modifiers;
+        let previous = std::mem::replace(&mut desktop.modifiers, next);
+        for (name, before, now) in [
+            ("shift", previous.shift, next.shift),
+            ("control", previous.control, next.control),
+            ("alt", previous.alt, next.alt),
+            ("super", previous.platform, next.platform),
+        ] {
+            if before != now {
+                desktop.send(Command::Key {
+                    key: KeyInput::modifier(name),
+                    down: now,
+                });
+            }
+        }
+        // CapsLock 是切换键：远端要一按一抬才能翻转状态，不能只发按下。
+        if desktop.capslock != event.capslock.on {
+            desktop.capslock = event.capslock.on;
+            let key = KeyInput::modifier("capslock");
+            desktop.send(Command::Key { key, down: true });
+            desktop.send(Command::Key { key, down: false });
+        }
     }
 
     /// 工具条：把本地剪贴板文本发给远端。
@@ -1505,14 +1793,79 @@ impl RuTermApp {
             DesktopPhase::Live => {
                 let pal = self.palette(cx);
                 let id = tab.id;
+                let screen = self.render_desktop_screen(id, desktop, cx);
+                let upload = self.render_upload_card(desktop, cx);
                 v_flex()
                     .size_full()
                     .bg(pal.window_bg)
                     .child(self.render_desktop_toolbar(tab, desktop, cx))
-                    .child(self.render_desktop_screen(id, desktop, cx))
+                    .child(
+                        // 必须是 flex 容器：画面根节点靠 flex_1 吃满剩余高度，
+                        // 换成普通 div 会让 canvas 变成 0 高（整片白屏）。
+                        v_flex()
+                            .flex_1()
+                            .min_h_0()
+                            .relative()
+                            .child(screen)
+                            .when_some(upload, |this, card| this.child(card)),
+                    )
                     .into_any_element()
             }
         }
+    }
+
+    /// 右下角的拖放上传进度卡：文件数 + 已发送字节 + 进度条。
+    fn render_upload_card(
+        &self,
+        desktop: &DesktopTab,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let upload = desktop.upload.as_ref()?;
+        let pal = self.palette(cx);
+        let fraction = if upload.total > 0 {
+            (upload.done as f32 / upload.total as f32).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let detail = format!(
+            "{} / {}",
+            crate::transfer::format_bytes(upload.done),
+            crate::transfer::format_bytes(upload.total)
+        );
+        let title = tr!(cx, "正在粘贴 {count} 个文件到远端", count = upload.files);
+        Some(
+            v_flex()
+                .absolute()
+                .bottom(px(12.0))
+                .right(px(12.0))
+                .w(px(260.0))
+                .gap_1()
+                .px_3()
+                .py_2()
+                .rounded(px(6.0))
+                .bg(pal.card_bg)
+                .border_1()
+                .border_color(pal.border)
+                .shadow_md()
+                .child(div().text_xs().text_color(pal.text).child(title))
+                .child(
+                    div()
+                        .h(px(4.0))
+                        .w_full()
+                        .rounded(px(2.0))
+                        .bg(pal.border)
+                        .overflow_hidden()
+                        .child(
+                            div()
+                                .h_full()
+                                .w(rgpui::relative(fraction))
+                                .rounded(px(2.0))
+                                .bg(pal.accent),
+                        ),
+                )
+                .child(div().text_xs().text_color(pal.muted).child(detail))
+                .into_any_element(),
+        )
     }
 
     fn render_desktop_screen(
@@ -1550,6 +1903,10 @@ impl RuTermApp {
                         .find(|tab| tab.id == id)
                         .and_then(|tab| tab.desktop.as_mut())
                     {
+                        // 捕获瞬间以窗口的真实修饰键状态为基线：之后只补发变化量，
+                        // 不会把点击前就按着的键误发一遍。
+                        desktop.modifiers = window.modifiers();
+                        desktop.capslock = window.capslock().on;
                         desktop.capture_keys = true;
                         desktop.focus.focus(window, cx);
                     }
@@ -1607,6 +1964,11 @@ impl RuTermApp {
             .capture_key_up(cx.listener(move |this, event: &KeyUpEvent, window, cx| {
                 this.desktop_key_up(id, event, window, cx);
             }))
+            .on_modifiers_changed(cx.listener(
+                move |this, event: &ModifiersChangedEvent, window, cx| {
+                    this.desktop_modifiers_changed(id, event, window, cx);
+                },
+            ))
             .child(
                 canvas(
                     move |bounds, _window, _cx| {
@@ -1977,20 +2339,18 @@ impl RuTermApp {
                                 &pal,
                             )),
                     )
-                    .child(
-                        h_flex()
-                            .items_center()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(pal.muted)
-                                    .child(tr!(
-                                        cx,
-                                        "保存主机只记地址与用户名；密码只在本次连接的内存里使用"
-                                    )),
-                            ),
-                    )
+                    .child(h_flex().items_center().gap_1().child({
+                        // 密码去向取决于凭据库是否可用：可用就加密入库，否则只留在内存。
+                        let hint = if self.vault.is_some() {
+                            tr!(
+                                cx,
+                                "保存主机时填写的密码会加密存入凭据库；不点保存则只在本次连接使用"
+                            )
+                        } else {
+                            tr!(cx, "保存主机只记地址与用户名；密码只在本次连接的内存里使用")
+                        };
+                        div().text_xs().text_color(pal.muted).child(hint)
+                    }))
                     .when_some(desktop.form_error.clone(), |this, error| {
                         this.child(
                             div()
@@ -2100,12 +2460,18 @@ impl RuTermApp {
                                 &pal,
                             )),
                     )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(pal.muted)
-                            .child(tr!(cx, "密码只在本次连接的内存里使用；留空表示不带密码")),
-                    )
+                    .child({
+                        // 直连成功后密码会加密入库：这里说明下次不用再输。
+                        let hint = if self.vault.is_some() {
+                            tr!(
+                                cx,
+                                "密码会加密保存到凭据库，下次点该主机直接复用；留空表示不带密码"
+                            )
+                        } else {
+                            tr!(cx, "密码只在本次连接的内存里使用；留空表示不带密码")
+                        };
+                        div().text_xs().text_color(pal.muted).child(hint)
+                    })
                     .when_some(desktop.form_error.clone(), |this, error| {
                         this.child(
                             div()
@@ -2362,6 +2728,76 @@ fn desktop_cache_key(host: &str, port: u16, username: &str, domain: &str) -> Str
     } else {
         format!("{user}@{host}:{port}")
     }
+}
+
+/// 把远程桌面密码加密写入凭据库（与 SSH 密码同一套）。返回是否已提交入库。
+///
+/// 只对已保存主机（id 非 0）且库已解锁时生效；写库是异步的，不阻塞界面线程。
+fn store_desktop_secret(
+    vault: Option<Arc<Vault>>,
+    saved_host: Option<i64>,
+    password: &str,
+    cx: &mut Context<RuTermApp>,
+) -> bool {
+    let (Some(vault), Some(host_id)) = (vault, saved_host.filter(|id| *id != 0)) else {
+        return false;
+    };
+    if password.is_empty() {
+        return false;
+    }
+    let secret = password.to_string();
+    cx.spawn(async move |_, _| {
+        if let Err(error) = vault.set_password(host_id, Some(&secret)).await {
+            log::warn!("保存远程桌面凭据失败: {error}");
+        }
+    })
+    .detach();
+    true
+}
+
+/// 保存主机后写密码：先 upsert 确保行存在（新建主机时 id 是刚分配的），再加密写库；
+/// 两步放在同一任务里，避免与 `persist_host` 的并发写入抢先后导致密码落在不存在的行上。
+fn store_desktop_secret_after_save(
+    vault: Option<Arc<Vault>>,
+    host: HostConfig,
+    password: &str,
+    cx: &mut Context<RuTermApp>,
+) -> bool {
+    let Some(vault) = vault else {
+        return false;
+    };
+    if host.id == 0 || password.is_empty() {
+        return false;
+    }
+    let secret = password.to_string();
+    cx.spawn(async move |_, _| {
+        if let Err(error) = vault.upsert(&host).await {
+            log::warn!("保存远程桌面主机失败: {error}");
+            return;
+        }
+        if let Err(error) = vault.set_password(host.id, Some(&secret)).await {
+            log::warn!("保存远程桌面凭据失败: {error}");
+        }
+    })
+    .detach();
+    true
+}
+
+/// 认证失败后清掉库里存的旧密码，否则重启后直连仍会拿失效密码重试。
+fn clear_desktop_secret(
+    vault: Option<Arc<Vault>>,
+    saved_host: Option<i64>,
+    cx: &mut Context<RuTermApp>,
+) {
+    let (Some(vault), Some(host_id)) = (vault, saved_host.filter(|id| *id != 0)) else {
+        return;
+    };
+    cx.spawn(async move |_, _| {
+        if let Err(error) = vault.set_password(host_id, None).await {
+            log::warn!("清除远程桌面凭据失败: {error}");
+        }
+    })
+    .detach();
 }
 
 /// RDP 失败信息是否属于「凭据不对」：这类错误回表单让用户改密码，

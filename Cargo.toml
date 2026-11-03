@@ -32,6 +32,8 @@ des = "0.9"
 image = { version = "0.25.10", default-features = false }
 # RDP 客户端（IronRDP）。客户端 + 输入 + 协议层 + 剪贴板重定向；服务端 / 音频不拉进来。
 # 剪贴板在 Windows 上由 ironrdp-cliprdr-native 直接挂系统剪贴板，文本双向自动同步。
+# 本机副本还提供拖放上传的进度登记（写剪贴板前登记，剪贴板线程回报已发送字节）。
+ironrdp-cliprdr-native = { path = "vendor/cliprdr-native" }
 ironrdp = { version = "0.17", default-features = false, features = [
     "client",
     "client-clipboard",
@@ -64,6 +66,8 @@ windows = { version = "0.62", default-features = false, features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
     "Win32_Storage_FileSystem",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
     "Win32_System_Ole",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
@@ -74,6 +78,18 @@ png = "0.18"
 winresource = "0.1"
 
 
+
+# 日常 `cargo run` 也把依赖按优化编译：RDP 每个更新包都要整帧搬像素，
+# ironrdp / image / rgpui 这些库在 opt-level 0 下一包要 20+ms，首屏会从上往下
+# 慢慢刷出来、拖动时也卡。
+[profile.dev.package."*"]
+opt-level = 2
+
+# 本 crate 也开一档优化：帧转换、元素树构造这些热路径在 opt-level 0 下慢一个
+# 数量级（实测 1080p 整帧补 alpha 从 20ms 降到 0.4ms），连上 RDP 后每帧都要跑，
+# 不优化就是持续掉帧。opt-level 1 相比 2 的运行时差别很小，但增量编译快得多。
+[profile.dev]
+opt-level = 1
 
 # release 优化
 # 日常发版用 thin LTO（构建快）；打安装包用下面的 size 档（体积最小）。

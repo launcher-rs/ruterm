@@ -95,6 +95,15 @@ impl KeyInput {
             ch,
         })
     }
+
+    /// 修饰键 / CapsLock 的按下抬起：keysym 给 VNC，扫描码给 RDP。
+    pub fn modifier(name: &str) -> Self {
+        Self {
+            keysym: keysym::named_keysym(name).unwrap_or(0),
+            scancode: scancode::named_scancode(name),
+            ch: None,
+        }
+    }
 }
 
 /// 界面发给会话的指令。
@@ -108,6 +117,8 @@ pub enum Command {
     Wheel { x: u16, y: u16, up: bool, buttons: u8 },
     /// 本地剪贴板 → 远端。
     Clipboard(String),
+    /// 把本地文件放上系统剪贴板并让远端粘贴（RDP 文件剪贴板；VNC 忽略）。
+    PasteFiles(Vec<std::path::PathBuf>),
     /// 请求一次增量更新（正常由会话自己排，界面基本不用发）。
     Refresh,
     /// 请求整帧（切回标签、自适应时用）。
@@ -127,6 +138,14 @@ pub enum Event {
     FrameReady,
     /// 每秒一次的实际帧率（toolbar 的 `Nfps`）。
     Fps { fps: f32 },
+    /// 拖放文件上传进度（RDP 文件剪贴板）：已发送 / 总字节、文件数、是否结束。
+    Upload {
+        done: u64,
+        total: u64,
+        files: u32,
+        finished: bool,
+        failed: bool,
+    },
     /// 远端剪贴板。
     Clipboard(String),
     /// 会话结束（正常关闭或出错），原因就地展示。
@@ -232,6 +251,8 @@ async fn connect_vnc(config: Config) -> Result<Session> {
                 Command::RequestFull => vnc::update_request_message(false, width, height),
                 // VNC 的动态分辨率要协商 ExtendedDesktopSize，这里不做；忽略即可。
                 Command::Resize { .. } => continue,
+                // RFB 没有文件剪贴板，界面侧已提前拦下并提示。
+                Command::PasteFiles(_) => continue,
                 Command::Close => {
                     let _ = writer.shutdown().await;
                     break;

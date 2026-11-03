@@ -7498,6 +7498,7 @@ dependencies = [
  "getrandom 0.4.3",
  "image",
  "ironrdp",
+ "ironrdp-cliprdr-native",
  "keyring",
  "log",
  "png",

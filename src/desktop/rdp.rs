@@ -3,7 +3,8 @@
 //! `RdpClient::run` 的 future 不是 `Send`，整条会话跑在独立线程的 current-thread
 //! 运行时上；与界面之间只用 tokio 通道和一个帧槽位对接，界面线程不做任何网络 IO。
 
-use std::sync::Mutex;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
@@ -11,13 +12,8 @@ use ironrdp::client::config::{ConfigBuilder, Destination};
 use ironrdp::client::rdp::{RdpClient, RdpInputEvent, RdpOutputEvent};
 use ironrdp::input::{Database, MouseButton, MousePosition, Operation, Scancode, WheelRotations};
 use ironrdp::pdu::rdp::capability_sets::MajorPlatformType;
+use ironrdp_cliprdr_native::upload::{UploadProgress, begin_upload, cancel_upload};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
-#[cfg(windows)]
-use windows::Win32::System::Ole::{OleInitialize, OleUninitialize};
-#[cfg(windows)]
-use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, MSG, PM_REMOVE, PeekMessageW, TranslateMessage,
-};
 
 use super::{Command, Config, Event, KeyInput, Session, Snapshot};
 
@@ -27,8 +23,16 @@ const CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
 const FPS_INTERVAL: Duration = Duration::from_secs(1);
 /// 快照发布的最小间隔：RDP 的增量更新很密，整帧转换与纹理上传不必跟着每个包走。
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
-/// 剪贴板监听窗口的 Win32 消息泵间隔（见 `pump_messages`）。
-const PUMP_INTERVAL: Duration = Duration::from_millis(10);
+/// 文件列表进剪贴板后最多等这么久，再替用户按 Ctrl+V（正常情况远端一确认就按）。
+const PASTE_FALLBACK: Duration = Duration::from_secs(2);
+/// 上传进度的轮询间隔。
+const UPLOAD_TICK: Duration = Duration::from_millis(200);
+/// 开始接收后，多久没有新字节就认为传输停了。
+const UPLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
+/// 远端已回执、但一直没开始读字节：多半是卡在同名文件覆盖确认框上，等人点。
+const UPLOAD_START_TIMEOUT: Duration = Duration::from_secs(120);
+/// 剪贴板线程枚举大目录的宽限；超过还没认出这批文件就当登记失败。
+const UPLOAD_ENUM_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// 连上服务器：建好客户端配置后把会话交给专用线程。
 pub async fn connect(config: Config) -> Result<Session> {
@@ -94,10 +98,6 @@ fn run_session(
         .enable_all()
         .build()
         .context("创建 RDP 运行时失败")?;
-    // IronRDP 的剪贴板监听窗口在本线程创建，Win32 消息也只能在本线程泵；
-    // 先把线程挂到 OLE STA，远端复制的文件才能作为数据对象放进本机剪贴板。
-    #[cfg(windows)]
-    let _com = ComApartment::new();
     runtime.block_on(async {
         let (output_tx, mut output_rx) = tokio::sync::mpsc::channel::<RdpOutputEvent>(1);
         let client = RdpClient::new(client_config, output_tx);
@@ -117,10 +117,11 @@ fn run_session(
             .checked_sub(FRAME_INTERVAL)
             .unwrap_or_else(Instant::now);
         let mut pending_at: Option<Instant> = None;
-        // 持续存在的计时器：select! 每轮都会重建其它 future，用 sleep 会在密集帧
-        // 期间被反复重置而饿死消息泵。
-        let mut pump = tokio::time::interval(PUMP_INTERVAL);
-        pump.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // 拖放文件：先放进本机剪贴板，等远端确认文件列表后替用户按一次 Ctrl+V；
+        // 同时轮询剪贴板线程回报的已发送字节，供界面画进度条。
+        let mut upload: Option<UploadState> = None;
+        // 下次轮询上传进度的时间（固定节拍，避免被高频帧事件不断重置）。
+        let mut upload_tick: Option<Instant> = None;
 
         loop {
             tokio::select! {
@@ -147,8 +148,7 @@ fn run_session(
                         Output::Ended => return,
                         Output::Dirty => {
                             if last_publish.elapsed() >= FRAME_INTERVAL {
-                                flush_frame(event_tx, latest, &frame, &mut last_publish);
-                                pending_at = None;
+                                pending_at = flush_or_retry(event_tx, latest, &frame, &mut last_publish);
                             } else {
                                 pending_at.get_or_insert(last_publish + FRAME_INTERVAL);
                             }
@@ -163,8 +163,31 @@ fn run_session(
                         let _ = input.send(RdpInputEvent::Close);
                         return;
                     };
-                    if handle_command(command, &mut database, &input, latest, frame.as_ref()) {
-                        close_at = Some(Instant::now() + CLOSE_TIMEOUT);
+                    match command {
+                        Command::PasteFiles(paths) => {
+                            // 放进本机剪贴板即可：剪贴板线程的监听窗口会把文件列表报给远端。
+                            // 先登记进度再写剪贴板，剪贴板线程才认领得到。
+                            let progress = begin_upload(&paths);
+                            if set_clipboard_files(&paths) {
+                                upload = Some(UploadState::new(progress));
+                                upload_tick = Some(Instant::now());
+                            } else {
+                                cancel_upload(&progress);
+                                // 本机剪贴板被占用之类：明确告诉界面，别让它停在「已放进剪贴板」。
+                                let _ = event_tx.send(Event::Upload {
+                                    done: 0,
+                                    total: 0,
+                                    files: 0,
+                                    finished: true,
+                                    failed: true,
+                                });
+                            }
+                        }
+                        command => {
+                            if handle_command(command, &mut database, &input, latest, frame.as_ref()) {
+                                close_at = Some(Instant::now() + CLOSE_TIMEOUT);
+                            }
+                        }
                     }
                 }
                 _ = async {
@@ -174,8 +197,7 @@ fn run_session(
                         std::future::pending::<()>().await;
                     }
                 }, if pending_at.is_some() => {
-                    flush_frame(event_tx, latest, &frame, &mut last_publish);
-                    pending_at = None;
+                    pending_at = flush_or_retry(event_tx, latest, &frame, &mut last_publish);
                 }
                 _ = async {
                     if let Some(deadline) = close_at {
@@ -186,9 +208,78 @@ fn run_session(
                 }, if close_at.is_some() => {
                     return;
                 }
-                // 剪贴板监听窗口与 OLE 的跨线程调用都靠本线程泵消息。
-                _ = pump.tick() => {
-                    pump_messages();
+                // 上传中的文件：远端确认文件列表后替用户按 Ctrl+V，同时回报进度。
+                _ = async {
+                    if let Some(deadline) = upload_tick {
+                        tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                }, if upload_tick.is_some() => {
+                    let Some(state) = upload.as_mut() else {
+                        upload_tick = None;
+                        continue;
+                    };
+                    // 剪贴板线程已把这批文件报给远端，才有必要按键；否则远端剪贴板还是旧内容。
+                    if state.progress.started()
+                        && state
+                            .paste_at
+                            .is_some_and(|deadline| state.progress.acknowledged() || Instant::now() >= deadline)
+                    {
+                        state.paste_at = None;
+                        send_input(&mut database, &input, paste_operations());
+                    }
+
+                    let done = state.progress.sent();
+                    if done != state.last_done {
+                        state.last_done = done;
+                        state.last_change = Instant::now();
+                    }
+                    if state.started_at.is_none() && state.progress.started() {
+                        state.started_at = Some(Instant::now());
+                    }
+                    // 远端开始读字节（或已回执）就算进入接收阶段：此后只看「还有没有新字节」。
+                    let reading = state.progress.acknowledged() || done > 0;
+                    if reading && !state.acked_seen {
+                        state.acked_seen = true;
+                        state.last_change = Instant::now();
+                    }
+                    if !state.progress.failed() {
+                        let stalled = if state.started_at.is_none() {
+                            // 还在枚举目录：大文件夹可能很久，别拿建连超时误判。
+                            state.since.elapsed() >= UPLOAD_ENUM_TIMEOUT
+                        } else if done == 0 {
+                            // 远端收下列表后可能弹了覆盖确认框：等用户点完，别急着判失败。
+                            state.last_change.elapsed() >= UPLOAD_START_TIMEOUT
+                        } else {
+                            state.last_change.elapsed() >= UPLOAD_IDLE_TIMEOUT
+                        };
+                        if stalled && state.paste_at.is_none() {
+                            state.progress.abort();
+                        }
+                    }
+
+                    let failed = state.progress.failed();
+                    let reportable = state.progress.started() || failed;
+                    if reportable
+                        && (done != state.reported_done || failed != state.reported_failed)
+                    {
+                        state.reported_done = done;
+                        state.reported_failed = failed;
+                        let _ = event_tx.send(Event::Upload {
+                            done,
+                            total: state.progress.total(),
+                            files: state.progress.files(),
+                            finished: state.progress.finished(),
+                            failed,
+                        });
+                    }
+                    if state.progress.finished() {
+                        upload = None;
+                        upload_tick = None;
+                    } else {
+                        upload_tick = Some(Instant::now() + UPLOAD_TICK);
+                    }
                 }
             }
         }
@@ -196,45 +287,39 @@ fn run_session(
     Ok(())
 }
 
-/// 会话线程的 OLE 单线程套间；线程退出时在同一线程卸载。
-#[cfg(windows)]
-struct ComApartment(bool);
-
-#[cfg(windows)]
-impl ComApartment {
-    fn new() -> Self {
-        // SAFETY: 会话线程新建，尚未初始化 COM；卸载在 Drop 里同线程完成。
-        Self(unsafe { OleInitialize(None) }.is_ok())
-    }
+/// 一次拖放上传的界面侧跟踪状态。
+struct UploadState {
+    progress: Arc<UploadProgress>,
+    /// 还没替用户按 Ctrl+V（等远端确认文件列表，或兜底超时）。
+    paste_at: Option<Instant>,
+    since: Instant,
+    last_done: u64,
+    last_change: Instant,
+    /// 剪贴板线程开始上报这批文件的时间（枚举完目录才有）。
+    started_at: Option<Instant>,
+    /// 已经看到远端回执或实际读取字节。
+    acked_seen: bool,
+    reported_done: u64,
+    reported_failed: bool,
 }
 
-#[cfg(windows)]
-impl Drop for ComApartment {
-    fn drop(&mut self) {
-        if self.0 {
-            // SAFETY: 与 `OleInitialize` 在同一线程配对。
-            unsafe { OleUninitialize() };
+impl UploadState {
+    fn new(progress: Arc<UploadProgress>) -> Self {
+        let now = Instant::now();
+        Self {
+            progress,
+            paste_at: Some(now + PASTE_FALLBACK),
+            since: now,
+            last_done: 0,
+            last_change: now,
+            started_at: None,
+            acked_seen: false,
+            // 首轮进度一定要发一次，界面才知道要画卡片。
+            reported_done: u64::MAX,
+            reported_failed: false,
         }
     }
 }
-
-/// 泵一轮本线程的 Win32 消息（空窗口句柄＝只取本线程的）。
-#[cfg(windows)]
-fn pump_messages() {
-    let mut message = MSG::default();
-    // SAFETY: 标准的线程消息泵。
-    while unsafe { PeekMessageW(&mut message, None, 0, 0, PM_REMOVE) }.as_bool() {
-        // SAFETY: 消息由 `PeekMessageW` 取到，按常规分发。
-        unsafe {
-            let _ = TranslateMessage(&message);
-            DispatchMessageW(&message);
-        }
-    }
-}
-
-/// 非 Windows 没有剪贴板监听窗口，无需泵消息。
-#[cfg(not(windows))]
-fn pump_messages() {}
 
 /// 一条服务器输出对会话的影响。
 enum Output {
@@ -246,18 +331,37 @@ enum Output {
     Ended,
 }
 
-/// 把 `frame` 里最新整帧转成快照发布（槽位已有帧时放弃这次）。
+/// 把 `frame` 里最新整帧转成快照发布；返回是否真的发布成功。
 fn flush_frame(
     event_tx: &UnboundedSender<Event>,
     latest: &Mutex<Option<Snapshot>>,
     frame: &Option<Frame>,
     last_publish: &mut Instant,
-) {
+) -> bool {
     *last_publish = Instant::now();
     if let Some(current) = frame.as_ref()
         && publish_frame(latest, current)
     {
         let _ = event_tx.send(Event::FrameReady);
+        return true;
+    }
+    false
+}
+
+/// 尝试发布最新整帧；返回下一次需要重试的时间（`None` 表示无需重试）。
+///
+/// 界面还没取走上一帧时槽位是占着的，这次转换会直接跳过；隔一拍再试，
+/// 保证画面停止变化时最新一帧最终一定能送到界面。
+fn flush_or_retry(
+    event_tx: &UnboundedSender<Event>,
+    latest: &Mutex<Option<Snapshot>>,
+    frame: &Option<Frame>,
+    last_publish: &mut Instant,
+) -> Option<Instant> {
+    if flush_frame(event_tx, latest, frame, last_publish) || frame.is_none() {
+        None
+    } else {
+        Some(Instant::now() + FRAME_INTERVAL)
     }
 }
 
@@ -323,20 +427,63 @@ fn report_fps(event_tx: &UnboundedSender<Event>, frames: &mut u32, stats_at: &mu
     *stats_at = Instant::now();
 }
 
-/// 把整屏 `0x00RRGGBB` 转成界面用的 BGRA；界面还没取走上一帧就丢掉这次转换。
+/// 把整屏 `0x00RRGGBB` 拷成界面用的 BGRA（高字节补 0xFF）。
+///
+/// 小端下 `0x00RRGGBB` 在内存里正好是 B,G,R,0，拷贝和补 alpha 合成一趟，
+/// 1080p 一帧比「先 memcpy 再遍历补字节」少读一整块内存。这一步和解码共用
+/// 会话线程，x86_64 用 SSE2 一次处理 4 个像素。
+#[cfg(all(target_endian = "little", target_arch = "x86_64"))]
+fn to_bgra(buffer: &[u32]) -> Vec<u8> {
+    use std::arch::x86_64::{_mm_loadu_si128, _mm_or_si128, _mm_set1_epi32, _mm_storeu_si128};
+
+    let mut bgra = Vec::<u8>::with_capacity(buffer.len() * 4);
+    // SAFETY: x86_64 基线含 SSE2，无需运行时探测；下面按整像素写满
+    // `len * 4` 字节后才 set_len，u8 无需析构，中间不会观察未初始化内存。
+    unsafe {
+        let alpha = _mm_set1_epi32(0xFF00_0000u32 as i32);
+        let src = buffer.as_ptr().cast::<u8>();
+        let dst = bgra.as_mut_ptr();
+        let mut i = 0;
+        while i + 4 <= buffer.len() {
+            let pixels = _mm_loadu_si128(src.add(i * 4).cast());
+            _mm_storeu_si128(dst.add(i * 4).cast(), _mm_or_si128(pixels, alpha));
+            i += 4;
+        }
+        while i < buffer.len() {
+            std::ptr::write_unaligned(dst.add(i * 4).cast::<u32>(), buffer[i] | 0xFF00_0000);
+            i += 1;
+        }
+        bgra.set_len(buffer.len() * 4);
+    }
+    bgra
+}
+
+#[cfg(not(all(target_endian = "little", target_arch = "x86_64")))]
+fn to_bgra(buffer: &[u32]) -> Vec<u8> {
+    buffer
+        .iter()
+        .flat_map(|pixel| (*pixel | 0xFF00_0000).to_le_bytes())
+        .collect()
+}
+
+/// 把整屏转成 BGRA 快照；界面还没取走上一帧就丢掉这次转换。
+///
+/// 转换在锁外完成：界面线程取快照时只拿一下锁，不会被这几 MB 的搬运挡在后面。
 fn publish_frame(latest: &Mutex<Option<Snapshot>>, frame: &Frame) -> bool {
+    // 槽位非空说明界面还没取走上一帧，这次连转换都省掉。
+    match latest.lock() {
+        Ok(slot) if slot.is_none() => {}
+        _ => return false,
+    }
+    let (buffer, width, height) = frame;
+    let bgra = to_bgra(buffer);
+
     let Ok(mut slot) = latest.lock() else {
         return false;
     };
+    // 槽位只有本函数写；转换期间界面只会把它取空，这里照旧确认一次。
     if slot.is_some() {
         return false;
-    }
-    let (buffer, width, height) = frame;
-    // 源像素是 0x00RRGGBB；补上不透明 alpha 后按小端写出的字节序正好是 B,G,R,A，
-    // 整块只需一次按 4 字节步进的拷贝，逐通道拆分的开销省掉。
-    let mut bgra = vec![0u8; buffer.len() * 4];
-    for (pixel, out) in buffer.iter().zip(bgra.as_chunks_mut::<4>().0) {
-        out.copy_from_slice(&(*pixel | 0xFF00_0000).to_le_bytes());
     }
     *slot = Some(Snapshot {
         width: *width,
@@ -396,6 +543,8 @@ fn handle_command(
         // 剪贴板由 WinClipboard 后端直接挂系统剪贴板（文本与文件都自动双向同步）；
         // 界面侧再发一遍会覆盖远端刚复制的内容，这里忽略。
         Command::Clipboard(_) => false,
+        // 文件拖放在会话循环里先进剪贴板、再按 Ctrl+V，不走这里。
+        Command::PasteFiles(_) => false,
         // RDP 只在画面变化时推帧；界面要整帧时把最后一帧再放回槽位。
         Command::Refresh | Command::RequestFull => {
             if let Some(frame) = frame {
@@ -452,4 +601,127 @@ fn key_operation(key: KeyInput, down: bool) -> Option<Operation> {
     } else {
         Operation::UnicodeKeyReleased(character)
     })
+}
+
+/// Ctrl+V：文件列表到远端后，由资源管理器把文件粘到当前文件夹。
+fn paste_operations() -> [Operation; 4] {
+    let ctrl = Scancode::from_u16(0x1D);
+    let v = Scancode::from_u16(0x2F);
+    [
+        Operation::KeyPressed(ctrl),
+        Operation::KeyPressed(v),
+        Operation::KeyReleased(v),
+        Operation::KeyReleased(ctrl),
+    ]
+}
+
+/// 把文件列表放进系统剪贴板（`CF_HDROP`）：剪贴板线程的监听窗口会把它报给远端。
+///
+/// 只做本机剪贴板写入，不需要 OLE；剪贴板线程负责发现这次变化。
+#[cfg(windows)]
+fn set_clipboard_files(paths: &[PathBuf]) -> bool {
+    use std::os::windows::ffi::OsStrExt as _;
+
+    use windows::Win32::Foundation::{GlobalFree, HANDLE};
+    use windows::Win32::System::DataExchange::{
+        CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+    };
+    use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
+    use windows::Win32::System::Ole::CF_HDROP;
+    use windows::Win32::UI::Shell::DROPFILES;
+
+    if paths.is_empty() {
+        return false;
+    }
+    // DROPFILES 头 + 每项一个 \0，末尾再补一个 \0 结束列表。
+    let mut names: Vec<u16> = Vec::new();
+    for path in paths {
+        names.extend(path.as_os_str().encode_wide());
+        names.push(0);
+    }
+    names.push(0);
+    let header = std::mem::size_of::<DROPFILES>();
+    let bytes = header + names.len() * std::mem::size_of::<u16>();
+
+    // SAFETY: 剪贴板在 OpenClipboard / CloseClipboard 之间独占；写入的 HGLOBAL
+    // 成功交给系统后不再由本进程释放。
+    unsafe {
+        if OpenClipboard(None).is_err() {
+            return false;
+        }
+        let result = (|| -> windows::core::Result<()> {
+            EmptyClipboard()?;
+            let memory = GlobalAlloc(GMEM_MOVEABLE, bytes)?;
+            let base = GlobalLock(memory);
+            if base.is_null() {
+                let _ = GlobalFree(Some(memory));
+                return Err(windows::core::Error::from_thread());
+            }
+            std::ptr::write(
+                base.cast::<DROPFILES>(),
+                DROPFILES {
+                    pFiles: u32::try_from(header).expect("DROPFILES 头长度"),
+                    pt: Default::default(),
+                    fNC: false.into(),
+                    fWide: true.into(),
+                },
+            );
+            std::ptr::copy_nonoverlapping(
+                names.as_ptr(),
+                base.cast::<u16>().add(header / 2),
+                names.len(),
+            );
+            let _ = GlobalUnlock(memory);
+            if SetClipboardData(u32::from(CF_HDROP.0), Some(HANDLE(memory.0))).is_err() {
+                let _ = GlobalFree(Some(memory));
+                return Err(windows::core::Error::from_thread());
+            }
+            Ok(())
+        })();
+        let _ = CloseClipboard();
+        result.is_ok()
+    }
+}
+
+/// 非 Windows 没有系统剪贴板文件通道；RDP 文件粘贴只在 Windows 生效。
+#[cfg(not(windows))]
+fn set_clipboard_files(_paths: &[PathBuf]) -> bool {
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn publish_frame_writes_opaque_bgra() {
+        let latest = Mutex::new(None);
+        // 0x00RRGGBB = 红 0x11、绿 0x22、蓝 0x33。
+        let frame = (vec![0x0011_2233], 1, 1);
+        assert!(publish_frame(&latest, &frame));
+
+        let snapshot = latest.lock().unwrap().take().expect("快照已发布");
+        assert_eq!((snapshot.width, snapshot.height), (1, 1));
+        assert_eq!(snapshot.bgra, vec![0x33, 0x22, 0x11, 0xFF]);
+    }
+
+    #[test]
+    fn publish_frame_skips_when_slot_is_busy() {
+        let latest = Mutex::new(Some(Snapshot {
+            width: 1,
+            height: 1,
+            bgra: vec![0; 4],
+        }));
+        assert!(!publish_frame(&latest, &(vec![0x0011_2233], 1, 1)));
+    }
+
+    #[test]
+    fn to_bgra_converts_simd_blocks_and_tail() {
+        // 7 个像素：SSE2 一次 4 个，剩下的零头走逐像素分支。
+        let bgra = to_bgra(&vec![0x0011_2233; 7]);
+        assert_eq!(bgra.len(), 7 * 4);
+        for pixel in bgra.chunks_exact(4) {
+            assert_eq!(pixel, [0x33, 0x22, 0x11, 0xFF]);
+        }
+    }
 }

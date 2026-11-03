@@ -11,7 +11,7 @@ mod transport;
 mod utils;
 
 use std::rc::Rc;
-use std::sync::{Arc, mpsc as mpsc_sync};
+use std::sync::{Arc, mpsc, mpsc as mpsc_sync};
 
 use ironrdp_cliprdr::backend::{ClipboardMessageProxy, CliprdrBackend, CliprdrBackendFactory};
 use ironrdp_cliprdr::pdu::{
@@ -21,15 +21,14 @@ use ironrdp_cliprdr::pdu::{
 use tracing::{debug, warn};
 pub use windows::Win32::Foundation::HWND;
 use windows::Win32::Foundation::{CLIPBRD_E_CANT_OPEN, E_ACCESSDENIED, FALSE, LPARAM, LRESULT, WPARAM};
-use windows::Win32::System::Com::{APTTYPE, APTTYPE_MAINSTA, APTTYPE_STA, APTTYPEQUALIFIER, CoGetApartmentType};
 use windows::Win32::System::DataExchange::AddClipboardFormatListener;
 use windows::Win32::System::LibraryLoader::GetModuleHandleA;
 use windows::Win32::System::Ole::{OleInitialize, OleUninitialize};
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Shell::SetWindowSubclass;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CW_USEDEFAULT, CreateWindowExA, DefWindowProcA, GetClassInfoA, PostMessageW, RegisterClassA, WINDOW_EX_STYLE,
-    WM_USER, WNDCLASSA, WS_POPUP,
+    CW_USEDEFAULT, CreateWindowExA, DefWindowProcA, DestroyWindow, DispatchMessageW, GetClassInfoA, GetMessageW,
+    MSG, PostThreadMessageW, RegisterClassA, TranslateMessage, WINDOW_EX_STYLE, WM_QUIT, WM_USER, WNDCLASSA, WS_POPUP,
 };
 use windows::core::{Error, s};
 
@@ -39,9 +38,6 @@ use self::shared::ClipboardShared;
 
 const BACKEND_CHANNEL_SIZE: usize = 8;
 const WM_CLIPRDR_BACKEND_EVENT: u32 = WM_USER;
-/// Posted by a [`WinClipboard`] dropped on another thread than its own, with its reference to the
-/// window state as `lparam`.
-const WM_CLIPRDR_RELEASE: u32 = WM_USER + 1;
 
 pub type WinCliprdrResult<T> = Result<T, WinCliprdrError>;
 
@@ -59,6 +55,7 @@ pub enum WinCliprdrError {
     Alloc,
     DataReceiveTimeout,
     RenderFormat,
+    ThreadSpawn,
     WinAPI(Error),
 }
 
@@ -79,6 +76,7 @@ impl core::fmt::Display for WinCliprdrError {
             WinCliprdrError::Alloc => write!(f, "failed to allocate global memory"),
             WinCliprdrError::DataReceiveTimeout => write!(f, "failed to receive data from remote clipboard"),
             WinCliprdrError::RenderFormat => write!(f, "failed to render clipboard format"),
+            WinCliprdrError::ThreadSpawn => write!(f, "failed to spawn the clipboard thread"),
             WinCliprdrError::WinAPI(_error) => write!(f, "WinAPI error"),
         }
     }
@@ -99,6 +97,7 @@ impl core::error::Error for WinCliprdrError {
             WinCliprdrError::Alloc => None,
             WinCliprdrError::DataReceiveTimeout => None,
             WinCliprdrError::RenderFormat => None,
+            WinCliprdrError::ThreadSpawn => None,
             WinCliprdrError::WinAPI(error) => Some(error),
         }
     }
@@ -152,17 +151,21 @@ pub(crate) enum BackendEvent {
 /// [`WinClipboard`] instance holds ownership of the actual clipboard backend processing logic
 /// and should be kept alive during the whole lifetime of the application.
 ///
-/// This type is not thread safe, it should be used only in the main thread with a windows event
-/// loop. (GUI thread). However, backend factory returned by [`WinClipboard::backend_factory`]
-/// can be safely used in other threads.
+/// # Threading
+///
+/// The hidden window, its subclass and OLE live on a dedicated thread owned by this type,
+/// which runs its own blocking message loop. This is required: `WM_RENDERFORMAT` must fetch
+/// the remote data before returning, while the answer comes from the `CLIPRDR` session loop;
+/// on a shared thread the two would wait on each other until the fetch times out. The embedder
+/// no longer has to pump this window's messages.
 ///
 /// # File transfer
 ///
 /// Files are copied in both directions ([MS-RDPECLIP] file stream protocol): local files
 /// (`CF_HDROP`, or `FileGroupDescriptorW` from another application) are offered to the
 /// remote, and remote files are put on the local clipboard as an OLE data object, so that
-/// pasting into Explorer works. The latter needs a single-threaded apartment: it is only
-/// enabled when [`WinClipboard`] is created on an STA thread (a GUI thread normally is).
+/// pasting into Explorer works. The latter needs a single-threaded apartment: the clipboard
+/// thread is initialized as one whenever file transfer is enabled.
 ///
 /// File transfer is off unless enabled with [`WinClipboard::with_file_transfer`]. The embedder
 /// must then route [`ClipboardMessage::SendInitiateFileCopy`],
@@ -185,18 +188,17 @@ pub struct WinClipboard {
     backend_tx: mpsc_sync::SyncSender<BackendEvent>,
     file_transfer: bool,
     shared: Arc<ClipboardShared>,
-    /// Shared with the window subclass; `None` once dropped.
-    state: Option<Rc<ClipboardWindowState>>,
-    /// The thread that created the window, which owns it, its subclass and OLE.
+    /// 剪贴板窗口所在线程：Drop 向它投递 `WM_QUIT`，由它自己收尾。
     thread_id: u32,
+}
 
-    /// From MS docs:
-    /// ```text
-    /// You cannot use the subclassing helper functions to subclass a window across threads
-    /// ```
-    ///
-    /// Therefore this type should be non-Send and non-Sync to prevent incorrect use.
-    _thread_marker: core::marker::PhantomData<*const ()>,
+/// 剪贴板线程启动成功时交回父线程的东西：窗口句柄、事件通道与线程 id。
+///
+/// 句柄以整数传递：`HWND` 本身不是 `Send`，而窗口只属于工作线程，父线程只拿它投消息。
+struct ClipboardThreadStart {
+    window: isize,
+    backend_tx: mpsc_sync::SyncSender<BackendEvent>,
+    thread_id: u32,
 }
 
 impl WinClipboard {
@@ -218,107 +220,27 @@ impl WinClipboard {
         message_proxy: impl ClipboardMessageProxy + 'static,
         file_transfer: bool,
     ) -> WinCliprdrResult<Self> {
-        extern "system" fn wndproc(window: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-            // SAFETY: default handler
-            unsafe { DefWindowProcA(window, message, wparam, lparam) }
-        }
-
-        // SAFETY: low-level WinAPI call
-        let instance = unsafe { GetModuleHandleA(None)? };
-        let window_class = s!("IronRDPClipboardMonitor");
-
-        let mut existing_wc = WNDCLASSA::default();
-        // SAFETY: `instance` is a valid module handle, `window_class` is a valid null-terminated string,
-        // and `existing_wc` is a valid mutable reference to a WNDCLASSA structure.
-        let class_exists = unsafe { GetClassInfoA(Some(instance.into()), window_class, &mut existing_wc).is_ok() };
-
-        if !class_exists {
-            let wc = WNDCLASSA {
-                hInstance: instance.into(),
-                lpszClassName: window_class,
-                lpfnWndProc: Some(wndproc),
-                ..Default::default()
-            };
-
-            // SAFETY: low-level WinAPI call
-            let atom = unsafe { RegisterClassA(&wc) };
-            if atom == 0 {
-                return Err(WinCliprdrError::from(Error::from_thread()));
-            }
-        }
-
-        // SAFETY: low-level WinAPI call
-        let window = unsafe {
-            CreateWindowExA(
-                WINDOW_EX_STYLE::default(),
-                window_class,
-                None,
-                WS_POPUP,
-                CW_USEDEFAULT,
-                CW_USEDEFAULT,
-                CW_USEDEFAULT,
-                CW_USEDEFAULT,
-                None,
-                None,
-                Some(instance.into()),
-                None,
-            )?
-        };
-
-        if window.is_invalid() {
-            return Err(WinCliprdrError::from(Error::from_thread()));
-        }
-        // Init clipboard processing for WinAPI event loop
-        //
-        // SAFETY: `window` is a valid window handle
-        unsafe { AddClipboardFormatListener(window)? };
-
-        let (backend_tx, backend_rx) = mpsc_sync::sync_channel(BACKEND_CHANNEL_SIZE);
-
-        let ole_initialized = file_transfer && init_ole();
-
         let shared = Arc::new(ClipboardShared::new(Box::new(message_proxy)));
+        let (start_tx, start_rx) = mpsc::channel();
 
-        let state = Rc::new(ClipboardWindowState::new(WinClipboardImpl::new(
-            window,
-            Arc::clone(&shared),
-            backend_rx,
-            file_transfer,
-            ole_initialized,
-        )));
+        let thread_shared = Arc::clone(&shared);
+        std::thread::Builder::new()
+            .name("ruterm-cliprdr".to_string())
+            .spawn(move || clipboard_thread(thread_shared, file_transfer, start_tx))
+            .map_err(|error| {
+                debug!(%error, "Failed to spawn the clipboard thread");
+                WinCliprdrError::ThreadSpawn
+            })?;
 
-        let subclass_reference = Rc::into_raw(Rc::clone(&state)).expose_provenance();
-
-        // We need to receive winapi messages in the main thread, so we need to add a subclass to
-        // the window.
-        //
-        // SAFETY: `window` is a valid window handle, `clipboard_subproc` is in the static memory,
-        // and the subclass gets its own reference to the state, from `Rc::into_raw`.
-        let winapi_result = unsafe { SetWindowSubclass(window, Some(clipboard_subproc), 0, subclass_reference) };
-
-        if winapi_result == FALSE {
-            // SAFETY: The reference comes from `Rc::into_raw` above and the subclass never got it.
-            drop(unsafe {
-                Rc::from_raw(core::ptr::with_exposed_provenance::<ClipboardWindowState>(
-                    subclass_reference,
-                ))
-            });
-            if ole_initialized {
-                // SAFETY: Balances the successful `OleInitialize` above, on the same thread.
-                unsafe { OleUninitialize() };
-            }
-            return Err(WinCliprdrError::WindowSubclass);
-        }
+        // 等线程把窗口建好再返回：之后它只负责收消息，不再回传结果。
+        let start = start_rx.recv().map_err(|_| WinCliprdrError::ThreadSpawn)??;
 
         Ok(Self {
-            window,
-            backend_tx,
+            window: HWND(start.window as *mut core::ffi::c_void),
+            backend_tx: start.backend_tx,
             file_transfer,
             shared,
-            state: Some(state),
-            // SAFETY: Always safe to call.
-            thread_id: unsafe { GetCurrentThreadId() },
-            _thread_marker: Default::default(),
+            thread_id: start.thread_id,
         })
     }
 
@@ -335,64 +257,175 @@ impl WinClipboard {
 
 impl Drop for WinClipboard {
     fn drop(&mut self) {
-        let Some(state) = self.state.take() else {
-            return;
-        };
-
-        // SAFETY: Always safe to call.
-        if unsafe { GetCurrentThreadId() } == self.thread_id {
-            release(self.window, state);
-            return;
-        }
-
-        // Dropped on another thread, e.g. by a .NET finalizer: the window, its subclass and OLE
-        // belong to the thread that created them, so the reference is handed over to it rather
-        // than used, or waited on, from here.
-        let address = Rc::into_raw(state).expose_provenance();
-
-        // SAFETY: Posting is safe from any thread; the window's thread takes over the reference.
-        let posted = unsafe {
-            PostMessageW(
-                Some(self.window),
-                WM_CLIPRDR_RELEASE,
-                WPARAM(0),
-                LPARAM(address.cast_signed()),
-            )
-        };
-
-        if let Err(error) = posted {
-            // The window's thread is gone: leaking the state is all that is safe from here.
-            warn!(%error, "Clipboard dropped on another thread and its own is gone; leaking it");
+        // 窗口、子类与 OLE 都归工作线程；这里只叫它退出，不等它收尾，避免拖慢会话结束。
+        // SAFETY: `PostThreadMessageW` 可以投递到其它线程的消息队列。
+        if let Err(error) = unsafe { PostThreadMessageW(self.thread_id, WM_QUIT, WPARAM(0), LPARAM(0)) } {
+            warn!(%error, "Failed to stop the clipboard thread");
         }
     }
 }
 
-/// Initializes OLE on the current thread if it is a single-threaded apartment.
+/// 剪贴板工作线程：建窗口、处理消息、结束时收尾。
 ///
-/// OLE needs an STA. Threads without COM are left alone, rather than turned into STAs behind
-/// the embedder's back.
-fn init_ole() -> bool {
-    let mut apartment_type = APTTYPE::default();
-    let mut qualifier = APTTYPEQUALIFIER::default();
-    // SAFETY: Both pointers are valid for writes.
-    let apartment = unsafe { CoGetApartmentType(&mut apartment_type, &mut qualifier) };
+/// `WM_RENDERFORMAT` 要同步等远端数据，而答复由 RDP 会话循环驱动；两者同线程会互相
+/// 等死（直到超时），表现为界面卡顿。独立线程后，等待只阻塞这一个线程，会话照常取帧。
+fn clipboard_thread(
+    shared: Arc<ClipboardShared>,
+    file_transfer: bool,
+    started: mpsc::Sender<WinCliprdrResult<ClipboardThreadStart>>,
+) {
+    // 远端文件要作为 OLE 数据对象放进本机剪贴板：本线程只为剪贴板而生，直接初始化成 STA。
+    let ole_initialized = if file_transfer {
+        // SAFETY: 本线程新建，尚未初始化 COM；卸载在收尾时同线程完成。
+        match unsafe { OleInitialize(None) } {
+            Ok(()) => true,
+            Err(error) => {
+                debug!(%error, "Failed to initialize OLE; remote files can't be pasted");
+                false
+            }
+        }
+    } else {
+        false
+    };
 
-    if apartment.is_err() || !(apartment_type == APTTYPE_STA || apartment_type == APTTYPE_MAINSTA) {
-        debug!(
-            ?apartment_type,
-            "Clipboard thread is not a single-threaded apartment; remote files can't be pasted"
-        );
-        return false;
+    let (window, state, backend_tx) = match setup_window(Arc::clone(&shared), file_transfer, ole_initialized) {
+        Ok(setup) => setup,
+        Err(error) => {
+            if ole_initialized {
+                // SAFETY: 与上面的 `OleInitialize` 配对，同线程。
+                unsafe { OleUninitialize() };
+            }
+            let _ = started.send(Err(error));
+            return;
+        }
+    };
+
+    let start = ClipboardThreadStart {
+        window: window.0 as isize,
+        backend_tx,
+        // SAFETY: Always safe to call.
+        thread_id: unsafe { GetCurrentThreadId() },
+    };
+    if started.send(Ok(start)).is_err() {
+        // 父线程在启动完成前就没了：收拾干净再退出。
+        release(window, state);
+        // SAFETY: 窗口属于本线程。
+        unsafe {
+            let _ = DestroyWindow(window);
+        }
+        return;
     }
 
-    // SAFETY: Called on an STA thread; balanced by `OleUninitialize` when the clipboard is torn down.
-    match unsafe { OleInitialize(None) } {
-        Ok(()) => true,
-        Err(error) => {
-            debug!(%error, "Failed to initialize OLE; remote files can't be pasted");
-            false
+    let mut message = MSG::default();
+    loop {
+        // SAFETY: 标准的线程消息循环；`WM_QUIT` 让 `GetMessageW` 返回 0。
+        let result = unsafe { GetMessageW(&mut message, None, 0, 0) };
+        if result.0 <= 0 {
+            break;
+        }
+        // SAFETY: 消息由 `GetMessageW` 取到，按常规分发。
+        unsafe {
+            let _ = TranslateMessage(&message);
+            DispatchMessageW(&message);
         }
     }
+
+    // `release` 摘掉监听与子类、关掉传输并（必要时）卸载 OLE。
+    release(window, state);
+    // SAFETY: 窗口属于本线程。
+    unsafe {
+        let _ = DestroyWindow(window);
+    }
+}
+
+/// 在本线程建隐藏窗口、挂剪贴板监听与子类，返回窗口、状态与事件通道。
+fn setup_window(
+    shared: Arc<ClipboardShared>,
+    file_transfer: bool,
+    ole_available: bool,
+) -> WinCliprdrResult<(HWND, Rc<ClipboardWindowState>, mpsc_sync::SyncSender<BackendEvent>)> {
+    extern "system" fn wndproc(window: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+        // SAFETY: default handler
+        unsafe { DefWindowProcA(window, message, wparam, lparam) }
+    }
+
+    // SAFETY: low-level WinAPI call
+    let instance = unsafe { GetModuleHandleA(None)? };
+    let window_class = s!("IronRDPClipboardMonitor");
+
+    let mut existing_wc = WNDCLASSA::default();
+    // SAFETY: `instance` is a valid module handle, `window_class` is a valid null-terminated string,
+    // and `existing_wc` is a valid mutable reference to a WNDCLASSA structure.
+    let class_exists = unsafe { GetClassInfoA(Some(instance.into()), window_class, &mut existing_wc).is_ok() };
+
+    if !class_exists {
+        let wc = WNDCLASSA {
+            hInstance: instance.into(),
+            lpszClassName: window_class,
+            lpfnWndProc: Some(wndproc),
+            ..Default::default()
+        };
+
+        // SAFETY: low-level WinAPI call
+        let atom = unsafe { RegisterClassA(&wc) };
+        if atom == 0 {
+            return Err(WinCliprdrError::from(Error::from_thread()));
+        }
+    }
+
+    // SAFETY: low-level WinAPI call
+    let window = unsafe {
+        CreateWindowExA(
+            WINDOW_EX_STYLE::default(),
+            window_class,
+            None,
+            WS_POPUP,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            None,
+            None,
+            Some(instance.into()),
+            None,
+        )?
+    };
+
+    if window.is_invalid() {
+        return Err(WinCliprdrError::from(Error::from_thread()));
+    }
+    // Init clipboard processing for WinAPI event loop
+    //
+    // SAFETY: `window` is a valid window handle
+    unsafe { AddClipboardFormatListener(window)? };
+
+    let (backend_tx, backend_rx) = mpsc_sync::sync_channel(BACKEND_CHANNEL_SIZE);
+
+    let state = Rc::new(ClipboardWindowState::new(WinClipboardImpl::new(
+        window,
+        Arc::clone(&shared),
+        backend_rx,
+        file_transfer,
+        ole_available,
+    )));
+
+    let subclass_reference = Rc::into_raw(Rc::clone(&state)).expose_provenance();
+
+    // SAFETY: `window` is a valid window handle, `clipboard_subproc` is in the static memory,
+    // and the subclass gets its own reference to the state, from `Rc::into_raw`.
+    let winapi_result = unsafe { SetWindowSubclass(window, Some(clipboard_subproc), 0, subclass_reference) };
+
+    if winapi_result == FALSE {
+        // SAFETY: The reference comes from `Rc::into_raw` above and the subclass never got it.
+        drop(unsafe {
+            Rc::from_raw(core::ptr::with_exposed_provenance::<ClipboardWindowState>(
+                subclass_reference,
+            ))
+        });
+        return Err(WinCliprdrError::WindowSubclass);
+    }
+
+    Ok((window, state, backend_tx))
 }
 
 /// Windows-specific clipboard backend factory

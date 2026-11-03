@@ -20,11 +20,12 @@ use windows::Win32::System::DataExchange::{
 use windows::Win32::System::Ole::{OleGetClipboard, OleSetClipboard, OleUninitialize};
 use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
-    KillTimer, SetTimer, WA_INACTIVE, WM_ACTIVATE, WM_ACTIVATEAPP, WM_CLIPBOARDUPDATE, WM_NCDESTROY,
+    KillTimer, SetTimer, WM_CLIPBOARDUPDATE, WM_NCDESTROY,
     WM_RENDERALLFORMATS, WM_RENDERFORMAT, WM_TIMER,
 };
 use windows::core::{HRESULT, Interface as _};
 
+use crate::upload;
 use crate::windows::clipboard_data_ref::ClipboardDataRef;
 use crate::windows::data_object::{FileFormatIds, RemoteDataObject};
 use crate::windows::file_list::{
@@ -37,7 +38,7 @@ use crate::windows::remote_format_registry::{RemoteClipboardFormatRegistry, regi
 use crate::windows::shared::ClipboardShared;
 use crate::windows::transport::RemoteTransport;
 use crate::windows::utils::render_format;
-use crate::windows::{BackendEvent, WM_CLIPRDR_BACKEND_EVENT, WM_CLIPRDR_RELEASE, WinCliprdrError, WinCliprdrResult};
+use crate::windows::{BackendEvent, WM_CLIPRDR_BACKEND_EVENT, WinCliprdrError, WinCliprdrResult};
 
 const IDT_CLIPBOARD_RETRY: usize = 1;
 
@@ -182,6 +183,12 @@ impl WinClipboardImpl {
 
     fn on_clipboard_update(&mut self) -> WinCliprdrResult<Option<ClipboardMessage>> {
         if self.owns_clipboard() {
+            // 文件正在传给远端时，远端剪贴板还是这份文件列表：不要拿空列表去覆盖它，
+            // 否则远端刚开始读的文件流会随剪贴板一起被清掉。
+            if upload::in_flight() {
+                debug!("Keeping the remote file clipboard while an upload is in progress");
+                return Ok(None);
+            }
             // The clipboard holds remote data (e.g. while reconnecting): it can't be offered back.
             self.local_files.offer(None);
             return Ok(Some(ClipboardMessage::SendInitiateCopy(Vec::new())));
@@ -189,6 +196,12 @@ impl WinClipboardImpl {
 
         let mut clipboard = OwnedOsClipboard::new(self.window)?;
         let formats = clipboard.enum_available_formats()?;
+
+        // 刚写进剪贴板的文件列表也可能先以空剪贴板的形式被观察到；同上，别去清远端。
+        if formats.is_empty() && upload::in_flight() {
+            debug!("Skipping an empty clipboard offer while an upload is in progress");
+            return Ok(None);
+        }
 
         let files = if self.can_send_files() {
             self.find_local_files(&mut clipboard, &formats)
@@ -680,7 +693,6 @@ fn is_current_ole_clipboard(data_object: &IDataObject) -> bool {
 pub(crate) struct ClipboardWindowState {
     inner: UnsafeCell<WinClipboardImpl>,
     busy: Cell<bool>,
-    window_is_active: Cell<bool>,
     missed_backend_events: Cell<u32>,
     missed_clipboard_update: Cell<bool>,
     missed_retry_timer: Cell<bool>,
@@ -695,7 +707,6 @@ impl ClipboardWindowState {
         Self {
             inner: UnsafeCell::new(inner),
             busy: Cell::new(false),
-            window_is_active: Cell::new(true), // We assume that we start with current window active,
             missed_backend_events: Cell::new(0),
             missed_clipboard_update: Cell::new(false),
             missed_retry_timer: Cell::new(false),
@@ -742,11 +753,10 @@ impl ClipboardWindowState {
     }
 
     fn on_clipboard_update(&self, ctx: &mut WinClipboardImpl) {
-        // We need to send copy message from remote only when window is NOT active, because if
-        // it is active, then user wants to perform copy from remote instead. Also, we need to
-        // check that we are not the source of the clipboard change, because if we are,
-        // then we don't need to send copy message to remote.
-        if !(self.window_is_active.get() || ctx.owns_clipboard()) {
+        // 本机副本：上游只在本窗口不在前台时才把本地剪贴板发给远端，而 ruterm 的拖放
+        // 恰好发生在窗口处于前台时，那条更新会被整个挡掉。这里的回环由 `owns_clipboard`
+        // 兜底（远端数据对象仍在本机剪贴板时直接跳过），因此不再按激活状态过滤。
+        if !ctx.owns_clipboard() {
             ctx.handle_event(BackendEvent::ClipboardUpdated);
         }
     }
@@ -841,13 +851,6 @@ pub(crate) unsafe extern "system" fn clipboard_subproc(
             // SAFETY: `DefSubclassProc` is always safe to call in context of subclass event loop
             unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
         }
-        // We need to keep track of window state to distinguish between local and remote copy
-        WM_ACTIVATE | WM_ACTIVATEAPP => {
-            state
-                .window_is_active
-                .set(wparam.0 != usize::try_from(WA_INACTIVE).expect("WA_INACTIVE fits into usize"));
-            LRESULT(0)
-        }
         // Sent by the OS when OS clipboard content is changed
         WM_CLIPBOARDUPDATE => {
             if state.with_impl(|ctx, state| state.on_clipboard_update(ctx)).is_none() {
@@ -886,14 +889,6 @@ pub(crate) unsafe extern "system" fn clipboard_subproc(
                     .missed_backend_events
                     .set(state.missed_backend_events.get().saturating_add(1));
             }
-            LRESULT(0)
-        }
-        // A `WinClipboard` dropped on another thread handed its reference over.
-        WM_CLIPRDR_RELEASE => {
-            let address = lparam.0.cast_unsigned();
-            // SAFETY: `WinClipboard::drop` posts a reference from `Rc::into_raw` as `lparam`.
-            let reference = unsafe { Rc::from_raw(with_exposed_provenance::<ClipboardWindowState>(address)) };
-            release(hwnd, reference);
             LRESULT(0)
         }
         // Retry timer. Some operations clipboard operations such as `OpenClipboard` are

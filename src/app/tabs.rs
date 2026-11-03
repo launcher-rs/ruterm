@@ -847,8 +847,8 @@ impl RuTermApp {
                     }
                 }),
             )
-            // 本地文件拖进标签：终端走 lrzsz；远程桌面没有 shell，改经同一主机的 SSH
-            // 会话走 SFTP（见 `desktop_drop_paths`）。
+            // 本地文件拖进标签：终端走 lrzsz；远程桌面走 RDP 剪贴板文件流
+            //（VNC 无文件通道，见 `desktop_drop_paths`）。
             .drag_over::<ExternalPaths>(move |style, _, _, _| {
                 style.border_1().border_color(pal.accent)
             })

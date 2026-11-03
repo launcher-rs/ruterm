@@ -5,9 +5,10 @@ use core::cell::RefCell;
 use core::ffi::c_void;
 use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use ironrdp_cliprdr::pdu::{FileContentsFlags, FileContentsRequest, FileContentsResponse, FileDescriptor};
-use tracing::debug;
+use tracing::{debug, warn};
 use windows::Win32::Foundation::HGLOBAL;
 use windows::Win32::System::Com::{IDataObject, IStream, STREAM_SEEK_SET, TYMED_HGLOBAL, TYMED_ISTREAM};
 use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
@@ -16,6 +17,7 @@ use windows::Win32::System::Ole::ReleaseStgMedium;
 /// 与上游 `Cliprdr` 的锁数量上限一致（0.7 里还没有公开这个常量）。
 const MAX_LOCKED_FILE_LISTS: usize = 100;
 
+use crate::upload::{self, UploadProgress};
 use crate::windows::file_list::{LocalFileEntry, MAX_FILE_CONTENTS_CHUNK, is_directory, read_file_contents};
 use crate::windows::utils::format_etc;
 
@@ -166,12 +168,41 @@ pub(crate) struct LocalFiles {
     dropped_offers: usize,
     /// The offer the remote acknowledged last.
     current: Option<Rc<LocalFileSource>>,
+    /// The last accepted file offer, kept after `current` goes away.
+    ///
+    /// 上传期间剪贴板可能被远端的文件对象接管、或被短暂清空，`current` 随之变空；
+    /// 远端已经按这个列表发起的 `FileContentsRequest` 仍应从它继续应答，否则正在
+    /// 粘贴的文件会在第一个分片之后收到错误而中断。
+    last_accepted: Option<Rc<LocalFileSource>>,
     locked: HashMap<u32, Rc<LocalFileSource>>,
+    /// 界面登记的上传进度（本机副本新增），对上路径的文件列表被报给远端时挂上。
+    upload: Option<Arc<UploadProgress>>,
 }
 
 impl LocalFiles {
     /// Records a format list sent to the remote, with the files it offers if any.
     pub(crate) fn offer(&mut self, source: Option<Rc<LocalFileSource>>) {
+        if let Some(LocalFileSource::Paths(entries)) = source.as_deref() {
+            let files = entries
+                .iter()
+                .filter(|entry| !is_directory(&entry.descriptor))
+                .count();
+            let total = entries
+                .iter()
+                .filter(|entry| !is_directory(&entry.descriptor))
+                .filter_map(|entry| entry.descriptor.file_size)
+                .sum();
+            let paths = entries
+                .iter()
+                .map(|entry| entry.path.as_path())
+                .collect::<Vec<_>>();
+            if let Some(progress) =
+                upload::attach(&paths, total, u32::try_from(files).unwrap_or(u32::MAX))
+            {
+                self.upload = Some(progress);
+            }
+        }
+
         if MAX_PENDING_OFFERS <= self.offered.len() {
             // The remote is not answering. The oldest offer goes, but its response is still
             // counted, so that later responses keep pairing with the right offers.
@@ -196,17 +227,30 @@ impl LocalFiles {
 
         // A rejected list leaves the remote with no local files, as in `Cliprdr`.
         self.current = if accepted { offered } else { None };
+
+        if let Some(source) = self.current.as_ref() {
+            self.last_accepted = Some(Rc::clone(source));
+            // 只有本机路径的列表才是界面登记的上传；远端文件镜像（Virtual）不算。
+            if matches!(source.as_ref(), LocalFileSource::Paths(_)) {
+                if let Some(upload) = self.upload.as_ref() {
+                    upload.mark_acknowledged();
+                }
+            }
+        }
     }
 
     pub(crate) fn clear(&mut self) {
         self.offered.clear();
         self.dropped_offers = 0;
         self.current = None;
+        self.last_accepted = None;
         self.locked.clear();
+        self.upload = None;
     }
 
     pub(crate) fn lock(&mut self, clip_data_id: u32) {
-        let Some(current) = self.current.as_ref() else {
+        // 列表响应可能还在路上：锁也要能落在最近一次被接受的文件列表上。
+        let Some(current) = self.current.as_ref().or(self.last_accepted.as_ref()) else {
             // Locks also arrive when there are no local files, see `Cliprdr`.
             return;
         };
@@ -233,18 +277,45 @@ impl LocalFiles {
         let source = request
             .data_id
             .and_then(|data_id| self.locked.get(&data_id))
-            .or(self.current.as_ref());
+            .or(self.current.as_ref())
+            .or(self.last_accepted.as_ref());
 
-        match source {
+        let response = match source {
             Some(source) => source.file_contents(request),
             None => {
                 debug!(
                     stream_id = request.stream_id,
                     "File contents requested with no local files"
                 );
+                if let Some(upload) = self.upload.as_ref() {
+                    // 列表丢了：远端后续请求只会一直报错，这次粘贴已经中断。
+                    warn!(
+                        stream_id = request.stream_id,
+                        sent = upload.sent(),
+                        total = upload.total(),
+                        "Lost the local file list in the middle of a transfer"
+                    );
+                    upload.mark_failed();
+                }
                 FileContentsResponse::new_error(request.stream_id)
             }
+        };
+
+        if let Some(upload) = self.upload.as_ref() {
+            if response.is_error() {
+                debug!(
+                    stream_id = request.stream_id,
+                    index = request.index,
+                    position = request.position,
+                    requested = request.requested_size,
+                    "Answered a file contents request with an error"
+                );
+            } else if !request.flags.contains(FileContentsFlags::SIZE) {
+                upload.add_sent(response.data().len());
+            }
         }
+
+        response
     }
 }
 
