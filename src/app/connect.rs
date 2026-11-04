@@ -407,6 +407,7 @@ impl RuTermApp {
         // Programmatic 从而不再反弹。
         let mirror_tx = self.mirror_tx.clone();
         terminal.update(cx, |terminal, _| {
+            terminal.add_middleware(Arc::new(NormalizePastedLineEndings));
             terminal.add_middleware(Arc::new(MirrorInput {
                 tab_id: id,
                 tx: mirror_tx,
@@ -705,6 +706,7 @@ impl RuTermApp {
         // 同步输入同样覆盖 Telnet 会话。
         let mirror_tx = self.mirror_tx.clone();
         terminal.update(cx, |terminal, _| {
+            terminal.add_middleware(Arc::new(NormalizePastedLineEndings));
             terminal.add_middleware(Arc::new(MirrorInput {
                 tab_id: id,
                 tx: mirror_tx,

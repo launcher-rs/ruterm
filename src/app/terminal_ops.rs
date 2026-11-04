@@ -45,6 +45,41 @@ impl TerminalMiddleware for MirrorInput {
     }
 }
 
+/// 粘贴行尾归一化：Windows 剪贴板的多行文本是 CRLF，而 bracketed-paste 模式下
+/// 终端框架会把原文原样包进 `ESC[200~ … ESC[201~` 发给远端。远端 readline 会把
+/// 其中的 `\r` 当普通字符留在行缓冲里（回显 `^M`），行尾 `\` 也续不上行；这里在
+/// 字节进 PTY 前把括号内的 CRLF / 孤立 CR 折成 LF。
+///
+/// 只处理 bracketed 包裹的粘贴：未开 bracketed-paste 时框架已把换行转成 `\r`
+/// （回车），不能再动，否则 vim 之类的原始模式程序收不到回车。
+pub(super) struct NormalizePastedLineEndings;
+
+impl TerminalMiddleware for NormalizePastedLineEndings {
+    fn on_input(
+        &self,
+        input: std::borrow::Cow<'static, [u8]>,
+        origin: InputOrigin,
+    ) -> Option<std::borrow::Cow<'static, [u8]>> {
+        if origin != InputOrigin::Paste {
+            return Some(input);
+        }
+        let Ok(text) = std::str::from_utf8(&input) else {
+            return Some(input);
+        };
+        let Some(inner) = text
+            .strip_prefix("\x1b[200~")
+            .and_then(|rest| rest.strip_suffix("\x1b[201~"))
+        else {
+            return Some(input);
+        };
+        if !inner.as_bytes().contains(&b'\r') {
+            return Some(input);
+        }
+        let inner = inner.replace("\r\n", "\n").replace('\r', "\n");
+        Some(format!("\x1b[200~{inner}\x1b[201~").into_bytes().into())
+    }
+}
+
 /// 命令广播弹窗：把一条命令以回车结尾写进所有活动会话（需二次确认）。
 pub(super) struct BroadcastState {
     pub(super) input: Entity<InputState>,
@@ -463,4 +498,53 @@ impl RuTermApp {
     }
 
 
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn transform(input: &[u8], origin: InputOrigin) -> Vec<u8> {
+        NormalizePastedLineEndings
+            .on_input(input.to_vec().into(), origin)
+            .expect("输入不应被丢弃")
+            .into_owned()
+    }
+
+    #[test]
+    fn bracketed_paste_crlf_becomes_lf() {
+        assert_eq!(
+            transform(
+                b"\x1b[200~echo one \\\r\n  two\r\n\x1b[201~",
+                InputOrigin::Paste
+            ),
+            b"\x1b[200~echo one \\\n  two\n\x1b[201~"
+        );
+    }
+
+    #[test]
+    fn bracketed_paste_lone_cr_becomes_lf() {
+        assert_eq!(
+            transform(b"\x1b[200~one\rtwo\x1b[201~", InputOrigin::Paste),
+            b"\x1b[200~one\ntwo\x1b[201~"
+        );
+    }
+
+    #[test]
+    fn bracketed_paste_without_cr_is_untouched() {
+        let input = b"\x1b[200~one\ntwo\x1b[201~";
+        assert_eq!(transform(input, InputOrigin::Paste), input);
+    }
+
+    #[test]
+    fn unbracketed_paste_is_untouched() {
+        let input = b"one\rtwo\r";
+        assert_eq!(transform(input, InputOrigin::Paste), input);
+    }
+
+    #[test]
+    fn other_origins_are_untouched() {
+        let input = b"\x1b[200~one\r\ntwo\x1b[201~";
+        assert_eq!(transform(input, InputOrigin::Text), input);
+    }
 }
