@@ -19,6 +19,7 @@ use rgpui::Task;
 use rgpui_term::{ExternalHandles, FeedHandle, PtyBoundMessage};
 use russh::Channel;
 use russh::ChannelMsg;
+use russh::ChannelWriteHalf;
 use russh::client::{Config as SshConfig, Handle, Msg};
 use russh::keys::PrivateKeyWithHashAlg;
 use russh::keys::agent::client::AgentClient;
@@ -73,8 +74,8 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(8);
 /// 远程信息刷新间隔（负载/内存/磁盘随会话持续变化，只探一次会一直显示连接时的值）。
 const PROBE_INTERVAL: Duration = Duration::from_secs(5);
 
-/// 客户端会话通道别名。
-type SessionChannel = Channel<Msg>;
+/// 客户端会话通道的写半边（上行方向）。
+type SessionChannelWrite = ChannelWriteHalf<Msg>;
 
 /// 转发方向：本地转发（-L）监听本机，远程转发（-R）让服务器监听，
 /// 动态转发（-D）在本机开 SOCKS5 代理、目标由客户端逐条协商。
@@ -506,6 +507,13 @@ async fn run(
                 connect_timeout.as_secs()
             ),
         };
+
+    // 终端下行由 `SshTerminalHandler::data` 直接喂给终端；russh 仍会把每条
+    // CHANNEL_DATA 复制一份塞进通道自带的有界接收队列（默认 100 条）。该队列
+    // 没人消费，满 100 条后会话任务永久阻塞在 `chan.send().await`，上下行一起
+    // 停摆（终端看似卡死）。读半边若丢弃，send 会立即失败返回，不再堵住会话。
+    let (channel_read, channel) = channel.split();
+    drop(channel_read);
 
     // 上行转发先落地：探测通道握手即使被慢服务器拖住，也不能延迟按键转发。
     tokio::spawn(forward_uplink(channel, ui_rx, raw_rx, cwd_hint_tx));
@@ -1308,7 +1316,7 @@ async fn probe_remote_info(
 /// 同时逐字节扫描用户键入，识别 `cd` / `pushd` 行并作为目录线索回传，
 /// 由 [`follow_cwd`] 校验后再回传 UI，避免 cd 失败或含变量替换时污染面板。
 async fn forward_uplink(
-    channel: SessionChannel,
+    channel: SessionChannelWrite,
     mut ui_rx: mpsc::UnboundedReceiver<PtyBoundMessage>,
     mut raw_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     cwd_hint_tx: mpsc::UnboundedSender<CwdHint>,
