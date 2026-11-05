@@ -286,10 +286,28 @@ pub fn start<C: AppContext>(
     std::thread::Builder::new()
         .name("ruterm-uplink".to_string())
         .spawn(move || {
+            let trace = std::env::var_os("RUTERM_TRACE_EXTERNAL").is_some();
+            let mut count = 0usize;
             while let Some(message) = rx.recv() {
+                count += 1;
+                if trace && (count <= 3 || count % 50 == 0) {
+                    let kind = match &message {
+                        PtyBoundMessage::Input(bytes) => format!("input len={}", bytes.len()),
+                        PtyBoundMessage::Resize(size) => {
+                            format!("resize {}x{}", size.num_cols, size.num_lines)
+                        }
+                    };
+                    eprintln!("[rt-trace] uplink pump received message #{count}: {kind}");
+                }
                 if ui_tx.send(message).is_err() {
+                    if trace {
+                        eprintln!("[rt-trace] uplink pump receiver closed at #{count}");
+                    }
                     break; // 转发任务已结束
                 }
+            }
+            if trace {
+                eprintln!("[rt-trace] uplink pump ended after {count} messages");
             }
         })
         .expect("无法启动 ruterm 上行泵线程");
@@ -393,21 +411,37 @@ async fn run(
         for (index, node) in nodes.iter().enumerate() {
             let is_target = index + 1 == nodes.len();
             let config = Arc::new(SshConfig::default());
-            let node_side = if is_target { side.clone() } else { SideChannels::default() };
+            let node_side = if is_target {
+                side.clone()
+            } else {
+                SideChannels::default()
+            };
             let handler = SshTerminalHandler::new(
                 feed.clone(),
                 node.host.clone(),
                 node.port,
                 node_side.clone(),
                 vault.clone(),
-                if is_target { ended_tx.clone() } else { jump_ended_tx.clone() },
-                if is_target { forwarded_tx.clone() } else { jump_forwarded_tx.clone() },
+                if is_target {
+                    ended_tx.clone()
+                } else {
+                    jump_ended_tx.clone()
+                },
+                if is_target {
+                    forwarded_tx.clone()
+                } else {
+                    jump_forwarded_tx.clone()
+                },
                 if is_target {
                     Some(zmodem_sink.clone())
                 } else {
                     None
                 },
-                if is_target { Some(cwd_hint_tx.clone()) } else { None },
+                if is_target {
+                    Some(cwd_hint_tx.clone())
+                } else {
+                    None
+                },
             );
             let hop = if index == 0 {
                 String::new()
@@ -429,16 +463,12 @@ async fn run(
                             0,
                         )
                         .await
-                        .with_context(|| {
-                            format!("跳板机 {hop} 无法转发到 {}", node.addr())
-                        })?;
+                        .with_context(|| format!("跳板机 {hop} 无法转发到 {}", node.addr()))?;
                     // 通道必须登记进跳板机的旁路集合，否则字节会灌进终端。
                     previous_side.add(channel.id());
                     russh::client::connect_stream(config, channel.into_stream(), handler)
                         .await
-                        .with_context(|| {
-                            format!("经跳板机 {hop} 连接 {} 失败", node.addr())
-                        })?
+                        .with_context(|| format!("经跳板机 {hop} 连接 {} 失败", node.addr()))?
                 }
             };
             if let Err(error) = authenticate(&mut handle, node).await {
@@ -900,12 +930,7 @@ async fn start_dynamic_forward(
 ) -> Result<ActiveForward> {
     let listener = TcpListener::bind(("127.0.0.1", rule.listen_port))
         .await
-        .with_context(|| {
-            format!(
-                "无法监听 SOCKS5 端口 {}（可能已被占用）",
-                rule.listen_port
-            )
-        })?;
+        .with_context(|| format!("无法监听 SOCKS5 端口 {}（可能已被占用）", rule.listen_port))?;
     let listener = tokio::spawn(dynamic_accept_loop(
         listener,
         accepted.clone(),
@@ -1289,6 +1314,10 @@ async fn forward_uplink(
     cwd_hint_tx: mpsc::UnboundedSender<CwdHint>,
 ) {
     let mut tracker = CwdKeystrokes::default();
+    let trace = std::env::var_os("RUTERM_TRACE_EXTERNAL").is_some();
+    let mut input_count = 0usize;
+    let mut input_bytes = 0usize;
+    let mut resize_count = 0usize;
     loop {
         let sent = tokio::select! {
             maybe = ui_rx.recv() => {
@@ -1297,20 +1326,85 @@ async fn forward_uplink(
                 };
                 match message {
                     PtyBoundMessage::Input(bytes) => {
+                        input_count += 1;
+                        input_bytes += bytes.len();
+                        let trace_this = trace;
+                        // Key repeats arrive as hundreds of one-byte events. Writing each
+                        // event separately can fill russh's bounded channel queue and leave
+                        // the forwarding task waiting while the UI keeps enqueueing input.
+                        // Coalesce only adjacent input messages; byte order is unchanged.
+                        let mut bytes = bytes;
+                        let mut resize_after_batch = None;
+                        while bytes.len() < 64 * 1024 {
+                            match ui_rx.try_recv() {
+                                Ok(PtyBoundMessage::Input(next)) => {
+                                    input_count += 1;
+                                    input_bytes += next.len();
+                                    bytes.extend_from_slice(&next);
+                                }
+                                Ok(PtyBoundMessage::Resize(size)) => {
+                                    resize_count += 1;
+                                    resize_after_batch = Some(size);
+                                    break;
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        if trace_this {
+                            eprintln!(
+                                "[rt-trace] uplink input batch ending at #{input_count} bytes={} total_bytes={input_bytes} write start",
+                                bytes.len(),
+                            );
+                        }
                         if let Some(arg) = tracker.feed(&bytes) {
                             let _ = cwd_hint_tx.send(CwdHint::Cd(arg));
                         }
-                        channel.data_bytes(Bytes::from(bytes)).await
+                        let wait_started = std::time::Instant::now();
+                        let mut result = channel.data_bytes(Bytes::from(bytes)).await;
+                        if result.is_ok()
+                            && let Some(size) = resize_after_batch
+                        {
+                            result = channel
+                                .window_change(
+                                    u32::from(size.num_cols),
+                                    u32::from(size.num_lines),
+                                    u32::from(size.cell_width) * u32::from(size.num_cols),
+                                    u32::from(size.cell_height) * u32::from(size.num_lines),
+                                )
+                                .await;
+                        }
+                        if trace_this {
+                            eprintln!(
+                                "[rt-trace] uplink input batch ending at #{input_count} write done ok={} elapsed_ms={}",
+                                result.is_ok(), wait_started.elapsed().as_millis()
+                            );
+                        }
+                        result
                     }
                     PtyBoundMessage::Resize(size) => {
-                        channel
+                        resize_count += 1;
+                        let trace_this = trace && (resize_count <= 3 || resize_count % 10 == 0);
+                        if trace_this {
+                            eprintln!(
+                                "[rt-trace] uplink resize #{resize_count} {}x{} start",
+                                size.num_cols, size.num_lines
+                            );
+                        }
+                        let result = channel
                             .window_change(
                                 u32::from(size.num_cols),
                                 u32::from(size.num_lines),
                                 u32::from(size.cell_width) * u32::from(size.num_cols),
                                 u32::from(size.cell_height) * u32::from(size.num_lines),
                             )
-                            .await
+                            .await;
+                        if trace_this {
+                            eprintln!(
+                                "[rt-trace] uplink resize #{resize_count} done ok={}",
+                                result.is_ok()
+                            );
+                        }
+                        result
                     }
                 }
             }
@@ -1349,9 +1443,10 @@ impl CwdKeystrokes {
                         log::debug!("[CwdKeystrokes] 检测到 cd: {}", arg);
                         done = Some(arg);
                     } else if !self.skip
-                        && let Ok(line) = std::str::from_utf8(&self.buf) {
-                            log::debug!("[CwdKeystrokes] 行结束但未检测到 cd: {:?}", line);
-                        }
+                        && let Ok(line) = std::str::from_utf8(&self.buf)
+                    {
+                        log::debug!("[CwdKeystrokes] 行结束但未检测到 cd: {:?}", line);
+                    }
                     self.buf.clear();
                     self.skip = false;
                 }
@@ -1854,7 +1949,7 @@ mod tests {
         assert!(server.await.unwrap().is_err());
     }
 
-    use super::{cd_arg_from_line, lex_join, path_from_osc7, percent_decode, CwdKeystrokes};
+    use super::{CwdKeystrokes, cd_arg_from_line, lex_join, path_from_osc7, percent_decode};
 
     #[test]
     fn cd_arg_plain_and_quoted() {
@@ -1868,10 +1963,7 @@ mod tests {
             cd_arg_from_line("cd \"/mnt/c/My Files\""),
             Some("/mnt/c/My Files".into())
         );
-        assert_eq!(
-            cd_arg_from_line("cd '/var/log'"),
-            Some("/var/log".into())
-        );
+        assert_eq!(cd_arg_from_line("cd '/var/log'"), Some("/var/log".into()));
     }
 
     #[test]
@@ -1926,10 +2018,7 @@ mod tests {
             path_from_osc7("file:///home/user"),
             Some("/home/user".into())
         );
-        assert_eq!(
-            path_from_osc7("file://h/a%20b"),
-            Some("/a b".into())
-        );
+        assert_eq!(path_from_osc7("file://h/a%20b"), Some("/a b".into()));
         assert_eq!(path_from_osc7("not-a-uri"), None);
         assert_eq!(path_from_osc7("file://host"), None);
     }

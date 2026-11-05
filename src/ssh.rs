@@ -407,6 +407,13 @@ impl client::Handler for SshTerminalHandler {
         if self.side.contains(channel) {
             return Ok(());
         }
+        // TEMP 复现用：模拟远端链路延迟，拉大按键与回显的交叠窗口。
+        if let Some(ms) = std::env::var("RUTERM_TEST_DOWNLINK_DELAY_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+        }
         // 先扫描 OSC 7（shell 工作目录上报），再决定是否转交 zmodem / 终端。
         self.osc7.feed(data, &self.cwd);
         if !self.divert_zmodem(data) {

@@ -6,12 +6,11 @@ use std::time::{Duration, Instant};
 use rgpui::input_ui::{Input, InputContentType, InputState};
 use rgpui::prelude::*;
 use rgpui::{
-    AnyElement, Button, ButtonVariants, Context, Entity, Focusable, InteractiveElement, IntoElement, KeyDownEvent, ParentElement, SharedString,
-    StatefulInteractiveElement, Styled, Window, div, h_flex, px, v_flex,
+    AnyElement, Button, ButtonVariants, Context, Entity, Focusable, InteractiveElement,
+    IntoElement, KeyDownEvent, ParentElement, SharedString, StatefulInteractiveElement, Styled,
+    Window, div, h_flex, px, v_flex,
 };
-use rgpui_term::{
-    Event as TerminalEvent, TerminalBuilder, TerminalView,
-};
+use rgpui_term::{Event as TerminalEvent, TerminalBuilder, TerminalView};
 
 use crate::config::SshTarget;
 use crate::sessions::{AuthMethod, HostConfig, ProtocolKind};
@@ -71,9 +70,13 @@ impl RuTermApp {
         }
     }
 
-
     /// 密码/私钥主机的取密顺序：缓存 → 加密库 →（密码）弹窗 /（私钥）免口令直连探测。
-    pub(super) fn click_secret_host(&mut self, host: HostConfig, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn click_secret_host(
+        &mut self,
+        host: HostConfig,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let key = host.addr();
         if let Some(secret) = self.password_cache.get(&key).cloned() {
             self.connect_with_secret(host, secret, key, false, window, cx);
@@ -131,7 +134,6 @@ impl RuTermApp {
         }
     }
 
-
     /// 由主机配置 + 本次秘密构造连接目标，并带上加密库里的内嵌私钥。
     ///
     /// 标记为内嵌却取不到私钥时返回 Err：宁可明确报错，也不静默退回 SSH Agent
@@ -153,7 +155,6 @@ impl RuTermApp {
             .with_key_data(key_data)
             .with_jump(jump))
     }
-
 
     /// 把主机表单里选的跳板机构造成完整的连接目标（含它自己的认证材料）。
     ///
@@ -212,7 +213,6 @@ impl RuTermApp {
         ))
     }
 
-
     /// 用取到的秘密（缓存或加密库）建立连接目标并连接。
     pub(super) fn connect_with_secret(
         &mut self,
@@ -241,7 +241,6 @@ impl RuTermApp {
         self.connect(title, target, Some(key), Some(host), from_vault, window, cx);
     }
 
-
     /// 不带秘密直连（私钥主机的口令探测路径）。
     pub(super) fn connect_without_secret(
         &mut self,
@@ -260,7 +259,6 @@ impl RuTermApp {
         let title = host.name.clone();
         self.connect(title, target, None, Some(host), false, window, cx);
     }
-
 
     /// 弹出密码/私钥口令输入面板（默认不保存；加密库可用时提供"保存"勾选）。
     pub(super) fn prompt_secret(
@@ -285,13 +283,11 @@ impl RuTermApp {
         cx.notify();
     }
 
-
     /// 取消待输入密码的连接。
     pub(super) fn cancel_pending(&mut self, cx: &mut Context<Self>) {
         self.pending = None;
         cx.notify();
     }
-
 
     /// 用输入的秘密完成待连接：内存缓存必写；勾选保存且加密库可用时再持久化入库。
     pub(super) fn confirm_pending(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -339,7 +335,6 @@ impl RuTermApp {
         );
     }
 
-
     /// 建立外接终端并启动 SSH 会话，追加为新标签。
     ///
     /// shell 开启前的失败（连不上 / 认证被拒 / 私钥需口令）**保留标签页**，
@@ -374,7 +369,6 @@ impl RuTermApp {
             cx,
         );
     }
-
 
     /// 在指定标签槽位启动 SSH 会话：`reconnect` 为真时原位替换该标签的终端，
     /// 否则追加为新标签。`retry_attempt` 为自动重连的连续次数（手动连接为 0）。
@@ -490,7 +484,55 @@ impl RuTermApp {
         }
         // 新标签/重连后把焦点交回终端，键入住处即可继续敲命令。
         self.activate_tab(id, window, cx);
-        // shell 真正开起来才算"连接可用"：记录时刻供断线后判断会话是否稳定过。
+        if let Ok(spec) = std::env::var("RUTERM_SMOKE_BACKSPACE") {
+            let deletes = spec.parse::<usize>().unwrap_or(300);
+            let payload = "curl https://openrouter.ai/api/v1/chat/completions \\\n  -H \"Content-Type: application/json\" \\\n  -H \"Authorization: Bearer sk-test-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\" \\\n  -d '{\n    \"model\": \"nvidia/nemotron-3-ultra-550b-a55b:free\",\n    \"messages\": [{\"role\": \"user\", \"content\": \"How many r`s are in the word `strawberry?`\"}],\n    \"reasoning\": {\"enabled\": true}\n}'".to_string();
+            let delay_ms = std::env::var("RUTERM_SMOKE_DELAY_MS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(8);
+            let prefill = std::env::var("RUTERM_SMOKE_PREFILL")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(0);
+            let window_handle = window.window_handle();
+            let smoke_terminal = terminal.clone();
+            cx.spawn(async move |_, cx| {
+                cx.background_executor().timer(Duration::from_secs(6)).await;
+                let terminal = smoke_terminal.clone();
+                if prefill > 0 {
+                    let prefill = prefill;
+                    let _ = window_handle.update(cx, move |_, _, cx| {
+                        terminal.update(cx, |terminal, _| {
+                            terminal.input(format!("seq 1 {prefill}\r").into_bytes());
+                        });
+                    });
+                    cx.background_executor()
+                        .timer(Duration::from_millis(1500))
+                        .await;
+                }
+                let terminal = smoke_terminal.clone();
+                let _ = window_handle.update(cx, move |_, _, cx| {
+                    terminal.update(cx, |terminal, _| terminal.paste(&payload));
+                });
+                for index in 0..deletes {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(delay_ms))
+                        .await;
+                    let _ = window_handle.update(cx, |_, window, cx| {
+                        window.dispatch_keystroke(
+                            rgpui::Keystroke::parse("backspace").unwrap(),
+                            cx,
+                        );
+                    });
+                    if index % 25 == 0 {
+                        eprintln!("[smoke] dispatched {} backspaces", index + 1);
+                    }
+                }
+                eprintln!("[smoke] finished dispatching {deletes} backspaces");
+            })
+            .detach();
+        }
         let ready_view = terminal_view.clone();
         let ready_addr = addr.clone();
         let recent_host_id = host.as_ref().map(|host| host.id).filter(|id| *id != 0);
@@ -555,7 +597,9 @@ impl RuTermApp {
                         }
                         return;
                     }
-                    let rejected = error.downcast_ref::<crate::session::SecretRejected>().is_some();
+                    let rejected = error
+                        .downcast_ref::<crate::session::SecretRejected>()
+                        .is_some();
                     if rejected {
                         if let Some(key) = &cache_key {
                             this.password_cache.remove(key);
@@ -582,10 +626,16 @@ impl RuTermApp {
                         }
                     }
                     let message = if shell_started {
-                        format!("连接中断：{addr}（{}）", crate::session::error_summary(&error))
+                        format!(
+                            "连接中断：{addr}（{}）",
+                            crate::session::error_summary(&error)
+                        )
                     } else {
                         // 建连阶段失败同样带上原因：横幅的「复制错误」要有内容可复制。
-                        format!("连接失败：{addr}（{}）", crate::session::error_summary(&error))
+                        format!(
+                            "连接失败：{addr}（{}）",
+                            crate::session::error_summary(&error)
+                        )
                     };
                     this.fail_session_tab(id, message.into(), shell_started, cx);
                 });
@@ -596,16 +646,15 @@ impl RuTermApp {
         let info_view = terminal_view.clone();
         cx.spawn(async move |this, cx| {
             while let Some(info) = remote_info.recv().await {
-                let _ = this.update(cx, |this, cx| {
-                    if let Some(tab) = this
-                        .tabs
-                        .iter_mut()
-                        .find(|tab| tab.id == id && tab.terminal_view.as_ref() == Some(&info_view))
-                    {
-                        tab.remote_info = Some(info);
-                        cx.notify();
-                    }
-                });
+                let _ =
+                    this.update(cx, |this, cx| {
+                        if let Some(tab) = this.tabs.iter_mut().find(|tab| {
+                            tab.id == id && tab.terminal_view.as_ref() == Some(&info_view)
+                        }) {
+                            tab.remote_info = Some(info);
+                            cx.notify();
+                        }
+                    });
             }
         })
         .detach();
@@ -616,11 +665,9 @@ impl RuTermApp {
             while let Some(path) = cwd_events.recv().await {
                 log::debug!("[cwd_events] 收到确认路径: {}", path);
                 let _ = this.update(cx, |this, cx| {
-                    let Some(pos) = this
-                        .tabs
-                        .iter()
-                        .position(|tab| tab.id == id && tab.terminal_view.as_ref() == Some(&cwd_view))
-                    else {
+                    let Some(pos) = this.tabs.iter().position(|tab| {
+                        tab.id == id && tab.terminal_view.as_ref() == Some(&cwd_view)
+                    }) else {
                         log::debug!("[cwd_events] 未找到对应标签");
                         return;
                     };
@@ -653,9 +700,13 @@ impl RuTermApp {
         cx.notify();
     }
 
-
     /// 建立外接终端并启动 Telnet 会话，追加为新标签。
-    pub(super) fn connect_telnet(&mut self, host: &HostConfig, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn connect_telnet(
+        &mut self,
+        host: &HostConfig,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let id = self.next_id;
         self.next_id += 1;
         self.view_split = None;
@@ -677,7 +728,6 @@ impl RuTermApp {
             cx,
         );
     }
-
 
     /// 在指定标签槽位启动 Telnet 会话（与 [`Self::start_ssh`] 同形的落标签流程）：
     /// 会话结束保留终端内容与断开横幅，可原标签重连。
@@ -782,25 +832,24 @@ impl RuTermApp {
             if ready.await.is_err() {
                 return;
             }
-            let _ = this.update(cx, |this, cx| {
-                let Some(tab) = this
-                    .tabs
-                    .iter_mut()
-                    .find(|tab| tab.id == id && tab.terminal_view.as_ref() == Some(&ready_view))
-                else {
-                    return;
-                };
-                tab.connected_at = Some(Instant::now());
-                tab.auto_retry_pending = false;
-                if let Some(host_id) = recent_host_id {
-                    this.record_recent_host(host_id, cx);
-                }
-                let connecting = format!("正在连接 Telnet {ready_addr}…");
-                if this.status == connecting {
-                    this.status = SharedString::from(format!("已连接 Telnet {ready_addr}"));
-                }
-                cx.notify();
-            });
+            let _ =
+                this.update(cx, |this, cx| {
+                    let Some(tab) = this.tabs.iter_mut().find(|tab| {
+                        tab.id == id && tab.terminal_view.as_ref() == Some(&ready_view)
+                    }) else {
+                        return;
+                    };
+                    tab.connected_at = Some(Instant::now());
+                    tab.auto_retry_pending = false;
+                    if let Some(host_id) = recent_host_id {
+                        this.record_recent_host(host_id, cx);
+                    }
+                    let connecting = format!("正在连接 Telnet {ready_addr}…");
+                    if this.status == connecting {
+                        this.status = SharedString::from(format!("已连接 Telnet {ready_addr}"));
+                    }
+                    cx.notify();
+                });
         })
         .detach();
         let current_view = terminal_view.clone();
@@ -839,7 +888,6 @@ impl RuTermApp {
         cx.notify();
     }
 
-
     /// 回车重连：只在焦点落在「已断开的终端」上、且没有弹窗时生效。
     ///
     /// 断开的终端仍持有焦点，但按键已无处可写；在捕获阶段拦截回车，
@@ -870,7 +918,6 @@ impl RuTermApp {
         cx.stop_propagation();
         self.reconnect_tab(id, window, cx);
     }
-
 
     /// 密码输入面板。
     pub(super) fn render_pending_panel(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -954,6 +1001,4 @@ impl RuTermApp {
             )
             .into_any_element()
     }
-
-
 }
