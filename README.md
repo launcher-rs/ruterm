@@ -403,9 +403,9 @@ Windows 下 `~` 取 `%USERPROFILE%`，其他平台取 `$HOME`。
 
 | Crate | 版本 | 用途 |
 |-------|------|------|
-| `rgpui` | 1.6.0 | GUI 框架（启用 `tokio` 特性：异步运行时集成） |
-| `rgpui-platform` | 1.6.0 | 平台应用入口（`rgpui_platform::application()`） |
-| `rgpui-term` | 1.6.0 | 终端组件（SSH 用外接 IO 后端 `TerminalBuilder::new_external`，本地终端用内置 PTY 后端 `TerminalBuilder::new`） |
+| `rgpui` | 1.7.0 | GUI 框架（启用 `tokio` 特性：异步运行时集成） |
+| `rgpui-platform` | 1.7.0 | 平台应用入口（`rgpui_platform::application()`） |
+| `rgpui-term` | 1.7.0 | 终端组件（SSH 用外接 IO 后端 `TerminalBuilder::new_external`，本地终端用内置 PTY 后端 `TerminalBuilder::new`） |
 | `russh` | 0.64 | SSH 客户端（`flate2` / `ring` / `rsa`，关闭默认特性） |
 | `tokio` | 1 | 运行时与网络（rt-multi-thread、net、io-util、time 等） |
 | `serde` / `serde_json` | 1 | 降级路径（`sessions.json` / `settings.json`）持久化 |
@@ -416,7 +416,7 @@ Windows 下 `~` 取 `%USERPROFILE%`，其他平台取 `$HOME`。
 | `getrandom` | 0.4 | 主密钥与盐的随机生成 |
 | `winresource` | 0.1 | 仅 Windows：构建期嵌入 exe 图标资源 |
 
-rgpui 三个 crate 走 crates.io 正式版本。本地联调 rgpui 时可在 `[patch]` 或临时把依赖指回 `path = "../rgpui/crates/..."`（工作区标签 `v1.6.0` 与发布版本一致）。
+rgpui 三个 crate 走 crates.io 正式版本，仓库里不再保留指向本地源码的 `[patch]`。本地联调 rgpui 时可临时把依赖指回 `path = "../rgpui/crates/..."`（工作区标签 `v1.7.0` 与发布版本一致）。
 
 ## 模块结构
 

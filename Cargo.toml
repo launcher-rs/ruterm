@@ -5,9 +5,9 @@ edition = "2024"
 description = "面向开发者的开源远程连接工具（SSH 客户端），基于 rgpui + rgpui-term 外接 IO 后端"
 
 [dependencies]
-rgpui = { version = "1.6.0", features = ["tokio"] }
-rgpui-platform = "1.6.0"
-rgpui-term = "1.6.0"
+rgpui = { version = "1.7.0", features = ["tokio"] }
+rgpui-platform = "1.7.0"
+rgpui-term = "1.7.0"
 russh = { version = "0.64.1", default-features = false, features = ["flate2", "ring", "rsa"] }
 russh-sftp = "3.0.1"
 zmodem2 = "0.7.3"
@@ -47,12 +47,6 @@ ironrdp = { version = "0.17", default-features = false, features = [
 sspi = "=0.21.3"
 
 [patch.crates-io]
-# rgpui 侧以本地源码工程（../rgpui）为准：外接 IO 解析线程的自锁、Windows
-# 平台 activate 误把窗口销毁这两处修复都只在源码仓库里，1.6.0 发布版还没有。
-# 三个 crate 一起换，避免同一套类型出现两份。
-rgpui = { path = "../rgpui/crates/rgpui" }
-rgpui-platform = { path = "../rgpui/crates/rgpui-platform" }
-rgpui-term = { path = "../rgpui/crates/rgpui-term" }
 # ironrdp-connector 的 CredSSP 唯一用到的是 `picky::key::PrivateKey`。上游
 # 7.0.0-rc.25 把 curve25519-dalek 等钉在预发布版，与 russh 已解析的 5.0.0 /
 # 3.0.0 落在同一兼容区间而无法共存；本地副本只把几个 RustCrypto 依赖跟到
