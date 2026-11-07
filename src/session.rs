@@ -483,6 +483,13 @@ async fn run(
 
         let (handle, _) = hops.pop().expect("链上至少有最终目标一个节点");
         let channel = handle.channel_open_session().await?;
+        // 声明 locale：vim 等按 locale 决定内部编码，POSIX 会退成 latin1，
+        // 重绘时把多字节字符拆散穿插转义序列，任何 UTF-8 终端都显示成乱码。
+        // 对齐 OpenSSH 的 `SendEnv LANG LC_*`：本地显式设置就透传；没有则默认
+        // 声明 C.UTF-8。sshd 未配置 AcceptEnv 时会静默拒绝，不影响连接。
+        for (name, value) in ssh_locale_env() {
+            let _ = channel.set_env(false, name, value).await;
+        }
         channel
             .request_pty(
                 true,
@@ -1308,6 +1315,20 @@ async fn probe_remote_info(
         }
         let _ = write.close().await;
     });
+}
+
+/// SSH 会话要声明的 locale 变量：本地显式设置的优先透传，否则默认 C.UTF-8。
+fn ssh_locale_env() -> Vec<(&'static str, String)> {
+    let mut env = Vec::new();
+    for name in ["LANG", "LC_ALL"] {
+        if let Some(value) = std::env::var_os(name).filter(|v| !v.is_empty()) {
+            env.push((name, value.to_string_lossy().into_owned()));
+        }
+    }
+    if env.is_empty() {
+        env.push(("LANG", "C.UTF-8".to_string()));
+    }
+    env
 }
 
 /// 终端 → 远端：按键字节写通道，尺寸变化发 window_change；
