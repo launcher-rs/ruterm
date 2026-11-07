@@ -4,15 +4,18 @@
 use rgpui::input_ui::{Input, InputEvent, InputState};
 use rgpui::prelude::*;
 use rgpui::{
-    AnyElement, Button, ButtonVariants, Checkbox, Context, Disableable, Entity, Focusable, FontWeight, InteractiveElement, IntoElement, MouseButton, ParentElement, SharedString,
-    Styled, Window, div, h_flex, px, v_flex,
+    Anchor, AnyElement, Button, ButtonVariants, Checkbox, Context, DismissEvent, Disableable, Entity, Focusable, FontWeight, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement, Pixels, Point, PopupMenu, SharedString,
+    Styled, Window, anchored, deferred, div, h_flex, px, v_flex,
 };
 use rgpui_term::{
     InputOrigin,
     TerminalMiddleware, TerminalView,
 };
 
-use crate::{FindInTerminal, CloseFind, ToggleSyncInput, BroadcastCommand, CancelBroadcast};
+use crate::{
+    BroadcastCommand, CancelBroadcast, CloseFind, FindInTerminal, TerminalCopy, TerminalCopyText,
+    TerminalPaste, ToggleSyncInput,
+};
 use crate::tr;
 
 use super::*;
@@ -98,6 +101,15 @@ pub(super) struct FindBar {
     pub(super) applied: Option<(String, bool)>,
 }
 
+/// 终端右键菜单：菜单实体 + 弹出位置（窗口坐标）。
+///
+/// 菜单放在 root 的 `deferred` 图层里渲染，命中区在终端之上；点外部或按 Esc
+/// 由 `PopupMenu` 自己关闭，并通过 `DismissEvent` 把这里的状态清掉。
+pub(super) struct TerminalMenu {
+    pub(super) position: Point<Pixels>,
+    pub(super) menu: Entity<PopupMenu>,
+}
+
 impl RuTermApp {
     /// Ctrl+F / 菜单「终端内查找」：展开查找条并聚焦关键词输入框。
     ///
@@ -155,6 +167,297 @@ impl RuTermApp {
             .iter()
             .find(|tab| tab.id == id)
             .and_then(|tab| tab.terminal_view.clone())
+    }
+
+
+    /// 持有键盘焦点的终端视图（分屏时可能是非活动标签）；找不到时回落到活动标签。
+    fn focused_terminal(&self, window: &Window, cx: &App) -> Option<Entity<TerminalView>> {
+        let focused = window.focused(cx)?;
+        self.tabs
+            .iter()
+            .filter_map(|tab| tab.terminal_view.as_ref())
+            .find(|view| view.read(cx).focus_handle(cx) == focused)
+            .cloned()
+    }
+
+
+    /// 按标签 id 找终端视图，并给出会话是否还能收输入。
+    fn terminal_view_by_id(&self, tab_id: usize) -> Option<(Entity<TerminalView>, bool)> {
+        let tab = self.tabs.iter().find(|tab| tab.id == tab_id)?;
+        let view = tab.terminal_view.clone()?;
+        Some((view, !tab.ended && !tab.failed))
+    }
+
+
+    /// 复制终端当前选区，返回是否真的有选区。
+    ///
+    /// 走终端自身的 `copy`：它在下次 `sync` 时写剪贴板并清掉选区
+    /// （与 Windows Terminal 一致，复制后高亮消失即"已复制"的反馈）。
+    fn copy_terminal_selection(
+        &self,
+        view: &Entity<TerminalView>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let terminal = view.read(cx).terminal().clone();
+        if terminal.read(cx).last_content().selection.is_none() {
+            return false;
+        }
+        terminal.update(cx, |terminal, _| terminal.copy(Some(false)));
+        cx.notify();
+        true
+    }
+
+
+    /// 把系统剪贴板里的文本粘进终端（bracketed-paste / CRLF 归一化由终端负责）。
+    fn paste_terminal(&self, view: &Entity<TerminalView>, cx: &mut Context<Self>) {
+        let Some(text) = cx
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .filter(|text| !text.is_empty())
+        else {
+            return;
+        };
+        let terminal = view.read(cx).terminal().clone();
+        terminal.update(cx, |terminal, _| terminal.paste(&text));
+    }
+
+
+    fn copy_terminal_by_id(&mut self, tab_id: usize, cx: &mut Context<Self>) {
+        let Some((view, _)) = self.terminal_view_by_id(tab_id) else {
+            return;
+        };
+        self.copy_terminal_selection(&view, cx);
+    }
+
+
+    fn paste_terminal_by_id(&mut self, tab_id: usize, cx: &mut Context<Self>) {
+        let Some((view, live)) = self.terminal_view_by_id(tab_id) else {
+            return;
+        };
+        if live {
+            self.paste_terminal(&view, cx);
+        }
+    }
+
+
+    fn select_all_terminal(&mut self, tab_id: usize, cx: &mut Context<Self>) {
+        let Some((view, _)) = self.terminal_view_by_id(tab_id) else {
+            return;
+        };
+        let terminal = view.read(cx).terminal().clone();
+        terminal.update(cx, |terminal, _| terminal.select_all());
+    }
+
+
+    fn clear_terminal_by_id(&mut self, tab_id: usize, cx: &mut Context<Self>) {
+        let Some((view, _)) = self.terminal_view_by_id(tab_id) else {
+            return;
+        };
+        let terminal = view.read(cx).terminal().clone();
+        terminal.update(cx, |terminal, _| terminal.clear());
+    }
+
+
+    /// Ctrl+C：有选区复制，没有选区就把 ^C 送给 shell（经典终端语义）。
+    pub(super) fn terminal_copy_action(
+        &mut self,
+        _: &TerminalCopy,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let view = self
+            .focused_terminal(window, cx)
+            .or_else(|| self.active_terminal_view());
+        if let Some(view) = view
+            && !self.copy_terminal_selection(&view, cx)
+        {
+            let terminal = view.read(cx).terminal().clone();
+            // 用 Keystroke 来源而不是 Programmatic：开了「同步输入」时 Ctrl+C
+            // 也要一并中断其它会话。
+            terminal.update(cx, |terminal, _| {
+                terminal.input_with_origin(vec![0x03], InputOrigin::Keystroke);
+            });
+        }
+        // 必须掐断动作分发：否则绑定处理完还会走到 TerminalView 的 on_key_down，
+        // 把 ^C 再送一遍（有选区时就会"复制 + 中断"同时发生）。
+        cx.stop_propagation();
+    }
+
+
+    /// Ctrl+Shift+C：只复制，没有选区就什么都不做（绝不误发中断）。
+    pub(super) fn terminal_copy_text_action(
+        &mut self,
+        _: &TerminalCopyText,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(view) = self
+            .focused_terminal(window, cx)
+            .or_else(|| self.active_terminal_view())
+        {
+            self.copy_terminal_selection(&view, cx);
+        }
+        cx.stop_propagation();
+    }
+
+
+    /// Ctrl+V / Ctrl+Shift+V / Shift+Insert：把剪贴板文本粘进终端。
+    pub(super) fn terminal_paste_action(
+        &mut self,
+        _: &TerminalPaste,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(view) = self
+            .focused_terminal(window, cx)
+            .or_else(|| self.active_terminal_view())
+        {
+            let live = self.tabs.iter().any(|tab| {
+                tab.terminal_view.as_ref() == Some(&view) && !tab.ended && !tab.failed
+            });
+            if live {
+                self.paste_terminal(&view, cx);
+            }
+        }
+        // 没有可粘贴的会话时也要吞掉按键，避免 ^V 落到 shell。
+        cx.stop_propagation();
+    }
+
+
+    /// 终端区域右键：先于框架的「右键=粘贴」拦下事件，改为弹剪贴板菜单。
+    ///
+    /// `TerminalView` 在冒泡阶段直接粘贴且没有开关，所以只能在 pane 的捕获阶段
+    /// `stop_propagation()`：冒泡阶段整个跳过，也就不会误粘。鼠标上报模式
+    ///（vim / mc 等）下右键属于远端程序，原样放行。
+    pub(super) fn maybe_open_terminal_menu(
+        &mut self,
+        tab_id: usize,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.button != MouseButton::Right {
+            return;
+        }
+        let Some((view, _)) = self.terminal_view_by_id(tab_id) else {
+            return;
+        };
+        let terminal = view.read(cx).terminal().clone();
+        let intercept = {
+            let terminal = terminal.read(cx);
+            !terminal.mouse_mode(event.modifiers.shift)
+                && terminal
+                    .last_content()
+                    .terminal_bounds
+                    .bounds
+                    .contains(&event.position)
+        };
+        if !intercept {
+            return;
+        }
+        cx.stop_propagation();
+        // 分屏时右键另一侧也要切过去：菜单关闭后焦点回到终端，活动标签不能还
+        // 停在旧会话上（与左键点击面板一致）。
+        if self.active_tab != Some(tab_id) {
+            self.activate_tab(tab_id, window, cx);
+        }
+        self.open_terminal_menu(tab_id, event.position, window, cx);
+    }
+
+
+    fn open_terminal_menu(
+        &mut self,
+        tab_id: usize,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((view, live)) = self.terminal_view_by_id(tab_id) else {
+            return;
+        };
+        let terminal = view.read(cx).terminal().clone();
+        let focus = view.read(cx).focus_handle(cx);
+        let has_selection = terminal.read(cx).last_content().selection.is_some();
+        let has_clipboard_text = cx
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .is_some_and(|text| !text.is_empty());
+        let entity = cx.entity();
+        let menu = PopupMenu::build(window, cx, move |menu, _, cx| {
+            // 关闭菜单时焦点回到终端；否则键盘接着敲就落不到 PTY 上。
+            let menu = menu.min_w(px(180.0)).action_context(focus.clone());
+            menu.item(
+                Self::menu_item(
+                    entity.clone(),
+                    tr!(cx, "复制"),
+                    None,
+                    false,
+                    false,
+                    move |this, _, cx| this.copy_terminal_by_id(tab_id, cx),
+                )
+                .disabled(!has_selection),
+            )
+            .item(
+                Self::menu_item(
+                    entity.clone(),
+                    tr!(cx, "粘贴"),
+                    None,
+                    false,
+                    false,
+                    move |this, _, cx| this.paste_terminal_by_id(tab_id, cx),
+                )
+                .disabled(!live || !has_clipboard_text),
+            )
+            .separator()
+            .item(Self::menu_item(
+                entity.clone(),
+                tr!(cx, "全选"),
+                None,
+                false,
+                false,
+                move |this, _, cx| this.select_all_terminal(tab_id, cx),
+            ))
+            .item(Self::menu_item(
+                entity.clone(),
+                tr!(cx, "清屏"),
+                None,
+                false,
+                false,
+                move |this, _, cx| this.clear_terminal_by_id(tab_id, cx),
+            ))
+        });
+        menu.focus_handle(cx).focus(window, cx);
+        // 菜单自己处理 Esc / 点外部；关闭时把应用侧状态一并清掉。
+        cx.subscribe(&menu, |this, _, _: &DismissEvent, cx| {
+            this.terminal_menu = None;
+            cx.notify();
+        })
+        .detach();
+        self.terminal_menu = Some(TerminalMenu { position, menu });
+        cx.notify();
+    }
+
+
+    /// 右键菜单的独立图层（root 最后绘制，命中区盖在终端与状态栏之上）。
+    pub(super) fn render_terminal_menu(&mut self) -> AnyElement {
+        // 打开设置等居中模态后收起，避免菜单隔着模态显示、再次关闭时又冒出来。
+        if self.overlay_open() {
+            self.terminal_menu = None;
+            return div().into_any_element();
+        }
+        let Some(state) = self.terminal_menu.as_ref() else {
+            return div().into_any_element();
+        };
+        let menu = state.menu.clone();
+        deferred(
+            anchored()
+                .snap_to_window_with_margin(px(8.0))
+                .anchor(Anchor::TopLeft)
+                .position(state.position)
+                .child(menu),
+        )
+        .with_priority(1)
+        .into_any_element()
     }
 
 

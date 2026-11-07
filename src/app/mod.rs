@@ -87,6 +87,9 @@ pub(crate) struct RuTermApp {
     home_search: Entity<InputState>,
     /// 终端内查找条（Ctrl+F）。
     find: FindBar,
+    /// 终端右键菜单（复制 / 粘贴 / 全选 / 清屏）。菜单是独立图层里的实体，
+    /// `None` 表示当前没有打开。
+    terminal_menu: Option<TerminalMenu>,
     /// 同步输入开关：活动终端的按键同时写进其它会话（仅本次运行有效）。
     sync_input: bool,
     /// 终端输入镜像通道（中间件 → UI 分发循环）。
@@ -347,6 +350,7 @@ impl RuTermApp {
                 regex: false,
                 applied: None,
             },
+            terminal_menu: None,
             sync_input: false,
             mirror_tx,
             broadcast: None,
@@ -1212,6 +1216,9 @@ impl Render for RuTermApp {
             .on_action(cx.listener(Self::cancel_broadcast))
             .on_action(cx.listener(Self::open_macro_manager))
             .on_action(cx.listener(Self::close_macro_manager_action))
+            .on_action(cx.listener(Self::terminal_copy_action))
+            .on_action(cx.listener(Self::terminal_copy_text_action))
+            .on_action(cx.listener(Self::terminal_paste_action))
             // 捕获阶段先看到回车：断开的终端已写不到远端，回车要用来重连而不是被它吞掉。
             .capture_key_down(cx.listener(Self::capture_session_key))
             .child(self.render_title_bar(window, cx))
@@ -1275,6 +1282,7 @@ impl Render for RuTermApp {
             })
             .child(self.render_status_bar(cx).flex_shrink_0().w_full())
             .child(self.render_overlay(window, cx))
+            .child(self.render_terminal_menu())
     }
 }
 

@@ -847,6 +847,11 @@ impl RuTermApp {
                     }
                 }),
             )
+            // 终端右键：框架的 TerminalView 在冒泡阶段直接粘贴，捕获阶段先截住并
+            // 改为弹剪贴板菜单（鼠标上报模式下放行，交还给远端程序）。
+            .capture_any_mouse_down(cx.listener(move |this, event, window, cx| {
+                this.maybe_open_terminal_menu(id, event, window, cx);
+            }))
             // 本地文件拖进标签：终端走 lrzsz；远程桌面走 RDP 剪贴板文件流
             //（VNC 无文件通道，见 `desktop_drop_paths`）。
             .drag_over::<ExternalPaths>(move |style, _, _, _| {

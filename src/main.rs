@@ -89,7 +89,12 @@ actions!(
         BroadcastCommand,
         CancelBroadcast,
         MacroManager,
-        CloseMacroManager
+        CloseMacroManager,
+        // 终端剪贴板：Ctrl+C 有选区就复制、没选区把 ^C 送给 shell；
+        // Ctrl+Shift+C 只复制（不误发中断），Ctrl+V 粘贴。
+        TerminalCopy,
+        TerminalCopyText,
+        TerminalPaste
     ]
 );
 
@@ -143,6 +148,9 @@ fn main() {
             cx,
         );
         rgpui::input_ui::init(cx);
+        // 弹窗菜单的键位（Esc 关闭、方向键选择、回车确认）：不初始化时右键菜单
+        // 只能用鼠标点，键盘完全关不掉。
+        rgpui::menu::init(cx);
         // 全局快捷键：与菜单项上的 action 同名，菜单里会自动显示这组按键。
         cx.bind_keys([
             KeyBinding::new("ctrl-b", ToggleSidebar, None),
@@ -187,6 +195,14 @@ fn main() {
             // 抢占：它比 Root 更深，分发解析到它就停止，按键原样落到 on_key_down 转发给 PTY。
             KeyBinding::new("tab", NoAction {}, Some("Terminal")),
             KeyBinding::new("shift-tab", NoAction {}, Some("Terminal")),
+            // 终端复制粘贴：只在终端持有焦点时生效。Ctrl+C 走「有选区复制、无选区
+            // 中断」的经典终端语义；Ctrl+Shift+C 永远只复制，避免误发 ^C。
+            // Ctrl+V 被抢占后不会再作为 ^V 送给 shell，与 Windows Terminal 一致。
+            KeyBinding::new("ctrl-c", TerminalCopy, Some("Terminal")),
+            KeyBinding::new("ctrl-shift-c", TerminalCopyText, Some("Terminal")),
+            KeyBinding::new("ctrl-v", TerminalPaste, Some("Terminal")),
+            KeyBinding::new("ctrl-shift-v", TerminalPaste, Some("Terminal")),
+            KeyBinding::new("shift-insert", TerminalPaste, Some("Terminal")),
         ]);
         let opened = cx.open_window(
             WindowOptions {
