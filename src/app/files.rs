@@ -2,6 +2,7 @@
 
 use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use rgpui::input_ui::{Input, InputEvent, InputState};
 use rgpui::prelude::*;
@@ -88,6 +89,83 @@ pub(super) const FILE_COL_MAX_W: f32 = 180.0;
 pub(super) const FILE_ROW_LEAD_W: f32 = 20.0;
 /// 面板实测宽度低于此值算「窄栏」：隐掉修改时间与权限两列（见 [`RuTermApp::pane_narrow`]）。
 pub(super) const FILE_PANE_NARROW_W: f32 = 430.0;
+
+/// 「打开后回传」的本地巡检间隔。编辑器保存往往分成多次写盘，要连续两轮
+/// 看到同一个新标记才认为写完，避免把半截内容传到远端。
+const OPEN_FILE_POLL: Duration = Duration::from_millis(800);
+
+/// 由「打开」下载到本地的远端文件：本地保存后自动回传远端。
+pub(super) struct OpenedRemote {
+    pub(super) local: PathBuf,
+    pub(super) remote: String,
+    pub(super) name: String,
+    /// 最近一次已知（刚下载或已回传）的本地版本标记。
+    pub(super) stamp: FileStamp,
+    /// 上一轮看到的新标记：连续两轮相同才认为写入结束。
+    pub(super) candidate: Option<FileStamp>,
+}
+
+/// 本地文件的版本标记：长度 + 修改时间，任一变就当作改过。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) struct FileStamp {
+    len: u64,
+    modified: Option<(u64, u32)>,
+}
+
+impl OpenedRemote {
+    /// 本轮看到的标记是否已经稳定、可以回传。
+    ///
+    /// 第一次看到新标记只记下候选（编辑器可能还在写），连续两轮相同才放行；
+    /// 放行后由调用方真正发起上传，成功时再 [`Self::confirm_upload`]。
+    pub(super) fn ready_to_upload(&mut self, stamp: FileStamp) -> bool {
+        if stamp == self.stamp {
+            self.candidate = None;
+            return false;
+        }
+        if self.candidate == Some(stamp) {
+            return true;
+        }
+        self.candidate = Some(stamp);
+        false
+    }
+
+    /// 回传已发起：把新标记记为已知版本，避免同一份改动重复上传。
+    pub(super) fn confirm_upload(&mut self, stamp: FileStamp) {
+        self.stamp = stamp;
+        self.candidate = None;
+    }
+}
+
+/// 取本地文件当前标记；文件已不存在（用户删了临时副本）时返回 None。
+pub(super) fn file_stamp(path: &Path) -> Option<FileStamp> {
+    let metadata = std::fs::metadata(path).ok()?;
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|time| (time.as_secs(), time.subsec_nanos()));
+    Some(FileStamp {
+        len: metadata.len(),
+        modified,
+    })
+}
+
+/// 巡检一轮：把本地副本已稳定修改的文件挑出来（每轮最多一个，其余下一轮继续）。
+/// 临时副本被用户删掉的顺带清理。
+pub(super) fn poll_opened_files(browser: &mut FileBrowser) -> Option<(PathBuf, String, String)> {
+    let mut ready = None;
+    browser.opened.retain_mut(|item| {
+        let Some(stamp) = file_stamp(&item.local) else {
+            return false;
+        };
+        if item.ready_to_upload(stamp) && ready.is_none() {
+            item.confirm_upload(stamp);
+            ready = Some((item.local.clone(), item.remote.clone(), item.name.clone()));
+        }
+        true
+    });
+    ready
+}
 
 /// 远端修改时间（Unix 秒，UTC）→ `MM-DD HH:MM`（面板窄，省掉年份）。
 pub(super) fn format_remote_time_short(seconds: u32) -> String {
@@ -195,6 +273,10 @@ pub(super) struct FileBrowser {
     pub(super) sort_desc: bool,
     /// 类型 / 大小 / 修改时间 / 权限 四列宽度；名称列占剩余空间。
     pub(super) cols: [f32; 4],
+    /// 通过「打开」落到本地的远端文件：本地改动稳定后自动传回。
+    pub(super) opened: Vec<OpenedRemote>,
+    /// 本地改动巡检循环是否已启动（每个标签一条，标签消失时自行退出）。
+    pub(super) watching: bool,
 }
 
 impl Default for FileBrowser {
@@ -216,6 +298,8 @@ impl Default for FileBrowser {
                 FILE_COL_TIME_W,
                 FILE_COL_PERM_W,
             ],
+            opened: Vec::new(),
+            watching: false,
         }
     }
 }
@@ -297,6 +381,16 @@ pub(super) struct FileConfirm {
     pub(super) path: String,
     pub(super) name: String,
     pub(super) is_dir: bool,
+}
+
+/// 本地副本改动后等待用户决定是否回传的文件（一次弹窗确认一个）。
+pub(super) struct FileUploadPrompt {
+    pub(super) tab_id: usize,
+    pub(super) local: PathBuf,
+    pub(super) remote: String,
+    pub(super) name: String,
+    /// 展示用的连接地址（`user@host:port`），与 WindTerm 的提示一致。
+    pub(super) server: SharedString,
 }
 
 /// 下载保存对话框的起始目录：优先系统下载目录，缺失则退回当前目录。
@@ -502,6 +596,17 @@ impl RuTermApp {
             return;
         }
         let local = dir.join(safe);
+        // 已打开过的文件直接复用本地副本：重新下载会把还没回传的修改盖掉。
+        if let Some(opened) = self
+            .tabs
+            .iter()
+            .find(|tab| tab.id == tab_id)
+            .and_then(|tab| tab.files.opened.iter().find(|item| item.remote == remote))
+            .filter(|item| item.local.exists())
+        {
+            open_path_with_default(&opened.local);
+            return;
+        }
         self.file_transfer(
             tab_id,
             crate::transfer::Direction::Download,
@@ -511,6 +616,184 @@ impl RuTermApp {
             false,
             cx,
         );
+    }
+
+
+    /// 登记一个已用本地程序打开的远端文件，并确保该标签的巡检循环在跑。
+    pub(super) fn track_opened_remote(
+        &mut self,
+        tab_id: usize,
+        local: PathBuf,
+        remote: String,
+        name: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(stamp) = file_stamp(&local) else {
+            return;
+        };
+        let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) else {
+            return;
+        };
+        if let Some(item) = tab.files.opened.iter_mut().find(|item| item.remote == remote) {
+            item.local = local;
+            item.stamp = stamp;
+            item.candidate = None;
+        } else {
+            tab.files.opened.push(OpenedRemote {
+                local,
+                remote,
+                name,
+                stamp,
+                candidate: None,
+            });
+        }
+        if tab.files.watching {
+            return;
+        }
+        tab.files.watching = true;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(OPEN_FILE_POLL).await;
+                let ready = this
+                    .update(cx, |this, _| {
+                        let tab = this.tabs.iter_mut().find(|tab| tab.id == tab_id)?;
+                        // 有传输在跑就先让路，下一轮再判断。
+                        if tab.files.busy.is_some() {
+                            return Some(None);
+                        }
+                        let ready = poll_opened_files(&mut tab.files);
+                        if tab.files.opened.is_empty() {
+                            tab.files.watching = false;
+                            return None;
+                        }
+                        Some(ready)
+                    })
+                    .ok()
+                    .flatten();
+                let Some(ready) = ready else {
+                    break;
+                };
+                if let Some((local, remote, name)) = ready {
+                    let _ = this.update(cx, |this, cx| {
+                        this.queue_remote_upload(tab_id, local, remote, name, cx);
+                    });
+                }
+                // 队列里的回传 / 确认每轮都试着推进：忙完一笔就接着下一笔。
+                let _ = this.update(cx, |this, cx| this.pump_remote_uploads(cx));
+            }
+        })
+        .detach();
+    }
+
+
+    /// 本地改动被确认后入队：默认先弹窗问用户，选过「全部是」的直接回传。
+    pub(super) fn queue_remote_upload(
+        &mut self,
+        tab_id: usize,
+        local: PathBuf,
+        remote: String,
+        name: String,
+        cx: &mut Context<Self>,
+    ) {
+        let server = self
+            .tabs
+            .iter()
+            .find(|tab| tab.id == tab_id)
+            .map(|tab| tab.addr.clone())
+            .unwrap_or_default();
+        self.file_upload_queue.push(FileUploadPrompt {
+            tab_id,
+            local,
+            remote,
+            name,
+            server,
+        });
+        cx.notify();
+    }
+
+
+    /// 推进回传队列：会话已消失的条目丢掉；开了「全部是」就直接传，
+    /// 否则弹窗确认。目标标签正忙时先等着，下一轮巡检再推进。
+    pub(super) fn pump_remote_uploads(&mut self, cx: &mut Context<Self>) {
+        if self.file_upload_prompt.is_some() {
+            return;
+        }
+        while self
+            .file_upload_queue
+            .first()
+            .is_some_and(|item| self.tabs.iter().all(|tab| tab.id != item.tab_id))
+        {
+            self.file_upload_queue.remove(0);
+        }
+        let Some(front) = self.file_upload_queue.first() else {
+            return;
+        };
+        let busy = self
+            .tabs
+            .iter()
+            .find(|tab| tab.id == front.tab_id)
+            .is_some_and(|tab| tab.files.busy.is_some());
+        if self.file_upload_all {
+            if !busy {
+                self.start_queued_upload(cx);
+            }
+            return;
+        }
+        if busy {
+            return;
+        }
+        self.file_upload_prompt = Some(self.file_upload_queue.remove(0));
+        cx.notify();
+    }
+
+
+    /// 直接回传队首（不再确认）；目标标签忙或已消失时原样留在队列里。
+    fn start_queued_upload(&mut self, cx: &mut Context<Self>) {
+        let Some(front) = self.file_upload_queue.first() else {
+            return;
+        };
+        if self
+            .tabs
+            .iter()
+            .find(|tab| tab.id == front.tab_id)
+            .is_none_or(|tab| tab.files.busy.is_some())
+        {
+            return;
+        }
+        let item = self.file_upload_queue.remove(0);
+        self.status = format!("检测到 {} 已修改，正在回传远端…", item.name).into();
+        self.file_transfer(
+            item.tab_id,
+            crate::transfer::Direction::Upload,
+            item.local,
+            item.remote,
+            false,
+            true,
+            cx,
+        );
+    }
+
+
+    /// 确认弹窗的回答：`upload` 表示回传当前文件，`all` 表示本会话后续改动
+    /// 都不再询问；两者都 false 即「否」，跳过这一份改动。
+    pub(super) fn answer_remote_upload(
+        &mut self,
+        upload: bool,
+        all: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(prompt) = self.file_upload_prompt.take() else {
+            return;
+        };
+        if all {
+            self.file_upload_all = true;
+        }
+        if upload {
+            self.file_upload_queue.insert(0, prompt);
+            self.start_queued_upload(cx);
+        }
+        self.pump_remote_uploads(cx);
+        cx.notify();
     }
 
 
@@ -612,6 +895,15 @@ impl RuTermApp {
             });
             if open_after && !failed {
                 open_path_with_default(&local);
+                // 打开之后盯住这份临时副本：本地保存后自动传回远端。
+                let name = remote
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(remote.as_str())
+                    .to_string();
+                let _ = this.update(cx, |this, cx| {
+                    this.track_opened_remote(tab_id, local.clone(), remote.clone(), name, cx);
+                });
             }
             if reload {
                 let path = this
@@ -2287,6 +2579,108 @@ impl RuTermApp {
     }
 
 
+    /// 本地副本改动后的回传确认（对照 WindTerm 的 Upload File 弹窗）。
+    pub(super) fn render_file_upload_prompt(&self, cx: &Context<Self>) -> AnyElement {
+        let pal = self.palette(cx);
+        let Some(prompt) = self.file_upload_prompt.as_ref() else {
+            return div().into_any_element();
+        };
+        let title = tr!(cx, "远程文件已被修改");
+        let message = tr!(cx, "是否要将此文件上传回服务器？");
+        let name_label = tr!(cx, "文件名称");
+        let server_label = tr!(cx, "服务器");
+        let path_label = tr!(cx, "远程路径");
+        let yes_label = tr!(cx, "是");
+        let yes_all_label = tr!(cx, "全部是");
+        let no_label = tr!(cx, "否");
+        let name = prompt.name.clone();
+        let server = prompt.server.clone();
+        let remote = prompt.remote.clone();
+        let field = |label: SharedString, value: SharedString| {
+            h_flex()
+                .w_full()
+                .gap_3()
+                .child(
+                    div()
+                        .w(px(72.0))
+                        .flex_shrink_0()
+                        .text_xs()
+                        .text_color(pal.muted)
+                        .child(label),
+                )
+                .child(div().flex_1().min_w_0().text_xs().text_ellipsis().child(value))
+        };
+        v_flex()
+            .id("file-upload-backdrop")
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .size_full()
+            .items_center()
+            .justify_center()
+            .bg(rgpui::hsla(0.0, 0.0, 0.0, 0.45))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_, _, _, cx| cx.stop_propagation()),
+            )
+            .child(
+                v_flex()
+                    .id("file-upload-dialog")
+                    .w(px(420.0))
+                    .gap_3()
+                    .p_4()
+                    .rounded(px(8.0))
+                    .bg(pal.card_bg)
+                    .border_1()
+                    .border_color(pal.border)
+                    .child(
+                        div()
+                            .text_base()
+                            .font_weight(FontWeight(600.0))
+                            .child(title),
+                    )
+                    .child(div().text_sm().child(message))
+                    .child(field(name_label, name.into()))
+                    .child(field(server_label, server))
+                    .child(field(path_label, remote.into()))
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .justify_end()
+                            .child(
+                                Button::new("file-upload-yes")
+                                    .label(yes_label)
+                                    .primary()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.answer_remote_upload(true, false, cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("file-upload-yes-all")
+                                    .label(yes_all_label)
+                                    .ghost()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.answer_remote_upload(true, true, cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("file-upload-no")
+                                    .label(no_label)
+                                    .ghost()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.answer_remote_upload(false, false, cx);
+                                    })),
+                            ),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                    ),
+            )
+            .into_any_element()
+    }
+
+
     /// 文件面板的新建 / 重命名弹窗。
     pub(super) fn render_file_prompt(&self, cx: &Context<Self>) -> AnyElement {
         let pal = self.palette(cx);
@@ -2472,8 +2866,12 @@ impl RuTermApp {
 
 #[cfg(test)]
 mod tests {
-    use super::{FileBrowser, FileSortKey, format_remote_time_short, safe_local_name};
+    use super::{
+        FileBrowser, FileSortKey, FileStamp, OpenedRemote, file_stamp,
+        format_remote_time_short, poll_opened_files, safe_local_name,
+    };
     use crate::remote_fs;
+    use std::path::PathBuf;
 
     #[test]
     fn safe_local_name_keeps_basename_only() {
@@ -2535,5 +2933,91 @@ mod tests {
         files.sort_desc = false;
         files.sort_entries();
         assert_eq!(names(&files), ["zeta", "alpha.txt", "Beta.txt"]);
+    }
+
+    fn stamp(len: u64, secs: u64) -> FileStamp {
+        FileStamp {
+            len,
+            modified: Some((secs, 0)),
+        }
+    }
+
+    fn opened() -> OpenedRemote {
+        OpenedRemote {
+            local: PathBuf::from("unused"),
+            remote: "/tmp/a.txt".to_string(),
+            name: "a.txt".to_string(),
+            stamp: stamp(3, 10),
+            candidate: None,
+        }
+    }
+
+    #[test]
+    fn opened_remote_waits_for_a_stable_stamp_before_uploading() {
+        let mut item = opened();
+        // 第一次看到新标记：编辑器可能还在写，先记候选。
+        assert!(!item.ready_to_upload(stamp(5, 11)));
+        // 连续两轮同一个标记：放行。
+        assert!(item.ready_to_upload(stamp(5, 11)));
+        item.confirm_upload(stamp(5, 11));
+        // 已经回传过的版本不再重复上传。
+        assert!(!item.ready_to_upload(stamp(5, 11)));
+        // 再写一次要重新走两轮确认。
+        assert!(!item.ready_to_upload(stamp(7, 12)));
+        assert!(item.ready_to_upload(stamp(7, 12)));
+    }
+
+    #[test]
+    fn file_stamp_changes_with_content_and_reports_missing_files() {
+        let path = std::env::temp_dir().join(format!(
+            "ruterm-stamp-{}-{}.txt",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::write(&path, b"one").unwrap();
+        let first = file_stamp(&path).expect("刚写入的文件应有标记");
+        std::fs::write(&path, b"one-two").unwrap();
+        let second = file_stamp(&path).expect("追加后仍应有标记");
+        assert_ne!(first, second);
+        std::fs::remove_file(&path).unwrap();
+        assert!(file_stamp(&path).is_none());
+    }
+
+    #[test]
+    fn poll_opened_files_uploads_once_after_a_stable_change() {
+        let dir = std::env::temp_dir().join(format!(
+            "ruterm-poll-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let local = dir.join("a.txt");
+        std::fs::write(&local, b"one").unwrap();
+
+        let mut browser = FileBrowser::default();
+        browser.opened.push(OpenedRemote {
+            local: local.clone(),
+            remote: "/tmp/a.txt".to_string(),
+            name: "a.txt".to_string(),
+            stamp: file_stamp(&local).unwrap(),
+            candidate: None,
+        });
+
+        // 没动过：不回传。
+        assert!(poll_opened_files(&mut browser).is_none());
+        // 刚写完一轮：可能还没写完，先等下一轮。
+        std::fs::write(&local, b"one-two").unwrap();
+        assert!(poll_opened_files(&mut browser).is_none());
+        // 同一个标记再次出现：回传，并且只回传一次。
+        let (path, remote, name) = poll_opened_files(&mut browser).expect("稳定修改应触发回传");
+        assert_eq!(path, local);
+        assert_eq!(remote, "/tmp/a.txt");
+        assert_eq!(name, "a.txt");
+        assert!(poll_opened_files(&mut browser).is_none());
+        // 本地副本被删：跟踪项清理掉。
+        std::fs::remove_file(&local).unwrap();
+        assert!(poll_opened_files(&mut browser).is_none());
+        assert!(browser.opened.is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

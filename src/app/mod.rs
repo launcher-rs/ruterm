@@ -156,6 +156,12 @@ pub(crate) struct RuTermApp {
     file_prompt: Option<FilePrompt>,
     /// 文件面板删除确认。
     file_confirm: Option<FileConfirm>,
+    /// 本地副本改动后等待用户确认是否回传（一次显示一个）。
+    file_upload_prompt: Option<FileUploadPrompt>,
+    /// 其余等待确认 / 回传的文件；按巡检节奏逐个推进。
+    file_upload_queue: Vec<FileUploadPrompt>,
+    /// 本次运行内「全部是」：后续本地改动直接回传，不再弹窗。
+    file_upload_all: bool,
     /// 文件面板路径编辑输入框（点击路径栏时激活）：连同它归属的面板一起存，
     /// 本机页和远端页各自认领，不会在 A 页输入、回车却跳到 B 页。
     path_edit: Option<(PaneTarget, Entity<InputState>)>,
@@ -382,6 +388,9 @@ impl RuTermApp {
             col_drag: None,
             file_prompt: None,
             file_confirm: None,
+            file_upload_prompt: None,
+            file_upload_queue: Vec::new(),
+            file_upload_all: false,
             path_edit: None,
             local: LocalBrowser::from_prefs(&local_files),
             split_drag: None,
@@ -863,6 +872,9 @@ impl RuTermApp {
         }
         if self.file_confirm.is_some() {
             return self.render_file_confirm(cx);
+        }
+        if self.file_upload_prompt.is_some() {
+            return self.render_file_upload_prompt(cx);
         }
         // 删除二次确认：半透明遮罩 + 居中卡片，点遮罩或"取消"关闭。
         if let Some(index) = self.confirm_delete {

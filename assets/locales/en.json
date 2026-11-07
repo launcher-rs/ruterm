@@ -361,5 +361,13 @@
  "远端还没开始接收：若弹出了同名文件覆盖确认，请在那个窗口里选「替换」，或先删掉远端同名文件": "The remote hasn't started receiving yet: if a same-name overwrite prompt appeared, choose Replace in that window, or delete the remote file with the same name first",
  "让远端把桌面分辨率调整为当前窗口大小": "Ask the remote to resize its desktop to this window",
  "匹配窗口": "Match window",
- "正在把远端桌面调整为 {width}×{height}…": "Resizing the remote desktop to {width}×{height}…"
+ "正在把远端桌面调整为 {width}×{height}…": "Resizing the remote desktop to {width}×{height}…",
+ "远程文件已被修改": "Remote file modified",
+ "是否要将此文件上传回服务器？": "Do you want to upload this file back to the server?",
+ "文件名称": "File name",
+ "服务器": "Server",
+ "远程路径": "Remote path",
+ "是": "Yes",
+ "全部是": "Yes to All",
+ "否": "No"
 }
