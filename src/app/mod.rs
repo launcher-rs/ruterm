@@ -40,7 +40,7 @@ use vault_ui::*;
 use widgets::*;
 
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -160,8 +160,12 @@ pub(crate) struct RuTermApp {
     file_upload_prompt: Option<FileUploadPrompt>,
     /// 其余等待确认 / 回传的文件；按巡检节奏逐个推进。
     file_upload_queue: Vec<FileUploadPrompt>,
-    /// 本次运行内「全部是」：后续本地改动直接回传，不再弹窗。
-    file_upload_all: bool,
+    /// 「全部是」授权：仅对授权过的 (标签, 远端路径) 免确认，换文件仍要弹窗。
+    file_upload_all: HashSet<(usize, String)>,
+    /// 传输（上传/下载）的醒目瞬态提示；数秒后自动淡出，回落到普通 status。
+    transfer_flash: Option<TransferFlash>,
+    /// 传输提示序号：过期定时器只清掉自己那一条，不误删更新的提示。
+    transfer_flash_seq: u64,
     /// 文件面板路径编辑输入框（点击路径栏时激活）：连同它归属的面板一起存，
     /// 本机页和远端页各自认领，不会在 A 页输入、回车却跳到 B 页。
     path_edit: Option<(PaneTarget, Entity<InputState>)>,
@@ -390,7 +394,9 @@ impl RuTermApp {
             file_confirm: None,
             file_upload_prompt: None,
             file_upload_queue: Vec::new(),
-            file_upload_all: false,
+            file_upload_all: HashSet::new(),
+            transfer_flash: None,
+            transfer_flash_seq: 0,
             path_edit: None,
             local: LocalBrowser::from_prefs(&local_files),
             split_drag: None,

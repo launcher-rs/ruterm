@@ -1,6 +1,7 @@
 //! //! 远端文件面板：目录浏览、上传 / 下载传输、新建 / 重命名 / 删除与表格渲染。
 
 use std::cmp::Ordering;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -20,6 +21,15 @@ use crate::FileIcon;
 use crate::tr;
 
 use super::*;
+
+/// 传输方向对应的状态栏图标：上传向上、下载向下。
+fn transfer_icon(direction: crate::transfer::Direction) -> IconName {
+    if matches!(direction, crate::transfer::Direction::Upload) {
+        IconName::ArrowUp
+    } else {
+        IconName::ArrowDown
+    }
+}
 
 /// 远端文件名洗净成本地可用的文件名：拒绝空名与相对目录，替换路径分隔符和
 /// Windows 非法字符，避免下载时跳目录或建不出文件。
@@ -733,7 +743,14 @@ impl RuTermApp {
             .iter()
             .find(|tab| tab.id == front.tab_id)
             .is_some_and(|tab| tab.files.busy.is_some());
-        if self.file_upload_all {
+        // 「全部是」只认授权过的那份文件；会话关掉后授权随之失效。
+        let live: HashSet<usize> = self.tabs.iter().map(|tab| tab.id).collect();
+        self.file_upload_all
+            .retain(|(id, _)| live.contains(id));
+        let auto = self
+            .file_upload_all
+            .contains(&(front.tab_id, front.remote.clone()));
+        if auto {
             if !busy {
                 self.start_queued_upload(cx);
             }
@@ -774,8 +791,8 @@ impl RuTermApp {
     }
 
 
-    /// 确认弹窗的回答：`upload` 表示回传当前文件，`all` 表示本会话后续改动
-    /// 都不再询问；两者都 false 即「否」，跳过这一份改动。
+    /// 确认弹窗的回答：`upload` 表示回传当前文件，`all` 表示仅这份文件后续
+    /// 改动不再询问（换文件仍弹窗）；两者都 false 即「否」，跳过这一份改动。
     pub(super) fn answer_remote_upload(
         &mut self,
         upload: bool,
@@ -786,7 +803,8 @@ impl RuTermApp {
             return;
         };
         if all {
-            self.file_upload_all = true;
+            self.file_upload_all
+                .insert((prompt.tab_id, prompt.remote.clone()));
         }
         if upload {
             self.file_upload_queue.insert(0, prompt);
@@ -844,6 +862,12 @@ impl RuTermApp {
             cx.notify();
             return;
         }
+        self.flash_transfer(
+            format!("正在{} {name}…", direction.label()),
+            transfer_icon(direction),
+            false,
+            cx,
+        );
         cx.notify();
 
         cx.spawn(async move |this, cx| {
@@ -883,12 +907,15 @@ impl RuTermApp {
                             crate::transfer::format_bytes(summary.bytes),
                             summary.elapsed.as_secs_f64()
                         );
-                        this.status = message.into();
                         tab.files.error = None;
+                        this.status = message.clone().into();
+                        this.flash_transfer(message, IconName::CircleCheck, true, cx);
                     }
                     Err(error) => {
                         tab.files.error = Some(error.clone().into());
-                        this.status = format!("{}失败：{error}", direction.label()).into();
+                        let text = format!("{}失败：{error}", direction.label());
+                        this.status = text.clone().into();
+                        this.flash_transfer(text, IconName::TriangleAlert, true, cx);
                     }
                 }
                 cx.notify();
@@ -974,6 +1001,12 @@ impl RuTermApp {
             tab.files.error = None;
         }
         self.status = format!("正在上传 {total} 个文件…{note}").into();
+        self.flash_transfer(
+            format!("正在上传 {total} 个文件…{note}"),
+            IconName::ArrowUp,
+            false,
+            cx,
+        );
         cx.notify();
 
         cx.spawn(async move |this, cx| {
@@ -1047,7 +1080,17 @@ impl RuTermApp {
                         Some(message.clone().into())
                     };
                 }
-                this.status = message.into();
+                this.status = message.clone().into();
+                this.flash_transfer(
+                    message,
+                    if failed.is_empty() {
+                        IconName::CircleCheck
+                    } else {
+                        IconName::TriangleAlert
+                    },
+                    true,
+                    cx,
+                );
                 cx.notify();
             });
             let path = this
@@ -1195,6 +1238,7 @@ impl RuTermApp {
         tab.files.progress = Some((0, 0));
         tab.files.error = None;
         self.status = format!("正在下载 {name}…").into();
+        self.flash_transfer(format!("正在下载 {name}…"), IconName::ArrowDown, false, cx);
         cx.notify();
         cx.spawn(async move |this, cx| {
             let (progress_tx, mut progress_rx) =
@@ -1215,7 +1259,8 @@ impl RuTermApp {
                         tab.files.progress = None;
                         tab.files.error = Some(message.clone().into());
                     }
-                    this.status = message.into();
+                    this.status = message.clone().into();
+                    this.flash_transfer(message, IconName::TriangleAlert, true, cx);
                     cx.notify();
                 });
                 return;
@@ -1262,7 +1307,17 @@ impl RuTermApp {
                     tab.files.progress = None;
                     tab.files.error = error.map(Into::into);
                 }
-                this.status = message.into();
+                this.status = message.clone().into();
+                this.flash_transfer(
+                    message,
+                    if downloaded {
+                        IconName::CircleCheck
+                    } else {
+                        IconName::TriangleAlert
+                    },
+                    true,
+                    cx,
+                );
                 if refresh_local_pane && downloaded {
                     this.local_refresh(cx);
                 }
@@ -1321,6 +1376,12 @@ impl RuTermApp {
             tab.zmodem_progress = Some((0, 0));
         }
         self.status = format!("正在通过 lrzsz 上传 {total} 个文件…{note}").into();
+        self.flash_transfer(
+            format!("正在通过 lrzsz 上传 {total} 个文件…{note}"),
+            IconName::ArrowUp,
+            false,
+            cx,
+        );
         cx.notify();
 
         cx.spawn(async move |this, cx| {
@@ -1393,7 +1454,17 @@ impl RuTermApp {
                     tab.zmodem = None;
                     tab.zmodem_progress = None;
                 }
-                this.status = message.into();
+                this.status = message.clone().into();
+                this.flash_transfer(
+                    message,
+                    if failed.is_empty() {
+                        IconName::CircleCheck
+                    } else {
+                        IconName::TriangleAlert
+                    },
+                    true,
+                    cx,
+                );
                 cx.notify();
             });
         })

@@ -60,6 +60,15 @@ pub(super) fn shown() -> bool {
     true
 }
 
+/// 传输类瞬态提示：带图标 + 高亮背景，比左侧普通状态更醒目。
+#[derive(Clone)]
+pub(super) struct TransferFlash {
+    pub(super) text: SharedString,
+    pub(super) icon: IconName,
+    /// 序号：过期定时器只清掉自己那一条。
+    pub(super) seq: u64,
+}
+
 impl RuTermApp {
     /// 底部状态栏：左侧瞬态状态 + 活动会话信息（按用户勾选的显示项拼装），右侧会话计数。
     pub(super) fn render_status_bar(&self, cx: &Context<Self>) -> StatusBar {
@@ -67,7 +76,17 @@ impl RuTermApp {
             .active_tab
             .and_then(|id| self.tabs.iter().find(|tab| tab.id == id));
 
-        let mut left = vec![StatusBarItem::new(self.status.clone()).id("status")];
+        let mut left = Vec::new();
+        if let Some(flash) = &self.transfer_flash {
+            left.push(
+                StatusBarItem::new(flash.text.clone())
+                    .id("status")
+                    .icon(flash.icon.clone())
+                    .active(true),
+            );
+        } else {
+            left.push(StatusBarItem::new(self.status.clone()).id("status"));
+        }
         if let Some(tab) = active {
             if self.status_bar.addr {
                 left.push(StatusBarItem::new(tab.addr.clone()).id("addr"));
@@ -132,6 +151,42 @@ impl RuTermApp {
                 .muted(true),
         );
         StatusBar::new().left(left).right(right)
+    }
+
+
+    /// 在状态栏打一条醒目的传输提示（图标 + 高亮背景）。
+    /// `expire` 为 true 时数秒后自动淡出回普通 status；进行中提示不自动过期，
+    /// 由完成时的新提示覆盖。
+    pub(super) fn flash_transfer(
+        &mut self,
+        text: impl Into<SharedString>,
+        icon: IconName,
+        expire: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.transfer_flash_seq += 1;
+        let seq = self.transfer_flash_seq;
+        self.transfer_flash = Some(TransferFlash {
+            text: text.into(),
+            icon,
+            seq,
+        });
+        cx.notify();
+        if !expire {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_secs(6))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.transfer_flash.as_ref().is_some_and(|f| f.seq == seq) {
+                    this.transfer_flash = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
 
