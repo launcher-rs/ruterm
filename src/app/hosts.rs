@@ -8,6 +8,9 @@ use rgpui::{
     ContextMenuExt, Div, Entity, FontWeight, Icon, IconName, InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels, ScrollableElement, SharedString, Stateful,
     StatefulInteractiveElement, Styled, Window, div, h_flex, px, v_flex,
 };
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::fs;
 
 use crate::desktop::Protocol;
 use crate::sessions::{AuthMethod, HostConfig, ProtocolKind};
@@ -26,6 +29,14 @@ pub(super) struct GroupPrompt {
 
 /// 「会话」菜单里最近连接最多保留几条；再多菜单就太长了。
 pub(super) const RECENT_HOSTS_MAX: usize = 8;
+
+#[derive(Serialize, Deserialize)]
+struct HostConfigBackup {
+    version: u32,
+    hosts: Vec<HostConfig>,
+    #[serde(default)]
+    sidebar: SidebarPrefs,
+}
 
 /// 侧边栏右键菜单的目标。
 #[derive(Clone)]
@@ -142,6 +153,162 @@ impl RuTermApp {
             status.push_str(&format!("，{missing_keys} 条私钥不存在改用 Agent"));
         }
         self.status = SharedString::from(status);
+        cx.notify();
+    }
+
+    /// 导出主机配置 JSON。保存密码与内嵌私钥只留在凭据库中，不写入明文备份。
+    pub(super) fn export_host_configs(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("RuTerm 主机配置", &["json"])
+            .set_file_name("ruterm-hosts.json")
+            .save_file()
+        else {
+            return;
+        };
+        let mut hosts = self.hosts.clone();
+        let mut inline_keys = 0usize;
+        for host in &mut hosts {
+            if host.key_inline {
+                host.key_inline = false;
+                host.auth = AuthMethod::Agent;
+                host.key_path.clear();
+                inline_keys += 1;
+            }
+        }
+        let backup = HostConfigBackup {
+            version: 1,
+            hosts,
+            sidebar: self.sidebar.clone(),
+        };
+        match serde_json::to_vec_pretty(&backup)
+            .map_err(anyhow::Error::from)
+            .and_then(|json| fs::write(&path, json).map_err(anyhow::Error::from))
+        {
+            Ok(()) => {
+                self.status = SharedString::from(format!(
+                    "已导出 {} 台主机配置到 {}；密码与内嵌私钥未导出",
+                    backup.hosts.len(),
+                    path.display()
+                ));
+            }
+            Err(error) => {
+                self.status = SharedString::from(format!("导出主机配置失败：{error}"));
+            }
+        }
+        if inline_keys > 0 {
+            log::info!("主机配置导出省略了 {inline_keys} 个内嵌私钥");
+        }
+        cx.notify();
+    }
+
+    /// 从 RuTerm 主机 JSON 导入，按源主机 id 重映射跳板机引用。
+    pub(super) fn import_host_configs(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("RuTerm 主机配置", &["json"])
+            .pick_file()
+        else {
+            return;
+        };
+        let parsed = fs::read(&path)
+            .map_err(anyhow::Error::from)
+            .and_then(|bytes| serde_json::from_slice::<HostConfigBackup>(&bytes).map_err(anyhow::Error::from));
+        let backup = match parsed {
+            Ok(backup) if backup.version == 1 => backup,
+            Ok(_) => {
+                self.status = "主机配置文件版本不受支持".into();
+                cx.notify();
+                return;
+            }
+            Err(error) => {
+                self.status = SharedString::from(format!("读取主机配置失败：{error}"));
+                cx.notify();
+                return;
+            }
+        };
+        let HostConfigBackup {
+            hosts,
+            sidebar: imported_sidebar,
+            ..
+        } = backup;
+        let mut valid = Vec::new();
+        let mut invalid = 0usize;
+        for mut host in hosts {
+            host.key_inline = false;
+            if host.validate().is_some() {
+                invalid += 1;
+                continue;
+            }
+            valid.push(host);
+        }
+        let mut next_id = self.hosts.iter().map(|host| host.id).max().unwrap_or(0) + 1;
+        let mut id_map = HashMap::new();
+        let mut planned = Vec::new();
+        let mut imported_ids = Vec::new();
+        let mut duplicates = 0usize;
+        for mut host in valid {
+            if let Some(existing) = self.hosts.iter().find(|existing| {
+                existing.protocol == host.protocol
+                    && existing.user.eq_ignore_ascii_case(&host.user)
+                    && existing.host.eq_ignore_ascii_case(&host.host)
+                    && existing.port == host.port
+            }) {
+                id_map.insert(host.id, existing.id);
+                duplicates += 1;
+                continue;
+            }
+            let source_id = host.id;
+            host.id = if self.vault.is_some() { next_id } else { 0 };
+            if self.vault.is_some() {
+                next_id += 1;
+            }
+            id_map.insert(source_id, host.id);
+            imported_ids.push(host.id);
+            planned.push(host);
+        }
+        let mut imported = 0usize;
+        for mut host in planned {
+            if let Some(source_jump) = host.proxy_jump {
+                host.proxy_jump = id_map.get(&source_jump).copied();
+            }
+            if self.vault.is_some() {
+                self.protocols.set(host.id, host.protocol);
+                self.jumps.set(host.id, host.proxy_jump);
+            }
+            self.hosts.push(host.clone());
+            self.persist_host(&host, cx);
+            imported += 1;
+        }
+        if self.vault.is_some() {
+            self.persist_protocols(cx);
+            self.persist_jumps(cx);
+        }
+        if !imported_ids.is_empty() {
+            for group in &imported_sidebar.groups {
+                if !self.sidebar.names().any(|name| name == group.name) {
+                    self.sidebar.groups.push(group.clone());
+                }
+            }
+            for (source_id, group) in &imported_sidebar.assign {
+                if let Some(target_id) = id_map.get(source_id)
+                    && imported_ids.contains(target_id)
+                    && self.sidebar.names().any(|name| name == group)
+                {
+                    self.sidebar.assign_to(*target_id, Some(group));
+                }
+            }
+            for source_id in &imported_sidebar.order {
+                if let Some(target_id) = id_map.get(source_id)
+                    && imported_ids.contains(target_id)
+                    && !self.sidebar.order.contains(target_id)
+                {
+                    self.sidebar.order.push(*target_id);
+                }
+            }
+            self.persist_sidebar(cx);
+        }
+        self.status = SharedString::from(format!(
+            "主机配置导入完成：新增 {imported} 台，重复 {duplicates} 台，跳过无效 {invalid} 台（密码与内嵌私钥不包含在 JSON 中）"
+        ));
         cx.notify();
     }
 

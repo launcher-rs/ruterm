@@ -41,6 +41,12 @@ impl StorageMode {
         StorageMode::Global(global_dir())
     }
 
+    /// 可启用的便携数据目录（exe 同目录的 `data/`）。
+    pub fn portable_dir() -> Option<PathBuf> {
+        let exe = std::env::current_exe().ok()?;
+        Some(exe.parent()?.join("data"))
+    }
+
     /// 数据目录。
     pub fn dir(&self) -> &Path {
         match self {
@@ -81,9 +87,7 @@ impl StorageMode {
 
 /// exe 同目录的 `data/`（仅当它已存在时返回）。
 fn portable_dir_if_exists() -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    let dir = exe.parent()?;
-    let candidate = dir.join("data");
+    let candidate = StorageMode::portable_dir()?;
     candidate.is_dir().then_some(candidate)
 }
 

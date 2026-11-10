@@ -5,7 +5,7 @@ use std::sync::Arc;
 use rgpui::input_ui::{Input, InputContentType, InputEvent, InputState};
 use rgpui::prelude::*;
 use rgpui::{
-    AnyElement, Button, ButtonVariants, Context, Entity, FontWeight, InteractiveElement, IntoElement, MouseButton, ParentElement, SharedString,
+    AnyElement, Button, ButtonVariants, Context, Disableable, Entity, FontWeight, InteractiveElement, IntoElement, MouseButton, ParentElement, SharedString,
     Styled, Window, div, h_flex, px, v_flex,
 };
 use rgpui::title_bar::TITLE_BAR_HEIGHT;
@@ -165,6 +165,115 @@ impl RuTermApp {
         {
             self.lock_vault(window, cx);
         }
+    }
+
+    /// 将当前加密库复制到 exe 旁的 data/，切换为便携模式并重启。
+    pub(super) fn enable_portable_mode(&mut self, cx: &mut Context<Self>) {
+        if self.mode.is_portable() {
+            return;
+        }
+        let Some(vault) = self.vault.clone() else {
+            self.status = "凭据库未解锁，无法迁移到便携模式".into();
+            cx.notify();
+            return;
+        };
+        let Some(hexkey) = self.unlocked_key.clone() else {
+            self.status = "凭据库密钥不可用，无法迁移到便携模式".into();
+            cx.notify();
+            return;
+        };
+        let Some(portable_dir) = StorageMode::portable_dir() else {
+            self.status = "无法确定程序所在目录，无法启用便携模式".into();
+            cx.notify();
+            return;
+        };
+        if portable_dir.exists() {
+            self.status = SharedString::from(format!(
+                "便携目录已存在：{}；请先备份并移走该目录后重试",
+                portable_dir.display()
+            ));
+            cx.notify();
+            return;
+        }
+        let source_mode = self.mode.clone();
+        let runtime = vault.runtime();
+        if let Some(state) = self.settings.as_mut() {
+            state.busy = true;
+            state.error = None;
+            state.info = None;
+        }
+        self.status = "正在复制凭据库到便携目录，完成后应用会重启…".into();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = async {
+                std::fs::create_dir(&portable_dir)?;
+                let copied = async {
+                    let dump = vault.export_all().await?;
+                    let staging = portable_dir.join("ruterm.db.new");
+                    crate::vault::remove_db_bundle(&staging);
+                    let fresh = Vault::open_at(
+                        &staging.to_string_lossy(),
+                        hexkey,
+                        runtime.clone(),
+                    )
+                    .await?;
+                    fresh.import_dump(&dump).await?;
+                    drop(fresh);
+                    crate::vault::rename_db_bundle(
+                        &runtime,
+                        staging,
+                        portable_dir.join(crate::paths::DB_FILE),
+                        100,
+                    )
+                    .await
+                    .map_err(anyhow::Error::msg)?;
+                    for name in [
+                        crate::paths::SALT_FILE,
+                        crate::paths::UNLOCK_FILE,
+                        crate::paths::LOCALE_FILE,
+                        crate::paths::THEME_FILE,
+                    ] {
+                        let from = source_mode.dir().join(name);
+                        if from.is_file() {
+                            std::fs::copy(&from, portable_dir.join(name))?;
+                        }
+                    }
+                    Ok::<_, anyhow::Error>(())
+                }
+                .await;
+                if copied.is_err() {
+                    let _ = std::fs::remove_dir_all(&portable_dir);
+                }
+                copied
+            }
+            .await;
+            let _ = this.update(cx, |this, cx| {
+                if let Some(state) = this.settings.as_mut() {
+                    state.busy = false;
+                }
+                match result {
+                    Ok(()) => {
+                        this.status = "便携数据已准备好；请退出并重新启动 RuTerm 以切换模式".into();
+                        if let Some(state) = this.settings.as_mut() {
+                            state.info = Some(
+                                "便携数据已复制。重新启动 RuTerm 后生效；原数据会保留。".into(),
+                            );
+                        }
+                        cx.notify();
+                        cx.quit();
+                    }
+                    Err(error) => {
+                        let message = format!("启用便携模式失败：{error}");
+                        this.status = SharedString::from(message.clone());
+                        if let Some(state) = this.settings.as_mut() {
+                            state.error = Some(SharedString::from(message));
+                        }
+                        cx.notify();
+                    }
+                }
+            });
+        })
+        .detach();
     }
 
 
@@ -709,6 +818,31 @@ impl RuTermApp {
                     tr!(cx, "系统凭据管理器（无需输入）")
                 }
             )))
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(div().text_sm().text_color(pal.muted).child(tr!(cx, "存储模式")))
+                    .child(div().text_sm().font_weight(FontWeight(600.0)).child(if self.mode.is_portable() {
+                        tr!(cx, "便携模式")
+                    } else {
+                        tr!(cx, "全局模式")
+                    })),
+            )
+            .child(div().text_xs().text_color(pal.muted).child(if self.mode.is_portable() {
+                tr!(cx, "数据位于程序目录的 data 文件夹；复制程序与 data 文件夹即可迁移。")
+            } else {
+                tr!(cx, "启用后会将加密凭据库复制到程序目录的 data 文件夹，应用随后自动退出；重新启动后切换，原数据会保留。")
+            }))
+            .when(!self.mode.is_portable(), |this| {
+                this.child(
+                    Button::new("enable-portable-mode")
+                        .label(tr!(cx, "迁移并退出"))
+                        .primary()
+                        .disabled(!unlocked || state.busy)
+                        .on_click(cx.listener(|this, _, _, cx| this.enable_portable_mode(cx))),
+                )
+            })
             .child(
                 div()
                     .text_sm()

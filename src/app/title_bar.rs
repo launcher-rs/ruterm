@@ -114,13 +114,29 @@ impl RuTermApp {
         let session_menu =
             move |menu: PopupMenu, window: &mut Window, cx: &mut Context<PopupMenu>| {
                 let importing = menu_entity.clone();
+                let importing_json = menu_entity.clone();
+                let exporting_json = menu_entity.clone();
                 let mut menu = menu
                     .item(PopupMenuItem::new(tr!(cx, "新建主机…")).action(Box::new(NewHost)))
                     .item(PopupMenuItem::new(tr!(cx, "导入 ~/.ssh/config…")).on_click(
                         move |_, _, cx| {
                             importing.update(cx, |this, cx| this.import_ssh_config(cx));
                         },
-                    ));
+                    ))
+                    .item(
+                        PopupMenuItem::new(tr!(cx, "导入主机配置 JSON…"))
+                            .disabled(locked)
+                            .on_click(move |_, _, cx| {
+                                importing_json.update(cx, |this, cx| this.import_host_configs(cx));
+                            }),
+                    )
+                    .item(
+                        PopupMenuItem::new(tr!(cx, "导出主机配置 JSON…"))
+                            .disabled(locked)
+                            .on_click(move |_, _, cx| {
+                                exporting_json.update(cx, |this, cx| this.export_host_configs(cx));
+                            }),
+                    );
                 // 最近连接收进二级菜单：主菜单不再被历史条目撑长。
                 if !recent_items.is_empty() {
                     let sub_entity = menu_entity.clone();
