@@ -8,6 +8,7 @@ use rgpui::{
     AnyElement, Button, ButtonVariants, Context, Entity, FontWeight, InteractiveElement, IntoElement, MouseButton, ParentElement, SharedString,
     Styled, Window, div, h_flex, px, v_flex,
 };
+use rgpui::title_bar::TITLE_BAR_HEIGHT;
 
 use crate::paths::StorageMode;
 use crate::sessions::HostConfig;
@@ -150,6 +151,20 @@ impl RuTermApp {
         self.status = "凭据库已锁定，需主密码解锁".into();
         self.open_unlock_dialog(window, cx);
         cx.notify();
+    }
+
+    pub(super) fn lock_vault_action(
+        &mut self,
+        _: &crate::LockVault,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.vault.is_some()
+            && crate::vault::read_unlock_marker(&self.mode)
+                == crate::vault::UnlockBackend::Passphrase
+        {
+            self.lock_vault(window, cx);
+        }
     }
 
 
@@ -497,10 +512,7 @@ impl RuTermApp {
                 "便携模式首次使用：设置主密码以创建加密库。密码仅用于派生库密钥，不会保存到任何地方——一旦忘记无法恢复，请务必牢记。"
             )
         } else {
-            tr!(
-                cx,
-                "输入主密码解锁凭据库（库文件与密码均不离开本机/本目录）。"
-            )
+            tr!(cx, "输入主密码解锁凭据库")
         };
         let cancel_label = tr!(cx, "退出应用");
         let confirm_label = if is_new {
@@ -511,12 +523,61 @@ impl RuTermApp {
         v_flex()
             .id("unlock-backdrop")
             .absolute()
-            .top(px(0.0))
+            .top(TITLE_BAR_HEIGHT)
             .left(px(0.0))
-            .size_full()
+            .right(px(0.0))
+            .bottom(px(0.0))
             .items_center()
             .justify_center()
-            .bg(rgpui::hsla(0.0, 0.0, 0.0, 0.45))
+            .bg(rgpui::linear_gradient(
+                135.0,
+                rgpui::linear_color_stop(rgpui::hsla(0.617, 0.34, 0.13, 1.0), 0.0),
+                rgpui::linear_color_stop(rgpui::hsla(0.589, 0.38, 0.23, 1.0), 1.0),
+            ))
+            .child(
+                div()
+                    .absolute()
+                    .top(px(0.0))
+                    .left(px(0.0))
+                    .size(px(520.0))
+                    .rounded_full()
+                    .bg(rgpui::radial_gradient(
+                        0.5,
+                        0.5,
+                        0.5,
+                        &[
+                            rgpui::linear_color_stop(rgpui::hsla(0.569, 0.75, 0.56, 0.20), 0.0),
+                            rgpui::linear_color_stop(rgpui::hsla(0.569, 0.75, 0.56, 0.0), 1.0),
+                        ],
+                    )),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .right(px(0.0))
+                    .bottom(px(0.0))
+                    .size(px(560.0))
+                    .rounded_full()
+                    .bg(rgpui::radial_gradient(
+                        0.5,
+                        0.5,
+                        0.5,
+                        &[
+                            rgpui::linear_color_stop(rgpui::hsla(0.514, 0.72, 0.50, 0.16), 0.0),
+                            rgpui::linear_color_stop(rgpui::hsla(0.514, 0.72, 0.50, 0.0), 1.0),
+                        ],
+                    )),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .right(px(58.0))
+                    .bottom(px(38.0))
+                    .text_size(px(104.0))
+                    .font_weight(rgpui::FontWeight(700.0))
+                    .text_color(rgpui::hsla(0.528, 0.68, 0.78, 0.10))
+                    .child(">_"),
+            )
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|_, _, _, cx| cx.stop_propagation()),
@@ -524,10 +585,10 @@ impl RuTermApp {
             .child(
                 v_flex()
                     .id("unlock-dialog")
-                    .w(px(420.0))
-                    .gap_3()
-                    .p_5()
-                    .rounded(px(8.0))
+                    .w(px(440.0))
+                    .gap_4()
+                    .p_6()
+                    .rounded(px(14.0))
                     .bg(pal.card_bg)
                     .border_1()
                     .border_color(pal.border)
@@ -537,11 +598,50 @@ impl RuTermApp {
                         cx.listener(|_, _, _, cx| cx.stop_propagation()),
                     )
                     .child(
-                        div()
-                            .text_base()
-                            .font_weight(rgpui::FontWeight(600.0))
-                            .child(title),
+                        h_flex()
+                            .items_center()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .size(px(48.0))
+                                    .rounded(px(14.0))
+                                    .bg(rgpui::linear_gradient(
+                                        135.0,
+                                        rgpui::linear_color_stop(
+                                            rgpui::hsla(0.611, 0.88, 0.56, 1.0),
+                                            0.0,
+                                        ),
+                                        rgpui::linear_color_stop(
+                                            rgpui::hsla(0.522, 0.82, 0.48, 1.0),
+                                            1.0,
+                                        ),
+                                    ))
+                                    .items_center()
+                                    .justify_center()
+                                    .text_size(px(17.0))
+                                    .font_weight(rgpui::FontWeight(700.0))
+                                    .text_color(rgpui::hsla(0.0, 0.0, 1.0, 1.0))
+                                    .child(">_"),
+                            )
+                            .child(
+                                v_flex()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .font_weight(rgpui::FontWeight(600.0))
+                                            .text_color(pal.muted)
+                                            .child("RuTerm"),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_base()
+                                            .font_weight(rgpui::FontWeight(650.0))
+                                            .child(title),
+                                    ),
+                            ),
                     )
+                    .child(div().h(px(1.0)).w_full().bg(pal.border))
                     .child(div().text_sm().text_color(pal.muted).child(hint))
                     .child(styled_input(
                         Input::new(&state.passphrase).content_type(InputContentType::Password),

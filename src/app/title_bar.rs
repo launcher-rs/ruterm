@@ -10,7 +10,7 @@ use rgpui::{
 };
 
 use crate::MacroManager as OpenMacroManager;
-use crate::{ToggleSidebar, ToggleFilePanel, ToggleLocalPanel, ToggleTheme, NewHost, NewLocalTerminal, NewRemoteDesktop, NextTab, PrevTab, CloseTab, OpenSettings, OpenForward, SplitRight, SplitDown, CloseSplit, FindInTerminal, ToggleSyncInput, BroadcastCommand};
+use crate::{ToggleSidebar, ToggleFilePanel, ToggleLocalPanel, ToggleTheme, LockVault, NewHost, NewLocalTerminal, NewRemoteDesktop, NextTab, PrevTab, CloseTab, OpenSettings, OpenForward, SplitRight, SplitDown, CloseSplit, FindInTerminal, ToggleSyncInput, BroadcastCommand};
 use crate::tr;
 
 use super::*;
@@ -241,11 +241,9 @@ impl RuTermApp {
         // 凭据菜单：解锁 / 主密码设置 / 锁定，末尾附当前档位（只读）。
         let unlock = entity.clone();
         let settings = entity.clone();
-        let lock = entity.clone();
         let vault_menu = move |menu: PopupMenu, _: &mut Window, cx: &mut Context<PopupMenu>| {
             let unlock = unlock.clone();
             let settings = settings.clone();
-            let lock = lock.clone();
             let menu = if locked {
                 menu.item(PopupMenuItem::new(tr!(cx, "解锁凭据库…")).on_click(
                     move |_, window, cx| {
@@ -262,11 +260,7 @@ impl RuTermApp {
                 ))
             };
             let menu = if passphrase_mode && !locked {
-                menu.item(PopupMenuItem::new(tr!(cx, "锁定凭据库")).on_click(
-                    move |_, window, cx| {
-                        lock.update(cx, |this, cx| this.lock_vault(window, cx));
-                    },
-                ))
+                menu.item(PopupMenuItem::new(tr!(cx, "锁定凭据库")).action(Box::new(LockVault)))
             } else {
                 menu
             };
@@ -435,21 +429,6 @@ impl RuTermApp {
                     .gap_1()
                     .flex_shrink_0()
                     .pr_3()
-                    // 口令档且未解锁：只留重新解锁入口（其余操作都需要库）。
-                    .when(locked, |this| {
-                        this.child(
-                            Button::new("unlock-vault")
-                                // 图标集里没有钥匙/锁，保留 emoji（口令档才会出现）。
-                                .label("🔑")
-                                .compact()
-                                .ghost()
-                                .text_color(fg)
-                                .tooltip(tr!(cx, "输入主密码解锁凭据库"))
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.open_unlock_dialog(window, cx);
-                                })),
-                        )
-                    })
                     // 已设主密码才出现锁定按钮：锁定后需重新输入口令才能用库。
                     .when(passphrase_mode && !locked, |this| {
                         this.child(

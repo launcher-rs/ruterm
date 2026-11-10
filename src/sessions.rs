@@ -190,6 +190,8 @@ pub struct SessionStore {
     /// 开库迁移会把 settings.json 当遗留文件归档并回灌各键，
     /// 届时镜像里未设置的 `theme` 会抹掉库内主题。
     locale_path: PathBuf,
+    /// 明暗主题启动镜像；主题不是秘密，锁库时也可用于首帧渲染。
+    theme_path: PathBuf,
 }
 
 impl SessionStore {
@@ -200,6 +202,7 @@ impl SessionStore {
             path: dir.join(crate::paths::LEGACY_SESSIONS_FILE),
             settings_path: dir.join(crate::paths::LEGACY_SETTINGS_FILE),
             locale_path: dir.join(crate::paths::LOCALE_FILE),
+            theme_path: dir.join(crate::paths::THEME_FILE),
         }
     }
 
@@ -208,6 +211,30 @@ impl SessionStore {
         match std::fs::read_to_string(&self.settings_path) {
             Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
             Err(_) => Settings::default(),
+        }
+    }
+
+    /// 先读启动镜像；旧版本没有镜像时兼容 settings.json，默认暗色。
+    pub fn load_theme(&self) -> bool {
+        match std::fs::read_to_string(&self.theme_path) {
+            Ok(theme) if theme.trim() == "light" => false,
+            Ok(theme) if theme.trim() == "dark" => true,
+            _ => {
+                let legacy = std::fs::read_to_string(&self.settings_path)
+                    .ok()
+                    .and_then(|text| serde_json::from_str::<Settings>(&text).ok());
+                let archived = self
+                    .settings_path
+                    .with_file_name("settings.json.migrated");
+                let settings = legacy.or_else(|| {
+                    std::fs::read_to_string(archived)
+                        .ok()
+                        .and_then(|text| serde_json::from_str::<Settings>(&text).ok())
+                });
+                let dark = settings.is_none_or(|settings| settings.dark());
+                self.save_theme_mirror(dark);
+                dark
+            }
         }
     }
 
@@ -236,6 +263,20 @@ impl SessionStore {
         self.update_settings(|settings| {
             settings.theme = if dark { "dark" } else { "light" }.to_string();
         });
+        self.save_theme_mirror(dark);
+    }
+
+    /// 仅更新加密库锁定期间可读取的非敏感主题启动镜像。
+    pub fn save_theme_mirror(&self, dark: bool) {
+        if let Some(parent) = self.theme_path.parent()
+            && let Err(error) = std::fs::create_dir_all(parent)
+        {
+            log::warn!("无法创建 {}（{error}），主题启动镜像不持久化", parent.display());
+            return;
+        }
+        if let Err(error) = std::fs::write(&self.theme_path, if dark { "dark" } else { "light" }) {
+            log::warn!("写入 theme.txt 失败: {error}");
+        }
     }
 
     /// 保存托盘开关（启动时要读，统一放 settings.json）。

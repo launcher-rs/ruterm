@@ -668,7 +668,8 @@ impl RuTermApp {
         cx.spawn(async move |this, cx| {
             if let Ok(Some(theme)) = vault.setting("theme").await {
                 let dark = theme != "light";
-                let _ = this.update(cx, |_, cx| {
+                let _ = this.update(cx, |this, cx| {
+                    this.store.save_theme_mirror(dark);
                     rgpui::theme::Theme::change(
                         if dark {
                             rgpui::theme::ThemeMode::Dark
@@ -1215,6 +1216,7 @@ impl Render for RuTermApp {
             .on_action(cx.listener(Self::toggle_file_panel_action))
             .on_action(cx.listener(Self::toggle_local_panel))
             .on_action(cx.listener(Self::toggle_theme_action))
+            .on_action(cx.listener(Self::lock_vault_action))
             .on_action(cx.listener(Self::new_host))
             .on_action(cx.listener(Self::new_local_terminal))
             .on_action(cx.listener(Self::new_desktop))

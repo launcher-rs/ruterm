@@ -71,6 +71,7 @@ actions!(
         ToggleFilePanel,
         ToggleLocalPanel,
         ToggleTheme,
+        LockVault,
         NewHost,
         NewLocalTerminal,
         NewRemoteDesktop,
@@ -128,11 +129,11 @@ fn main() {
         // 主题 + 输入子系统必须初始化：否则输入框无配色且
         // 退格/删除等键位动作未注册（无法编辑已输入内容）。
         rgpui::theme::init(cx);
-        // theme::init 默认切到亮色；库内主题要等开库后才能读到，这里先按
-        // 旧 settings.json（降级/迁移前）或默认暗色起窗，避免闪一下亮色。
+        // theme::init 默认切到亮色；库内主题要等解锁后才能读到，这里先按
+        // 非敏感 theme.txt 镜像起窗，避免解锁前后切换主题。
         let store = SessionStore::new(&StorageMode::detect());
         let settings = store.load_settings();
-        let dark = settings.dark();
+        let dark = store.load_theme();
         // 托盘必须在建窗前决定：关闭时窗口直接退出，不留下后台进程。
         TRAY_ENABLED.store(settings.tray, std::sync::atomic::Ordering::Relaxed);
         // 语言管理器同样必须在开窗前装好：首帧的标题栏菜单、侧栏与状态栏就要取词。
@@ -159,6 +160,7 @@ fn main() {
             // 本机文件页：远端面板是 ctrl-shift-b，本机加一个 L（local）。
             KeyBinding::new("ctrl-shift-l", ToggleLocalPanel, None),
             KeyBinding::new("ctrl-t", ToggleTheme, None),
+            KeyBinding::new("ctrl-shift-k", LockVault, None),
             KeyBinding::new("ctrl-n", NewHost, None),
             KeyBinding::new("ctrl-shift-t", NewLocalTerminal, None),
             // 远程桌面（VNC）：R 取 remote，与本地终端的 T 相邻。

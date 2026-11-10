@@ -44,6 +44,10 @@ impl RuTermApp {
             // 降级模式（无加密库）沿用旧 settings.json。
             self.store.save_theme(dark);
         }
+        // 明暗主题不是秘密：同步写入启动镜像，锁库时首帧也能直接用上次主题。
+        if self.vault.is_some() {
+            self.store.save_theme_mirror(dark);
+        }
         cx.notify();
     }
 
