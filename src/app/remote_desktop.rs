@@ -17,7 +17,8 @@ use rgpui::{
     Entity, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, KeyUpEvent, Keystroke,
     Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     ParentElement, Pixels, Point, RenderImage, ScrollDelta, ScrollWheelEvent, SharedString,
-    StatefulInteractiveElement, Styled, Tooltip, Window, canvas, div, h_flex, point, px, v_flex,
+    StatefulInteractiveElement, Styled, Subscription, Tooltip, Window, canvas, div, h_flex, point,
+    px, v_flex,
 };
 
 use crate::desktop::{Command, Event, KeyInput, Protocol, Session, Snapshot};
@@ -119,6 +120,12 @@ pub(super) struct DesktopTab {
     pub(super) fps: f32,
     /// 连接代号：重连后旧事件循环的迟到事件按代号丢弃。
     pub(super) token: u64,
+    /// RDP 系统剪贴板授权令牌：同一时刻只允许活动标签的会话读写本机剪贴板。
+    /// VNC 不使用（协议层自己同步文本）。
+    pub(super) clipboard_token: Option<u64>,
+    /// 画面焦点丢失时释放远端按键（切走窗口不能让远端一直以为键还按着）。
+    /// 只为保持订阅存活而持有，不直接读取。
+    pub(super) _focus_out: Option<Subscription>,
 }
 
 impl DesktopTab {
@@ -130,6 +137,13 @@ impl DesktopTab {
 
     fn clear_buttons(&mut self) {
         self.buttons = 0;
+    }
+}
+
+/// 会话结束时收回剪贴板授权：只有仍在活动的那份会被撤销，后台会话不受影响。
+fn release_desktop_clipboard(desktop: &mut DesktopTab) {
+    if let Some(token) = desktop.clipboard_token.take() {
+        ironrdp_cliprdr_native::release_clipboard_session(token);
     }
 }
 
@@ -293,6 +307,12 @@ impl RuTermApp {
             })
             .detach();
         }
+        // 画面失焦就释放远端按键：切走窗口 / 点别处时，远端不该还按着 Ctrl 或鼠标。
+        let focus = cx.focus_handle();
+        let entity = cx.entity();
+        let focus_out = window.on_focus_out(&focus, cx, move |_, _, cx| {
+            entity.update(cx, |this, cx| this.desktop_focus_lost(id, cx));
+        });
         let desktop = DesktopTab {
             host: prefilled_host.clone().unwrap_or_default(),
             port: port_text.parse::<u16>().unwrap_or(protocol.default_port()),
@@ -313,7 +333,7 @@ impl RuTermApp {
             form_username,
             form_domain,
             form_error: None,
-            focus: cx.focus_handle(),
+            focus,
             image: None,
             drop_queue: Vec::new(),
             draw_rect: Rc::new(Cell::new(None)),
@@ -330,6 +350,8 @@ impl RuTermApp {
             upload: None,
             fps: 0.0,
             token: 0,
+            clipboard_token: None,
+            _focus_out: Some(focus_out),
         };
         // 直连标签开局就带地址，别在等密码时还写着泛泛的「远程桌面」。
         let initial_title = if auto_connect {
@@ -892,6 +914,7 @@ impl RuTermApp {
         desktop.latest = None;
         desktop.fps = 0.0;
         desktop.clear_buttons();
+        release_desktop_clipboard(desktop);
         if let Some(old) = desktop.image.take() {
             desktop.drop_queue.push(old);
         }
@@ -949,6 +972,7 @@ impl RuTermApp {
             command,
             latest,
             events,
+            clipboard_token,
         } = session;
         let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) else {
             let _ = command.send(Command::Close);
@@ -963,34 +987,17 @@ impl RuTermApp {
         }
         desktop.command = Some(command);
         desktop.latest = Some(latest.clone());
-        desktop.phase = DesktopPhase::Live;
-        desktop.capture_keys = true;
-        // 连接成功才缓存密码：内存里供本进程复用；已保存主机再加密写入凭据库，
-        // 重启后点同一主机也不用再问。
-        let connected_password = desktop.password.clone();
-        let cached_password = if connected_password.is_empty() {
-            None
-        } else {
-            desktop
-                .cache_key
-                .clone()
-                .map(|key| (key, connected_password.clone()))
-        };
-        let saved_host = desktop.saved_host;
+        desktop.clipboard_token = clipboard_token;
+        // 连接成功前不切 Live、不缓存密码：VNC 帧到达或 RDP 首帧才真正可用。
         tab.ended = false;
         tab.failed = false;
         tab.last_error = None;
-        tab.connected_at = Some(std::time::Instant::now());
-        if tab.custom_title.is_none() {
-            let title = SharedString::from(host_port(&desktop.host, desktop.port));
-            tab.title = title.clone();
-            tab.base_title = title;
+        // 活动标签立即拿到剪贴板授权；后台标签等切过去时再接。
+        if self.active_tab == Some(id)
+            && let Some(token) = clipboard_token
+        {
+            ironrdp_cliprdr_native::authorize_clipboard_session(token);
         }
-        if let Some((key, password)) = cached_password {
-            self.password_cache.insert(key, password);
-        }
-        store_desktop_secret(self.vault.clone(), saved_host, &connected_password, cx);
-        self.status = tr!(cx, "已连接远程桌面");
         self.sync_tray(cx);
         cx.notify();
 
@@ -1099,17 +1106,49 @@ impl RuTermApp {
         name: String,
         cx: &mut Context<Self>,
     ) {
-        if let Some(desktop) = self
-            .tabs
-            .iter_mut()
-            .find(|tab| tab.id == id)
-            .and_then(|tab| tab.desktop.as_mut())
-            && desktop.token == token
-        {
-            desktop.name = name;
-            desktop.size = (width, height);
-            cx.notify();
+        let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) else {
+            return;
+        };
+        let Some(desktop) = tab.desktop.as_mut() else {
+            return;
+        };
+        if desktop.token != token {
+            return;
         }
+        desktop.name = name;
+        desktop.size = (width, height);
+        // 重复的 Connected（重绘/重协商）只更新尺寸，不重复缓存密码。
+        if desktop.phase == DesktopPhase::Live {
+            cx.notify();
+            return;
+        }
+        desktop.phase = DesktopPhase::Live;
+        desktop.capture_keys = true;
+        // 连接成功才缓存密码：内存里供本进程复用；已保存主机再加密写入凭据库，
+        // 重启后点同一主机也不用再问。
+        let connected_password = desktop.password.clone();
+        let cached_password = if connected_password.is_empty() {
+            None
+        } else {
+            desktop
+                .cache_key
+                .clone()
+                .map(|key| (key, connected_password.clone()))
+        };
+        let saved_host = desktop.saved_host;
+        tab.connected_at = Some(std::time::Instant::now());
+        if tab.custom_title.is_none() {
+            let title = SharedString::from(host_port(&desktop.host, desktop.port));
+            tab.title = title.clone();
+            tab.base_title = title;
+        }
+        if let Some((key, password)) = cached_password {
+            self.password_cache.insert(key, password);
+        }
+        store_desktop_secret(self.vault.clone(), saved_host, &connected_password, cx);
+        self.status = tr!(cx, "已连接远程桌面");
+        self.sync_tray(cx);
+        cx.notify();
     }
 
     fn apply_desktop_fps(&mut self, id: usize, token: u64, fps: f32, cx: &mut Context<Self>) {
@@ -1230,6 +1269,7 @@ impl RuTermApp {
         desktop.latest = None;
         desktop.capture_keys = false;
         desktop.clear_buttons();
+        release_desktop_clipboard(desktop);
         if auth_failure {
             // 缓存里留下的若是旧密码，认证失败后必须清掉，否则下次点主机又拿它重试。
             if let Some(key) = desktop.cache_key.take() {
@@ -1293,6 +1333,7 @@ impl RuTermApp {
         desktop.latest = None;
         desktop.capture_keys = false;
         desktop.clear_buttons();
+        release_desktop_clipboard(desktop);
         if auth_failure {
             // 同 fail_desktop：清掉失效的缓存密码，避免下次直连再拿旧密码重试。
             if let Some(key) = desktop.cache_key.take() {
@@ -1385,9 +1426,11 @@ impl RuTermApp {
         else {
             return;
         };
+        desktop.send(Command::ReleaseAll);
         desktop.send(Command::Close);
         desktop.capture_keys = false;
         desktop.clear_buttons();
+        release_desktop_clipboard(desktop);
         if self.active_tab == Some(id) {
             self.status = tr!(cx, "正在断开远程桌面…").into();
         }
@@ -1488,6 +1531,30 @@ impl RuTermApp {
         let _ = cx;
     }
 
+    /// 画面失焦：释放远端所有按键与鼠标按钮，避免切走窗口后“黏键”。
+    fn desktop_focus_lost(&mut self, id: usize, cx: &mut Context<Self>) {
+        let Some(desktop) = self
+            .tabs
+            .iter_mut()
+            .find(|tab| tab.id == id)
+            .and_then(|tab| tab.desktop.as_mut())
+        else {
+            return;
+        };
+        if !desktop.capture_keys {
+            return;
+        }
+        desktop.send(Command::ReleaseAll);
+        desktop.capture_keys = false;
+        desktop.modifiers = Modifiers::default();
+        desktop.capslock = false;
+        desktop.clear_buttons();
+        if self.active_tab == Some(id) {
+            self.status = tr!(cx, "远程桌面失去焦点，已释放键盘").into();
+        }
+        cx.notify();
+    }
+
     /// 当前标签是否正在捕获键盘（活动标签是桌面、画面持有焦点且捕获已开启）。
     ///
     /// 用于全局按键拦截：捕获期间应用快捷键要让位给远端。
@@ -1525,21 +1592,11 @@ impl RuTermApp {
                 .find(|tab| tab.id == id)
                 .and_then(|tab| tab.desktop.as_mut())
             {
-                // 释放捕获前把还按着的修饰键抬起来，否则远端会一直认为 Ctrl 没松。
-                let held = std::mem::take(&mut desktop.modifiers);
-                for (name, down) in [
-                    ("shift", held.shift),
-                    ("control", held.control),
-                    ("alt", held.alt),
-                    ("super", held.platform),
-                ] {
-                    if down {
-                        desktop.send(Command::Key {
-                            key: KeyInput::modifier(name),
-                            down: false,
-                        });
-                    }
-                }
+                // 释放捕获前把远端还按着的键与鼠标抬起来，否则远端会一直认为 Ctrl 没松。
+                desktop.send(Command::ReleaseAll);
+                desktop.modifiers = Modifiers::default();
+                desktop.capslock = false;
+                desktop.clear_buttons();
                 desktop.capture_keys = false;
             }
             self.status = tr!(cx, "已释放键盘，点击画面可重新捕获").into();
@@ -1737,10 +1794,16 @@ impl RuTermApp {
         else {
             return;
         };
-        desktop.capture_keys = !desktop.capture_keys;
-        let on = desktop.capture_keys;
+        let on = !desktop.capture_keys;
+        desktop.capture_keys = on;
         if on {
             desktop.focus.focus(window, cx);
+        } else {
+            // 关掉捕获时把远端还按着的键与鼠标一并抬起。
+            desktop.send(Command::ReleaseAll);
+            desktop.modifiers = Modifiers::default();
+            desktop.capslock = false;
+            desktop.clear_buttons();
         }
         self.status = if on {
             tr!(cx, "键盘已捕获（Esc 释放）").into()

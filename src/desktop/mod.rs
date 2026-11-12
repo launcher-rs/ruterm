@@ -125,6 +125,8 @@ pub enum Command {
     RequestFull,
     /// 让远端把桌面改成指定像素尺寸（RDP 动态分辨率；VNC 忽略）。
     Resize { width: u16, height: u16, scale_factor: u32 },
+    /// 释放该会话已发送的所有键和鼠标按钮。
+    ReleaseAll,
     /// 主动断开。
     Close,
 }
@@ -165,6 +167,8 @@ pub struct Session {
     /// 最新一帧；界面画完 `take` 走，会话见空才产下一帧。
     pub latest: Arc<Mutex<Option<Snapshot>>>,
     pub events: UnboundedReceiver<Event>,
+    /// RDP 的系统剪贴板授权令牌；界面只允许当前活动桌面会话持有它。
+    pub clipboard_token: Option<u64>,
 }
 
 /// 按协议连上服务器，交出统一的事件与指令通道。
@@ -195,8 +199,15 @@ async fn connect_vnc(config: Config) -> Result<Session> {
     .await
     .context("握手超时")??;
 
-    let (mut reader, mut writer) = stream.into_split();
-    let (command_tx, command_rx) = unbounded_channel::<Command>();
+    start_vnc(stream, init).await
+}
+
+async fn start_vnc<S>(stream: S, init: vnc::ServerInit) -> Result<Session>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let (mut reader, mut writer) = tokio::io::split(stream);
+    let (command_tx, mut command_rx) = unbounded_channel::<Command>();
     let (event_tx, event_rx) = unbounded_channel::<Event>();
     let latest = Arc::new(Mutex::new(None));
 
@@ -220,28 +231,34 @@ async fn connect_vnc(config: Config) -> Result<Session> {
         name: init.name.clone(),
     });
 
-    // 写侧：只做指令 → 字节的翻译，网络慢也只是这里排队。
+    // 两个后台任务只通过内部通道与监督任务说话：外部 Session 句柄一旦放下，
+    // 监督任务立刻取消读、写两侧，内部续帧请求不会把已经关掉的会话吊住。
+    let (writer_tx, mut writer_rx) = unbounded_channel::<Command>();
+    let (end_tx, mut end_rx) = unbounded_channel::<String>();
+
     let writer_size = size.clone();
-    tokio::spawn(async move {
-        let mut command_rx = command_rx;
-        while let Some(command) = command_rx.recv().await {
+    let writer_end = end_tx.clone();
+    let writer_task = tokio::spawn(async move {
+        let mut input = VncInput::default();
+        while let Some(command) = writer_rx.recv().await {
             let (width, height) = *writer_size.lock().unwrap();
             let bytes = match command {
-                Command::Pointer { x, y, buttons } => vnc::pointer_message(x, y, buttons),
+                Command::Pointer { x, y, buttons } => {
+                    input.pointer(x, y, buttons);
+                    vnc::pointer_message(x, y, buttons)
+                }
                 Command::Key { key, down } => {
                     if key.keysym == 0 {
                         continue;
                     }
+                    input.key(key.keysym, down);
                     vnc::key_message(key.keysym, down)
                 }
-                // VNC 没有滚轮事件：上/下滚就是滚轮按钮（4/5）的按下与释放。
-                Command::Wheel {
-                    x,
-                    y,
-                    up,
-                    buttons,
-                } => {
-                    let wheel = if up { 4 } else { 5 };
+                // VNC 没有独立的滚轮事件：滚轮就是按钮 4/5 的按下与释放。
+                // 按钮位图里 4 号按钮是 bit3（0b1000），5 号是 bit4（0b10000）。
+                Command::Wheel { x, y, up, buttons } => {
+                    let wheel = if up { 1 << 3 } else { 1 << 4 };
+                    input.pointer(x, y, buttons);
                     let mut bytes = vnc::pointer_message(x, y, buttons | wheel);
                     bytes.extend_from_slice(&vnc::pointer_message(x, y, buttons));
                     bytes
@@ -249,64 +266,61 @@ async fn connect_vnc(config: Config) -> Result<Session> {
                 Command::Clipboard(text) => vnc::clipboard_message(&text),
                 Command::Refresh => vnc::update_request_message(true, width, height),
                 Command::RequestFull => vnc::update_request_message(false, width, height),
+                // 松开所有仍按着的键和鼠标按钮；失焦 / 退出键鼠捕获时由界面下发。
+                Command::ReleaseAll => input.release_all(),
                 // VNC 的动态分辨率要协商 ExtendedDesktopSize，这里不做；忽略即可。
                 Command::Resize { .. } => continue,
                 // RFB 没有文件剪贴板，界面侧已提前拦下并提示。
                 Command::PasteFiles(_) => continue,
-                Command::Close => {
-                    let _ = writer.shutdown().await;
-                    break;
-                }
+                Command::Close => break,
             };
-            if writer.write_all(&bytes).await.is_err() {
-                break;
+            if tokio::time::timeout(vnc::WRITE_TIMEOUT, writer.write_all(&bytes))
+                .await
+                .map_or(true, |result| result.is_err())
+            {
+                let _ = writer_end.send("向远端写入失败或超时".to_string());
+                return;
             }
         }
     });
 
     // 读侧：解码进帧缓冲，按节流产快照。
     let reader_latest = latest.clone();
-    let reader_command = command_tx.clone();
-    tokio::spawn(async move {
-        let latest = reader_latest;
-        let command_tx = reader_command;
+    let reader_size = size.clone();
+    let reader_writer = writer_tx.clone();
+    let reader_event = event_tx.clone();
+    let reader_end = end_tx.clone();
+    let reader_task = tokio::spawn(async move {
         let mut state = match vnc::ClientState::new(init) {
             Ok(state) => state,
             Err(error) => {
-                let _ = event_tx.send(Event::Closed {
-                    reason: error.to_string(),
-                });
+                let _ = reader_end.send(error.to_string());
                 return;
             }
         };
         let mut frames = 0u32;
         let mut stats_at = Instant::now();
         let mut last_frame = Instant::now();
-        let mut closed = "连接已关闭".to_string();
-        loop {
-            let message =
-                match tokio::time::timeout(vnc::READ_TIMEOUT, vnc::read_message(&mut reader, &mut state))
-                    .await
-                {
-                    Err(_) => {
-                        closed = "服务器长时间没有回帧".to_string();
-                        break;
-                    }
-                    Ok(Err(error)) => {
-                        closed = error.to_string();
-                        break;
-                    }
-                    Ok(Ok(message)) => message,
-                };
+        let reason = loop {
+            let message = match tokio::time::timeout(
+                vnc::READ_TIMEOUT,
+                vnc::read_message(&mut reader, &mut state),
+            )
+            .await
+            {
+                Err(_) => break "服务器长时间没有响应".to_string(),
+                Ok(Err(error)) => break error.to_string(),
+                Ok(Ok(message)) => message,
+            };
             match message {
                 vnc::Message::Update { resized } => {
                     frames += 1;
                     if resized {
-                        *size.lock().unwrap() = (state.fb.width, state.fb.height);
+                        *reader_size.lock().unwrap() = (state.fb.width, state.fb.height);
                     }
                     // 界面还没取走上一帧就跳过这次拷贝：画面只会追新，不排队。
                     let publish = {
-                        let mut slot = latest.lock().unwrap();
+                        let mut slot = reader_latest.lock().unwrap();
                         if slot.is_none() {
                             *slot = Some(Snapshot {
                                 width: state.fb.width,
@@ -319,12 +333,12 @@ async fn connect_vnc(config: Config) -> Result<Session> {
                         }
                     };
                     if publish {
-                        let _ = event_tx.send(Event::FrameReady);
+                        let _ = reader_event.send(Event::FrameReady);
                         last_frame = Instant::now();
                     }
                     if stats_at.elapsed() >= STATS_INTERVAL {
                         let fps = frames as f32 / stats_at.elapsed().as_secs_f32();
-                        let _ = event_tx.send(Event::Fps { fps });
+                        let _ = reader_event.send(Event::Fps { fps });
                         frames = 0;
                         stats_at = Instant::now();
                     }
@@ -338,22 +352,79 @@ async fn connect_vnc(config: Config) -> Result<Session> {
                     } else {
                         Command::Refresh
                     };
-                    if command_tx.send(next).is_err() {
-                        break;
+                    if reader_writer.send(next).is_err() {
+                        break "连接已关闭".to_string();
                     }
                 }
                 vnc::Message::Clipboard(text) => {
-                    let _ = event_tx.send(Event::Clipboard(text));
+                    let _ = reader_event.send(Event::Clipboard(text));
                 }
                 vnc::Message::Ignored => {}
             }
-        }
-        let _ = event_tx.send(Event::Closed { reason: closed });
+        };
+        let _ = reader_end.send(reason);
+    });
+
+    tokio::spawn(async move {
+        let reason = loop {
+            tokio::select! {
+                command = command_rx.recv() => match command {
+                    None | Some(Command::Close) => break "连接已关闭".to_string(),
+                    Some(command) => {
+                        if writer_tx.send(command).is_err() {
+                            break "连接已关闭".to_string();
+                        }
+                    }
+                },
+                Some(reason) = end_rx.recv() => break reason,
+            }
+        };
+        writer_task.abort();
+        reader_task.abort();
+        let _ = event_tx.send(Event::Closed { reason });
     });
 
     Ok(Session {
         command: command_tx,
         latest,
         events: event_rx,
+        clipboard_token: None,
     })
+}
+
+/// VNC 侧需要记住「按着什么」，才能在失焦 / 关闭捕获时把远端按键全部抬起。
+#[derive(Default)]
+struct VncInput {
+    keys: std::collections::BTreeSet<u32>,
+    x: u16,
+    y: u16,
+    buttons: u8,
+}
+
+impl VncInput {
+    fn pointer(&mut self, x: u16, y: u16, buttons: u8) {
+        self.x = x;
+        self.y = y;
+        self.buttons = buttons;
+    }
+
+    fn key(&mut self, keysym: u32, down: bool) {
+        if down {
+            self.keys.insert(keysym);
+        } else {
+            self.keys.remove(&keysym);
+        }
+    }
+
+    fn release_all(&mut self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for keysym in std::mem::take(&mut self.keys) {
+            bytes.extend_from_slice(&vnc::key_message(keysym, false));
+        }
+        if self.buttons != 0 {
+            self.buttons = 0;
+            bytes.extend_from_slice(&vnc::pointer_message(self.x, self.y, 0));
+        }
+        bytes
+    }
 }

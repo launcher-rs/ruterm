@@ -35,6 +35,17 @@ pub(super) struct PendingConnect {
 }
 
 impl RuTermApp {
+    pub(super) fn ssh_ready(&self) -> bool {
+        self.auth_gate.ready() && self.vault.is_some() && !self.vault_maintenance
+    }
+
+    pub(super) fn require_ssh_ready(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.ssh_ready() { return true; }
+        self.status = "凭据库未就绪或已锁定；解锁后才能进行 SSH 认证".into();
+        cx.notify();
+        false
+    }
+
     /// 点击主机账号：密码/私钥口令按 内存缓存 → 加密库 → 弹窗 的顺序取得；Agent 直接连接。
     pub(super) fn click_host(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(host) = self.hosts.get(index).cloned() else {
@@ -50,6 +61,7 @@ impl RuTermApp {
             self.connect_telnet(&host, window, cx);
             return;
         }
+        if !self.require_ssh_ready(cx) { return; }
         match host.auth {
             AuthMethod::Agent => {
                 let target = match self.host_target(&host, None) {
@@ -77,6 +89,7 @@ impl RuTermApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.require_ssh_ready(cx) { return; }
         let key = host.addr();
         if let Some(secret) = self.password_cache.get(&key).cloned() {
             self.connect_with_secret(host, secret, key, false, window, cx);
@@ -87,6 +100,7 @@ impl RuTermApp {
         }
         // 加密库可用：异步查已存秘密，命中直连，未命中回弹窗 / 免口令试连（口令信号由会话回抛）。
         if let (Some(vault), true) = (self.vault.clone(), host.id != 0) {
+            let generation = self.auth_gate.generation();
             let entity = cx.entity();
             let entity_id = entity.entity_id();
             cx.spawn(async move |_, cx| {
@@ -99,7 +113,7 @@ impl RuTermApp {
                 };
                 let _ = cx.with_window(entity_id, move |window, cx| {
                     entity.update(cx, move |this, cx| {
-                        if this.pending.is_some() {
+                        if !this.auth_gate.accepts(generation) || !this.ssh_ready() || this.pending.is_some() {
                             return;
                         }
                         if let Some(secret) = saved_jump
@@ -143,6 +157,7 @@ impl RuTermApp {
         host: &HostConfig,
         password: Option<String>,
     ) -> Result<SshTarget, String> {
+        if !self.ssh_ready() { return Err("凭据库未就绪，拒绝读取认证材料".into()); }
         let key_data = if host.auth == AuthMethod::IdentityFile && host.key_inline {
             Some(self.inline_keys.get(&host.id).cloned().ok_or_else(|| {
                 "内嵌私钥不可用（加密库未解锁或数据损坏），请编辑该主机重新导入".to_string()
@@ -268,6 +283,7 @@ impl RuTermApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if host.protocol == ProtocolKind::Ssh && !self.require_ssh_ready(cx) { return; }
         let placeholder = match kind {
             PromptKind::Password => "输入密码后点击连接",
             PromptKind::Passphrase => "输入私钥口令后点击连接",

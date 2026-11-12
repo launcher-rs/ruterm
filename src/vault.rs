@@ -137,6 +137,29 @@ pub enum Trust {
     New,
 }
 
+/// UI 与异步回调共享的认证代次。锁定/换库后旧票据永久失效。
+#[derive(Default)]
+pub struct AuthGate {
+    generation: u64,
+    ready: bool,
+}
+
+impl AuthGate {
+    pub fn generation(&self) -> u64 { self.generation }
+    pub fn ready(&self) -> bool { self.ready }
+    pub fn accepts(&self, generation: u64) -> bool {
+        self.ready && self.generation == generation
+    }
+    pub fn revoke(&mut self) {
+        self.ready = false;
+        self.generation = self.generation.checked_add(1).expect("认证代次溢出");
+    }
+    pub fn attach(&mut self) { self.ready = true; }
+    pub fn take_pending<T>(&self, pending: &mut Option<T>) -> Option<T> {
+        if self.ready { pending.take() } else { None }
+    }
+}
+
 /// 认证方式与库内标签字符串的互转。
 fn auth_tag(auth: AuthMethod) -> &'static str {
     match auth {
@@ -263,19 +286,17 @@ pub fn load_or_create_master_key() -> Result<String> {
 
 /// 读取（或首次生成）Argon2 派生盐；盐是公开参数，明文存放即可。
 pub fn load_or_create_salt(path: &Path) -> Result<[u8; 16]> {
-    if let Ok(bytes) = std::fs::read(path)
-        && bytes.len() == 16
-    {
-        let mut salt = [0u8; 16];
-        salt.copy_from_slice(&bytes);
-        return Ok(salt);
+    match std::fs::read(path) {
+        Ok(bytes) => return bytes.try_into().map_err(|_| anyhow::anyhow!("派生盐长度错误，拒绝覆盖")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+        Err(error) => return Err(error).context("读取派生盐失败，拒绝覆盖"),
     }
-    let mut salt = [0u8; 16];
-    getrandom::fill(&mut salt).context("生成派生盐失败")?;
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).ok();
+        anyhow::ensure!(!parent.join(crate::paths::DB_FILE).try_exists()?, "已有凭据库缺少盐，拒绝生成替代盐");
+        std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, salt).with_context(|| format!("写入 {}", path.display()))?;
+    let salt = generate_salt()?;
+    write_new_synced(path, &salt)?;
     Ok(salt)
 }
 
@@ -306,6 +327,45 @@ pub fn write_salt(path: &Path, salt: &[u8; 16]) -> Result<()> {
         std::fs::create_dir_all(parent).ok();
     }
     std::fs::write(path, salt).with_context(|| format!("写入 {} 失败", path.display()))
+}
+
+/// 首次写盘：独占建临时文件、落盘后原子改名，避免半截文件被当成有效内容。
+fn write_new_synced(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write as _;
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("无法创建 {}", parent.display()))?;
+    }
+    let mut suffix = [0u8; 4];
+    getrandom::fill(&mut suffix).context("生成临时文件名失败")?;
+    let temp = path.with_file_name(format!(
+        ".{}.{:02x}{:02x}{:02x}{:02x}.tmp",
+        path.file_name().and_then(|n| n.to_str()).unwrap_or("data"),
+        suffix[0],
+        suffix[1],
+        suffix[2],
+        suffix[3]
+    ));
+    let result = (|| -> Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+            .with_context(|| format!("创建 {} 失败", temp.display()))?;
+        file.write_all(bytes)
+            .with_context(|| format!("写入 {} 失败", temp.display()))?;
+        file.sync_all()
+            .with_context(|| format!("落盘 {} 失败", temp.display()))?;
+        drop(file);
+        std::fs::rename(&temp, path)
+            .with_context(|| format!("改名 {} → {} 失败", temp.display(), path.display()))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
 }
 
 /// 读取数据目录中的解锁后端标记；文件缺失按 keyring 档处理。
@@ -599,16 +659,15 @@ impl Vault {
         .await
     }
 
-    /// 批量写入 known_hosts（一次性迁移与换库搬迁用，已存在则覆盖）。
+    /// 旧信任记录只能补缺，绝不能覆盖新库中已确认的指纹。
     pub async fn record_known_hosts(&self, entries: Vec<(String, String, String)>) -> Result<()> {
-        self.job(move |cell| async move {
-            let mut db = cell.lock().await;
-            for (host_port, fingerprint, algorithm) in entries {
-                put_known_host(&mut db, &host_port, &fingerprint, &algorithm).await?;
-            }
-            Ok(())
-        })
-        .await
+        for (host_port, fingerprint, algorithm) in entries {
+            anyhow::ensure!(
+                self.check_or_record_known_host(&host_port, &fingerprint, &algorithm).await? != Trust::Mismatch,
+                "旧 known_hosts 与凭据库冲突：{host_port}；保留双方记录并拒绝迁移"
+            );
+        }
+        Ok(())
     }
 
     /// 导出本库全部数据（换主密钥时搬迁用）。
@@ -945,6 +1004,19 @@ fn text_of(row: &turso::Row, idx: usize) -> String {
     }
 }
 
+/// 缺失才表示没有旧信任记录；权限、编码、IO 错误必须阻止首次信任。
+pub fn read_legacy_known_hosts(path: &Path) -> Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).context("读取旧 known_hosts 失败，拒绝建立新的信任"),
+    }
+}
+
+pub async fn import_legacy_trust(vault: &Vault, text: &str) -> Result<()> {
+    vault.record_known_hosts(parse_legacy_known_hosts(text)).await
+}
+
 /// 解析旧 known_hosts 文本行：`[host]:port fingerprint [algorithm]`。
 fn parse_legacy_known_hosts(text: &str) -> Vec<(String, String, String)> {
     let mut entries = Vec::new();
@@ -1029,12 +1101,8 @@ pub async fn migrate_legacy(
 
     // known_hosts 文件 → 表
     let kh_path = mode.legacy_path(crate::paths::LEGACY_KNOWN_HOSTS_FILE);
-    if kh_path.exists() {
-        if let Ok(text) = std::fs::read_to_string(&kh_path) {
-            vault
-                .record_known_hosts(parse_legacy_known_hosts(&text))
-                .await?;
-        }
+    if let Some(text) = read_legacy_known_hosts(&kh_path)? {
+        vault.record_known_hosts(parse_legacy_known_hosts(&text)).await?;
         rename_preserving(&kh_path);
     }
     Ok(migrated_vault)
@@ -1152,6 +1220,77 @@ pub(crate) fn remove_db_bundle(base: &Path) {
             log::warn!("删除 {} 失败: {error}", path.display());
         }
     }
+}
+
+/// 启动时修复上次中断的换主密码事务。
+///
+/// 换密钥按“先把旧库改名成备份，再把新库就位，最后才写盐与解锁标记”的顺序进行，
+/// 因此任一时刻至少有一份可用库。启动时只看主库在不在：
+/// - 主库在：残留的 `ruterm.db.new` 是上一轮草稿，整套删掉；
+/// - 主库不在、有备份：把备份搬回原处（旧盐仍对应旧库），再删草稿；
+/// - 主库与备份都不在却仍有草稿：无法判断草稿对应哪份口令，拒绝自动处理并保留现场。
+pub fn recover_rekey(mode: &StorageMode) -> Result<()> {
+    let db = mode.db_path();
+    let staging = db.with_file_name("ruterm.db.new");
+    if db.exists() {
+        remove_db_bundle(&staging);
+        return Ok(());
+    }
+    let mut backups = Vec::new();
+    let primary = db.with_file_name("ruterm.db.keyring-bak");
+    if primary.exists() {
+        backups.push(primary);
+    }
+    if let Some(dir) = db.parent()
+        && let Ok(entries) = std::fs::read_dir(dir)
+    {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if name.to_string_lossy().starts_with("ruterm.db.bak-") {
+                backups.push(entry.path());
+            }
+        }
+    }
+    if let Some(backup) = backups.into_iter().next() {
+        rename_bundle_sync(&backup, &db)
+            .with_context(|| format!("恢复旧库 {} 失败", backup.display()))?;
+        remove_db_bundle(&staging);
+        log::warn!(
+            "检测到中断的主密码更换，已将旧库备份 {} 恢复为 {}",
+            backup.display(),
+            db.display()
+        );
+        return Ok(());
+    }
+    if staging.exists() {
+        anyhow::bail!(
+            "检测到中断的主密码更换：{} 不存在且找不到旧库备份，已拒绝自动处理（请保留现有文件并手工恢复）",
+            db.display()
+        );
+    }
+    Ok(())
+}
+
+/// 同步版整套换名：边文件先走，主文件最后，理由同 [`rename_db_bundle`]。
+fn rename_bundle_sync(from: &Path, to: &Path) -> Result<()> {
+    let name = from
+        .file_name()
+        .and_then(|n| n.to_str())
+        .context("库文件名无效")?;
+    let target_name = to
+        .file_name()
+        .and_then(|n| n.to_str())
+        .context("目标库文件名无效")?;
+    for suffix in ["-wal", "-shm"] {
+        let side = from.with_file_name(format!("{name}{suffix}"));
+        if side.exists() {
+            let target = to.with_file_name(format!("{target_name}{suffix}"));
+            std::fs::rename(&side, &target)
+                .with_context(|| format!("恢复 {} 失败", side.display()))?;
+        }
+    }
+    std::fs::rename(from, to)
+        .with_context(|| format!("恢复 {} → {} 失败", from.display(), to.display()))
 }
 
 /// 改名保留（同步版：用于从未被打开过的普通文本/JSON 文件）。

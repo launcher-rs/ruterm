@@ -509,6 +509,9 @@ impl RuTermApp {
             && let Some(desktop) = tab.desktop.as_mut()
         {
             desktop.send(Command::Close);
+            if let Some(token) = desktop.clipboard_token.take() {
+                ironrdp_cliprdr_native::release_clipboard_session(token);
+            }
             let mut frames: Vec<_> = std::mem::take(&mut desktop.drop_queue);
             frames.extend(desktop.image.take());
             for image in frames {
@@ -545,10 +548,23 @@ impl RuTermApp {
             }
         }
         self.prune_multi_session_state();
+        self.sync_desktop_clipboard_auth();
         self.sync_tray(cx);
         cx.notify();
     }
 
+
+    /// 系统剪贴板只属于当前活动的 RDP 桌面会话：切走即撤销，后台会话无法再
+    /// 读取本机剪贴板或把内容写给远端。
+    fn sync_desktop_clipboard_auth(&self) {
+        let token = self
+            .active_tab
+            .and_then(|id| self.tabs.iter().find(|tab| tab.id == id))
+            .and_then(|tab| tab.desktop.as_ref())
+            .and_then(|desktop| desktop.clipboard_token)
+            .unwrap_or(0);
+        ironrdp_cliprdr_native::authorize_clipboard_session(token);
+    }
 
     /// 切到指定标签：选中、滚进可见范围（标签多到溢出时），并把焦点交给它的终端。
     pub(crate) fn activate_tab(&mut self, id: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -605,6 +621,7 @@ impl RuTermApp {
             self.find.applied = None;
             self.apply_find(cx);
         }
+        self.sync_desktop_clipboard_auth();
         self.sync_tray(cx);
     }
 

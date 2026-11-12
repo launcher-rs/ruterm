@@ -24,8 +24,11 @@ const MAX_NAME_BYTES: usize = 4096;
 const MAX_CLIPBOARD_BYTES: usize = 4 * 1024 * 1024;
 /// 握手每一步的等待上限：连上了却不说 RFB 的端口不该把连接挂死。
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
-/// 帧更新的等待上限：服务器要先收到我们的请求才会回，正常远小于这个值。
-pub const READ_TIMEOUT: Duration = Duration::from_secs(120);
+/// 帧更新的等待上限。静止桌面可能长时间没有像素变化，不能按 120 秒就断线；
+/// 这里只兜底彻底失联的连接，正常退出走显式 Close。
+pub const READ_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+/// 单条消息的写入上限：远端不读时不能让发送任务无限期卡住取消。
+pub const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// 我们通告给服务器的编码（客户端 → 服务器的优先级顺序）。
 pub const ENCODINGS: [i32; 4] = [0, 1, 5, -223];
@@ -55,7 +58,31 @@ pub struct PixelFormat {
 }
 
 impl PixelFormat {
-    /// 每个像素占几个字节（向上取整，协议里 15bpp 之类也按 2 字节传）。
+    /// Validate before any server-controlled pixel data is decoded.
+    fn validate(&self) -> Result<()> {
+        if !matches!(self.bits_per_pixel, 8 | 16 | 32)
+            || self.depth == 0 || self.depth > self.bits_per_pixel || !self.true_colour
+        {
+            bail!("服务器上报的像素格式无效（仅支持 8/16/32bpp 真彩色）");
+        }
+        let mut used = 0u32;
+        let mut depth = 0;
+        for (max, shift) in [(self.red_max, self.red_shift), (self.green_max, self.green_shift), (self.blue_max, self.blue_shift)] {
+            let max = u32::from(max);
+            let bits = max.count_ones();
+            if max == 0 || max & (max + 1) != 0 || u32::from(shift) + bits > u32::from(self.bits_per_pixel) {
+                bail!("服务器上报的颜色最大值或位移无效");
+            }
+            let mask = max << shift;
+            if used & mask != 0 { bail!("服务器上报的颜色通道重叠"); }
+            used |= mask;
+            depth += bits;
+        }
+        if depth != u32::from(self.depth) { bail!("服务器上报的颜色深度无效"); }
+        Ok(())
+    }
+
+    /// 每个像素占几个字节（格式已校验）。
     pub fn bytes_per_pixel(&self) -> usize {
         usize::from(self.bits_per_pixel.div_ceil(8)).max(1)
     }
@@ -110,6 +137,7 @@ pub struct ClientState {
 
 impl ClientState {
     pub fn new(init: ServerInit) -> Result<Self> {
+        init.pixel_format.validate()?;
         let fb = Framebuffer::new(init.width, init.height)?;
         Ok(Self { init, fb })
     }
@@ -207,12 +235,7 @@ where
         green_shift: pf_bytes[11],
         blue_shift: pf_bytes[12],
     };
-    if !pixel_format.true_colour {
-        bail!("服务器使用调色板像素格式，暂不支持");
-    }
-    if pixel_format.bits_per_pixel == 0 {
-        bail!("服务器上报的像素格式无效（bpp=0）");
-    }
+    pixel_format.validate()?;
     let name_len = stream.read_u32().await.context("读取服务器名长度失败")? as usize;
     if name_len > MAX_NAME_BYTES {
         bail!("服务器名过长（{name_len} 字节）");
@@ -481,7 +504,7 @@ where
                         height,
                     },
                     Rect { x, y, width, height },
-                );
+                )?;
             }
             5 => {
                 apply_hextile(reader, state, Rect { x, y, width, height }).await?;
@@ -669,15 +692,15 @@ impl Framebuffer {
     }
 
     /// 复制矩形：源与目标可能重叠，逐行取到临时行再落。
-    pub fn copy_rect(&mut self, source: Rect, target: Rect) {
+    pub fn copy_rect(&mut self, source: Rect, target: Rect) -> Result<()> {
+        checked_rect(self, source)?;
+        checked_rect(self, target)?;
         let width = source.width.min(target.width);
         let height = source.height.min(target.height);
-        if width == 0 || height == 0 {
-            return;
-        }
         let stride = self.stride();
         let mut row = vec![0u8; usize::from(width) * 4];
-        for y in 0..usize::from(height) {
+        for index in 0..usize::from(height) {
+            let y = if target.y > source.y { usize::from(height) - 1 - index } else { index };
             let sy = usize::from(source.y) + y;
             let ty = usize::from(target.y) + y;
             let from = sy * stride + usize::from(source.x) * 4;
@@ -686,6 +709,7 @@ impl Framebuffer {
             let to = ty * stride + usize::from(target.x) * 4;
             self.bgra[to..to + row.len()].copy_from_slice(&row);
         }
+        Ok(())
     }
 
     /// 裁到帧缓冲内；完全在外就返回 None。
@@ -784,7 +808,8 @@ mod tests {
                 width: 2,
                 height: 2,
             },
-        );
+        )
+        .unwrap();
         let offset = (2 * 4 + 2) * 4;
         assert_eq!(&fb.bgra[offset..offset + 4], &[1, 2, 3, 255]);
     }

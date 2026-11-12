@@ -228,7 +228,13 @@ impl SshTerminalHandler {
         let fp = fingerprint_hex(key);
         let path = legacy_known_hosts_path();
 
-        let existing = std::fs::read_to_string(&path).unwrap_or_default();
+        let existing = match crate::vault::read_legacy_known_hosts(&path) {
+            Ok(text) => text.unwrap_or_default(),
+            Err(error) => {
+                log::warn!("{error}");
+                return false;
+            }
+        };
         let mut has_entry_for_host = false;
         for line in existing.lines() {
             let mut fields = line.split_whitespace();
@@ -406,13 +412,6 @@ impl client::Handler for SshTerminalHandler {
     ) -> Result<(), Self::Error> {
         if self.side.contains(channel) {
             return Ok(());
-        }
-        // TEMP 复现用：模拟远端链路延迟，拉大按键与回显的交叠窗口。
-        if let Some(ms) = std::env::var("RUTERM_TEST_DOWNLINK_DELAY_MS")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-        {
-            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
         }
         // 先扫描 OSC 7（shell 工作目录上报），再决定是否转交 zmodem / 终端。
         self.osc7.feed(data, &self.cwd);

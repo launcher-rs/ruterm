@@ -27,11 +27,14 @@ pub(crate) struct ClipboardShared {
     next_stream_id: AtomicU32,
     /// Streams waiting for a file contents response, by stream id.
     waiters: Mutex<HashMap<u32, mpsc::Sender<FileContentsResponse<'static>>>>,
+    /// RuTerm: this clipboard session's token (0 when the embedder did not allocate one).
+    token: u64,
 }
 
 impl ClipboardShared {
-    pub(crate) fn new(message_proxy: Box<dyn ClipboardMessageProxy>) -> Self {
+    pub(crate) fn new(message_proxy: Box<dyn ClipboardMessageProxy>, token: u64) -> Self {
         Self {
+            token,
             message_proxy: Mutex::new(message_proxy),
             capabilities: AtomicU32::new(0),
             generation: AtomicU64::new(0),
@@ -40,6 +43,11 @@ impl ClipboardShared {
             next_stream_id: AtomicU32::new(1),
             waiters: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Only the currently authorized session may exchange clipboard contents.
+    pub(crate) fn authorized(&self) -> bool {
+        crate::is_clipboard_session_authorized(self.token)
     }
 
     pub(crate) fn send(&self, message: ClipboardMessage) {

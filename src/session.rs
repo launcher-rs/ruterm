@@ -28,7 +28,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
-use tokio::task::{JoinHandle, JoinSet};
+use tokio::task::JoinSet;
 
 use crate::config::SshTarget;
 use crate::remote::{PROBE_CMD, RemoteInfo};
@@ -159,13 +159,35 @@ enum AcceptedForward {
     },
 }
 
-/// 一条生效中的转发：规则 + 监听任务（仅本地转发）+ 已建立连接的双向泵。
+/// 一条生效中的转发：规则 + 监听任务与已建立连接的双向泵。
 ///
 /// 停止转发要连活动连接一起掐断，不能让"停止"只关监听、流量照旧。
 struct ActiveForward {
     rule: ForwardRule,
-    listener: Option<JoinHandle<()>>,
+    // 监听、SOCKS 握手和数据泵同属此集合，停止规则时一并取消并等待。
     pumps: JoinSet<()>,
+}
+
+/// 框架接收端没有可取消的阻塞 recv。这里只轮询上行，不把定时器当作下行背压。
+/// 该任务必须放进会话 JoinSet，关闭标签无需等待 Terminal 实体的所有引用释放。
+pub(crate) async fn pump_external(
+    rx: rgpui_term::PtyBoundReceiver,
+    tx: mpsc::UnboundedSender<PtyBoundMessage>,
+) {
+    let mut tick = tokio::time::interval(Duration::from_millis(5));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            biased;
+            _ = tx.closed() => return,
+            _ = tick.tick() => {
+                for _ in 0..64 {
+                    let Some(message) = rx.try_recv() else { break };
+                    if tx.send(message).is_err() { return; }
+                }
+            }
+        }
+    }
 }
 
 /// UI 发给会话任务的指令：SFTP 与端口转发都必须借用同一条已认证的 SSH 连接。
@@ -274,44 +296,16 @@ pub fn start<C: AppContext>(
     cx: &C,
 ) -> SshSession {
     let ExternalHandles { feed, rx } = handles;
+    // 上行泵：终端的阻塞接收端只在本任务里轮询，关标签后发送端关闭，
+    // 任务随之退出；放进会话任务里，提前取消时不会留下卡在 recv 的线程。
     let (ui_tx, ui_rx) = mpsc::unbounded_channel::<PtyBoundMessage>();
+    let uplink = rgpui::tokio::Tokio::spawn(cx, pump_external(rx, ui_tx));
     let (info_tx, info_rx) = mpsc::unbounded_channel::<RemoteInfo>();
     let (cwd_tx, cwd_rx) = mpsc::unbounded_channel::<String>();
     let (ready_tx, ready_rx) = oneshot::channel::<()>();
     let (disconnect_tx, disconnect_rx) = oneshot::channel::<()>();
     let (command_tx, command_rx) = mpsc::unbounded_channel::<SessionCommand>();
     let started = Arc::new(AtomicBool::new(false));
-
-    // 上行泵：把终端的阻塞通道接到 tokio 通道；send 是非阻塞的，
-    // 泵线程只在 recv 上休眠，不碰 UI 也不占运行时。
-    std::thread::Builder::new()
-        .name("ruterm-uplink".to_string())
-        .spawn(move || {
-            let trace = std::env::var_os("RUTERM_TRACE_EXTERNAL").is_some();
-            let mut count = 0usize;
-            while let Some(message) = rx.recv() {
-                count += 1;
-                if trace && (count <= 3 || count % 50 == 0) {
-                    let kind = match &message {
-                        PtyBoundMessage::Input(bytes) => format!("input len={}", bytes.len()),
-                        PtyBoundMessage::Resize(size) => {
-                            format!("resize {}x{}", size.num_cols, size.num_lines)
-                        }
-                    };
-                    eprintln!("[rt-trace] uplink pump received message #{count}: {kind}");
-                }
-                if ui_tx.send(message).is_err() {
-                    if trace {
-                        eprintln!("[rt-trace] uplink pump receiver closed at #{count}");
-                    }
-                    break; // 转发任务已结束
-                }
-            }
-            if trace {
-                eprintln!("[rt-trace] uplink pump ended after {count} messages");
-            }
-        })
-        .expect("无法启动 ruterm 上行泵线程");
 
     feed.feed(format!("\r\n[ruterm] 正在连接 {}…\r\n", target.addr()).into_bytes());
 
@@ -336,6 +330,8 @@ pub fn start<C: AppContext>(
             ready_tx,
         )
         .await;
+        // run 结束后不再需要上行泵：丢弃 Task 即取消。
+        drop(uplink);
         if let Err(error) = &result {
             closing_feed
                 .feed(format!("\r\n[ruterm] 会话结束: {}\r\n", error_summary(error)).into_bytes());
@@ -884,31 +880,22 @@ async fn run(
         }
     }
     for (_, mut forward) in local_forwards {
-        if let Some(listener) = forward.listener.take() {
-            listener.abort();
-        }
         forward.pumps.shutdown().await;
     }
     for (_, mut forward) in remote_forwards {
         forward.pumps.shutdown().await;
     }
     for (_, mut forward) in dynamic_forwards {
-        if let Some(listener) = forward.listener.take() {
-            listener.abort();
-        }
         forward.pumps.shutdown().await;
     }
     Ok(())
 }
 
-/// 停止一条转发：先掐监听（本地转发）再收掉该规则的全部活动连接。
+/// 停止一条转发：收掉监听与该规则的全部活动连接。
 async fn stop_forward_task(task: &mut Option<ActiveForward>) -> bool {
     let Some(forward) = task else {
         return false;
     };
-    if let Some(listener) = forward.listener.take() {
-        listener.abort();
-    }
     forward.pumps.shutdown().await;
     true
 }
@@ -924,16 +911,9 @@ async fn start_local_forward(
     let listener = TcpListener::bind(("127.0.0.1", rule.listen_port))
         .await
         .with_context(|| format!("无法监听本地端口 {}（可能已被占用）", rule.listen_port))?;
-    let listener = tokio::spawn(forward_accept_loop(
-        listener,
-        accepted.clone(),
-        rule.clone(),
-    ));
-    Ok(ActiveForward {
-        rule,
-        listener: Some(listener),
-        pumps: JoinSet::new(),
-    })
+    let mut pumps = JoinSet::new();
+    pumps.spawn(forward_accept_loop(listener, accepted.clone(), rule.clone()));
+    Ok(ActiveForward { rule, pumps })
 }
 
 /// 开始一条动态转发（-D）：本机回环上的 SOCKS5 代理。
@@ -946,16 +926,9 @@ async fn start_dynamic_forward(
     let listener = TcpListener::bind(("127.0.0.1", rule.listen_port))
         .await
         .with_context(|| format!("无法监听 SOCKS5 端口 {}（可能已被占用）", rule.listen_port))?;
-    let listener = tokio::spawn(dynamic_accept_loop(
-        listener,
-        accepted.clone(),
-        rule.clone(),
-    ));
-    Ok(ActiveForward {
-        rule,
-        listener: Some(listener),
-        pumps: JoinSet::new(),
-    })
+    let mut pumps = JoinSet::new();
+    pumps.spawn(dynamic_accept_loop(listener, accepted.clone(), rule.clone()));
+    Ok(ActiveForward { rule, pumps })
 }
 
 /// 远程转发只绑服务器回环：不把服务器端口暴露到公网，避免变成开放代理。
@@ -988,7 +961,6 @@ async fn start_remote_forward(
         rule.clone(),
         ActiveForward {
             rule,
-            listener: None,
             pumps: JoinSet::new(),
         },
     ))

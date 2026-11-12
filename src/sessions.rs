@@ -2,7 +2,8 @@
 //!
 //! 凭据策略：密码不入库，连接时临时输入；私钥只存路径。
 
-use std::path::PathBuf;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -207,10 +208,32 @@ impl SessionStore {
     }
 
     /// 读取应用级设置；文件缺失或损坏时返回默认值（暗色）。
+    /// 损坏只影响本次读取，回写时 [`Self::update_settings`] 会拒绝覆盖原文件。
     pub fn load_settings(&self) -> Settings {
+        match self.read_settings_file() {
+            Ok(Some(settings)) => settings,
+            Ok(None) => Settings::default(),
+            Err(error) => {
+                log::warn!("{error}；本次按默认设置启动");
+                Settings::default()
+            }
+        }
+    }
+
+    /// 严格读取：缺失返回 None，损坏或不可读返回错误（避免把坏文件当空设置覆盖）。
+    fn read_settings_file(&self) -> Result<Option<Settings>, String> {
         match std::fs::read_to_string(&self.settings_path) {
-            Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
-            Err(_) => Settings::default(),
+            Ok(text) => serde_json::from_str(&text).map(Some).map_err(|error| {
+                format!(
+                    "settings.json 解析失败（{}）：{error}",
+                    self.settings_path.display()
+                )
+            }),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(format!(
+                "读取 {} 失败：{error}",
+                self.settings_path.display()
+            )),
         }
     }
 
@@ -239,18 +262,22 @@ impl SessionStore {
     }
 
     /// 就地改一项设置后整体回写（读-改-写，避免各设置项互相覆盖）。
+    ///
+    /// settings.json 已损坏或不可读时拒绝写入：宁可这次设置不生效，
+    /// 也不把用户其余设置连同坏文件一起覆盖掉。
     pub fn update_settings(&self, f: impl FnOnce(&mut Settings)) {
-        let mut settings = self.load_settings();
+        let mut settings = match self.read_settings_file() {
+            Ok(Some(settings)) => settings,
+            Ok(None) => Settings::default(),
+            Err(error) => {
+                log::error!("{error}；拒绝覆盖 settings.json");
+                return;
+            }
+        };
         f(&mut settings);
-        if let Some(parent) = self.settings_path.parent()
-            && let Err(error) = std::fs::create_dir_all(parent)
-        {
-            log::warn!("无法创建 {}（{error}），设置不持久化", parent.display());
-            return;
-        }
         match serde_json::to_string_pretty(&settings) {
             Ok(text) => {
-                if let Err(error) = std::fs::write(&self.settings_path, text) {
+                if let Err(error) = write_atomic(&self.settings_path, text.as_bytes()) {
                     log::warn!("写入 settings.json 失败: {error}");
                 }
             }
@@ -268,13 +295,7 @@ impl SessionStore {
 
     /// 仅更新加密库锁定期间可读取的非敏感主题启动镜像。
     pub fn save_theme_mirror(&self, dark: bool) {
-        if let Some(parent) = self.theme_path.parent()
-            && let Err(error) = std::fs::create_dir_all(parent)
-        {
-            log::warn!("无法创建 {}（{error}），主题启动镜像不持久化", parent.display());
-            return;
-        }
-        if let Err(error) = std::fs::write(&self.theme_path, if dark { "dark" } else { "light" }) {
+        if let Err(error) = write_atomic(&self.theme_path, if dark { "dark" } else { "light" }.as_bytes()) {
             log::warn!("写入 theme.txt 失败: {error}");
         }
     }
@@ -352,13 +373,7 @@ impl SessionStore {
 
     /// 保存界面语言偏好到启动镜像；失败仅记日志（库内那份才是权威值）。
     pub fn save_language(&self, locale: &str) {
-        if let Some(parent) = self.locale_path.parent()
-            && let Err(error) = std::fs::create_dir_all(parent)
-        {
-            log::warn!("无法创建 {}（{error}），语言不持久化", parent.display());
-            return;
-        }
-        if let Err(error) = std::fs::write(&self.locale_path, locale) {
+        if let Err(error) = write_atomic(&self.locale_path, locale.as_bytes()) {
             log::warn!("写入 {} 失败: {error}", self.locale_path.display());
         }
     }
@@ -383,31 +398,168 @@ impl SessionStore {
     }
 
     /// 读取主机列表；文件缺失或损坏时返回空列表（损坏文件记日志保留现场）。
+    /// 损坏时 [`Self::save`] 会拒绝覆盖，避免一次空列表把现场抹掉。
     pub fn load(&self) -> Vec<HostConfig> {
-        match std::fs::read_to_string(&self.path) {
-            Ok(text) => serde_json::from_str(&text).unwrap_or_else(|error| {
-                log::warn!("sessions.json 解析失败（{error}），本次以空列表启动");
+        match self.read_hosts_file() {
+            Ok(Some(hosts)) => hosts,
+            Ok(None) => Vec::new(),
+            Err(error) => {
+                log::warn!("{error}；本次以空列表启动");
                 Vec::new()
+            }
+        }
+    }
+
+    /// 严格读取：缺失返回 None，损坏或不可读返回错误。
+    fn read_hosts_file(&self) -> Result<Option<Vec<HostConfig>>, String> {
+        match std::fs::read_to_string(&self.path) {
+            Ok(text) => serde_json::from_str(&text).map(Some).map_err(|error| {
+                format!("sessions.json 解析失败（{}）：{error}", self.path.display())
             }),
-            Err(_) => Vec::new(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(format!("读取 {} 失败：{error}", self.path.display())),
         }
     }
 
     /// 整表写回；失败仅记日志（不阻断 UI 操作）。
+    ///
+    /// 写前再确认原文件可解析：用户手改坏的文件绝不被内存里的列表覆盖。
     pub fn save(&self, hosts: &[HostConfig]) {
-        if let Some(parent) = self.path.parent()
-            && let Err(error) = std::fs::create_dir_all(parent)
-        {
-            log::warn!("无法创建 {}（{error}），会话不持久化", parent.display());
+        if let Err(error) = self.read_hosts_file() {
+            log::error!("{error}；拒绝覆盖 sessions.json");
             return;
         }
         match serde_json::to_string_pretty(hosts) {
             Ok(text) => {
-                if let Err(error) = std::fs::write(&self.path, text) {
+                if let Err(error) = write_atomic(&self.path, text.as_bytes()) {
                     log::warn!("写入 sessions.json 失败: {error}");
                 }
             }
             Err(error) => log::warn!("序列化会话列表失败: {error}"),
         }
+    }
+}
+
+/// 同目录临时文件 + fsync + 原子替换：半截写入不会留下损坏的 JSON。
+fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "settings".into());
+    let temp = parent.join(format!(".{name}.{}.{stamp}.tmp", std::process::id()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        options.mode(0o600);
+    }
+    let result = (|| {
+        let mut file = options.open(&temp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn store(tag: &str) -> SessionStore {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "ruterm-sessions-{tag}-{}-{stamp}",
+            std::process::id()
+        ));
+        SessionStore {
+            path: dir.join("sessions.json"),
+            settings_path: dir.join("settings.json"),
+            locale_path: dir.join("locale.txt"),
+            theme_path: dir.join("theme.txt"),
+        }
+    }
+
+    fn host(name: &str) -> HostConfig {
+        HostConfig {
+            protocol: ProtocolKind::Ssh,
+            id: 1,
+            name: name.to_string(),
+            host: "example.com".to_string(),
+            port: 22,
+            user: "root".to_string(),
+            auth: AuthMethod::Agent,
+            key_path: String::new(),
+            key_inline: false,
+            favorite: false,
+            proxy_jump: None,
+        }
+    }
+
+    #[test]
+    fn missing_files_are_treated_as_empty() {
+        let store = store("missing");
+        assert!(store.load().is_empty());
+        assert_eq!(store.load_settings().theme, "");
+    }
+
+    #[test]
+    fn hosts_roundtrip_through_atomic_write() {
+        let store = store("hosts-roundtrip");
+        store.save(&[host("one")]);
+        let loaded = store.load();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].name, "one");
+        for entry in std::fs::read_dir(store.path.parent().unwrap()).unwrap() {
+            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+            assert!(!name.ends_with(".tmp"), "临时文件残留：{name}");
+        }
+    }
+
+    #[test]
+    fn corrupt_hosts_file_is_not_overwritten() {
+        let store = store("hosts-corrupt");
+        std::fs::create_dir_all(store.path.parent().unwrap()).unwrap();
+        std::fs::write(&store.path, b"[{\"name\":").unwrap();
+        assert!(store.load().is_empty());
+        store.save(&[host("replacement")]);
+        assert_eq!(std::fs::read(&store.path).unwrap(), b"[{\"name\":");
+    }
+
+    #[test]
+    fn corrupt_settings_file_is_not_overwritten() {
+        let store = store("settings-corrupt");
+        std::fs::create_dir_all(store.settings_path.parent().unwrap()).unwrap();
+        let original = b"{\"theme\": ";
+        std::fs::write(&store.settings_path, original).unwrap();
+        assert_eq!(store.load_settings().theme, "");
+        store.update_settings(|settings| settings.theme = "light".to_string());
+        assert_eq!(std::fs::read(&store.settings_path).unwrap(), original);
+    }
+
+    #[test]
+    fn settings_roundtrip_and_theme_mirror() {
+        let store = store("settings-roundtrip");
+        store.update_settings(|settings| settings.theme = "light".to_string());
+        assert_eq!(store.load_settings().theme, "light");
+        store.save_theme_mirror(true);
+        assert!(store.load_theme());
+        store.save_language("en");
+        assert_eq!(store.load_language(), "en");
     }
 }

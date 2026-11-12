@@ -8,8 +8,8 @@ use std::sync::{Arc, mpsc};
 
 use ironrdp_cliprdr::backend::ClipboardMessage;
 use ironrdp_cliprdr::pdu::{
-    ClipboardFormat, ClipboardFormatId, ClipboardFormatName, ClipboardGeneralCapabilityFlags, FormatDataRequest,
-    FormatDataResponse,
+    ClipboardFormat, ClipboardFormatId, ClipboardFormatName, ClipboardGeneralCapabilityFlags,
+    FileContentsResponse, FormatDataRequest, FormatDataResponse,
 };
 use tracing::{debug, error, warn};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, S_OK, WPARAM};
@@ -146,6 +146,10 @@ impl WinClipboardImpl {
     }
 
     fn on_format_data_request(&mut self, request: &FormatDataRequest) -> WinCliprdrResult<Option<ClipboardMessage>> {
+        // RuTerm: an unauthorized session must not hand clipboard contents to its remote.
+        if !self.transport.shared().authorized() {
+            return Ok(Some(ClipboardMessage::SendFormatData(FormatDataResponse::new_error())));
+        }
         // Get data from the clipboard and send event to the main event loop
         let clipboard = OwnedOsClipboard::new(self.window)?;
 
@@ -182,6 +186,10 @@ impl WinClipboardImpl {
     }
 
     fn on_clipboard_update(&mut self) -> WinCliprdrResult<Option<ClipboardMessage>> {
+        // RuTerm: do not leak the local clipboard into every connected remote.
+        if !self.transport.shared().authorized() {
+            return Ok(None);
+        }
         if self.owns_clipboard() {
             // 文件正在传给远端时，远端剪贴板还是这份文件列表：不要拿空列表去覆盖它，
             // 否则远端刚开始读的文件流会随剪贴板一起被清掉。
@@ -314,6 +322,10 @@ impl WinClipboardImpl {
         &mut self,
         format: ClipboardFormatId,
     ) -> WinCliprdrResult<Option<FormatDataResponse<'static>>> {
+        // RuTerm: only the active session may paste remote data into the local clipboard.
+        if !self.transport.shared().authorized() {
+            return Ok(None);
+        }
         let mapped_format = self.remote_format_registry.local_to_remote(format);
 
         let remote_format = if let Some(format) = mapped_format {
@@ -395,6 +407,11 @@ impl WinClipboardImpl {
 
         // Clear previous format mapping
         self.remote_format_registry.clear();
+
+        // RuTerm: an inactive session must not take over the local clipboard.
+        if !self.transport.shared().authorized() {
+            return Ok(None);
+        }
 
         let mut local_format_ids = formats
             .iter()
@@ -555,9 +572,15 @@ impl WinClipboardImpl {
             }
             BackendEvent::Ready => self.on_ready(),
 
-            BackendEvent::FileContentsRequest(request) => Ok(Some(ClipboardMessage::SendFileContentsResponse(
-                self.local_files.file_contents(request),
-            ))),
+            BackendEvent::FileContentsRequest(request) => {
+                let response = if self.transport.shared().authorized() {
+                    self.local_files.file_contents(request)
+                } else {
+                    // RuTerm: revoke file reads as soon as another session takes over.
+                    FileContentsResponse::new_error(request.stream_id)
+                };
+                Ok(Some(ClipboardMessage::SendFileContentsResponse(response)))
+            }
             BackendEvent::FormatListResponse(accepted) => {
                 self.local_files.acknowledge(*accepted);
                 Ok(None)

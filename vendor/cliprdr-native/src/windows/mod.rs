@@ -220,7 +220,8 @@ impl WinClipboard {
         message_proxy: impl ClipboardMessageProxy + 'static,
         file_transfer: bool,
     ) -> WinCliprdrResult<Self> {
-        let shared = Arc::new(ClipboardShared::new(Box::new(message_proxy)));
+        let token = crate::take_prepared_clipboard_session();
+        let shared = Arc::new(ClipboardShared::new(Box::new(message_proxy), token));
         let (start_tx, start_rx) = mpsc::channel();
 
         let thread_shared = Arc::clone(&shared);

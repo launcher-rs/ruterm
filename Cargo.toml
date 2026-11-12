@@ -2,7 +2,9 @@
 name = "ruterm"
 version = "0.1.0"
 edition = "2024"
-description = "面向开发者的开源远程连接工具（SSH 客户端），基于 rgpui + rgpui-term 外接 IO 后端"
+license = "Apache-2.0"
+readme = "README.md"
+description = "Rust 远程连接工具，集成 SSH、本地终端、SFTP 与远程桌面"
 
 [dependencies]
 rgpui = { version = "1.7.0", features = ["tokio"] }
@@ -48,6 +50,8 @@ ironrdp = { version = "0.17", default-features = false, features = [
 sspi = "=0.21.3"
 
 [patch.crates-io]
+# Require system CA + hostname validation in both TLS backends.
+ironrdp-tls = { path = "vendor/ironrdp-tls" }
 # ironrdp-connector 的 CredSSP 唯一用到的是 `picky::key::PrivateKey`。上游
 # 7.0.0-rc.25 把 curve25519-dalek 等钉在预发布版，与 russh 已解析的 5.0.0 /
 # 3.0.0 落在同一兼容区间而无法共存；本地副本只把几个 RustCrypto 依赖跟到

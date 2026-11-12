@@ -42,12 +42,17 @@ pub async fn connect(config: Config) -> Result<Session> {
     let (command_tx, command_rx) = unbounded_channel::<Command>();
     let (event_tx, event_rx) = unbounded_channel::<Event>();
     let latest = std::sync::Arc::new(Mutex::new(None));
+    let clipboard_token = ironrdp_cliprdr_native::allocate_clipboard_session();
 
     let thread_latest = latest.clone();
     std::thread::Builder::new()
         .name("ruterm-rdp".to_string())
         .spawn(move || {
-            if let Err(error) = run_session(client_config, name, command_rx, &event_tx, &thread_latest) {
+            // WinClipboard is built on this thread inside `RdpClient::run`.
+            ironrdp_cliprdr_native::prepare_clipboard_session(clipboard_token);
+            let result = run_session(client_config, name, command_rx, &event_tx, &thread_latest);
+            ironrdp_cliprdr_native::release_clipboard_session(clipboard_token);
+            if let Err(error) = result {
                 let _ = event_tx.send(Event::Closed {
                     reason: format!("{error:#}"),
                 });
@@ -59,6 +64,7 @@ pub async fn connect(config: Config) -> Result<Session> {
         command: command_tx,
         latest,
         events: event_rx,
+        clipboard_token: Some(clipboard_token),
     })
 }
 
@@ -75,7 +81,8 @@ fn build_client_config(config: &Config) -> Result<ironrdp::client::config::Confi
         .with_desktop_height(config.size.1.max(200))
         .with_color_depth(32)
         .with_credssp(true)
-        .with_tls(true)
+        // Only disable legacy TLS + graphical login; CredSSP still uses validated TLS.
+        .with_tls(false)
         .with_autologon(true)
         .with_compression(true)
         // Windows 后端直接挂系统剪贴板：文本与文件（CF_HDROP / 文件流）双向同步。
@@ -106,6 +113,7 @@ fn run_session(
         tokio::pin!(session);
 
         let mut database = Database::new();
+        let mut held = HeldInput::default();
         let mut frame: Option<Frame> = None;
         let mut announced = false;
         let mut frames = 0u32;
@@ -184,7 +192,14 @@ fn run_session(
                             }
                         }
                         command => {
-                            if handle_command(command, &mut database, &input, latest, frame.as_ref()) {
+                            if handle_command(
+                                command,
+                                &mut database,
+                                &input,
+                                latest,
+                                frame.as_ref(),
+                                &mut held,
+                            ) {
                                 close_at = Some(Instant::now() + CLOSE_TIMEOUT);
                             }
                         }
@@ -500,6 +515,7 @@ fn handle_command(
     input: &UnboundedSender<RdpInputEvent>,
     latest: &Mutex<Option<Snapshot>>,
     frame: Option<&Frame>,
+    held: &mut HeldInput,
 ) -> bool {
     match command {
         Command::Close => {
@@ -511,9 +527,14 @@ fn handle_command(
             false
         }
         Command::Key { key, down } => {
+            held.track(key, down);
             if let Some(operation) = key_operation(key, down) {
                 send_input(database, input, [operation]);
             }
+            false
+        }
+        Command::ReleaseAll => {
+            held.release_all(database, input);
             false
         }
         Command::Wheel { x, y, up, .. } => {
@@ -552,6 +573,53 @@ fn handle_command(
             }
             false
         }
+    }
+}
+
+/// 会话线程记住已按下的 Unicode 字符。扫描码键由 `Database` 自己记账，
+/// 界面在 Esc、失焦或关闭时发 `ReleaseAll`，把两边都清干净，避免远端一直
+/// 以为某个键还按着（切走窗口后最常见的“黏键”）。
+#[derive(Default)]
+struct HeldInput {
+    unicode: std::collections::BTreeSet<char>,
+}
+
+impl HeldInput {
+    fn track(&mut self, key: KeyInput, down: bool) {
+        let Some(character) = key.ch.filter(|_| key.scancode.is_none()) else {
+            return;
+        };
+        if down {
+            self.unicode.insert(character);
+        } else {
+            self.unicode.remove(&character);
+        }
+    }
+
+    fn release_all(&mut self, database: &mut Database, input: &UnboundedSender<RdpInputEvent>) {
+        let mut operations = Vec::new();
+        for index in 0..512u16 {
+            let scancode = (index & 0x100 != 0, (index & 0xFF) as u8);
+            let scancode = Scancode::from(scancode);
+            if database.is_key_pressed(scancode) {
+                operations.push(Operation::KeyReleased(scancode));
+            }
+        }
+        for character in std::mem::take(&mut self.unicode) {
+            operations.push(Operation::UnicodeKeyReleased(character));
+        }
+        for button in [
+            MouseButton::Left,
+            MouseButton::Middle,
+            MouseButton::Right,
+            MouseButton::X1,
+            MouseButton::X2,
+        ] {
+            if database.is_mouse_button_pressed(button) {
+                operations.push(Operation::MouseButtonReleased(button));
+            }
+        }
+        send_input(database, input, operations);
     }
 }
 

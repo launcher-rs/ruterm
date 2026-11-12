@@ -9,7 +9,7 @@ use rgpui::{
     StatefulInteractiveElement, Styled, Window, div, h_flex, px, v_flex,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 
 use crate::desktop::Protocol;
@@ -232,9 +232,12 @@ impl RuTermApp {
         } = backup;
         let mut valid = Vec::new();
         let mut invalid = 0usize;
+        let mut seen_ids = HashSet::new();
         for mut host in hosts {
             host.key_inline = false;
-            if host.validate().is_some() {
+            // 源 id 重复会让跳板机引用产生歧义；拒绝后出现的重复条目。
+            let id_unique = host.id <= 0 || seen_ids.insert(host.id);
+            if host.validate().is_some() || !id_unique {
                 invalid += 1;
                 continue;
             }
@@ -246,29 +249,42 @@ impl RuTermApp {
         let mut imported_ids = Vec::new();
         let mut duplicates = 0usize;
         for mut host in valid {
+            let source_id = host.id;
             if let Some(existing) = self.hosts.iter().find(|existing| {
                 existing.protocol == host.protocol
                     && existing.user.eq_ignore_ascii_case(&host.user)
                     && existing.host.eq_ignore_ascii_case(&host.host)
                     && existing.port == host.port
             }) {
-                id_map.insert(host.id, existing.id);
+                if self.vault.is_some() && source_id > 0 {
+                    id_map.insert(source_id, existing.id);
+                }
                 duplicates += 1;
                 continue;
             }
-            let source_id = host.id;
             host.id = if self.vault.is_some() { next_id } else { 0 };
             if self.vault.is_some() {
                 next_id += 1;
+                if source_id > 0 {
+                    id_map.insert(source_id, host.id);
+                }
             }
-            id_map.insert(source_id, host.id);
             imported_ids.push(host.id);
             planned.push(host);
         }
         let mut imported = 0usize;
+        let mut broken_jumps = 0usize;
         for mut host in planned {
             if let Some(source_jump) = host.proxy_jump {
-                host.proxy_jump = id_map.get(&source_jump).copied();
+                let host_id = host.id;
+                // 降级模式 id 不稳定，跳板机引用无法跟随导入；坏引用一律改为直连。
+                host.proxy_jump = id_map
+                    .get(&source_jump)
+                    .copied()
+                    .filter(|target| self.vault.is_some() && *target != host_id);
+                if host.proxy_jump.is_none() {
+                    broken_jumps += 1;
+                }
             }
             if self.vault.is_some() {
                 self.protocols.set(host.id, host.protocol);
@@ -307,7 +323,7 @@ impl RuTermApp {
             self.persist_sidebar(cx);
         }
         self.status = SharedString::from(format!(
-            "主机配置导入完成：新增 {imported} 台，重复 {duplicates} 台，跳过无效 {invalid} 台（密码与内嵌私钥不包含在 JSON 中）"
+            "主机配置导入完成：新增 {imported} 台，重复 {duplicates} 台，跳过无效 {invalid} 台，{broken_jumps} 条跳板机引用改为直连（密码与内嵌私钥不包含在 JSON 中）"
         ));
         cx.notify();
     }

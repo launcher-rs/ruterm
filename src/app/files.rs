@@ -86,6 +86,91 @@ pub(super) fn open_path_with_default(path: &Path) {
     }
 }
 
+/// 每份新副本独占随机目录；create（非 create_dir_all）不接受预先存在的目录。
+fn create_open_copy(name: &str) -> std::io::Result<PathBuf> {
+    let safe = safe_local_name(name).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "文件名不合法")
+    })?;
+    for _ in 0..16 {
+        let mut random = [0u8; 16];
+        getrandom::fill(&mut random).map_err(|error| {
+            std::io::Error::other(format!("无法生成临时目录随机数：{error}"))
+        })?;
+        let suffix: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
+        let dir = std::env::temp_dir().join(format!("ruterm-open-{suffix}"));
+        let builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        let builder = {
+            use std::os::unix::fs::DirBuilderExt as _;
+            let mut builder = builder;
+            builder.mode(0o700);
+            builder
+        };
+        match builder.create(&dir) {
+            Ok(()) => return Ok(dir.join(safe)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "无法分配独占临时目录",
+    ))
+}
+
+/// 远端文件只能作为文本编辑器的数据参数；绝不按扩展名执行或退回默认关联。
+fn open_remote_in_editor(path: &Path) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStringExt as _;
+        // 从系统 API 获取可信目录，不使用 PATH、SystemRoot 或文件关联。
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetSystemDirectoryW(buffer: *mut u16, size: u32) -> u32;
+        }
+        let mut buffer = vec![0u16; 32768];
+        let len = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) };
+        if len == 0 || len as usize >= buffer.len() {
+            return Err("无法获取 Windows 系统目录，未打开远端文件".to_string());
+        }
+        let editor = PathBuf::from(std::ffi::OsString::from_wide(&buffer[..len as usize]))
+            .join("notepad.exe");
+        std::process::Command::new(editor)
+            .arg(path)
+            .spawn()
+            .map(|_| ())
+            .map_err(|error| format!("无法启动系统记事本：{error}"))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // open(1): -a 指定应用，-- 结束选项；路径是 TextEdit 的文档参数。
+        std::process::Command::new("/usr/bin/open")
+            .args(["-a", "TextEdit", "--"])
+            .arg(path)
+            .spawn()
+            .map(|_| ())
+            .map_err(|error| format!("无法启动 TextEdit：{error}"))
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let mut errors = Vec::new();
+        for editor in [
+            "/usr/bin/gnome-text-editor", "/usr/bin/gedit", "/usr/bin/kate",
+            "/usr/bin/mousepad", "/usr/bin/pluma", "/usr/bin/xed", "/usr/bin/leafpad",
+        ] {
+            match std::process::Command::new(editor).arg("--").arg(path).spawn() {
+                Ok(_) => return Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => errors.push(format!("{editor}: {error}")),
+            }
+        }
+        Err(format!(
+            "无法启动文本编辑器，请安装 gnome-text-editor、gedit、Kate 或 Mousepad；副本保存在 {}。{}",
+            path.display(), errors.join("；")
+        ))
+    }
+}
+
 /// 文件列表固定列宽：表头与数据行共用，保证纵向对齐。
 /// 是拖拽前的默认值；实际宽度存在每个标签的 [`FileBrowser::cols`] 里。
 pub(super) const FILE_COL_KIND_W: f32 = 36.0;
@@ -109,8 +194,13 @@ pub(super) struct OpenedRemote {
     pub(super) local: PathBuf,
     pub(super) remote: String,
     pub(super) name: String,
-    /// 最近一次已知（刚下载或已回传）的本地版本标记。
-    pub(super) stamp: FileStamp,
+    /// 仅刚下载或收到成功回执时更新，绝不以排队 / 发起上传代替同步成功。
+    pub(super) synchronized: FileStamp,
+    /// 等待确认 / 等待空闲的版本，与正在上传的版本分离。
+    pending: Option<FileStamp>,
+    inflight: Option<FileStamp>,
+    /// 用户选择「否」的版本；后续编辑仍需再次提示。
+    ignored: Option<FileStamp>,
     /// 上一轮看到的新标记：连续两轮相同才认为写入结束。
     pub(super) candidate: Option<FileStamp>,
 }
@@ -123,12 +213,22 @@ pub(super) struct FileStamp {
 }
 
 impl OpenedRemote {
-    /// 本轮看到的标记是否已经稳定、可以回传。
-    ///
-    /// 第一次看到新标记只记下候选（编辑器可能还在写），连续两轮相同才放行；
-    /// 放行后由调用方真正发起上传，成功时再 [`Self::confirm_upload`]。
+    fn new(local: PathBuf, remote: String, name: String, synchronized: FileStamp) -> Self {
+        Self {
+            local, remote, name, synchronized,
+            pending: None,
+            inflight: None,
+            ignored: None,
+            candidate: None,
+        }
+    }
+
+    /// 稳定两轮才入队；已在排队或传输时不重复入队。
     pub(super) fn ready_to_upload(&mut self, stamp: FileStamp) -> bool {
-        if stamp == self.stamp {
+        if self.pending.is_some() || self.inflight.is_some() {
+            return false;
+        }
+        if stamp == self.synchronized || self.ignored == Some(stamp) {
             self.candidate = None;
             return false;
         }
@@ -139,10 +239,44 @@ impl OpenedRemote {
         false
     }
 
-    /// 回传已发起：把新标记记为已知版本，避免同一份改动重复上传。
-    pub(super) fn confirm_upload(&mut self, stamp: FileStamp) {
-        self.stamp = stamp;
+    fn cancel_pending(&mut self, stamp: FileStamp) {
+        if self.pending == Some(stamp) {
+            self.pending = None;
+            self.candidate = None;
+        }
+    }
+
+    fn ignore_pending(&mut self, stamp: FileStamp) {
+        if self.pending == Some(stamp) {
+            self.ignored = Some(stamp);
+            self.cancel_pending(stamp);
+        }
+    }
+
+    /// 排队期间再有编辑，必须重新稳定 / 确认，不能把新内容当作旧版本发送。
+    fn begin_upload(&mut self, stamp: FileStamp, current: Option<FileStamp>) -> bool {
+        if self.pending != Some(stamp) || self.inflight.is_some() {
+            return false;
+        }
+        self.cancel_pending(stamp);
+        if current != Some(stamp) {
+            return false;
+        }
+        self.inflight = Some(stamp);
+        true
+    }
+
+    fn finish_upload(&mut self, stamp: FileStamp, succeeded: bool) -> bool {
+        if self.inflight != Some(stamp) {
+            return false;
+        }
+        self.inflight = None;
         self.candidate = None;
+        if succeeded {
+            // 确认的是发送前的标记，不是回执到达时可能已经再次编辑的版本。
+            self.synchronized = stamp;
+        }
+        true
     }
 }
 
@@ -169,7 +303,8 @@ pub(super) fn poll_opened_files(browser: &mut FileBrowser) -> Option<(PathBuf, S
             return false;
         };
         if item.ready_to_upload(stamp) && ready.is_none() {
-            item.confirm_upload(stamp);
+            item.pending = Some(stamp);
+            item.candidate = None;
             ready = Some((item.local.clone(), item.remote.clone(), item.name.clone()));
         }
         true
@@ -287,6 +422,8 @@ pub(super) struct FileBrowser {
     pub(super) opened: Vec<OpenedRemote>,
     /// 本地改动巡检循环是否已启动（每个标签一条，标签消失时自行退出）。
     pub(super) watching: bool,
+    /// 打开 / 回传操作的本地路径身份，防止旧副本的进度和回执污染新操作。
+    active_transfer: Option<PathBuf>,
 }
 
 impl Default for FileBrowser {
@@ -310,11 +447,21 @@ impl Default for FileBrowser {
             ],
             opened: Vec::new(),
             watching: false,
+            active_transfer: None,
         }
     }
 }
 
 impl FileBrowser {
+    fn opened_mut(&mut self, local: &Path, remote: &str) -> Option<&mut OpenedRemote> {
+        self.opened.iter_mut().find(|item| item.local == local && item.remote == remote)
+    }
+
+    fn finish_upload(&mut self, local: &Path, remote: &str, stamp: FileStamp, succeeded: bool) -> bool {
+        self.opened_mut(local, remote)
+            .is_some_and(|item| item.finish_upload(stamp, succeeded))
+    }
+
     /// 按当前排序状态重排条目。
     pub(super) fn sort_entries(&mut self) {
         sort_entries(&mut self.entries, self.sort, self.sort_desc);
@@ -399,6 +546,10 @@ pub(super) struct FileUploadPrompt {
     pub(super) local: PathBuf,
     pub(super) remote: String,
     pub(super) name: String,
+    /// 提示对应的稳定版本；「否」只忽略此版本。
+    stamp: FileStamp,
+    /// 用户已选择「是」但标签正忙时，保留确认，不再重复询问。
+    approved: bool,
     /// 展示用的连接地址（`user@host:port`），与 WindTerm 的提示一致。
     pub(super) server: SharedString,
 }
@@ -567,7 +718,7 @@ impl RuTermApp {
     }
 
 
-    /// 双击条目：目录就进去，文件就下载到临时目录并用系统默认程序打开。
+    /// 双击条目：目录就进去，远端文件下载到独占目录并作为文本打开。
     pub(super) fn open_file_entry(&mut self, tab_id: usize, name: &str, is_dir: bool, cx: &mut Context<Self>) {
         let Some(path) = self
             .tabs
@@ -586,7 +737,7 @@ impl RuTermApp {
     }
 
 
-    /// 下载到临时目录后交给系统默认程序（“打开”）。
+    /// 同一会话、完整远端路径复用副本；新副本的目录永不按文件名或标签共享。
     pub(super) fn open_remote_file(
         &mut self,
         tab_id: usize,
@@ -594,38 +745,47 @@ impl RuTermApp {
         name: &str,
         cx: &mut Context<Self>,
     ) {
-        let Some(safe) = safe_local_name(name) else {
-            self.file_error(tab_id, "文件名不合法，无法在本地打开", cx);
+        let Some(tab) = self.tabs.iter().find(|tab| tab.id == tab_id) else {
             return;
         };
-        let dir = std::env::temp_dir()
-            .join("ruterm-open")
-            .join(tab_id.to_string());
-        if let Err(error) = std::fs::create_dir_all(&dir) {
-            self.file_error(tab_id, format!("无法创建临时目录：{error}"), cx);
+        if tab.ended || tab.commands.as_ref().is_none_or(|sender| sender.is_closed()) {
+            self.file_error(tab_id, "会话已断开，无法打开远端文件", cx);
             return;
         }
-        let local = dir.join(safe);
-        // 已打开过的文件直接复用本地副本：重新下载会把还没回传的修改盖掉。
-        if let Some(opened) = self
-            .tabs
-            .iter()
-            .find(|tab| tab.id == tab_id)
-            .and_then(|tab| tab.files.opened.iter().find(|item| item.remote == remote))
-            .filter(|item| item.local.exists())
+        // 重新下载会覆盖尚未回传的修改；只按完整远端路径复用。
+        if let Some(opened) = tab.files.opened.iter()
+            .find(|item| item.remote == remote && item.local.is_file())
         {
-            open_path_with_default(&opened.local);
+            if let Err(error) = open_remote_in_editor(&opened.local) {
+                self.file_error(tab_id, error, cx);
+            }
             return;
         }
-        self.file_transfer(
+        if tab.files.busy.is_some() {
+            self.status = "已有文件操作进行中，请稍候".into();
+            cx.notify();
+            return;
+        }
+        let local = match create_open_copy(name) {
+            Ok(local) => local,
+            Err(error) => {
+                self.file_error(tab_id, format!("无法创建临时副本：{error}"), cx);
+                return;
+            }
+        };
+        if !self.file_transfer(
             tab_id,
             crate::transfer::Direction::Download,
-            local,
+            local.clone(),
             remote,
             true,
             false,
             cx,
-        );
+        ) {
+            if let Some(dir) = local.parent() {
+                let _ = std::fs::remove_dir(dir);
+            }
+        }
     }
 
 
@@ -644,19 +804,19 @@ impl RuTermApp {
         let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) else {
             return;
         };
-        if let Some(item) = tab.files.opened.iter_mut().find(|item| item.remote == remote) {
-            item.local = local;
-            item.stamp = stamp;
-            item.candidate = None;
-        } else {
-            tab.files.opened.push(OpenedRemote {
-                local,
-                remote,
-                name,
-                stamp,
-                candidate: None,
-            });
+        let Some(sender) = tab.commands.clone().filter(|sender| !sender.is_closed()) else {
+            return;
+        };
+        if tab.ended {
+            return;
         }
+        if tab.files.opened.iter().any(|item| item.remote == remote && item.local == local) {
+            return;
+        }
+        // 新本地路径代表新副本，不能继承旧副本的「全部是」授权。
+        self.file_upload_all.remove(&(tab_id, remote.clone()));
+        tab.files.opened.retain(|item| item.remote != remote);
+        tab.files.opened.push(OpenedRemote::new(local, remote, name, stamp));
         if tab.files.watching {
             return;
         }
@@ -664,32 +824,33 @@ impl RuTermApp {
         cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(OPEN_FILE_POLL).await;
-                let ready = this
-                    .update(cx, |this, _| {
-                        let tab = this.tabs.iter_mut().find(|tab| tab.id == tab_id)?;
-                        // 有传输在跑就先让路，下一轮再判断。
-                        if tab.files.busy.is_some() {
-                            return Some(None);
-                        }
-                        let ready = poll_opened_files(&mut tab.files);
-                        if tab.files.opened.is_empty() {
-                            tab.files.watching = false;
-                            return None;
-                        }
-                        Some(ready)
-                    })
-                    .ok()
-                    .flatten();
-                let Some(ready) = ready else {
-                    break;
-                };
-                if let Some((local, remote, name)) = ready {
-                    let _ = this.update(cx, |this, cx| {
+                let watching = this.update(cx, |this, cx| {
+                    this.prune_remote_uploads(cx);
+                    let Some(tab) = this.tabs.iter_mut().find(|tab| tab.id == tab_id) else {
+                        return false;
+                    };
+                    if !tab.commands.as_ref().is_some_and(|current| current.same_channel(&sender)) {
+                        return false; // 旧巡检不能修改同 id 新会话的 watching。
+                    }
+                    if tab.ended || sender.is_closed() || tab.files.opened.is_empty() {
+                        tab.files.watching = false;
+                        return false;
+                    }
+                    // 忙时保留 pending，空闲后继续推进已确认的上传。
+                    let ready = if tab.files.busy.is_none() {
+                        poll_opened_files(&mut tab.files)
+                    } else {
+                        None
+                    };
+                    if let Some((local, remote, name)) = ready {
                         this.queue_remote_upload(tab_id, local, remote, name, cx);
-                    });
+                    }
+                    this.pump_remote_uploads(cx);
+                    true
+                }).unwrap_or(false);
+                if !watching {
+                    break;
                 }
-                // 队列里的回传 / 确认每轮都试着推进：忙完一笔就接着下一笔。
-                let _ = this.update(cx, |this, cx| this.pump_remote_uploads(cx));
             }
         })
         .detach();
@@ -705,58 +866,101 @@ impl RuTermApp {
         name: String,
         cx: &mut Context<Self>,
     ) {
-        let server = self
-            .tabs
-            .iter()
-            .find(|tab| tab.id == tab_id)
-            .map(|tab| tab.addr.clone())
-            .unwrap_or_default();
+        let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) else {
+            return;
+        };
+        let server = tab.addr.clone();
+        let live = !tab.ended && tab.commands.as_ref().is_some_and(|sender| !sender.is_closed());
+        let Some(item) = tab.files.opened_mut(&local, &remote) else {
+            return;
+        };
+        let Some(stamp) = item.pending else {
+            return;
+        };
+        if !live {
+            item.cancel_pending(stamp);
+            self.file_upload_all.remove(&(tab_id, remote));
+            return;
+        }
         self.file_upload_queue.push(FileUploadPrompt {
-            tab_id,
-            local,
-            remote,
-            name,
-            server,
+            tab_id, local, remote, name, server, stamp, approved: false,
         });
         cx.notify();
     }
 
+    fn upload_prompt_is_current(&self, prompt: &FileUploadPrompt) -> bool {
+        self.tabs.iter().find(|tab| tab.id == prompt.tab_id)
+            .filter(|tab| !tab.ended && tab.commands.as_ref().is_some_and(|sender| !sender.is_closed()))
+            .is_some_and(|tab| tab.files.opened.iter().any(|item| {
+                item.local == prompt.local && item.remote == prompt.remote
+                    && item.pending == Some(prompt.stamp)
+            }))
+    }
+
+    fn cancel_remote_upload(&mut self, prompt: &FileUploadPrompt) {
+        if let Some(item) = self.tabs.iter_mut().find(|tab| tab.id == prompt.tab_id)
+            .and_then(|tab| tab.files.opened_mut(&prompt.local, &prompt.remote))
+        {
+            item.cancel_pending(prompt.stamp);
+            self.file_upload_all.remove(&(prompt.tab_id, prompt.remote.clone()));
+        }
+    }
+
+    /// 关会话 / 换副本后清理确认与队列；仍存在的副本保留 synchronized，以免丢失 dirty。
+    fn prune_remote_uploads(&mut self, cx: &mut Context<Self>) {
+        if let Some(prompt) = self.file_upload_prompt.take() {
+            if self.upload_prompt_is_current(&prompt) {
+                self.file_upload_prompt = Some(prompt);
+            } else {
+                self.cancel_remote_upload(&prompt);
+                cx.notify();
+            }
+        }
+        for prompt in std::mem::take(&mut self.file_upload_queue) {
+            if self.upload_prompt_is_current(&prompt) {
+                self.file_upload_queue.push(prompt);
+            } else {
+                self.cancel_remote_upload(&prompt);
+            }
+        }
+        let mut live = HashSet::new();
+        for tab in &mut self.tabs {
+            if tab.ended || tab.commands.as_ref().is_none_or(|sender| sender.is_closed()) {
+                for item in &mut tab.files.opened {
+                    item.pending = None;
+                    item.inflight = None;
+                    item.candidate = None;
+                }
+                if tab.files.active_transfer.take().is_some() {
+                    tab.files.busy = None;
+                    tab.files.progress = None;
+                    tab.files.error = Some("会话已断开，本地修改未回传".into());
+                    cx.notify();
+                }
+            } else {
+                live.extend(tab.files.opened.iter().map(|item| (tab.id, item.remote.clone())));
+            }
+        }
+        self.file_upload_all.retain(|key| live.contains(key));
+    }
 
     /// 推进回传队列：会话已消失的条目丢掉；开了「全部是」就直接传，
     /// 否则弹窗确认。目标标签正忙时先等着，下一轮巡检再推进。
     pub(super) fn pump_remote_uploads(&mut self, cx: &mut Context<Self>) {
+        self.prune_remote_uploads(cx);
         if self.file_upload_prompt.is_some() {
             return;
-        }
-        while self
-            .file_upload_queue
-            .first()
-            .is_some_and(|item| self.tabs.iter().all(|tab| tab.id != item.tab_id))
-        {
-            self.file_upload_queue.remove(0);
         }
         let Some(front) = self.file_upload_queue.first() else {
             return;
         };
-        let busy = self
-            .tabs
-            .iter()
-            .find(|tab| tab.id == front.tab_id)
-            .is_some_and(|tab| tab.files.busy.is_some());
-        // 「全部是」只认授权过的那份文件；会话关掉后授权随之失效。
-        let live: HashSet<usize> = self.tabs.iter().map(|tab| tab.id).collect();
-        self.file_upload_all
-            .retain(|(id, _)| live.contains(id));
-        let auto = self
-            .file_upload_all
-            .contains(&(front.tab_id, front.remote.clone()));
-        if auto {
-            if !busy {
-                self.start_queued_upload(cx);
-            }
+        if self.tabs.iter().find(|tab| tab.id == front.tab_id)
+            .is_none_or(|tab| tab.files.busy.is_some())
+        {
             return;
         }
-        if busy {
+        if front.approved || self.file_upload_all.contains(&(front.tab_id, front.remote.clone())) {
+            self.start_queued_upload(cx);
             return;
         }
         self.file_upload_prompt = Some(self.file_upload_queue.remove(0));
@@ -764,30 +968,47 @@ impl RuTermApp {
     }
 
 
-    /// 直接回传队首（不再确认）；目标标签忙或已消失时原样留在队列里。
+    /// 忙时保留队首及其确认；文件变化则重新巡检，发送失败则撤销自动回传授权。
     fn start_queued_upload(&mut self, cx: &mut Context<Self>) {
+        self.prune_remote_uploads(cx);
         let Some(front) = self.file_upload_queue.first() else {
             return;
         };
-        if self
-            .tabs
-            .iter()
-            .find(|tab| tab.id == front.tab_id)
+        if self.tabs.iter().find(|tab| tab.id == front.tab_id)
             .is_none_or(|tab| tab.files.busy.is_some())
         {
             return;
         }
-        let item = self.file_upload_queue.remove(0);
-        self.status = format!("检测到 {} 已修改，正在回传远端…", item.name).into();
-        self.file_transfer(
-            item.tab_id,
+        let prompt = self.file_upload_queue.remove(0);
+        let started = self.tabs.iter_mut().find(|tab| tab.id == prompt.tab_id)
+            .and_then(|tab| tab.files.opened_mut(&prompt.local, &prompt.remote))
+            .is_some_and(|item| item.begin_upload(prompt.stamp, file_stamp(&prompt.local)));
+        if !started {
+            return;
+        }
+        self.status = format!("检测到 {} 已修改，正在回传远端…", prompt.name).into();
+        if !self.file_transfer(
+            prompt.tab_id,
             crate::transfer::Direction::Upload,
-            item.local,
-            item.remote,
+            prompt.local.clone(),
+            prompt.remote.clone(),
             false,
             true,
             cx,
-        );
+        ) {
+            self.finish_remote_upload(prompt.tab_id, &prompt.local, &prompt.remote, prompt.stamp, false);
+        }
+    }
+
+    fn finish_remote_upload(
+        &mut self, tab_id: usize, local: &Path, remote: &str, stamp: FileStamp, succeeded: bool,
+    ) {
+        let matched = self.tabs.iter_mut().find(|tab| tab.id == tab_id)
+            .is_some_and(|tab| tab.files.finish_upload(local, remote, stamp, succeeded));
+        // 失败保留 dirty，但不允许「全部是」导致无限重试。再次提示后可重新授权。
+        if matched && !succeeded {
+            self.file_upload_all.remove(&(tab_id, remote.to_string()));
+        }
     }
 
 
@@ -799,23 +1020,32 @@ impl RuTermApp {
         all: bool,
         cx: &mut Context<Self>,
     ) {
-        let Some(prompt) = self.file_upload_prompt.take() else {
+        let Some(mut prompt) = self.file_upload_prompt.take() else {
             return;
         };
-        if all {
-            self.file_upload_all
-                .insert((prompt.tab_id, prompt.remote.clone()));
-        }
-        if upload {
+        if !self.upload_prompt_is_current(&prompt) {
+            self.cancel_remote_upload(&prompt);
+        } else if upload {
+            if all {
+                self.file_upload_all.insert((prompt.tab_id, prompt.remote.clone()));
+            }
+            prompt.approved = true;
             self.file_upload_queue.insert(0, prompt);
             self.start_queued_upload(cx);
+        } else {
+            if let Some(item) = self.tabs.iter_mut().find(|tab| tab.id == prompt.tab_id)
+                .and_then(|tab| tab.files.opened_mut(&prompt.local, &prompt.remote))
+            {
+                item.ignore_pending(prompt.stamp);
+            }
+            self.file_upload_all.remove(&(prompt.tab_id, prompt.remote));
         }
         self.pump_remote_uploads(cx);
         cx.notify();
     }
 
 
-    /// 面板内的一次上传 / 下载：进度写进面板底部，完成后刷新或打开。
+    /// 面板内的一次上传 / 下载。false 表示未发送，调用方必须释放 inflight。
     pub(super) fn file_transfer(
         &mut self,
         tab_id: usize,
@@ -825,26 +1055,31 @@ impl RuTermApp {
         open_after: bool,
         reload: bool,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
         let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) else {
-            return;
+            return false;
         };
         if tab.files.busy.is_some() {
             self.status = "已有文件操作进行中，请稍候".into();
             cx.notify();
-            return;
+            return false;
         }
-        let Some(sender) = tab.commands.clone() else {
+        let Some(sender) = tab.commands.clone().filter(|sender| !tab.ended && !sender.is_closed()) else {
             tab.files.error = Some("会话已断开，无法传输文件".into());
             cx.notify();
-            return;
+            return false;
         };
-        let name = local
-            .file_name()
+        let upload_stamp = if matches!(direction, crate::transfer::Direction::Upload) {
+            tab.files.opened_mut(&local, &remote).and_then(|item| item.inflight)
+        } else {
+            None
+        };
+        let name = local.file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| remote.clone());
         tab.files.busy = Some(format!("正在{} {name}…", direction.label()).into());
         tab.files.progress = Some((0, 0));
+        tab.files.active_transfer = Some(local.clone());
         tab.files.error = None;
         let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, u64)>();
         let (reply_tx, mut reply_rx) = tokio::sync::oneshot::channel();
@@ -858,15 +1093,14 @@ impl RuTermApp {
         if sender.send(command).is_err() {
             tab.files.busy = None;
             tab.files.progress = None;
+            tab.files.active_transfer = None;
             tab.files.error = Some("会话已断开，无法传输文件".into());
             cx.notify();
-            return;
+            return false;
         }
         self.flash_transfer(
             format!("正在{} {name}…", direction.label()),
-            transfer_icon(direction),
-            false,
-            cx,
+            transfer_icon(direction), false, cx,
         );
         cx.notify();
 
@@ -883,7 +1117,9 @@ impl RuTermApp {
                     Some(progress) = progress_rx.recv() => {
                         let _ = this.update(cx, |this, cx| {
                             if let Some(tab) = this.tabs.iter_mut().find(|tab| tab.id == tab_id)
-                                && tab.files.busy.is_some()
+                                && !tab.ended
+                                && tab.commands.as_ref().is_some_and(|current| current.same_channel(&sender))
+                                && tab.files.active_transfer.as_ref() == Some(&local)
                             {
                                 tab.files.progress = Some(progress);
                                 cx.notify();
@@ -892,62 +1128,63 @@ impl RuTermApp {
                     }
                 }
             };
-            let failed = outcome.is_err();
             let _ = this.update(cx, |this, cx| {
-                let Some(tab) = this.tabs.iter_mut().find(|tab| tab.id == tab_id) else {
+                // 校验、登记和打开处于同一次 UI 更新，关标签后不能在更新外启动编辑器。
+                this.prune_remote_uploads(cx);
+                let Some(tab) = this.tabs.iter_mut().find(|tab| tab.id == tab_id)
+                    .filter(|tab| !tab.ended
+                        && tab.commands.as_ref().is_some_and(|current| current.same_channel(&sender))
+                        && tab.files.active_transfer.as_ref() == Some(&local))
+                else {
                     return;
                 };
+                if let Some(stamp) = upload_stamp {
+                    if !tab.files.opened_mut(&local, &remote)
+                        .is_some_and(|item| item.inflight == Some(stamp))
+                    {
+                        return;
+                    }
+                }
+                let succeeded = outcome.is_ok();
+                let path = tab.files.path.clone();
                 tab.files.busy = None;
                 tab.files.progress = None;
-                match outcome {
+                tab.files.active_transfer = None;
+                let (message, icon) = match outcome {
                     Ok(summary) => {
-                        let message = format!(
-                            "{}完成 · {} · {:.1} 秒",
-                            direction.label(),
-                            crate::transfer::format_bytes(summary.bytes),
-                            summary.elapsed.as_secs_f64()
-                        );
                         tab.files.error = None;
-                        this.status = message.clone().into();
-                        this.flash_transfer(message, IconName::CircleCheck, true, cx);
+                        (format!(
+                            "{}完成 · {} · {:.1} 秒", direction.label(),
+                            crate::transfer::format_bytes(summary.bytes), summary.elapsed.as_secs_f64()
+                        ), IconName::CircleCheck)
                     }
                     Err(error) => {
                         tab.files.error = Some(error.clone().into());
-                        let text = format!("{}失败：{error}", direction.label());
-                        this.status = text.clone().into();
-                        this.flash_transfer(text, IconName::TriangleAlert, true, cx);
+                        (format!("{}失败：{error}", direction.label()), IconName::TriangleAlert)
+                    }
+                };
+                if let Some(stamp) = upload_stamp {
+                    this.finish_remote_upload(tab_id, &local, &remote, stamp, succeeded);
+                }
+                this.status = message.clone().into();
+                this.flash_transfer(message, icon, true, cx);
+                if open_after && succeeded {
+                    let name = remote.rsplit('/').next().unwrap_or(&remote).to_string();
+                    // 在启动编辑器之前记录下载版本，避免编辑器立即保存时被误记为已同步。
+                    this.track_opened_remote(tab_id, local.clone(), remote.clone(), name, cx);
+                    if let Err(error) = open_remote_in_editor(&local) {
+                        this.file_error(tab_id, error, cx);
                     }
                 }
+                if reload && let Some(path) = path {
+                    this.load_files(tab_id, Some(path), cx);
+                }
+                this.pump_remote_uploads(cx);
                 cx.notify();
             });
-            if open_after && !failed {
-                open_path_with_default(&local);
-                // 打开之后盯住这份临时副本：本地保存后自动传回远端。
-                let name = remote
-                    .rsplit('/')
-                    .next()
-                    .unwrap_or(remote.as_str())
-                    .to_string();
-                let _ = this.update(cx, |this, cx| {
-                    this.track_opened_remote(tab_id, local.clone(), remote.clone(), name, cx);
-                });
-            }
-            if reload {
-                let path = this
-                    .update(cx, |this, _| {
-                        this.tabs
-                            .iter()
-                            .find(|tab| tab.id == tab_id)
-                            .and_then(|tab| tab.files.path.clone())
-                    })
-                    .ok()
-                    .flatten();
-                if let Some(path) = path {
-                    let _ = this.update(cx, |this, cx| this.load_files(tab_id, Some(path), cx));
-                }
-            }
         })
         .detach();
+        true
     }
 
 
@@ -3014,13 +3251,12 @@ mod tests {
     }
 
     fn opened() -> OpenedRemote {
-        OpenedRemote {
-            local: PathBuf::from("unused"),
-            remote: "/tmp/a.txt".to_string(),
-            name: "a.txt".to_string(),
-            stamp: stamp(3, 10),
-            candidate: None,
-        }
+        OpenedRemote::new(
+            PathBuf::from("unused"),
+            "/tmp/a.txt".to_string(),
+            "a.txt".to_string(),
+            stamp(3, 10),
+        )
     }
 
     #[test]
@@ -3028,9 +3264,11 @@ mod tests {
         let mut item = opened();
         // 第一次看到新标记：编辑器可能还在写，先记候选。
         assert!(!item.ready_to_upload(stamp(5, 11)));
-        // 连续两轮同一个标记：放行。
+        // 连续两轮同一个标记：放行并排队。
         assert!(item.ready_to_upload(stamp(5, 11)));
-        item.confirm_upload(stamp(5, 11));
+        item.pending = Some(stamp(5, 11));
+        assert!(item.begin_upload(stamp(5, 11), Some(stamp(5, 11))));
+        assert!(item.finish_upload(stamp(5, 11), true));
         // 已经回传过的版本不再重复上传。
         assert!(!item.ready_to_upload(stamp(5, 11)));
         // 再写一次要重新走两轮确认。
@@ -3066,13 +3304,12 @@ mod tests {
         std::fs::write(&local, b"one").unwrap();
 
         let mut browser = FileBrowser::default();
-        browser.opened.push(OpenedRemote {
-            local: local.clone(),
-            remote: "/tmp/a.txt".to_string(),
-            name: "a.txt".to_string(),
-            stamp: file_stamp(&local).unwrap(),
-            candidate: None,
-        });
+        browser.opened.push(OpenedRemote::new(
+            local.clone(),
+            "/tmp/a.txt".to_string(),
+            "a.txt".to_string(),
+            file_stamp(&local).unwrap(),
+        ));
 
         // 没动过：不回传。
         assert!(poll_opened_files(&mut browser).is_none());

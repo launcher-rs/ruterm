@@ -74,6 +74,10 @@ pub(crate) struct RuTermApp {
     mode: StorageMode,
     /// 加密凭据库；None 表示启动引导中、已降级为旧 JSON 存储，或被用户锁定。
     vault: Option<Arc<Vault>>,
+    auth_gate: crate::vault::AuthGate,
+    pending_quick: Option<SshTarget>,
+    vault_opening: bool,
+    vault_maintenance: bool,
     /// 本次解锁所用的库主密钥（十六进制）。只存活在内存，绝不入库、入日志、入命令行；
     /// 换主密码前用它校验"当前主密码"，锁定/退出即丢弃。
     unlocked_key: Option<String>,
@@ -350,6 +354,10 @@ impl RuTermApp {
             store,
             mode,
             vault: None,
+            auth_gate: crate::vault::AuthGate::default(),
+            pending_quick: quick,
+            vault_opening: false,
+            vault_maintenance: false,
             hosts,
             recent_hosts: Vec::new(),
             search,
@@ -457,12 +465,6 @@ impl RuTermApp {
             }
         })
         .detach();
-        if let Some(target) = quick {
-            let title = target.addr();
-            // 命令行快速连接也登记成主机：否则连过的主机在侧边栏里找不到。
-            app.adopt_quick_host(&target, cx);
-            app.connect(title, target, None, None, false, window, cx);
-        }
         app
     }
 
@@ -519,7 +521,14 @@ impl RuTermApp {
     /// 口令档（已设置主密码）启动时弹出解锁对话框，口令错误可重试；
     /// keyring 档保持零输入直连。
     pub(super) fn boot_vault(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.vault_opening || self.vault_maintenance { return; }
         let mode = self.mode.clone();
+        if let Err(error) = crate::vault::recover_rekey(&mode) {
+            self.status = format!("凭据库事务恢复失败，已禁止连接：{error:#}").into();
+            cx.notify();
+            return;
+        }
+        let generation = self.auth_gate.generation();
         let json_hosts = self.hosts.clone();
         // 凭据库（toasty/turso）必须跑在 tokio 运行时上，句柄在此处取出后交给任务。
         let runtime = rgpui::tokio::Tokio::handle(cx);
@@ -534,20 +543,19 @@ impl RuTermApp {
             self.status =
                 "便携模式正用本机凭据管理器解锁；建议到设置中配置主密码，以便带往其他机器".into();
         }
+        if passphrase_needed { return; }
+        self.vault_opening = true;
         cx.spawn(async move |this, cx| {
-            // 口令档（已设置主密码）：密钥只能来自用户输入，
-            // 绝不能用 keyring 随机密钥代开——那会让主密码形同虚设。
-            if passphrase_needed {
-                return;
-            }
             // 库文件在数据目录还是原样，先探测主密钥是否可得。
             let keyring_key = match crate::vault::load_or_create_master_key() {
                 Ok(key) => Some(key),
                 Err(error) => {
                     let _ = this.update(cx, |this, cx| {
+                        this.vault_opening = false;
+                        if this.auth_gate.generation() != generation { return; }
                         log::warn!("系统凭据管理器不可用: {error}");
                         this.status =
-                            SharedString::from(format!("凭据管理器不可用（{error}），不保存密码"));
+                            SharedString::from(format!("凭据管理器不可用（{error}），SSH 连接已禁用"));
                         cx.notify();
                     });
                     return;
@@ -565,12 +573,16 @@ impl RuTermApp {
             match opened {
                 Ok((vault, hosts, key)) => {
                     let _ = this.update(cx, |this, cx| {
+                        this.vault_opening = false;
+                        if this.auth_gate.generation() != generation { return; }
                         this.attach_vault(vault, hosts, Some(key), cx);
                     });
                 }
                 Err(error) => {
                     log::warn!("加密凭据库不可用: {error}");
                     let _ = this.update(cx, |this, cx| {
+                        this.vault_opening = false;
+                        if this.auth_gate.generation() != generation { return; }
                         if crate::vault::read_unlock_marker(&this.mode)
                             == crate::vault::UnlockBackend::Passphrase
                         {
@@ -578,7 +590,7 @@ impl RuTermApp {
                             cx.notify();
                         } else {
                             this.status = SharedString::from(format!(
-                                "加密凭据库不可用（{error}），沿用旧存储且不保存密码"
+                                "加密凭据库不可用（{error}），SSH 连接已禁用"
                             ));
                             cx.notify();
                         }
@@ -602,6 +614,7 @@ impl RuTermApp {
         cx: &mut Context<Self>,
     ) {
         let vault = Arc::new(vault);
+        let generation = self.auth_gate.generation();
         self.unlock = None;
         // 旧版本快速连接登记曾把同一台主机重复入库：字段完全一致时只留最早一条，
         // 其余从库里删掉（名字、端口等有差异的条目不受影响）。
@@ -653,19 +666,20 @@ impl RuTermApp {
         self.vault = Some(vault.clone());
         self.unlocked_key = key;
         cx.notify();
-        // 内嵌私钥整体读入内存：连接与断线重连都走这份缓存，不再访问库。
-        let keys_vault = vault.clone();
+        // 私钥与连接偏好加载完毕之后才打开认证门闩。
         cx.spawn(async move |this, cx| {
-            if let Ok(keys) = keys_vault.load_host_keys().await {
-                let _ = this.update(cx, |this, cx| {
-                    this.inline_keys = keys.into_iter().collect();
-                    cx.notify();
-                });
-            }
-        })
-        .detach();
-        // 库内主题优先于启动时的旧 JSON/默认值。
-        cx.spawn(async move |this, cx| {
+            let keys = match vault.load_host_keys().await {
+                Ok(keys) => keys,
+                Err(error) => {
+                    let _ = this.update(cx, |this, cx| {
+                        if this.auth_gate.generation() == generation {
+                            this.status = format!("加载私钥失败，SSH 连接已禁用：{error}").into();
+                            cx.notify();
+                        }
+                    });
+                    return;
+                }
+            };
             if let Ok(Some(theme)) = vault.setting("theme").await {
                 let dark = theme != "light";
                 let _ = this.update(cx, |this, cx| {
@@ -832,12 +846,27 @@ impl RuTermApp {
             if let Ok(Some(json)) = vault.setting("macros").await {
                 let macros = crate::macros::from_json(&json);
                 let _ = this.update(cx, |this, cx| {
+                    if this.auth_gate.generation() != generation { return; }
                     if this.macros != macros {
                         this.macros = macros;
                         cx.notify();
                     }
                 });
             }
+            drop(vault);
+            let Some(entity) = this.upgrade() else { return; };
+            let _ = cx.with_window(entity.entity_id(), move |window, cx| {
+                entity.update(cx, |this, cx| {
+                    if this.auth_gate.generation() != generation || this.vault.is_none() { return; }
+                    this.inline_keys = keys.into_iter().collect();
+                    this.auth_gate.attach();
+                    if let Some(target) = this.auth_gate.take_pending(&mut this.pending_quick) {
+                        this.adopt_quick_host(&target, cx);
+                        this.connect(target.addr(), target, None, None, false, window, cx);
+                    }
+                    cx.notify();
+                });
+            });
         })
         .detach();
     }

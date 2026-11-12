@@ -65,6 +65,12 @@ impl RuTermApp {
 
     /// 打开口令档加密库并完成一次性迁移（解锁弹窗确认后调用）。
     pub(super) fn unlock_passphrase(&mut self, cx: &mut Context<Self>) {
+        if self.vault_opening || self.vault_maintenance || self.vault.is_some() { return; }
+        if let Err(error) = crate::vault::recover_rekey(&self.mode) {
+            self.status = format!("事务恢复失败，拒绝解锁：{error:#}").into();
+            cx.notify();
+            return;
+        }
         let Some(state) = self.unlock.as_ref() else {
             return;
         };
@@ -92,6 +98,8 @@ impl RuTermApp {
         let salt_path = mode.salt_path();
         let is_new = self.unlock.as_ref().map(|s| s.is_new).unwrap_or(false);
         let runtime = rgpui::tokio::Tokio::handle(cx);
+        let generation = self.auth_gate.generation();
+        self.vault_opening = true;
         cx.spawn(async move |this, cx| {
             let opened = async {
                 // 盐缺失时生成并写盘（首次建库）；已有盐沿用（解锁）。
@@ -111,7 +119,10 @@ impl RuTermApp {
                 Ok::<_, anyhow::Error>((vault, hosts, hexkey))
             }
             .await;
-            let _ = this.update(cx, |this, cx| match opened {
+            let _ = this.update(cx, |this, cx| {
+                this.vault_opening = false;
+                if this.auth_gate.generation() != generation { return; }
+                match opened {
                 Ok((vault, hosts, hexkey)) => {
                     this.attach_vault(vault, hosts, Some(hexkey), cx);
                 }
@@ -126,6 +137,7 @@ impl RuTermApp {
                     }
                     cx.notify();
                 }
+                }
             });
         })
         .detach();
@@ -134,8 +146,10 @@ impl RuTermApp {
 
     /// 退出解锁弹窗（尚未解锁时保持降级 JSON 行为）。
     pub(super) fn dismiss_unlock(&mut self, cx: &mut Context<Self>) {
+        self.auth_gate.revoke();
+        self.pending_quick = None;
         self.unlock = None;
-        self.status = "凭据库未解锁，本次运行不保存密码".into();
+        self.status = "凭据库未解锁，SSH 连接已禁用".into();
         cx.notify();
     }
 
@@ -143,9 +157,25 @@ impl RuTermApp {
     /// 锁定凭据库：丢弃库句柄与内存中的主密钥，清空主机列表并回到解锁弹窗。
     /// 已建立的终端会话不受影响，但不再能读取保存的凭据。
     pub(super) fn lock_vault(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.vault_maintenance {
+            self.status = "凭据库事务进行中，请等待完成后锁定".into();
+            cx.notify();
+            return;
+        }
+        self.auth_gate.revoke();
         self.vault = None;
         self.unlocked_key = None;
         self.password_cache.clear();
+        self.inline_keys.clear();
+        self.pending = None;
+        self.pending_quick = None;
+        self.new_host = None;
+        for tab in &mut self.tabs {
+            if matches!(tab.resume, Some(Resume::Ssh { .. })) {
+                tab.resume = None;
+                tab.auto_retry_pending = false;
+            }
+        }
         self.hosts.clear();
         self.settings = None;
         self.status = "凭据库已锁定，需主密码解锁".into();
@@ -402,6 +432,7 @@ impl RuTermApp {
             state.info = None;
         }
         self.status = "正在重建加密库…".into();
+        self.vault_maintenance = true;
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = async {
@@ -509,6 +540,7 @@ impl RuTermApp {
             };
             let _ = this.update(cx, |this, cx| match result {
                 Ok((vault, hosts, hexkey, kept_backup)) => {
+                    this.vault_maintenance = false;
                     this.vault = Some(Arc::new(vault));
                     this.hosts = hosts;
                     this.unlocked_key = Some(hexkey);
@@ -531,6 +563,7 @@ impl RuTermApp {
                     cx.notify();
                 }
                 Err(error) => {
+                    this.vault_maintenance = false;
                     log::warn!("更改主密码失败: {error}");
                     if let Some(state) = this.settings.as_mut() {
                         state.busy = false;
@@ -580,10 +613,14 @@ impl RuTermApp {
         keyring_hexkey: Option<&str>,
         json_hosts: &[HostConfig],
     ) -> anyhow::Result<Vec<HostConfig>> {
-        if let Some(key) = keyring_hexkey
-            && let Err(error) = crate::vault::migrate_legacy(vault, mode, key).await {
-                log::warn!("旧数据迁移未完成: {error}");
-            }
+        if let Some(key) = keyring_hexkey {
+            crate::vault::migrate_legacy(vault, mode, key).await?;
+        } else if let Some(text) = crate::vault::read_legacy_known_hosts(
+            &mode.legacy_path(crate::paths::LEGACY_KNOWN_HOSTS_FILE),
+        )? {
+            // 旧数据库密钥不可用也不能跳过已有信任记录。
+            crate::vault::import_legacy_trust(vault, &text).await?;
+        }
         let existing = vault.load_hosts().await?;
         if existing.is_empty() && !json_hosts.is_empty() {
             let mut imported = json_hosts.to_vec();

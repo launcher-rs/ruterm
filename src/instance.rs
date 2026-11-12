@@ -6,15 +6,16 @@
 //! 敲门；抢不到的人递一个令牌、请主实例把窗口带到前台，然后自己退出。
 //! 令牌要双向核对，端口被无关程序占着时宁可放弃守卫，也不让软件启动不了。
 
-use std::io::{BufRead, BufReader, Write};
-use std::net::{TcpListener, TcpStream};
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::time::Duration;
 
 /// 回环锁端口：挑在常见服务区间之外，降低撞车概率。
 const PORT: u16 = 47_122;
 /// 握手口令：两边都核对，确认对面确实是另一个 RuTerm。
-const TOKEN: &str = "ruterm-instance-v1";
-/// 敲门与应答的等待上限：主实例卡死时不该把第二次启动也拖住。
+/// 固定长度帧，不做行解析，避免本机进程用超长行撑爆内存。
+const TOKEN: &[u8] = b"ruterm-instance-v1";
+/// 单次握手的等待上限：主实例卡死时不该把第二次启动也拖住。
 const HANDSHAKE: Duration = Duration::from_millis(600);
 
 pub enum Claim {
@@ -55,23 +56,23 @@ pub fn claim() -> Claim {
 }
 
 /// 敲门：递令牌并等主实例回同一个令牌，回得上才认定对面是 RuTerm。
+/// 连接、写入、读取都受总时上限约束；对面只发半截或一直不回就放弃。
 fn knock() -> bool {
-    let Ok(stream) = TcpStream::connect(("127.0.0.1", PORT)) else {
+    let addr = SocketAddr::from(([127, 0, 0, 1], PORT));
+    let Ok(mut stream) = TcpStream::connect_timeout(&addr, HANDSHAKE) else {
         return false;
     };
     let _ = stream.set_write_timeout(Some(HANDSHAKE));
     let _ = stream.set_read_timeout(Some(HANDSHAKE));
-    let Ok(mut writer) = stream.try_clone() else {
-        return false;
-    };
-    if writeln!(writer, "{TOKEN}").is_err() {
+    if stream.write_all(TOKEN).is_err() {
         return false;
     }
-    let mut line = String::new();
-    let Ok(_) = BufReader::new(stream).read_line(&mut line) else {
+    let _ = stream.flush();
+    let mut reply = [0u8; TOKEN.len()];
+    if stream.read_exact(&mut reply).is_err() {
         return false;
-    };
-    line.trim() == TOKEN
+    }
+    reply == TOKEN
 }
 
 /// 主实例侧：把 std 监听换成 tokio 监听，交给应用执行器跑唤醒循环。
@@ -85,14 +86,23 @@ pub async fn serve<F: FnMut()>(listener: TcpListener, mut wake: F) {
         let Ok((mut stream, _)) = listener.accept().await else {
             continue;
         };
-        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
-        let mut line = String::new();
-        let mut reader = tokio::io::BufReader::new(&mut stream);
-        if reader.read_line(&mut line).await.unwrap_or(0) == 0 || line.trim() != TOKEN {
-            continue;
+        // 每个连接都必须在一个总时限内完成固定长度握手：读半截、慢速灌数据、
+        // 连上不说话都不能把唤醒循环卡住。
+        let authenticated = tokio::time::timeout(HANDSHAKE, async {
+            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+            let mut token = [0u8; TOKEN.len()];
+            stream.read_exact(&mut token).await.ok()?;
+            if token != TOKEN {
+                return None;
+            }
+            stream.write_all(TOKEN).await.ok()?;
+            stream.flush().await.ok()?;
+            Some(())
+        })
+        .await
+        .is_ok_and(|result| result.is_some());
+        if authenticated {
+            wake();
         }
-        let _ = stream.write_all(format!("{TOKEN}\n").as_bytes()).await;
-        let _ = stream.flush().await;
-        wake();
     }
 }
