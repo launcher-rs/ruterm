@@ -87,5 +87,3 @@ vendor/           少量上游依赖的本地修补版本（保留原许可证�
 ## 许可证
 
 本项目使用 [Apache-2.0](LICENSE)。
-
-图标来自 [Lucide](https://lucide.dev)，按 ISC 许可证使用，见 [`assets/lucide/LICENSE`](assets/lucide/LICENSE)。`vendor/` 下的第三方代码保留各自原始的 Apache-2.0 / MIT 许可证文件。
