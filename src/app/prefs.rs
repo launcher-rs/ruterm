@@ -320,6 +320,13 @@ pub struct TerminalPrefs {
     /// 自定义 16 色（选「自定义」时生效，始终随偏好一起持久化）。
     #[serde(default)]
     pub custom: TerminalColors,
+    /// 输入命令时自动弹出片段候选（Tab / Enter 补全）。
+    #[serde(default = "inline_completion_default")]
+    pub inline_completion: bool,
+}
+
+pub(super) fn inline_completion_default() -> bool {
+    true
 }
 
 pub(super) fn default_font_size() -> f32 {
@@ -341,6 +348,7 @@ impl Default for TerminalPrefs {
             line_height: LINE_HEIGHT_DEFAULT,
             theme: TERMINAL_THEME_DEFAULT.to_string(),
             custom: TerminalColors::default(),
+            inline_completion: true,
         }
     }
 }
@@ -1462,6 +1470,7 @@ mod tests {
         prefs.nudge_font_size(3);
         prefs.nudge_line_height(2);
         prefs.theme = "Dracula".into();
+        prefs.inline_completion = false;
         prefs
             .custom
             .set_hex_field(CUSTOM_BRIGHT_BASE + 3, "#123456".into());
@@ -1470,9 +1479,11 @@ mod tests {
         assert!((restored.line_height - prefs.line_height).abs() < 1e-3);
         assert_eq!(restored.theme, "Dracula");
         assert_eq!(restored.custom, prefs.custom);
-        // 旧版 JSON 没有 custom：按 One Dark 初始值补齐，不影响其余字段。
+        assert!(!restored.inline_completion);
+        // 旧版 JSON 没有 custom / inline_completion：补默认值（One Dark、自动补全开启）。
         let legacy = TerminalPrefs::from_json(r#"{"font_size":16.0}"#);
         assert_eq!(legacy.custom, TerminalColors::default());
+        assert!(legacy.inline_completion);
     }
 
     #[test]

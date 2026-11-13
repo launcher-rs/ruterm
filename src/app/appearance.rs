@@ -179,6 +179,18 @@ impl RuTermApp {
     }
 
 
+    /// 开关终端内自动补全：关闭后按键拦截器直接让路，浮层与行跟踪一起清掉。
+    pub(super) fn set_inline_completion(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        let mut prefs = self.terminal.clone();
+        prefs.inline_completion = enabled;
+        self.set_terminal_prefs(prefs, cx);
+        if !enabled {
+            self.close_completion(cx);
+            self.typed_line = Some(String::new());
+        }
+    }
+
+
     /// 把「自定义」配色注册进全局 `ThemeManager`（重复调用即覆盖）。
     pub(super) fn register_custom_theme(colors: &TerminalColors, cx: &mut App) {
         if !cx.has_global::<ThemeManager>() {

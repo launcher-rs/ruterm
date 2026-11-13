@@ -2,6 +2,7 @@
 //! 功能实现按模块拆在同目录：tabs / connect / files / forwards / hosts / settings 等。
 
 mod appearance;
+mod completion;
 mod connect;
 mod files;
 mod forwards;
@@ -25,6 +26,7 @@ mod vault_ui;
 mod widgets;
 
 use connect::*;
+use completion::*;
 use files::*;
 use forwards::*;
 use history_ui::*;
@@ -220,6 +222,10 @@ pub(crate) struct RuTermApp {
     history_seen: HashMap<usize, usize>,
     /// 命令历史弹窗。
     history_manager: Option<HistoryManager>,
+    /// 终端里正在输入的词；None＝光标被移动过，等回车开新行再跟踪。
+    typed_line: Option<String>,
+    /// 终端内命令补全浮层（只对正在输入的那个标签生效）。
+    completion: Option<CompletionState>,
     /// 侧边栏 ↔ 主区 的分隔面板状态（拖拽调整宽度 + 折叠/展开）。
     split_state: Entity<SplitPaneState>,
     /// 主区分屏（两个标签并排）；None＝单屏显示活动标签。
@@ -447,6 +453,8 @@ impl RuTermApp {
             history,
             history_seen: HashMap::new(),
             history_manager: None,
+            typed_line: Some(String::new()),
+            completion: None,
             split_state,
             view_split: None,
             focus_handle: cx.focus_handle(),
@@ -473,6 +481,8 @@ impl RuTermApp {
         })
         .detach();
         app.watch_readout(cx);
+        // 终端内命令补全：按键跟踪也必须在动作分发之前，否则 Tab / Enter 会先到终端。
+        Self::install_completion_interceptor(cx);
         app.boot_vault(window, cx);
         // 启动档 shell 只有几个，图标走 shell 缓存、毫秒级，直接在主线程取好再进列表。
         app.refresh_shell_icons();
@@ -1122,7 +1132,7 @@ impl RuTermApp {
                                 .on_drag(
                                     TabDragData {
                                         index,
-                                        title: tab.title.to_string(),
+                                        title: self.tab_display_title(id).to_string(),
                                         position: Point::default(),
                                     },
                                     |drag: &TabDragData, position, _window, cx| {
@@ -1204,7 +1214,7 @@ impl RuTermApp {
                                         .flex_1()
                                         .min_w_0()
                                         .truncate()
-                                        .child(tab.title.clone()),
+                                        .child(self.tab_display_title(id)),
                                 })
                                 // 只有活动标签常驻 ×：非活动项的 × 更挡标题，切换过去再关即可。
                                 .when(active, |this| {

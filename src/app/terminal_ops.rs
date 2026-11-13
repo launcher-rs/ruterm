@@ -739,7 +739,7 @@ impl RuTermApp {
         let count = live.len();
         let names = live
             .iter()
-            .map(|tab| tab.title.to_string())
+            .map(|tab| self.tab_display_title(tab.id).to_string())
             .collect::<Vec<_>>()
             .join("、");
         let confirm_entity = cx.entity();

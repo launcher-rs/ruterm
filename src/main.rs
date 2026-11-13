@@ -7,6 +7,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod completion;
 mod config;
 mod desktop;
 mod discovery;
@@ -16,6 +17,7 @@ mod instance;
 mod local_shell;
 mod macros;
 mod paths;
+mod platform;
 mod remote;
 mod remote_fs;
 mod session;

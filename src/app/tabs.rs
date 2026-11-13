@@ -16,6 +16,7 @@ use rgpui_term::{
 
 use crate::config::SshTarget;
 use crate::desktop::Command;
+use crate::platform::Platform;
 use crate::remote::RemoteInfo;
 use crate::sessions::{AuthMethod, HostConfig, ProtocolKind};
 use crate::{CancelRename, CloseTab, SplitRight, SplitDown, CloseSplit, NextTab, PrevTab};
@@ -33,12 +34,20 @@ pub(super) struct SessionTab {
     pub(super) base_title: SharedString,
     /// 用户双击重命名的标题：优先级最高，OSC 标题不再覆盖它。
     pub(super) custom_title: Option<SharedString>,
+    /// 同名标签的序号（1 起，1 显示原名）：打开时取最小空号，之后不随其它标签关闭而改变。
+    pub(super) title_ordinal: u32,
+    /// 是否跟随终端 OSC 0/2 标题改名：本地 shell 跟随（显示当前目录），
+    /// SSH / Telnet 固定用主机展示名，避免标签被 `user@host: ~` 覆盖。
+    pub(super) follow_osc_title: bool,
     /// 连接位置（user@host:port 或本地 shell 的路径），状态栏展示。
     pub(super) addr: SharedString,
     /// 认证方式，状态栏展示；本地终端没有认证概念，为 None。
     pub(super) auth: Option<AuthMethod>,
     /// 远程服务器基本信息（连接后经 exec 探测异步填充，探测失败保持 None）。
     pub(super) remote_info: Option<RemoteInfo>,
+    /// 本地 shell 的命令行平台（WSL→Linux、PowerShell/CMD→Windows、Git Bash→Unix）；
+    /// SSH / Telnet 为 None，平台以 `remote_info` 为准。
+    pub(super) platform: Option<Platform>,
     /// 渲染用终端视图；远程桌面标签为 None。
     pub(super) terminal_view: Option<Entity<TerminalView>>,
     /// 远程桌面标签的状态（连接表单 / 帧 / 输入转发）；终端标签为 None。
@@ -114,6 +123,39 @@ impl RuTermApp {
         self.tabs
             .iter()
             .any(|tab| tab.id == id && tab.terminal_view.as_ref() == Some(view))
+    }
+
+    /// 标签显示名：同名标签按序号显示 `名称:2`、`名称:3`（1 不显示后缀）。
+    /// 序号在打开时定下、不随其它标签关闭重排；用户重命名过的标签不再追加序号。
+    pub(super) fn tab_display_title(&self, id: usize) -> SharedString {
+        let Some(tab) = self.tabs.iter().find(|tab| tab.id == id) else {
+            return SharedString::default();
+        };
+        if tab.custom_title.is_some() {
+            return tab.title.clone();
+        }
+        numbered_label(&tab.title, tab.title_ordinal)
+    }
+
+    /// 同名标签的下一个序号：从 1 起取最小空号，已存在的序号跳过。
+    /// 前一个关闭后重开也只补空出来的号，已有标签的序号保持不变。
+    pub(super) fn next_title_ordinal(&self, base_title: &str, exclude: Option<usize>) -> u32 {
+        smallest_free_ordinal(
+            self.tabs
+                .iter()
+                .filter(|tab| Some(tab.id) != exclude && tab.base_title.as_ref() == base_title)
+                .map(|tab| tab.title_ordinal),
+        )
+    }
+
+    /// 当前标签的命令行平台：本地 shell 用建档时的类型，SSH 用 exec 探测的 `uname -s`。
+    /// 都识别不出（Telnet、探测失败的 SSH）时返回 None，补全只给通用命令。
+    pub(super) fn active_session_platform(&self) -> Option<Platform> {
+        let tab = self
+            .active_tab
+            .and_then(|id| self.tabs.iter().find(|tab| tab.id == id))?;
+        tab.platform
+            .or_else(|| tab.remote_info.as_ref().and_then(RemoteInfo::platform))
     }
 
 
@@ -398,6 +440,13 @@ impl RuTermApp {
         if tab.custom_title.is_some() {
             return;
         }
+        if !tab.follow_osc_title {
+            if tab.title != tab.base_title {
+                tab.title = tab.base_title.clone();
+                cx.notify();
+            }
+            return;
+        }
         // 终端清标题（ResetTitle 给空串）时回落默认名，别让标签空着。
         tab.title = match title.trim() {
             "" => tab.base_title.clone(),
@@ -568,6 +617,9 @@ impl RuTermApp {
 
     /// 切到指定标签：选中、滚进可见范围（标签多到溢出时），并把焦点交给它的终端。
     pub(crate) fn activate_tab(&mut self, id: usize, window: &mut Window, cx: &mut Context<Self>) {
+        // 切标签后旧标签的补全词与浮层都不再适用。
+        self.close_completion(cx);
+        self.typed_line = Some(String::new());
         // 分屏只描述"哪两个标签并排"：从标签栏 / 快捷键切到第三个会话时退出分屏，
         // 点两个分屏面板之一则保持在分屏里（两屏位置不互换）。
         if let Some(view) = self.view_split.as_ref()
@@ -751,7 +803,7 @@ impl RuTermApp {
                 "○"
             };
             menu.push(TrayMenuItem::Action {
-                label: format!("{marker} {}", tab.title).into(),
+                label: format!("{marker} {}", self.tab_display_title(tab.id)).into(),
                 id: format!("tab:{}", tab.id).into(),
             });
         }
@@ -844,7 +896,8 @@ impl RuTermApp {
         let pal = self.palette(cx);
         let id = tab.id;
         let desktop = tab.desktop.is_some();
-        div()
+        // 必须是 flex 列：补全容器要靠 flex_1 拿剩余高度，块级父容器里 flex_1 不生效。
+        v_flex()
             .flex_1()
             .min_w_0()
             .min_h_0()
@@ -858,6 +911,7 @@ impl RuTermApp {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _, window, cx| {
+                    this.close_completion(cx);
                     if this.active_tab != Some(id) {
                         this.activate_tab(id, window, cx);
                         cx.notify();
@@ -885,7 +939,18 @@ impl RuTermApp {
                 this.child(self.render_find_bar(tab, cx))
             })
             .when_some(tab.terminal_view.clone(), |this, view| {
-                this.child(view)
+                // 补全浮层按终端网格坐标定位，所以和终端视图同处一个相对定位容器。
+                this.child(
+                    div()
+                        .relative()
+                        .flex_1()
+                        .min_w_0()
+                        .min_h_0()
+                        .child(view)
+                        .when(active, |this| {
+                            this.child(self.render_completion_popup(id, cx))
+                        }),
+                )
             })
             .when_some(tab.desktop.as_ref(), |this, desktop| {
                 this.child(self.render_desktop_pane(tab, desktop, cx))
@@ -1173,4 +1238,44 @@ fn flatten_error_text(text: &str, max_chars: usize) -> SharedString {
         out.push('…');
     }
     SharedString::from(out)
+}
+
+/// 同名标签的显示名：序号 1 显示原名，之后显示 `名称:2`、`名称:3`。
+fn numbered_label(name: &SharedString, ordinal: u32) -> SharedString {
+    match ordinal {
+        0 | 1 => name.clone(),
+        n => SharedString::from(format!("{name}:{n}")),
+    }
+}
+
+/// 从 1 起取最小未被占用的序号。
+fn smallest_free_ordinal(used: impl Iterator<Item = u32>) -> u32 {
+    let used: Vec<u32> = used.collect();
+    (1..).find(|ordinal| !used.contains(ordinal)).unwrap_or(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn first_instance_of_a_title_keeps_the_plain_title() {
+        assert_eq!(numbered_label(&"docker".into(), 1), "docker");
+    }
+
+    #[test]
+    fn repeated_titles_use_a_colon_ordinal() {
+        let name: SharedString = "docker".into();
+        assert_eq!(numbered_label(&name, 2), "docker:2");
+        assert_eq!(numbered_label(&name, 3), "docker:3");
+    }
+
+    #[test]
+    fn ordinals_fill_the_smallest_gap_and_skip_existing() {
+        assert_eq!(smallest_free_ordinal([].into_iter()), 1);
+        assert_eq!(smallest_free_ordinal([1, 2].into_iter()), 3);
+        // 前两个关掉、第三个还在：新开的补 1，不会挤动仍在的 3。
+        assert_eq!(smallest_free_ordinal([3].into_iter()), 1);
+        assert_eq!(smallest_free_ordinal([1, 3].into_iter()), 2);
+    }
 }

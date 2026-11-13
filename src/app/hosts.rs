@@ -1000,7 +1000,8 @@ impl RuTermApp {
             pal,
             px(22.0),
         )
-        .on_click(cx.listener(move |this, _, window, cx| {
+        // 双击才连接：手快点两下不会误开两条会话。
+        .on_double_click(cx.listener(move |this, _, window, cx| {
             this.click_host(index, window, cx);
         }))
         .child(
@@ -1412,7 +1413,7 @@ impl RuTermApp {
     }
 
 
-    /// 首页里的一台主机：图标 + 展示名 + 地址，点一下即连接。
+    /// 首页里的一台主机：图标 + 展示名 + 地址，双击连接（与侧边栏一致，避免误触连开两次）。
     pub(super) fn render_home_host_row(
         &self,
         index: usize,
@@ -1430,7 +1431,7 @@ impl RuTermApp {
             pal,
             px(8.0),
         )
-        .on_click(cx.listener(move |this, _, window, cx| {
+        .on_double_click(cx.listener(move |this, _, window, cx| {
             this.click_host(index, window, cx);
         }))
         .child(

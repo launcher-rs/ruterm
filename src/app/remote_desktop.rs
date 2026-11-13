@@ -368,14 +368,18 @@ impl RuTermApp {
         } else {
             tr!(cx, "远程桌面")
         };
+        let title_ordinal = self.next_title_ordinal(&initial_title, None);
         self.tabs.push(SessionTab {
             id,
             title: initial_title.clone(),
             base_title: initial_title,
             custom_title: None,
+            title_ordinal,
+            follow_osc_title: false,
             addr: SharedString::default(),
             auth: None,
             remote_info: None,
+            platform: None,
             terminal_view: None,
             desktop: Some(desktop),
             ended: false,
@@ -892,6 +896,15 @@ impl RuTermApp {
         password: String,
         cx: &mut Context<Self>,
     ) {
+        let addr = host_port(&host, port);
+        let title = SharedString::from(addr.clone());
+        // 标题从「远程桌面」换成真实地址时重新取号：只有同地址的标签才编号。
+        let title_ordinal = self
+            .tabs
+            .iter()
+            .find(|tab| tab.id == id)
+            .filter(|tab| tab.base_title != title)
+            .map(|_| self.next_title_ordinal(&title, Some(id)));
         let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) else {
             return;
         };
@@ -921,10 +934,11 @@ impl RuTermApp {
         tab.ended = false;
         tab.failed = false;
         tab.last_error = None;
-        let addr = host_port(&host, port);
         tab.addr = addr.clone().into();
         if tab.custom_title.is_none() {
-            let title = SharedString::from(addr.clone());
+            if let Some(ordinal) = title_ordinal {
+                tab.title_ordinal = ordinal;
+            }
             tab.title = title.clone();
             tab.base_title = title;
         }
@@ -1106,6 +1120,20 @@ impl RuTermApp {
         name: String,
         cx: &mut Context<Self>,
     ) {
+        let title = self
+            .tabs
+            .iter()
+            .find(|tab| tab.id == id)
+            .and_then(|tab| tab.desktop.as_ref())
+            .map(|desktop| SharedString::from(host_port(&desktop.host, desktop.port)));
+        // 标题从「远程桌面」换成真实地址时重新取号：只有同地址的标签才编号。
+        let title_ordinal = title.as_ref().and_then(|title| {
+            self.tabs
+                .iter()
+                .find(|tab| tab.id == id)
+                .filter(|tab| tab.base_title != *title)
+                .map(|_| self.next_title_ordinal(title, Some(id)))
+        });
         let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) else {
             return;
         };
@@ -1137,8 +1165,12 @@ impl RuTermApp {
         };
         let saved_host = desktop.saved_host;
         tab.connected_at = Some(std::time::Instant::now());
-        if tab.custom_title.is_none() {
-            let title = SharedString::from(host_port(&desktop.host, desktop.port));
+        if tab.custom_title.is_none()
+            && let Some(title) = title
+        {
+            if let Some(ordinal) = title_ordinal {
+                tab.title_ordinal = ordinal;
+            }
             tab.title = title.clone();
             tab.base_title = title;
         }

@@ -15,6 +15,7 @@ use rgpui_term::{
 };
 
 use crate::local_shell::{NetTool, ShellProfile};
+use crate::platform::Platform;
 use crate::{NewLocalTerminal};
 use crate::tr;
 
@@ -483,6 +484,8 @@ impl RuTermApp {
         let program = crate::local_shell::command_line_with(&chosen, &extra_args);
         let env = self.local_shell_prefs.env_map_of(&profile_id);
         let label = self.shell_name(&chosen).to_string();
+        // 平台在建标签时就定下来：PowerShell/CMD 是 Windows 命令，WSL 是 Linux，Git Bash 只算 POSIX 工具。
+        let platform = Platform::from_shell_kind(chosen.kind);
         let working_directory = self
             .local_shell_prefs
             .cwd_of(&profile_id)
@@ -511,7 +514,7 @@ impl RuTermApp {
             let entity_id = entity.entity_id();
             let _ = cx.with_window(entity_id, move |window, cx| {
                 entity.update(cx, |this, cx| match builder {
-                    Ok(builder) => this.add_local_tab(builder, label, cwd, window, cx),
+                    Ok(builder) => this.add_local_tab(builder, label, cwd, platform, window, cx),
                     Err(error) => {
                         log::error!("启动本地终端失败: {error}");
                         this.status = SharedString::from(format!("启动本地终端失败：{label}"));
@@ -530,6 +533,7 @@ impl RuTermApp {
         builder: TerminalBuilder,
         label: String,
         cwd: String,
+        platform: Option<Platform>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -551,14 +555,18 @@ impl RuTermApp {
         } else {
             format!("{label} · {cwd}").into()
         };
+        let title_ordinal = self.next_title_ordinal(&label, None);
         self.tabs.push(SessionTab {
             id,
             title: label.clone().into(),
             base_title: label.clone().into(),
             custom_title: None,
+            title_ordinal,
+            follow_osc_title: true,
             addr,
             auth: None,
             remote_info: None,
+            platform,
             terminal_view: Some(terminal_view),
             desktop: None,
             ended: false,

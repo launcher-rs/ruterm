@@ -646,6 +646,22 @@ impl RuTermApp {
             .when(self.terminal.theme == TERMINAL_THEME_CUSTOM, |this| {
                 this.child(self.render_custom_colors(pal, cx))
             })
+            .child(div().mt_2().h(px(1.0)).w_full().bg(pal.border))
+            .child({
+                let entity = cx.entity();
+                Checkbox::new("terminal-inline-completion")
+                    .label(tr!(cx, "终端内自动补全"))
+                    .checked(self.terminal.inline_completion)
+                    .on_change(move |value, _window, cx| {
+                        entity.update(cx, |this, cx| this.set_inline_completion(value, cx));
+                    })
+            })
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(pal.muted)
+                    .child(tr!(cx, "输入命令时自动弹出片段候选：↑↓ 选择、Tab / Enter 补全、Esc 关闭；补全只替换正在输入的那个词，不会执行命令。关闭后按键完全交给 shell。")),
+            )
             .child(self.render_local_shell_row(pal, cx))
             .child(
                 div()

@@ -72,7 +72,7 @@ impl RuTermApp {
                         return;
                     }
                 };
-                let title = host.name.clone();
+                let title = Self::host_title(&host);
                 // 带上 host：Agent 主机也能进最近连接，且重连时按最新主机配置重建。
                 self.connect(title, target, None, Some(host), false, window, cx);
             }
@@ -252,7 +252,7 @@ impl RuTermApp {
                 return;
             }
         };
-        let title = host.name.clone();
+        let title = Self::host_title(&host);
         self.connect(title, target, Some(key), Some(host), from_vault, window, cx);
     }
 
@@ -271,7 +271,7 @@ impl RuTermApp {
                 return;
             }
         };
-        let title = host.name.clone();
+        let title = Self::host_title(&host);
         self.connect(title, target, None, Some(host), false, window, cx);
     }
 
@@ -341,7 +341,7 @@ impl RuTermApp {
             }
         };
         self.connect(
-            host.name.clone(),
+            Self::host_title(&host),
             target,
             Some(key),
             Some(host),
@@ -468,14 +468,27 @@ impl RuTermApp {
         // 查找是排队执行的：终端 sync 完才定状态，收到结果后重绘查找条。
         self.watch_terminal(id, &terminal, cx);
         self.status = SharedString::from(format!("正在连接 {addr}…"));
+        // 原标签重连沿用原序号；新标签补最小空号，已有标签的名字不受影响。
+        let title_ordinal = if reconnect {
+            self.tabs
+                .iter()
+                .find(|tab| tab.id == id)
+                .map(|tab| tab.title_ordinal)
+                .unwrap_or(1)
+        } else {
+            self.next_title_ordinal(&title, None)
+        };
         let tab = SessionTab {
             id,
             title: title.clone().into(),
             base_title: title.into(),
             custom_title: None,
+            title_ordinal,
+            follow_osc_title: false,
             addr: addr.clone().into(),
             auth: Some(auth),
             remote_info: None,
+            platform: None,
             terminal_view: Some(terminal_view.clone()),
             desktop: None,
             ended: false,
@@ -810,14 +823,26 @@ impl RuTermApp {
         .detach();
         self.watch_terminal(id, &terminal, cx);
         self.status = SharedString::from(format!("正在连接 Telnet {addr}…"));
+        let title_ordinal = if reconnect {
+            self.tabs
+                .iter()
+                .find(|tab| tab.id == id)
+                .map(|tab| tab.title_ordinal)
+                .unwrap_or(1)
+        } else {
+            self.next_title_ordinal(&title, None)
+        };
         let tab = SessionTab {
             id,
             title: title.clone().into(),
             base_title: title.into(),
             custom_title: None,
+            title_ordinal,
+            follow_osc_title: false,
             addr: addr.clone().into(),
             auth: None,
             remote_info: None,
+            platform: None,
             terminal_view: Some(terminal_view.clone()),
             desktop: None,
             ended: false,

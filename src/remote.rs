@@ -6,6 +6,8 @@
 
 use std::collections::BTreeMap;
 
+use crate::platform::Platform;
+
 /// 探测命令：只读、无交互、单通道跑完即退出。
 ///
 /// 键含义：`host` 主机名 / `os` 发行版名 / `sys` 内核名与版本 /
@@ -42,6 +44,11 @@ impl RemoteInfo {
     /// 该次探测是否什么都没探到（远端禁用 exec 或全部缺项）。
     pub fn is_empty(&self) -> bool {
         self.fields.is_empty()
+    }
+
+    /// 远端平台：由探测里的 `sys`（`uname -s` 内核名）判断，识别不出返回 `None`。
+    pub fn platform(&self) -> Option<Platform> {
+        Platform::from_uname(self.get("sys")?)
     }
 
     /// 单项指标的原始值（不含标签）；缺项返回 `None`，状态栏据此跳过该条目。
@@ -153,6 +160,22 @@ mod tests {
             text(&info, Metric::Os).as_deref(),
             Some("FreeBSD 14.1-RELEASE")
         );
+        assert_eq!(info.platform(), Some(Platform::Unix));
+    }
+
+    #[test]
+    fn platform_comes_from_kernel_name() {
+        assert_eq!(
+            RemoteInfo::parse("sys=Linux 6.8.0-45-generic\nos=Ubuntu 24.04.1 LTS\n").platform(),
+            Some(Platform::Linux)
+        );
+        assert_eq!(
+            RemoteInfo::parse("sys=Darwin 23.6.0\n").platform(),
+            Some(Platform::Unix)
+        );
+        // Windows OpenSSH 的 exec 不认 POSIX 脚本，探测不到 sys：平台保持未知。
+        assert_eq!(RemoteInfo::parse("os=Ubuntu 24.04.1 LTS\n").platform(), None);
+        assert_eq!(RemoteInfo::parse("").platform(), None);
     }
 
     #[test]

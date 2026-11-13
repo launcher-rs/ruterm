@@ -11,7 +11,9 @@ use rgpui::{
     Window, div, h_flex, px, v_flex,
 };
 
+use crate::platform::Platform;
 use crate::snippets::CommandSnippet;
+use crate::snippet_presets::{PRESETS, PRESET_GROUPS};
 use crate::tr;
 use crate::{CloseSnippetManager, SnippetManager as OpenSnippetManager};
 
@@ -26,6 +28,8 @@ pub(super) struct SnippetManager {
     pub(super) confirm_delete: Option<usize>,
     /// 列表是否切到「内置命令」页（默认显示自己的片段）。
     pub(super) builtin: bool,
+    /// 内置命令页正在查看的平台（打开时默认为当前会话平台，可手动切换）。
+    pub(super) preset_platform: Platform,
 }
 
 pub(super) struct SnippetEdit {
@@ -64,6 +68,7 @@ impl RuTermApp {
             editing: None,
             confirm_delete: None,
             builtin: false,
+            preset_platform: self.active_session_platform().unwrap_or(Platform::Cross),
         });
         cx.notify();
     }
@@ -75,6 +80,16 @@ impl RuTermApp {
         {
             manager.builtin = builtin;
             manager.confirm_delete = None;
+            cx.notify();
+        }
+    }
+
+    /// 切换内置命令页查看的平台。
+    pub(super) fn set_preset_platform(&mut self, platform: Platform, cx: &mut Context<Self>) {
+        if let Some(manager) = self.snippet_manager.as_mut()
+            && manager.preset_platform != platform
+        {
+            manager.preset_platform = platform;
             cx.notify();
         }
     }
@@ -443,29 +458,50 @@ impl RuTermApp {
             .active_tab
             .and_then(|id| self.tabs.iter().find(|tab| tab.id == id))
             .is_some_and(|tab| !tab.ended && tab.terminal_view.is_some());
-        let mut list = v_flex().id("preset-list").gap_1().overflow_y_scrollbar();
-        let mut shown = 0;
-        for category in crate::snippet_presets::PRESET_CATEGORIES {
-            let rows: Vec<usize> = crate::snippet_presets::PRESETS
+        // 默认展示当前会话平台，可用下方平台按钮切到其它平台查看；平台内按子分类分组。
+        let active = self.active_session_platform();
+        let viewing = state.preset_platform;
+        let mut rows: Vec<usize> = PRESETS
+            .iter()
+            .enumerate()
+            .filter(|(_, preset)| preset.platform() == viewing && matches(preset))
+            .map(|(index, _)| index)
+            .collect();
+        rows.sort_by_key(|index| {
+            PRESET_GROUPS
                 .iter()
-                .enumerate()
-                .filter(|(_, preset)| preset.category == *category && matches(preset))
-                .map(|(index, _)| index)
-                .collect();
-            if rows.is_empty() {
-                continue;
+                .position(|group| *group == PRESETS[*index].group)
+                .unwrap_or(usize::MAX)
+        });
+        let mut list = v_flex().id("preset-list").gap_1().overflow_y_scrollbar();
+        if !rows.is_empty() {
+            let mut heading = crate::i18n::translate(cx, viewing.label(), &[]).to_string();
+            if active == Some(viewing) {
+                heading.push_str(&crate::i18n::translate(cx, "（当前会话）", &[]));
             }
             list = list.child(
                 div()
                     .pt_2()
                     .pb_1()
-                    .text_xs()
-                    .text_color(pal.muted)
-                    .child(crate::i18n::translate(cx, category, &[])),
+                    .text_sm()
+                    .font_weight(FontWeight(600.0))
+                    .text_color(pal.text)
+                    .child(SharedString::from(heading)),
             );
+            let mut group = None;
             for index in rows {
-                shown += 1;
-                let preset = &crate::snippet_presets::PRESETS[index];
+                let preset = &PRESETS[index];
+                if group != Some(preset.group) {
+                    group = Some(preset.group);
+                    list = list.child(
+                        div()
+                            .pl_2()
+                            .pt_1()
+                            .text_xs()
+                            .text_color(pal.muted)
+                            .child(crate::i18n::translate(cx, preset.group, &[])),
+                    );
+                }
                 list = list.child(
                     h_flex()
                         .id(("preset-row", index))
@@ -534,8 +570,7 @@ impl RuTermApp {
                         ),
                 );
             }
-        }
-        if shown == 0 {
+        } else {
             list = list.child(
                 div()
                     .py_4()
@@ -544,17 +579,34 @@ impl RuTermApp {
                     .child(tr!(cx, "没有匹配的内置命令")),
             );
         }
+        let mut platform_row = h_flex().gap_1().items_center().child(
+            div()
+                .flex_shrink_0()
+                .text_xs()
+                .text_color(pal.muted)
+                .child(tr!(cx, "平台")),
+        );
+        for platform in Platform::ALL {
+            let selected = platform == viewing;
+            let mut chip = Button::new(("preset-platform", platform as usize))
+                .label(crate::i18n::translate(cx, platform.label(), &[]))
+                .compact()
+                .when(selected, |button| button.primary())
+                .when(!selected, |button| button.ghost())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.set_preset_platform(platform, cx);
+                }));
+            if active == Some(platform) {
+                chip = chip.tooltip(tr!(cx, "当前会话平台"));
+            }
+            platform_row = platform_row.child(chip);
+        }
         v_flex()
             .gap_3()
             .flex_1()
             .min_h_0()
-            .child(
-                h_flex()
-                    .w_full()
-                    .gap_2()
-                    .items_center()
-                    .child(div().flex_1().child(styled_input(Input::new(&state.search), pal))),
-            )
+            .child(styled_input(Input::new(&state.search), pal))
+            .child(platform_row)
             .child(list)
             .child(
                 div()
@@ -562,7 +614,7 @@ impl RuTermApp {
                     .text_color(pal.muted)
                     .child(tr!(
                         cx,
-                        "内置命令只读；需要固定参数时点「存为我的片段」再改。"
+                        "内置命令只读；可切换平台查看，补全只提示当前会话平台的命令。需要固定参数时点「存为我的片段」再改。"
                     )),
             )
             .into_any_element()
