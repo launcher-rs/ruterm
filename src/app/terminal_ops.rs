@@ -586,6 +586,47 @@ impl RuTermApp {
     }
 
 
+    /// 把一条命令写进活动终端：`run` 时追加回车。返回是否真的送出。
+    ///
+    /// 片段 / 内置命令 / 历史复用同一条路径；「执行」也会立刻记进命令历史，
+    /// 因为 Programmatic 输入不经过 block 追踪。
+    pub(super) fn send_command_to_terminal(
+        &mut self,
+        command: &str,
+        run: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let active = self
+            .active_tab
+            .and_then(|id| self.tabs.iter().find(|tab| tab.id == id));
+        let Some(tab) = active else {
+            self.status = tr!(cx, "没有可发送命令的终端会话");
+            cx.notify();
+            return false;
+        };
+        if tab.ended {
+            self.status = tr!(cx, "会话已断开，无法发送命令");
+            cx.notify();
+            return false;
+        }
+        let Some(view) = tab.terminal_view.clone() else {
+            self.status = tr!(cx, "没有可发送命令的终端会话");
+            cx.notify();
+            return false;
+        };
+        let terminal = view.read(cx).terminal().clone();
+        let mut bytes = command.trim_end_matches(['\r', '\n']).as_bytes().to_vec();
+        if run {
+            bytes.push(b'\r');
+        }
+        terminal.update(cx, |terminal, _| terminal.input(bytes));
+        if run {
+            self.push_history(command, cx);
+        }
+        true
+    }
+
+
     /// 菜单「命令发到所有会话…」：弹出输入框，确认后统一发送。
     pub(super) fn broadcast_command(
         &mut self,
@@ -659,7 +700,7 @@ impl RuTermApp {
             cx.notify();
             return;
         }
-        let mut bytes = command.into_bytes();
+        let mut bytes = command.clone().into_bytes();
         bytes.push(b'\r');
         let mut targets = 0;
         for tab in self.tabs.iter() {
@@ -674,6 +715,8 @@ impl RuTermApp {
             targets += 1;
         }
         self.broadcast = None;
+        // 广播是程序化输入，不产生 block，命令历史在这里补记一次。
+        self.push_history(&command, cx);
         self.status = SharedString::from(format!("已向 {targets} 个会话发送命令"));
         if let Some(view) = self.active_terminal_view() {
             view.read(cx).focus_handle(cx).focus(window, cx);

@@ -10,6 +10,7 @@ mod app;
 mod config;
 mod desktop;
 mod discovery;
+mod history;
 mod i18n;
 mod instance;
 mod local_shell;
@@ -19,6 +20,8 @@ mod remote;
 mod remote_fs;
 mod session;
 mod sessions;
+mod snippet_presets;
+mod snippets;
 mod ssh;
 mod ssh_config;
 mod telnet;
@@ -91,6 +94,10 @@ actions!(
         CancelBroadcast,
         MacroManager,
         CloseMacroManager,
+        SnippetManager,
+        CloseSnippetManager,
+        CommandHistory,
+        CloseCommandHistory,
         // 终端剪贴板：Ctrl+C 有选区就复制、没选区把 ^C 送给 shell；
         // Ctrl+Shift+C 只复制（不误发中断），Ctrl+V 粘贴。
         TerminalCopy,
@@ -192,6 +199,12 @@ fn main() {
             // 键宏管理器：与「会话」菜单里的「键宏…」同一条路径；Esc 只在该弹窗内关闭。
             KeyBinding::new("ctrl-shift-m", MacroManager, None),
             KeyBinding::new("escape", CloseMacroManager, Some("MacroManager")),
+            // 命令片段管理器：Esc 只关片段弹窗，不影响终端里的 Esc。
+            KeyBinding::new("ctrl-shift-s", SnippetManager, None),
+            KeyBinding::new("escape", CloseSnippetManager, Some("SnippetManager")),
+            // 命令历史：Esc 只关历史弹窗。
+            KeyBinding::new("ctrl-shift-h", CommandHistory, None),
+            KeyBinding::new("escape", CloseCommandHistory, Some("CommandHistory")),
             // Tab 在 rgpui 的 Root 上下文里被绑成焦点切换，而按键绑定分发早于 on_key_down，
             // 终端元素因此永远收不到 \x09（shell 补全失效）。在 Terminal 上下文用 NoAction
             // 抢占：它比 Root 更深，分发解析到它就停止，按键原样落到 on_key_down 转发给 PTY。

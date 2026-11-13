@@ -829,6 +829,15 @@ impl RuTermApp {
     }
 
 
+    /// 切换侧边栏排序方式并持久化。
+    pub(super) fn set_host_sort(&mut self, sort: SidebarSort, cx: &mut Context<Self>) {
+        if self.sidebar.set_sort(sort) {
+            self.persist_sidebar(cx);
+        }
+        cx.notify();
+    }
+
+
     /// 切换指定主机的收藏状态并持久化。
     pub(super) fn toggle_favorite(&mut self, index: usize, cx: &mut Context<Self>) {
         if let Some(host) = self.hosts.get_mut(index) {
@@ -862,6 +871,16 @@ impl RuTermApp {
             ProtocolKind::Telnet => format!("Telnet · {}", host.addr()),
             ProtocolKind::Rdp => format!("RDP · {}", host.addr()),
             ProtocolKind::Vnc => format!("VNC · {}", host.addr()),
+        }
+    }
+
+
+    /// 列表里显示的主机名：没填展示名时退回 user@host:port。
+    pub(super) fn host_title(host: &HostConfig) -> String {
+        if host.name.is_empty() {
+            host.addr()
+        } else {
+            host.name.clone()
         }
     }
 
@@ -901,6 +920,7 @@ impl RuTermApp {
             .collect();
         let toggle_name = SharedString::from(name.to_string());
         let menu_name = toggle_name.clone();
+        let sort = self.sidebar.sort;
         Self::row_base(
             SharedString::from(format!("group-row-{name}")),
             pal,
@@ -949,6 +969,7 @@ impl RuTermApp {
                 MenuTarget::Group(menu_name.clone()),
                 groups.clone(),
                 None,
+                sort,
                 entity.clone(),
                 menu,
             )
@@ -972,11 +993,8 @@ impl RuTermApp {
             .map(|name| SharedString::from(name.to_string()));
         let fav_glyph: &'static str = if host.favorite { "★" } else { "☆" };
         // 没填展示名时标题直接用地址，避免整行只剩一行灰字。
-        let title = if host.name.is_empty() {
-            host.addr()
-        } else {
-            host.name.clone()
-        };
+        let title = Self::host_title(host);
+        let sort = self.sidebar.sort;
         Self::row_base(
             SharedString::from(format!("host-row-{index}")),
             pal,
@@ -1029,6 +1047,7 @@ impl RuTermApp {
                 MenuTarget::Host(index),
                 groups.clone(),
                 current.clone(),
+                sort,
                 entity.clone(),
                 menu,
             )
@@ -1043,7 +1062,7 @@ impl RuTermApp {
         let pal = self.palette(cx);
         let query = self.search.read(cx).value().trim().to_lowercase();
         // 按展示名 / user@host:port 子串过滤；保留真实下标供点击/删除定位。
-        let mut matched: Vec<usize> = self
+        let matched: Vec<usize> = self
             .hosts
             .iter()
             .enumerate()
@@ -1054,10 +1073,27 @@ impl RuTermApp {
             })
             .map(|(index, _)| index)
             .collect();
-        // 收藏主机置顶；同桶内按手动排序，未登记的新主机稳定留在后面。
-        matched.sort_by_key(|&index| {
-            let host = &self.hosts[index];
-            (!host.favorite, self.sidebar.rank_of(host.id))
+        // 收藏主机置顶；同桶内按侧边栏当前选择的排序方式（手动 / 名称 / 最近连接）。
+        let mut rows: Vec<(usize, String)> = matched
+            .into_iter()
+            .map(|index| (index, Self::host_title(&self.hosts[index])))
+            .collect();
+        rows.sort_by(|(a_index, a_title), (b_index, b_title)| {
+            let a = &self.hosts[*a_index];
+            let b = &self.hosts[*b_index];
+            self.sidebar.compare_hosts(
+                SortableHost {
+                    id: a.id,
+                    title: a_title,
+                    favorite: a.favorite,
+                },
+                SortableHost {
+                    id: b.id,
+                    title: b_title,
+                    favorite: b.favorite,
+                },
+                &self.recent_hosts,
+            )
         });
         // 分桶：先按偏好里的组顺序建桶，末尾恒有「未分组」。
         let mut buckets: Vec<(String, Vec<usize>)> = self
@@ -1066,7 +1102,7 @@ impl RuTermApp {
             .map(|name| (name.to_string(), Vec::new()))
             .chain(std::iter::once((UNGROUPED.to_string(), Vec::new())))
             .collect();
-        for index in matched {
+        for (index, _) in rows {
             let group = self
                 .sidebar
                 .group_of(self.hosts[index].id)
@@ -1093,6 +1129,7 @@ impl RuTermApp {
                 .names()
                 .map(|n| SharedString::from(n.to_string()))
                 .collect();
+            let sort = self.sidebar.sort;
             div()
                 .id("sidebar-blank")
                 .w_full()
@@ -1103,6 +1140,7 @@ impl RuTermApp {
                         MenuTarget::Blank,
                         groups.clone(),
                         None,
+                        sort,
                         entity.clone(),
                         menu,
                     )

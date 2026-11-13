@@ -795,7 +795,19 @@ impl LocalShellPrefs {
     }
 }
 
-/// 侧边栏分组（文件夹）偏好：组顺序 + 折叠态 + 主机归属。
+/// 主机列表的组内排序方式。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SidebarSort {
+    /// 手动排序：右键「上移一位 / 下移一位 / 移到组内最前」。
+    #[default]
+    Manual,
+    /// 按展示名（大小写不敏感）。
+    Name,
+    /// 按最近连接：最近连过的在最前，从未连接的回落到手动序。
+    Recent,
+}
+
+/// 侧边栏分组（文件夹）偏好：组顺序 + 折叠态 + 主机归属 + 排序方式。
 ///
 /// 整体序列化成一个 JSON 串，存进加密库 `settings` 表的 `sidebar` 键（降级时进
 /// settings.json）。刻意不给 `hosts` 表加列：加列要在加密库上做真实 ALTER，
@@ -820,6 +832,17 @@ pub struct SidebarPrefs {
     /// 主机 id 的手动排序（跨组一条序列，渲染时只取组内相对次序）。
     #[serde(default)]
     pub(super) order: Vec<i64>,
+    /// 组内排序方式；收藏桶恒在最前，与排序方式无关。
+    #[serde(default)]
+    pub(super) sort: SidebarSort,
+}
+
+/// 参与排序的一台主机：只带排序需要的字段，便于脱离 UI 单测。
+#[derive(Clone, Copy)]
+pub(super) struct SortableHost<'a> {
+    pub(super) id: i64,
+    pub(super) title: &'a str,
+    pub(super) favorite: bool,
 }
 
 /// 一个分组（文件夹）条目。
@@ -976,6 +999,40 @@ impl SidebarPrefs {
         }
     }
 
+    /// 切换排序方式；返回是否真的发生了变化（用于决定要不要落盘）。
+    pub(super) fn set_sort(&mut self, sort: SidebarSort) -> bool {
+        if self.sort == sort {
+            return false;
+        }
+        self.sort = sort;
+        true
+    }
+
+    /// 两台主机的展示顺序：收藏恒在前，同桶内按当前排序方式。
+    ///
+    /// 手动序里未登记的主机排到最后；`recent` 是最近连接 id 列表（越靠前越新），
+    /// 未连过的按手动序垫底，保证列表不会因为连过一台就整体跳动。
+    pub(super) fn compare_hosts(
+        &self,
+        a: SortableHost<'_>,
+        b: SortableHost<'_>,
+        recent: &[i64],
+    ) -> std::cmp::Ordering {
+        b.favorite
+            .cmp(&a.favorite)
+            .then_with(|| match self.sort {
+                SidebarSort::Manual => self.rank_of(a.id).cmp(&self.rank_of(b.id)),
+                SidebarSort::Name => a
+                    .title
+                    .to_lowercase()
+                    .cmp(&b.title.to_lowercase())
+                    .then_with(|| self.rank_of(a.id).cmp(&self.rank_of(b.id))),
+                SidebarSort::Recent => recent_rank(a.id, recent)
+                    .cmp(&recent_rank(b.id, recent))
+                    .then_with(|| self.rank_of(a.id).cmp(&self.rank_of(b.id))),
+            })
+    }
+
     /// 序列化为入库/入文件的字符串。
     pub(super) fn to_json(&self) -> String {
         serde_json::to_string(self).unwrap_or_default()
@@ -990,15 +1047,23 @@ impl SidebarPrefs {
     }
 }
 
+/// 主机在最近连接列表里的位次；没连过的排在最后。
+fn recent_rank(id: i64, recent: &[i64]) -> usize {
+    recent
+        .iter()
+        .position(|&item| item == id)
+        .unwrap_or(usize::MAX)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         AUTO_RECONNECT_MAX, CONNECT_TIMEOUT_DEFAULT, CONNECT_TIMEOUT_MAX, CONNECT_TIMEOUT_MIN,
         CUSTOM_ANSI_BASE, CUSTOM_BRIGHT_BASE, CUSTOM_DEFAULT_ANSI, CUSTOM_DEFAULT_BRIGHT,
         FONT_SIZE_MAX, FONT_SIZE_MIN, ForwardPrefs, JumpPrefs, LINE_HEIGHT_MAX, LINE_HEIGHT_MIN,
-        LocalShellPrefs, ProtocolPrefs, SavedForward, SessionPrefs, SidebarPrefs, StatusBarPrefs,
-        TERMINAL_THEME_DEFAULT, TerminalColors, TerminalPrefs, auto_reconnect_delay, hex_to_hsla,
-        normalize_hex,
+        LocalShellPrefs, ProtocolPrefs, SavedForward, SessionPrefs, SidebarPrefs, SidebarSort,
+        SortableHost, StatusBarPrefs, TERMINAL_THEME_DEFAULT, TerminalColors, TerminalPrefs,
+        auto_reconnect_delay, hex_to_hsla, normalize_hex,
     };
     use crate::remote::Metric;
     use crate::session::ForwardKind;
@@ -1296,6 +1361,55 @@ mod tests {
         // 不存在的组名不应改动任何状态。
         prefs.expand("没有这个组");
         assert!(!prefs.collapsed("生产"));
+    }
+
+    #[test]
+    fn sidebar_sort_modes_keep_favorites_first() {
+        let mut prefs = SidebarPrefs::default();
+        prefs.sync_order(&[7, 5, 9, 3]);
+
+        let mut hosts = vec![
+            SortableHost {
+                id: 9,
+                title: "Zulu",
+                favorite: false,
+            },
+            SortableHost {
+                id: 5,
+                title: "alpha",
+                favorite: false,
+            },
+            SortableHost {
+                id: 7,
+                title: "Bravo",
+                favorite: true,
+            },
+            SortableHost {
+                id: 3,
+                title: "Delta",
+                favorite: false,
+            },
+        ];
+        let order = |prefs: &SidebarPrefs, hosts: &mut Vec<SortableHost<'static>>, recent: &[i64]| {
+            hosts.sort_by(|a, b| prefs.compare_hosts(*a, *b, recent));
+            hosts.iter().map(|host| host.id).collect::<Vec<_>>()
+        };
+
+        // 手动：收藏在前，其余按 order。
+        assert_eq!(order(&prefs, &mut hosts, &[]), vec![7, 5, 9, 3]);
+
+        // 名称：大小写不敏感；收藏仍被拉到最前。
+        assert!(prefs.set_sort(SidebarSort::Name));
+        assert_eq!(order(&prefs, &mut hosts, &[]), vec![7, 5, 3, 9]);
+
+        // 最近：连过的按最近排序，未连过的回落到手动序垫底。
+        assert!(prefs.set_sort(SidebarSort::Recent));
+        assert_eq!(order(&prefs, &mut hosts, &[9]), vec![7, 9, 5, 3]);
+
+        // 排序方式随偏好一起落盘；没有该字段的旧 JSON 读回手动排序。
+        assert_eq!(SidebarPrefs::from_json(&prefs.to_json()), prefs);
+        let old = SidebarPrefs::from_json(r#"{"groups":[]}"#);
+        assert_eq!(old.sort, SidebarSort::Manual);
     }
 
     #[test]

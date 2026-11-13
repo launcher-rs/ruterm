@@ -70,6 +70,7 @@ impl RuTermApp {
         target: MenuTarget,
         groups: Vec<SharedString>,
         current_group: Option<SharedString>,
+        sort: SidebarSort,
         entity: Entity<RuTermApp>,
         menu: PopupMenu,
     ) -> PopupMenu {
@@ -100,30 +101,40 @@ impl RuTermApp {
                     },
                 ))
                 .separator()
-                .item(Self::menu_item(
-                    entity.clone(),
-                    "上移一位",
-                    None,
-                    false,
-                    false,
-                    move |this, _, cx| this.reorder_host(index, ReorderAction::Up, cx),
-                ))
-                .item(Self::menu_item(
-                    entity.clone(),
-                    "下移一位",
-                    None,
-                    false,
-                    false,
-                    move |this, _, cx| this.reorder_host(index, ReorderAction::Down, cx),
-                ))
-                .item(Self::menu_item(
-                    entity.clone(),
-                    "移到组内最前",
-                    None,
-                    false,
-                    false,
-                    move |this, _, cx| this.reorder_host(index, ReorderAction::Top, cx),
-                ))
+                // 非手动排序下这几项不生效，禁用比隐藏更容易让人看懂现在为什么不动。
+                .item(
+                    Self::menu_item(
+                        entity.clone(),
+                        "上移一位",
+                        None,
+                        false,
+                        false,
+                        move |this, _, cx| this.reorder_host(index, ReorderAction::Up, cx),
+                    )
+                    .disabled(sort != SidebarSort::Manual),
+                )
+                .item(
+                    Self::menu_item(
+                        entity.clone(),
+                        "下移一位",
+                        None,
+                        false,
+                        false,
+                        move |this, _, cx| this.reorder_host(index, ReorderAction::Down, cx),
+                    )
+                    .disabled(sort != SidebarSort::Manual),
+                )
+                .item(
+                    Self::menu_item(
+                        entity.clone(),
+                        "移到组内最前",
+                        None,
+                        false,
+                        false,
+                        move |this, _, cx| this.reorder_host(index, ReorderAction::Top, cx),
+                    )
+                    .disabled(sort != SidebarSort::Manual),
+                )
                 .separator()
                 .item(Self::menu_item(
                     entity.clone(),
@@ -272,16 +283,45 @@ impl RuTermApp {
             }
             _ => menu,
         };
-        // 空白处额外给一个批量入口（主机行菜单已经够长，不重复放）。
+        // 空白处额外给一个批量入口（主机行菜单已经够长，不重复放），
+        // 排序方式是全局设置，也只在这里切换，避免每个分组菜单都挂一份。
         let menu = match &target {
-            MenuTarget::Blank => menu.separator().item(Self::menu_item(
-                entity.clone(),
-                "导入 ~/.ssh/config…",
-                None,
-                false,
-                false,
-                |this, _, cx| this.import_ssh_config(cx),
-            )),
+            MenuTarget::Blank => menu
+                .separator()
+                .item(Self::menu_item(
+                    entity.clone(),
+                    "导入 ~/.ssh/config…",
+                    None,
+                    false,
+                    false,
+                    |this, _, cx| this.import_ssh_config(cx),
+                ))
+                .separator()
+                .label("排序方式")
+                .item(Self::menu_item(
+                    entity.clone(),
+                    "手动排序",
+                    None,
+                    false,
+                    sort == SidebarSort::Manual,
+                    |this, _, cx| this.set_host_sort(SidebarSort::Manual, cx),
+                ))
+                .item(Self::menu_item(
+                    entity.clone(),
+                    "按名称排序",
+                    None,
+                    false,
+                    sort == SidebarSort::Name,
+                    |this, _, cx| this.set_host_sort(SidebarSort::Name, cx),
+                ))
+                .item(Self::menu_item(
+                    entity.clone(),
+                    "按最近连接排序",
+                    None,
+                    false,
+                    sort == SidebarSort::Recent,
+                    |this, _, cx| this.set_host_sort(SidebarSort::Recent, cx),
+                )),
             _ => menu,
         };
         match target {

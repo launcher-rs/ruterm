@@ -167,6 +167,12 @@ pub struct Settings {
     /// 键宏（名称 / 触发键 / 步骤序列，序列化成 JSON 数组）。
     #[serde(default)]
     pub macros: String,
+    /// 命令片段（名称 / 命令 / 备注，序列化成 JSON 数组）。
+    #[serde(default)]
+    pub snippets: String,
+    /// 命令历史（命令行数组，新的在前）。
+    #[serde(default)]
+    pub history: String,
     /// 本机文件页偏好（隐藏文件开关 + 上次停留的目录，序列化成 JSON 字符串）。
     #[serde(default)]
     pub local_files: String,
@@ -363,6 +369,18 @@ impl SessionStore {
     pub fn save_macros(&self, json: &str) {
         let json = json.to_string();
         self.update_settings(|settings| settings.macros = json);
+    }
+
+    /// 降级模式（无加密库）下保存命令片段。
+    pub fn save_snippets(&self, json: &str) {
+        let json = json.to_string();
+        self.update_settings(|settings| settings.snippets = json);
+    }
+
+    /// 降级模式（无加密库）下保存命令历史。
+    pub fn save_history(&self, json: &str) {
+        let json = json.to_string();
+        self.update_settings(|settings| settings.history = json);
     }
 
     /// 读取界面语言启动镜像；缺失或值不认识时按中文（界面原文语言）。

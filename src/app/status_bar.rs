@@ -255,6 +255,9 @@ impl RuTermApp {
                     .timer(Duration::from_millis(250))
                     .await;
                 let Ok(()) = this.update(cx, |this, cx| {
+                    // 命令历史与读数同一拍刷新：block 只在终端 sync 后才出现，
+                    // 这里扫到新 block 才重绘，没变化时开销只是几次空遍历。
+                    this.sync_command_history(cx);
                     let active = this.active_tab;
                     let next = active
                         .and_then(|id| this.tabs.iter().find(|tab| tab.id == id))

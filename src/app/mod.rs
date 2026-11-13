@@ -5,6 +5,8 @@ mod appearance;
 mod connect;
 mod files;
 mod forwards;
+mod history_ops;
+mod history_ui;
 mod host_form;
 mod hosts;
 mod local_files;
@@ -14,6 +16,7 @@ mod prefs;
 mod remote_desktop;
 mod settings;
 mod sidebar;
+mod snippets_ui;
 mod status_bar;
 mod tabs;
 mod terminal_ops;
@@ -24,6 +27,7 @@ mod widgets;
 use connect::*;
 use files::*;
 use forwards::*;
+use history_ui::*;
 use host_form::*;
 use hosts::*;
 use local_files::*;
@@ -33,6 +37,7 @@ use prefs::*;
 use remote_desktop::*;
 use settings::*;
 use sidebar::*;
+use snippets_ui::*;
 use status_bar::*;
 use tabs::*;
 use terminal_ops::*;
@@ -59,10 +64,12 @@ use rgpui_term::{
 };
 
 use crate::config::SshTarget;
+use crate::history::CommandHistory;
 use crate::local_shell::ShellProfile;
 use crate::macros::KeyMacro;
 use crate::paths::StorageMode;
 use crate::sessions::{AuthMethod, HostConfig, ProtocolKind, SessionStore};
+use crate::snippets::CommandSnippet;
 use crate::vault::Vault;
 use crate::tr;
 
@@ -203,6 +210,16 @@ pub(crate) struct RuTermApp {
     macros: Vec<KeyMacro>,
     /// 键宏管理器弹窗（列表 ⇄ 编辑表单）。
     macro_manager: Option<MacroManager>,
+    /// 命令片段列表（名称 + 单行命令 + 备注），同样双层持久化。
+    snippets: Vec<CommandSnippet>,
+    /// 命令片段管理器弹窗（列表 ⇄ 编辑表单）。
+    snippet_manager: Option<SnippetManager>,
+    /// 命令历史（新 → 旧），来源是终端 block 追踪。
+    history: CommandHistory,
+    /// 每个标签已收进历史的最后一个 block id，避免重复收录。
+    history_seen: HashMap<usize, usize>,
+    /// 命令历史弹窗。
+    history_manager: Option<HistoryManager>,
     /// 侧边栏 ↔ 主区 的分隔面板状态（拖拽调整宽度 + 折叠/展开）。
     split_state: Entity<SplitPaneState>,
     /// 主区分屏（两个标签并排）；None＝单屏显示活动标签。
@@ -297,6 +314,8 @@ impl RuTermApp {
         let jumps = JumpPrefs::from_json(&settings.jumps);
         let protocols = ProtocolPrefs::from_json(&settings.protocols);
         let macros = crate::macros::from_json(&settings.macros);
+        let snippets = crate::snippets::from_json(&settings.snippets);
+        let history = CommandHistory::from_json(&settings.history);
         let local_files = LocalFilesPrefs::from_json(&settings.local_files);
         // 终端配色预设管理器：全局一份，`TerminalView::set_theme` 与自建样式都从这里取。
         if !cx.has_global::<ThemeManager>() {
@@ -423,6 +442,11 @@ impl RuTermApp {
             forward_prefs,
             macros,
             macro_manager: None,
+            snippets,
+            snippet_manager: None,
+            history,
+            history_seen: HashMap::new(),
+            history_manager: None,
             split_state,
             view_split: None,
             focus_handle: cx.focus_handle(),
@@ -853,6 +877,28 @@ impl RuTermApp {
                     }
                 });
             }
+            // 命令片段同样以库内为准。
+            if let Ok(Some(json)) = vault.setting("snippets").await {
+                let snippets = crate::snippets::from_json(&json);
+                let _ = this.update(cx, |this, cx| {
+                    if this.auth_gate.generation() != generation { return; }
+                    if this.snippets != snippets {
+                        this.snippets = snippets;
+                        cx.notify();
+                    }
+                });
+            }
+            // 命令历史同样以库内为准。
+            if let Ok(Some(json)) = vault.setting("history").await {
+                let history = CommandHistory::from_json(&json);
+                let _ = this.update(cx, |this, cx| {
+                    if this.auth_gate.generation() != generation { return; }
+                    if this.history != history {
+                        this.history = history;
+                        cx.notify();
+                    }
+                });
+            }
             drop(vault);
             let Some(entity) = this.upgrade() else { return; };
             let _ = cx.with_window(entity.entity_id(), move |window, cx| {
@@ -886,6 +932,8 @@ impl RuTermApp {
             || self.shell_prompt.is_some()
             || self.pending.is_some()
             || self.macro_manager.is_some()
+            || self.snippet_manager.is_some()
+            || self.history_manager.is_some()
             || self.show_discovery
     }
 
@@ -902,6 +950,12 @@ impl RuTermApp {
         }
         if self.macro_manager.is_some() {
             return self.render_macro_manager(cx);
+        }
+        if self.snippet_manager.is_some() {
+            return self.render_snippet_manager(cx);
+        }
+        if self.history_manager.is_some() {
+            return self.render_history_manager(cx);
         }
         if self.file_prompt.is_some() {
             return self.render_file_prompt(cx);
@@ -1265,6 +1319,10 @@ impl Render for RuTermApp {
             .on_action(cx.listener(Self::cancel_broadcast))
             .on_action(cx.listener(Self::open_macro_manager))
             .on_action(cx.listener(Self::close_macro_manager_action))
+            .on_action(cx.listener(Self::open_snippet_manager))
+            .on_action(cx.listener(Self::close_snippet_manager_action))
+            .on_action(cx.listener(Self::open_history_manager))
+            .on_action(cx.listener(Self::close_history_manager_action))
             .on_action(cx.listener(Self::terminal_copy_action))
             .on_action(cx.listener(Self::terminal_copy_text_action))
             .on_action(cx.listener(Self::terminal_paste_action))

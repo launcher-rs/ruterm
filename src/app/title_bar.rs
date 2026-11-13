@@ -10,6 +10,8 @@ use rgpui::{
 };
 
 use crate::MacroManager as OpenMacroManager;
+use crate::CommandHistory as OpenCommandHistory;
+use crate::SnippetManager as OpenSnippetManager;
 use crate::{ToggleSidebar, ToggleFilePanel, ToggleLocalPanel, ToggleTheme, LockVault, NewHost, NewLocalTerminal, NewRemoteDesktop, NextTab, PrevTab, CloseTab, OpenSettings, OpenForward, SplitRight, SplitDown, CloseSplit, FindInTerminal, ToggleSyncInput, BroadcastCommand};
 use crate::tr;
 
@@ -251,6 +253,8 @@ impl RuTermApp {
                         .action(Box::new(BroadcastCommand)),
                 )
                 .item(PopupMenuItem::new(tr!(cx, "键宏…")).action(Box::new(OpenMacroManager)))
+                .item(PopupMenuItem::new(tr!(cx, "命令片段…")).action(Box::new(OpenSnippetManager)))
+                .item(PopupMenuItem::new(tr!(cx, "命令历史…")).action(Box::new(OpenCommandHistory)))
                 .item(PopupMenuItem::new(tr!(cx, "端口转发…")).action(Box::new(OpenForward)))
         };
 
