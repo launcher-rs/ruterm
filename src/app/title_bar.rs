@@ -1,22 +1,24 @@
 //! //! 自绘标题栏：窗口控制按钮、品牌段、多级菜单（会话 / 凭据 / 外观 / 帮助）。
 
-
 use rgpui::prelude::*;
 use rgpui::title_bar::TITLE_BAR_HEIGHT;
 use rgpui::{
-    AnyElement, Button, ButtonVariants, Context, DropdownMenu, FontWeight, Hsla, Icon, IconName, InteractiveElement, IntoElement, ParentElement, PopupMenu, PopupMenuItem, SharedString,
-    StatefulInteractiveElement, Styled, Window,
-    WindowControlArea, div, h_flex, px,
+    AnyElement, Button, ButtonVariants, Context, DropdownMenu, FontWeight, Hsla, Icon, IconName,
+    InteractiveElement, IntoElement, ParentElement, PopupMenu, PopupMenuItem, SharedString,
+    StatefulInteractiveElement, Styled, Window, WindowControlArea, div, h_flex, px,
 };
 
-use crate::MacroManager as OpenMacroManager;
 use crate::CommandHistory as OpenCommandHistory;
+use crate::MacroManager as OpenMacroManager;
 use crate::SnippetManager as OpenSnippetManager;
-use crate::{ToggleSidebar, ToggleFilePanel, ToggleLocalPanel, ToggleTheme, LockVault, NewHost, NewLocalTerminal, NewRemoteDesktop, NextTab, PrevTab, CloseTab, OpenSettings, OpenForward, SplitRight, SplitDown, CloseSplit, FindInTerminal, ToggleSyncInput, BroadcastCommand};
 use crate::tr;
+use crate::{
+    BroadcastCommand, CloseSplit, CloseTab, FindInTerminal, LockVault, NewHost, NewLocalTerminal,
+    NewRemoteDesktop, NextTab, OpenForward, OpenSettings, PrevTab, SplitDown, SplitRight,
+    ToggleFilePanel, ToggleLocalPanel, ToggleSidebar, ToggleSyncInput, ToggleTheme,
+};
 
 use super::*;
-
 
 impl RuTermApp {
     /// 标题栏右侧的窗口控制按钮：登记为 `WindowControlArea`，交给系统
@@ -55,7 +57,11 @@ impl RuTermApp {
     /// 命中区，而 Windows 的 WM_NCHITTEST 只取**第一个**命中的控制区，父级 Drag 先入表，
     /// 栏内按钮一律被判定为 caption，点击被系统吃掉（hover 仍在、click 永不触发）。
     /// 改成把拖拽区拆成"品牌段"与"中间空档"两个兄弟节点，交互控件落在 Drag 区之外。
-    pub(super) fn render_title_bar(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_title_bar(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let pal = self.palette(cx);
         let bar_bg = cx.theme().tokens.title_bar;
         let bar_border = cx.theme().title_bar_border;
@@ -92,6 +98,8 @@ impl RuTermApp {
         let hosts_open = sidebar_open && self.sidebar_page == SidebarPage::Hosts;
         let file_panel_open = sidebar_open && self.sidebar_page == SidebarPage::Files;
         let local_panel_open = sidebar_open && self.sidebar_page == SidebarPage::Local;
+        let history_panel_open = self.history_panel_open;
+        let snippets_panel_open = self.snippets_panel_open;
         // 菜单打开时把最近连接的 id 解析成当前列表里的条目（主机可能已删除或重排）。
         let recent_items: Vec<(usize, SharedString)> = self
             .recent_hosts
@@ -113,83 +121,80 @@ impl RuTermApp {
         let menu_entity = entity.clone();
         // 「会话」只留主机与窗口收场：面板开关 / 分屏 / 标签进「视图」，
         // 终端里的操作（查找、同步、广播、键宏、转发）进「终端」。
-        let session_menu =
-            move |menu: PopupMenu, window: &mut Window, cx: &mut Context<PopupMenu>| {
-                let importing = menu_entity.clone();
-                let importing_json = menu_entity.clone();
-                let exporting_json = menu_entity.clone();
-                let mut menu = menu
-                    .item(PopupMenuItem::new(tr!(cx, "新建主机…")).action(Box::new(NewHost)))
-                    .item(PopupMenuItem::new(tr!(cx, "导入 ~/.ssh/config…")).on_click(
-                        move |_, _, cx| {
-                            importing.update(cx, |this, cx| this.import_ssh_config(cx));
-                        },
-                    ))
-                    .item(
-                        PopupMenuItem::new(tr!(cx, "导入主机配置 JSON…"))
-                            .disabled(locked)
-                            .on_click(move |_, _, cx| {
-                                importing_json.update(cx, |this, cx| this.import_host_configs(cx));
-                            }),
-                    )
-                    .item(
-                        PopupMenuItem::new(tr!(cx, "导出主机配置 JSON…"))
-                            .disabled(locked)
-                            .on_click(move |_, _, cx| {
-                                exporting_json.update(cx, |this, cx| this.export_host_configs(cx));
-                            }),
-                    );
-                // 最近连接收进二级菜单：主菜单不再被历史条目撑长。
-                if !recent_items.is_empty() {
-                    let sub_entity = menu_entity.clone();
-                    let sub_items = recent_items.clone();
-                    menu = menu.submenu(
-                        tr!(cx, "最近连接"),
-                        window,
-                        cx,
-                        move |menu, _, _| {
-                            let entity = sub_entity.clone();
-                            // 构建器会被反复调用（菜单重建），所以每次都要拿一份副本。
-                            sub_items.clone().into_iter().fold(menu, |menu, (index, label)| {
-                                let entity = entity.clone();
-                                menu.item(PopupMenuItem::new(label).on_click(
-                                    move |_, window, cx| {
-                                        entity.update(cx, |this, cx| {
-                                            this.click_host(index, window, cx);
-                                        });
-                                    },
-                                ))
-                            })
-                        },
-                    );
-                }
-                let menu = menu
-                    .item(PopupMenuItem::new(tr!(cx, "本地终端…")).action(Box::new(NewLocalTerminal)))
-                    .item(PopupMenuItem::new(tr!(cx, "远程桌面…")).action(Box::new(NewRemoteDesktop)))
-                    .item(PopupMenuItem::new(tr!(cx, "局域网发现…")).on_click({
-                        let entity = menu_entity.clone();
-                        move |_, _, cx| {
-                            entity.update(cx, |this, cx| this.open_discovery(cx));
-                        }
-                    }))
-                    .separator()
-                    .item(PopupMenuItem::new(tr!(cx, "设置…")).action(Box::new(OpenSettings)));
-                // 托盘关闭时不给「隐藏到托盘」：窗口藏起来就再也点不回来。
-                let menu = if crate::tray_enabled() {
-                    menu.item(
-                        PopupMenuItem::new(tr!(cx, "隐藏到托盘")).on_click(move |_, window, _| {
-                            window.hide_window();
+        let session_menu = move |menu: PopupMenu,
+                                 window: &mut Window,
+                                 cx: &mut Context<PopupMenu>| {
+            let importing = menu_entity.clone();
+            let importing_json = menu_entity.clone();
+            let exporting_json = menu_entity.clone();
+            let mut menu = menu
+                .item(PopupMenuItem::new(tr!(cx, "新建主机…")).action(Box::new(NewHost)))
+                .item(PopupMenuItem::new(tr!(cx, "导入 ~/.ssh/config…")).on_click(
+                    move |_, _, cx| {
+                        importing.update(cx, |this, cx| this.import_ssh_config(cx));
+                    },
+                ))
+                .item(
+                    PopupMenuItem::new(tr!(cx, "导入主机配置 JSON…"))
+                        .disabled(locked)
+                        .on_click(move |_, _, cx| {
+                            importing_json.update(cx, |this, cx| this.import_host_configs(cx));
                         }),
-                    )
-                } else {
-                    menu
-                };
-                menu.item(
-                    PopupMenuItem::new(tr!(cx, "退出 RuTerm"))
-                        .danger(true)
-                        .on_click(move |_, _, cx| cx.quit()),
                 )
+                .item(
+                    PopupMenuItem::new(tr!(cx, "导出主机配置 JSON…"))
+                        .disabled(locked)
+                        .on_click(move |_, _, cx| {
+                            exporting_json.update(cx, |this, cx| this.export_host_configs(cx));
+                        }),
+                );
+            // 最近连接收进二级菜单：主菜单不再被历史条目撑长。
+            if !recent_items.is_empty() {
+                let sub_entity = menu_entity.clone();
+                let sub_items = recent_items.clone();
+                menu = menu.submenu(tr!(cx, "最近连接"), window, cx, move |menu, _, _| {
+                    let entity = sub_entity.clone();
+                    // 构建器会被反复调用（菜单重建），所以每次都要拿一份副本。
+                    sub_items
+                        .clone()
+                        .into_iter()
+                        .fold(menu, |menu, (index, label)| {
+                            let entity = entity.clone();
+                            menu.item(PopupMenuItem::new(label).on_click(move |_, window, cx| {
+                                entity.update(cx, |this, cx| {
+                                    this.click_host(index, window, cx);
+                                });
+                            }))
+                        })
+                });
+            }
+            let menu = menu
+                .item(PopupMenuItem::new(tr!(cx, "本地终端…")).action(Box::new(NewLocalTerminal)))
+                .item(PopupMenuItem::new(tr!(cx, "远程桌面…")).action(Box::new(NewRemoteDesktop)))
+                .item(PopupMenuItem::new(tr!(cx, "局域网发现…")).on_click({
+                    let entity = menu_entity.clone();
+                    move |_, _, cx| {
+                        entity.update(cx, |this, cx| this.open_discovery(cx));
+                    }
+                }))
+                .separator()
+                .item(PopupMenuItem::new(tr!(cx, "设置…")).action(Box::new(OpenSettings)));
+            // 托盘关闭时不给「隐藏到托盘」：窗口藏起来就再也点不回来。
+            let menu = if crate::tray_enabled() {
+                menu.item(PopupMenuItem::new(tr!(cx, "隐藏到托盘")).on_click(
+                    move |_, window, _| {
+                        window.hide_window();
+                    },
+                ))
+            } else {
+                menu
             };
+            menu.item(
+                PopupMenuItem::new(tr!(cx, "退出 RuTerm"))
+                    .danger(true)
+                    .on_click(move |_, _, cx| cx.quit()),
+            )
+        };
 
         let view_entity = entity.clone();
         let view_menu = move |menu: PopupMenu, _: &mut Window, cx: &mut Context<PopupMenu>| {
@@ -215,6 +220,30 @@ impl RuTermApp {
                     PopupMenuItem::new(tr!(cx, "本机文件页"))
                         .checked(local_panel_open)
                         .action(Box::new(ToggleLocalPanel)),
+                )
+                .item(
+                    PopupMenuItem::new(tr!(cx, "命令片段"))
+                        .checked(snippets_panel_open)
+                        .on_click({
+                            let entity = view_entity.clone();
+                            move |_, _, cx| {
+                                entity.update(cx, |this, cx| {
+                                    this.toggle_snippets_panel(cx);
+                                });
+                            }
+                        }),
+                )
+                .item(
+                    PopupMenuItem::new(tr!(cx, "命令历史"))
+                        .checked(history_panel_open)
+                        .on_click({
+                            let entity = view_entity.clone();
+                            move |_, _, cx| {
+                                entity.update(cx, |this, cx| {
+                                    this.toggle_history_panel(cx);
+                                });
+                            }
+                        }),
                 )
                 // 只折叠面板，最外缘的图标栏始终留着（RustRover 的工具窗口栏）。
                 .item(
@@ -422,8 +451,7 @@ impl RuTermApp {
                     .child(menu_button("menu-session", tr!(cx, "会话")).dropdown_menu(session_menu))
                     .child(menu_button("menu-view", tr!(cx, "视图")).dropdown_menu(view_menu))
                     .child(
-                        menu_button("menu-terminal", tr!(cx, "终端"))
-                            .dropdown_menu(terminal_menu),
+                        menu_button("menu-terminal", tr!(cx, "终端")).dropdown_menu(terminal_menu),
                     )
                     .child(menu_button("menu-vault", tr!(cx, "凭据")).dropdown_menu(vault_menu))
                     .child(
@@ -499,6 +527,4 @@ impl RuTermApp {
             ))
             .into_any_element()
     }
-
-
 }

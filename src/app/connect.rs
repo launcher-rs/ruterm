@@ -40,7 +40,9 @@ impl RuTermApp {
     }
 
     pub(super) fn require_ssh_ready(&mut self, cx: &mut Context<Self>) -> bool {
-        if self.ssh_ready() { return true; }
+        if self.ssh_ready() {
+            return true;
+        }
         self.status = "凭据库未就绪或已锁定；解锁后才能进行 SSH 认证".into();
         cx.notify();
         false
@@ -61,7 +63,9 @@ impl RuTermApp {
             self.connect_telnet(&host, window, cx);
             return;
         }
-        if !self.require_ssh_ready(cx) { return; }
+        if !self.require_ssh_ready(cx) {
+            return;
+        }
         match host.auth {
             AuthMethod::Agent => {
                 let target = match self.host_target(&host, None) {
@@ -89,7 +93,9 @@ impl RuTermApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.require_ssh_ready(cx) { return; }
+        if !self.require_ssh_ready(cx) {
+            return;
+        }
         let key = host.addr();
         if let Some(secret) = self.password_cache.get(&key).cloned() {
             self.connect_with_secret(host, secret, key, false, window, cx);
@@ -113,7 +119,10 @@ impl RuTermApp {
                 };
                 let _ = cx.with_window(entity_id, move |window, cx| {
                     entity.update(cx, move |this, cx| {
-                        if !this.auth_gate.accepts(generation) || !this.ssh_ready() || this.pending.is_some() {
+                        if !this.auth_gate.accepts(generation)
+                            || !this.ssh_ready()
+                            || this.pending.is_some()
+                        {
                             return;
                         }
                         if let Some(secret) = saved_jump
@@ -157,7 +166,9 @@ impl RuTermApp {
         host: &HostConfig,
         password: Option<String>,
     ) -> Result<SshTarget, String> {
-        if !self.ssh_ready() { return Err("凭据库未就绪，拒绝读取认证材料".into()); }
+        if !self.ssh_ready() {
+            return Err("凭据库未就绪，拒绝读取认证材料".into());
+        }
         let key_data = if host.auth == AuthMethod::IdentityFile && host.key_inline {
             Some(self.inline_keys.get(&host.id).cloned().ok_or_else(|| {
                 "内嵌私钥不可用（加密库未解锁或数据损坏），请编辑该主机重新导入".to_string()
@@ -283,7 +294,9 @@ impl RuTermApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if host.protocol == ProtocolKind::Ssh && !self.require_ssh_ready(cx) { return; }
+        if host.protocol == ProtocolKind::Ssh && !self.require_ssh_ready(cx) {
+            return;
+        }
         let placeholder = match kind {
             PromptKind::Password => "输入密码后点击连接",
             PromptKind::Passphrase => "输入私钥口令后点击连接",
@@ -513,55 +526,6 @@ impl RuTermApp {
         }
         // 新标签/重连后把焦点交回终端，键入住处即可继续敲命令。
         self.activate_tab(id, window, cx);
-        if let Ok(spec) = std::env::var("RUTERM_SMOKE_BACKSPACE") {
-            let deletes = spec.parse::<usize>().unwrap_or(300);
-            let payload = "curl https://openrouter.ai/api/v1/chat/completions \\\n  -H \"Content-Type: application/json\" \\\n  -H \"Authorization: Bearer sk-test-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\" \\\n  -d '{\n    \"model\": \"nvidia/nemotron-3-ultra-550b-a55b:free\",\n    \"messages\": [{\"role\": \"user\", \"content\": \"How many r`s are in the word `strawberry?`\"}],\n    \"reasoning\": {\"enabled\": true}\n}'".to_string();
-            let delay_ms = std::env::var("RUTERM_SMOKE_DELAY_MS")
-                .ok()
-                .and_then(|value| value.parse::<u64>().ok())
-                .unwrap_or(8);
-            let prefill = std::env::var("RUTERM_SMOKE_PREFILL")
-                .ok()
-                .and_then(|value| value.parse::<usize>().ok())
-                .unwrap_or(0);
-            let window_handle = window.window_handle();
-            let smoke_terminal = terminal.clone();
-            cx.spawn(async move |_, cx| {
-                cx.background_executor().timer(Duration::from_secs(6)).await;
-                let terminal = smoke_terminal.clone();
-                if prefill > 0 {
-                    let prefill = prefill;
-                    let _ = window_handle.update(cx, move |_, _, cx| {
-                        terminal.update(cx, |terminal, _| {
-                            terminal.input(format!("seq 1 {prefill}\r").into_bytes());
-                        });
-                    });
-                    cx.background_executor()
-                        .timer(Duration::from_millis(1500))
-                        .await;
-                }
-                let terminal = smoke_terminal.clone();
-                let _ = window_handle.update(cx, move |_, _, cx| {
-                    terminal.update(cx, |terminal, _| terminal.paste(&payload));
-                });
-                for index in 0..deletes {
-                    cx.background_executor()
-                        .timer(Duration::from_millis(delay_ms))
-                        .await;
-                    let _ = window_handle.update(cx, |_, window, cx| {
-                        window.dispatch_keystroke(
-                            rgpui::Keystroke::parse("backspace").unwrap(),
-                            cx,
-                        );
-                    });
-                    if index % 25 == 0 {
-                        eprintln!("[smoke] dispatched {} backspaces", index + 1);
-                    }
-                }
-                eprintln!("[smoke] finished dispatching {deletes} backspaces");
-            })
-            .detach();
-        }
         let ready_view = terminal_view.clone();
         let ready_addr = addr.clone();
         let recent_host_id = host.as_ref().map(|host| host.id).filter(|id| *id != 0);

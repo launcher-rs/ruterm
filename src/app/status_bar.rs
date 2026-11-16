@@ -3,9 +3,7 @@
 use std::time::Duration;
 
 use rgpui::components::status_bar::{StatusBar, StatusBarItem};
-use rgpui::{
-    App, Context, Entity, IconName, SharedString,
-};
+use rgpui::{App, Context, Entity, IconName, SharedString};
 use rgpui_term::Terminal;
 
 use crate::remote::Metric;
@@ -113,7 +111,10 @@ impl RuTermApp {
                         // 发行版名自成一条，其余加标签；标签取词后才能跟着界面换语言。
                         let text = match metric {
                             Metric::Os => value.to_string(),
-                            other => format!("{} {value}", crate::i18n::translate(cx, other.label(), &[])),
+                            other => format!(
+                                "{} {value}",
+                                crate::i18n::translate(cx, other.label(), &[])
+                            ),
                         };
                         left.push(StatusBarItem::new(SharedString::from(text)).id(metric.id()));
                     }
@@ -153,7 +154,6 @@ impl RuTermApp {
         StatusBar::new().left(left).right(right)
     }
 
-
     /// 在状态栏打一条醒目的传输提示（图标 + 高亮背景）。
     /// `expire` 为 true 时数秒后自动淡出回普通 status；进行中提示不自动过期，
     /// 由完成时的新提示覆盖。
@@ -176,9 +176,7 @@ impl RuTermApp {
             return;
         }
         cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(Duration::from_secs(6))
-                .await;
+            cx.background_executor().timer(Duration::from_secs(6)).await;
             let _ = this.update(cx, |this, cx| {
                 if this.transfer_flash.as_ref().is_some_and(|f| f.seq == seq) {
                     this.transfer_flash = None;
@@ -188,7 +186,6 @@ impl RuTermApp {
         })
         .detach();
     }
-
 
     /// 终端读数条目：回滚与选区只在发生时出现，不显示 `回滚 0 行` 这种空占位。
     pub(super) fn readout_items(&self, readout: StatusReadout, cx: &App) -> Vec<StatusBarItem> {
@@ -242,7 +239,6 @@ impl RuTermApp {
         items
     }
 
-
     /// 状态栏终端读数的刷新循环。
     ///
     /// 终端的渲染内容只在元素绘制时 `sync`，而 `Wakeup` / `SelectionsChanged` 这些事件
@@ -262,9 +258,9 @@ impl RuTermApp {
                     let next = active
                         .and_then(|id| this.tabs.iter().find(|tab| tab.id == id))
                         .and_then(|tab| {
-                            tab.terminal_view
-                                .as_ref()
-                                .and_then(|view| StatusReadout::capture(view.read(cx).terminal(), cx))
+                            tab.terminal_view.as_ref().and_then(|view| {
+                                StatusReadout::capture(view.read(cx).terminal(), cx)
+                            })
                         });
                     if next == this.readout_seen {
                         return;
@@ -279,7 +275,6 @@ impl RuTermApp {
         .detach();
     }
 
-
     /// 勾选状态栏显示项：即时生效并持久化（库内优先，降级时写 settings.json）。
     pub(super) fn set_status_pref(&mut self, pref: StatusPref, on: bool, cx: &mut Context<Self>) {
         match pref {
@@ -291,7 +286,6 @@ impl RuTermApp {
         cx.notify();
         self.persist_status_bar(cx);
     }
-
 
     /// 状态栏偏好落库；加密库不可用时退回旧 settings.json。
     pub(super) fn persist_status_bar(&self, cx: &mut Context<Self>) {
@@ -307,6 +301,4 @@ impl RuTermApp {
         })
         .detach();
     }
-
-
 }

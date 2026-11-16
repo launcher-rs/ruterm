@@ -61,24 +61,37 @@ impl PixelFormat {
     /// Validate before any server-controlled pixel data is decoded.
     fn validate(&self) -> Result<()> {
         if !matches!(self.bits_per_pixel, 8 | 16 | 32)
-            || self.depth == 0 || self.depth > self.bits_per_pixel || !self.true_colour
+            || self.depth == 0
+            || self.depth > self.bits_per_pixel
+            || !self.true_colour
         {
             bail!("服务器上报的像素格式无效（仅支持 8/16/32bpp 真彩色）");
         }
         let mut used = 0u32;
         let mut depth = 0;
-        for (max, shift) in [(self.red_max, self.red_shift), (self.green_max, self.green_shift), (self.blue_max, self.blue_shift)] {
+        for (max, shift) in [
+            (self.red_max, self.red_shift),
+            (self.green_max, self.green_shift),
+            (self.blue_max, self.blue_shift),
+        ] {
             let max = u32::from(max);
             let bits = max.count_ones();
-            if max == 0 || max & (max + 1) != 0 || u32::from(shift) + bits > u32::from(self.bits_per_pixel) {
+            if max == 0
+                || max & (max + 1) != 0
+                || u32::from(shift) + bits > u32::from(self.bits_per_pixel)
+            {
                 bail!("服务器上报的颜色最大值或位移无效");
             }
             let mask = max << shift;
-            if used & mask != 0 { bail!("服务器上报的颜色通道重叠"); }
+            if used & mask != 0 {
+                bail!("服务器上报的颜色通道重叠");
+            }
             used |= mask;
             depth += bits;
         }
-        if depth != u32::from(self.depth) { bail!("服务器上报的颜色深度无效"); }
+        if depth != u32::from(self.depth) {
+            bail!("服务器上报的颜色深度无效");
+        }
         Ok(())
     }
 
@@ -159,9 +172,7 @@ fn parse_version(text: &[u8; 12]) -> Result<(u8, u8)> {
     let rest = text
         .strip_prefix("RFB ")
         .context("服务器没有按 RFB 协议打招呼")?;
-    let (major, minor) = rest
-        .split_once('.')
-        .context("服务器版本号格式不对")?;
+    let (major, minor) = rest.split_once('.').context("服务器版本号格式不对")?;
     let major: u8 = major.trim_end().parse().context("版本号主版本不是数字")?;
     let minor: u8 = minor.trim_end().parse().context("版本号次版本不是数字")?;
     if major != 3 {
@@ -173,7 +184,11 @@ fn parse_version(text: &[u8; 12]) -> Result<(u8, u8)> {
 /// 握手：版本协商 → 选安全类型 → 认证 → ClientInit → ServerInit。
 ///
 /// `password` 只在这一步用于 VNC 认证的 DES 响应，不会留在任何状态里。
-pub async fn handshake<S>(stream: &mut S, password: Option<&str>, shared: bool) -> Result<ServerInit>
+pub async fn handshake<S>(
+    stream: &mut S,
+    password: Option<&str>,
+    shared: bool,
+) -> Result<ServerInit>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -271,7 +286,11 @@ enum SecurityType {
     VncAuth,
 }
 
-async fn negotiate_security<S>(stream: &mut S, minor: u8, has_password: bool) -> Result<SecurityType>
+async fn negotiate_security<S>(
+    stream: &mut S,
+    minor: u8,
+    has_password: bool,
+) -> Result<SecurityType>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -348,10 +367,7 @@ async fn read_security_result<S>(stream: &mut S, minor: u8) -> Result<()>
 where
     S: AsyncRead + Unpin,
 {
-    let result = stream
-        .read_u32()
-        .await
-        .context("读取安全认证结果失败")?;
+    let result = stream.read_u32().await.context("读取安全认证结果失败")?;
     if result == 0 {
         return Ok(());
     }
@@ -491,7 +507,17 @@ where
         let encoding = reader.read_i32().await?;
         match encoding {
             0 => {
-                apply_raw(reader, state, Rect { x, y, width, height }).await?;
+                apply_raw(
+                    reader,
+                    state,
+                    Rect {
+                        x,
+                        y,
+                        width,
+                        height,
+                    },
+                )
+                .await?;
             }
             1 => {
                 let src_x = reader.read_u16().await?;
@@ -503,11 +529,26 @@ where
                         width,
                         height,
                     },
-                    Rect { x, y, width, height },
+                    Rect {
+                        x,
+                        y,
+                        width,
+                        height,
+                    },
                 )?;
             }
             5 => {
-                apply_hextile(reader, state, Rect { x, y, width, height }).await?;
+                apply_hextile(
+                    reader,
+                    state,
+                    Rect {
+                        x,
+                        y,
+                        width,
+                        height,
+                    },
+                )
+                .await?;
             }
             -223 => {
                 // DesktopSize：矩形宽高即新尺寸，没有像素负载。
@@ -700,7 +741,11 @@ impl Framebuffer {
         let stride = self.stride();
         let mut row = vec![0u8; usize::from(width) * 4];
         for index in 0..usize::from(height) {
-            let y = if target.y > source.y { usize::from(height) - 1 - index } else { index };
+            let y = if target.y > source.y {
+                usize::from(height) - 1 - index
+            } else {
+                index
+            };
             let sy = usize::from(source.y) + y;
             let ty = usize::from(target.y) + y;
             let from = sy * stride + usize::from(source.x) * 4;
@@ -758,7 +803,10 @@ mod tests {
     fn pixel_decode_handles_32_and_16_bpp() {
         let pf = bgra_pf();
         // 内存顺序 B,G,R,A → 红 0x00112233 表示 r=0x00 g=0x11 b=0x22
-        assert_eq!(pf.decode(&[0x33, 0x22, 0x11, 0x00]), [0x33, 0x22, 0x11, 255]);
+        assert_eq!(
+            pf.decode(&[0x33, 0x22, 0x11, 0x00]),
+            [0x33, 0x22, 0x11, 255]
+        );
 
         let rgb565 = PixelFormat {
             bits_per_pixel: 16,
@@ -779,7 +827,10 @@ mod tests {
             big_endian: true,
             ..pf
         };
-        assert_eq!(be.decode(&[0x00, 0x11, 0x22, 0xff]), [0xff, 0x22, 0x11, 255]);
+        assert_eq!(
+            be.decode(&[0x00, 0x11, 0x22, 0xff]),
+            [0xff, 0x22, 0x11, 255]
+        );
     }
 
     #[test]
@@ -826,8 +877,14 @@ mod tests {
         // 一个块：bg 已指定 + fg 已指定 + 1 个非彩色子矩形（坐标 0,0 尺寸 2×2）
         let payload = vec![
             0b0000_1110, // bg + fg + any subrects
-            0x10, 0x20, 0x30, 0x00, // bg (BGR)
-            0x01, 0x02, 0x03, 0x00, // fg
+            0x10,
+            0x20,
+            0x30,
+            0x00, // bg (BGR)
+            0x01,
+            0x02,
+            0x03,
+            0x00, // fg
             0x01, // 1 个子矩形
             0x00, // x=0 y=0
             0x11, // w=2 h=2
@@ -891,9 +948,7 @@ mod tests {
             assert_eq!(shared[0], 0);
             write_server_init(&mut server).await;
         });
-        let init = handshake(&mut client, Some("secret"), false)
-            .await
-            .unwrap();
+        let init = handshake(&mut client, Some("secret"), false).await.unwrap();
         task.await.unwrap();
         assert_eq!((init.width, init.height), (16, 8));
     }
@@ -936,13 +991,19 @@ mod tests {
 
     #[test]
     fn client_messages_have_expected_headers() {
-        assert_eq!(key_message(0xff0d, true), vec![4, 1, 0, 0, 0, 0, 0xff, 0x0d]);
+        assert_eq!(
+            key_message(0xff0d, true),
+            vec![4, 1, 0, 0, 0, 0, 0xff, 0x0d]
+        );
         assert_eq!(pointer_message(3, 4, 1), vec![5, 1, 0, 3, 0, 4]);
         let encodings = set_encodings_message(&ENCODINGS);
         assert_eq!(&encodings[..4], &[2, 0, 0, 4]);
         let request = update_request_message(true, 640, 480);
         assert_eq!(&request[..2], &[3, 1]);
         assert_eq!(&request[6..], &[0x02, 0x80, 0x01, 0xE0]);
-        assert_eq!(clipboard_message("ab"), vec![6, 0, 0, 0, 0, 0, 0, 2, b'a', b'b']);
+        assert_eq!(
+            clipboard_message("ab"),
+            vec![6, 0, 0, 0, 0, 0, 0, 2, b'a', b'b']
+        );
     }
 }

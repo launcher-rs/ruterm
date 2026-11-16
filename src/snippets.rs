@@ -84,7 +84,8 @@ mod tests {
 
     #[test]
     fn validate_trims_labels_and_keeps_command() {
-        let snippet = validate("  重启 nginx  ", " sudo systemctl restart nginx ", " 运维 ").unwrap();
+        let snippet =
+            validate("  重启 nginx  ", " sudo systemctl restart nginx ", " 运维 ").unwrap();
         assert_eq!(snippet.name, "重启 nginx");
         assert_eq!(snippet.command, " sudo systemctl restart nginx ");
         assert_eq!(snippet.note, "运维");
@@ -94,9 +95,18 @@ mod tests {
     fn validate_rejects_blank_multiline_and_oversized_inputs() {
         assert_eq!(validate(" ", "ls", "").unwrap_err(), "片段名称不能为空");
         assert_eq!(validate("x", "  ", "").unwrap_err(), "命令内容不能为空");
-        assert_eq!(validate("x", "a\nb", "").unwrap_err(), "命令片段仅支持单行命令");
-        assert_eq!(validate("x", "a\rb", "").unwrap_err(), "命令片段仅支持单行命令");
-        assert_eq!(validate("x", "a\0b", "").unwrap_err(), "命令内容包含无法发送的字符");
+        assert_eq!(
+            validate("x", "a\nb", "").unwrap_err(),
+            "命令片段仅支持单行命令"
+        );
+        assert_eq!(
+            validate("x", "a\rb", "").unwrap_err(),
+            "命令片段仅支持单行命令"
+        );
+        assert_eq!(
+            validate("x", "a\0b", "").unwrap_err(),
+            "命令内容包含无法发送的字符"
+        );
         assert_eq!(
             validate(&"x".repeat(MAX_NAME_CHARS + 1), "ls", "").unwrap_err(),
             "片段名称过长（最多 80 个字符）"

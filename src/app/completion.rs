@@ -39,7 +39,9 @@ impl RuTermApp {
         let this = cx.entity().downgrade();
         cx.intercept_keystrokes(move |event, window, cx| {
             if let Some(entity) = this.upgrade() {
-                entity.update(cx, |this, cx| this.intercept_completion_key(event, window, cx));
+                entity.update(cx, |this, cx| {
+                    this.intercept_completion_key(event, window, cx)
+                });
             }
         })
         .detach();
@@ -141,24 +143,25 @@ impl RuTermApp {
     /// 候选：自己的片段在前，内置命令在后；名称与说明按当前界面语言翻译。
     /// 内置命令只取当前会话平台的：Linux 上不提示注册表命令，Windows 上不提示 apt。
     fn completion_items(&self, cx: &Context<Self>) -> Vec<CompletionItem> {
-        let mine = self.snippets.iter().enumerate().map(|(index, snippet)| {
-            CompletionItem {
+        let mine = self
+            .snippets
+            .iter()
+            .enumerate()
+            .map(|(index, snippet)| CompletionItem {
                 name: snippet.name.clone(),
                 command: snippet.command.clone(),
                 note: snippet.note.clone(),
                 builtin: false,
                 index,
-            }
-        });
-        let builtin = presets_for(self.active_session_platform()).map(|(index, preset)| {
-            CompletionItem {
+            });
+        let builtin =
+            presets_for(self.active_session_platform()).map(|(index, preset)| CompletionItem {
                 name: crate::i18n::translate(cx, preset.name, &[]).to_string(),
                 command: preset.command.to_string(),
                 note: crate::i18n::translate(cx, preset.note, &[]).to_string(),
                 builtin: true,
                 index,
-            }
-        });
+            });
         mine.chain(builtin).collect()
     }
 
@@ -259,7 +262,12 @@ impl RuTermApp {
         // 被别的程序挪过位置还盲删字符。滚出底部 / 对不上就放弃；但如果只是
         // 远程回显还没追上按键，网格行尾会是记录整行的前缀，按队列顺序替换仍安全。
         let token: Vec<char> = state.token.chars().collect();
-        let tracked: Vec<char> = self.typed_line.clone().unwrap_or_default().chars().collect();
+        let tracked: Vec<char> = self
+            .typed_line
+            .clone()
+            .unwrap_or_default()
+            .chars()
+            .collect();
         let prefix = {
             let term = terminal.read(cx);
             let content = term.last_content();
@@ -269,11 +277,21 @@ impl RuTermApp {
                 let line = content.cursor.point.line.0;
                 let column = content.cursor.point.column.0;
                 let before = line_chars_before(content, line, column);
-                if before.len() >= token.len() && before[before.len() - token.len()..] == token[..] {
-                    Some(before[..before.len() - token.len()].iter().collect::<String>())
-                } else if tracked.ends_with(&token[..]) && echo_lagging(&before, &tracked, token.len())
+                if before.len() >= token.len() && before[before.len() - token.len()..] == token[..]
                 {
-                    Some(tracked[..tracked.len() - token.len()].iter().collect::<String>())
+                    Some(
+                        before[..before.len() - token.len()]
+                            .iter()
+                            .collect::<String>(),
+                    )
+                } else if tracked.ends_with(&token[..])
+                    && echo_lagging(&before, &tracked, token.len())
+                {
+                    Some(
+                        tracked[..tracked.len() - token.len()]
+                            .iter()
+                            .collect::<String>(),
+                    )
                 } else {
                     None
                 }
@@ -290,7 +308,11 @@ impl RuTermApp {
         // 记录行同步成本地拼好的整行，后续继续输入时还能接着匹配。
         let mut tracked = tracked;
         tracked.truncate(tracked.len().saturating_sub(token.len()));
-        self.typed_line = Some(format!("{}{}", tracked.into_iter().collect::<String>(), merged));
+        self.typed_line = Some(format!(
+            "{}{}",
+            tracked.into_iter().collect::<String>(),
+            merged
+        ));
         self.status = crate::i18n::translate(cx, "已补全片段：{name}", &[("name", &item.name)]);
         cx.notify();
     }

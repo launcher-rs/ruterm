@@ -912,7 +912,11 @@ async fn start_local_forward(
         .await
         .with_context(|| format!("无法监听本地端口 {}（可能已被占用）", rule.listen_port))?;
     let mut pumps = JoinSet::new();
-    pumps.spawn(forward_accept_loop(listener, accepted.clone(), rule.clone()));
+    pumps.spawn(forward_accept_loop(
+        listener,
+        accepted.clone(),
+        rule.clone(),
+    ));
     Ok(ActiveForward { rule, pumps })
 }
 
@@ -927,7 +931,11 @@ async fn start_dynamic_forward(
         .await
         .with_context(|| format!("无法监听 SOCKS5 端口 {}（可能已被占用）", rule.listen_port))?;
     let mut pumps = JoinSet::new();
-    pumps.spawn(dynamic_accept_loop(listener, accepted.clone(), rule.clone()));
+    pumps.spawn(dynamic_accept_loop(
+        listener,
+        accepted.clone(),
+        rule.clone(),
+    ));
     Ok(ActiveForward { rule, pumps })
 }
 

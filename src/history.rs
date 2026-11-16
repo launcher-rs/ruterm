@@ -82,7 +82,7 @@ impl CommandHistory {
     }
 }
 
-/// 过滤空行、控制字符、超长命令与密码提示回显。
+/// 过滤空行、控制字符、超长命令、密码提示回显与纯提示符行。
 fn sanitize(command: &str) -> Option<String> {
     let command = command.trim();
     if command.is_empty() || command.len() > MAX_COMMAND_BYTES {
@@ -91,10 +91,33 @@ fn sanitize(command: &str) -> Option<String> {
     if command.chars().any(char::is_control) {
         return None;
     }
-    if looks_like_password_prompt(command) {
+    if looks_like_password_prompt(command) || looks_like_prompt(command) {
         return None;
     }
     Some(command.to_string())
+}
+
+/// 没敲命令就按下回车时，block 追踪可能把整行提示符当成命令
+///（如 `(base) root@debian:~#`）；这类行收进历史只是噪音。
+fn looks_like_prompt(command: &str) -> bool {
+    let Some(last) = command.chars().last() else {
+        return false;
+    };
+    if last == '❯' || last == '➜' {
+        return true;
+    }
+    if !matches!(last, '$' | '#' | '%' | '>') {
+        return false;
+    }
+    // bash / zsh 的 `user@host:path$` / `root@host:~#`。
+    if let Some(token) = command.split_whitespace().last()
+        && token.contains('@')
+        && token.contains(':')
+    {
+        return true;
+    }
+    // PowerShell 的 `PS C:\Users>`。
+    command.starts_with("PS ") && last == '>'
 }
 
 /// `sudo` 之类的密码提示没有回显，block 里只会留下提示符本身，收进历史徒增噪音。
@@ -150,6 +173,22 @@ mod tests {
         }
         assert_eq!(history.entries().len(), MAX_HISTORY);
         assert_eq!(history.entries()[0], format!("echo {}", MAX_HISTORY + 19));
+    }
+
+    #[test]
+    fn prompt_only_lines_are_rejected() {
+        let mut history = CommandHistory::default();
+        assert!(!history.push("(base) root@debian:~#"));
+        assert!(!history.push("user@host:/var/log$"));
+        assert!(!history.push("PS C:\\Users\\deego>"));
+        assert!(!history.push("❯"));
+        assert!(history.is_empty());
+
+        // 真正的命令照常记录：@ / : 只出现在参数里、行尾不是提示符。
+        assert!(history.push("ssh root@host"));
+        assert!(history.push("scp ./app root@host:/opt/app"));
+        assert!(history.push("git log --format='%h %s'"));
+        assert_eq!(history.entries().len(), 3);
     }
 
     #[test]

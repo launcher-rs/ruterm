@@ -90,8 +90,11 @@ pub fn start<C: AppContext>(
         .await;
         if let Err(error) = &result {
             closing_feed.feed(
-                format!("\r\n[ruterm] Telnet 会话结束: {}\r\n", crate::session::error_summary(error))
-                    .into_bytes(),
+                format!(
+                    "\r\n[ruterm] Telnet 会话结束: {}\r\n",
+                    crate::session::error_summary(error)
+                )
+                .into_bytes(),
             );
         }
         closing_feed.end_session();
@@ -319,8 +322,17 @@ impl IacFilter {
         };
         let [cols_hi, cols_lo] = cols.to_be_bytes();
         let [rows_hi, rows_lo] = rows.to_be_bytes();
-        self.replies
-            .extend([IAC, SB, TELOPT_NAWS, cols_hi, cols_lo, rows_hi, rows_lo, IAC, SE]);
+        self.replies.extend([
+            IAC,
+            SB,
+            TELOPT_NAWS,
+            cols_hi,
+            cols_lo,
+            rows_hi,
+            rows_lo,
+            IAC,
+            SE,
+        ]);
     }
 
     fn take_replies(&mut self) -> Vec<u8> {
@@ -342,7 +354,10 @@ mod tests {
     #[test]
     fn escaped_iac_decodes_to_literal_255() {
         let mut filter = IacFilter::default();
-        assert_eq!(filter.process(&[0x41, IAC, IAC, 0x42]), vec![0x41, 0xFF, 0x42]);
+        assert_eq!(
+            filter.process(&[0x41, IAC, IAC, 0x42]),
+            vec![0x41, 0xFF, 0x42]
+        );
     }
 
     #[test]
@@ -366,9 +381,7 @@ mod tests {
     #[test]
     fn subnegotiation_is_dropped_including_escaped_iac() {
         let mut filter = IacFilter::default();
-        let bytes = [
-            0x61, IAC, SB, 24, 0x00, IAC, IAC, 0x01, IAC, SE, 0x62,
-        ];
+        let bytes = [0x61, IAC, SB, 24, 0x00, IAC, IAC, 0x01, IAC, SE, 0x62];
         assert_eq!(filter.process(&bytes), vec![b'a', b'b']);
         assert!(filter.take_replies().is_empty());
     }
@@ -393,8 +406,18 @@ mod tests {
         assert_eq!(
             replies,
             vec![
-                IAC, WILL, TELOPT_NAWS,
-                IAC, SB, TELOPT_NAWS, 0x00, 120, 0x00, 40, IAC, SE,
+                IAC,
+                WILL,
+                TELOPT_NAWS,
+                IAC,
+                SB,
+                TELOPT_NAWS,
+                0x00,
+                120,
+                0x00,
+                40,
+                IAC,
+                SE,
             ]
         );
         // 再次变化只发子协商，不重复 WILL。
@@ -428,6 +451,9 @@ mod tests {
 
     #[test]
     fn uplink_escapes_literal_255() {
-        assert_eq!(escape_uplink(&[0x01, 0xFF, 0x02]), vec![0x01, 0xFF, 0xFF, 0x02]);
+        assert_eq!(
+            escape_uplink(&[0x01, 0xFF, 0x02]),
+            vec![0x01, 0xFF, 0xFF, 0x02]
+        );
     }
 }

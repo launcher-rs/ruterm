@@ -7,7 +7,7 @@ use rgpui::prelude::*;
 use rgpui::{Context, Window};
 
 use crate::tr;
-use crate::{CloseCommandHistory, CommandHistory as OpenCommandHistory};
+use crate::{CloseCommandHistory, CommandHistory as OpenCommandHistory, ToggleHistoryPanel};
 
 use super::*;
 
@@ -30,6 +30,7 @@ impl RuTermApp {
     /// 记一条命令：去重、裁剪与落库都在这里收口。
     pub(super) fn push_history(&mut self, command: &str, cx: &mut Context<Self>) {
         if self.history.push(command) {
+            self.history_clear_confirm = false;
             self.persist_history(cx);
             cx.notify();
         }
@@ -69,18 +70,49 @@ impl RuTermApp {
             changed |= self.history.push(&command);
         }
         if changed {
+            self.history_clear_confirm = false;
             self.persist_history(cx);
             cx.notify();
         }
     }
 
-    /// Ctrl+Shift+H /「终端」菜单：打开命令历史。
+    /// Ctrl+Shift+H / 导航栏「历史」图标：开关右侧历史面板。
+    pub(super) fn toggle_history_panel_action(
+        &mut self,
+        _: &ToggleHistoryPanel,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_history_panel(cx);
+    }
+
+    pub(super) fn toggle_history_panel(&mut self, cx: &mut Context<Self>) {
+        self.history_panel_open = !self.history_panel_open;
+        self.history_clear_confirm = false;
+        if self.history_panel_open {
+            // 刚执行过的命令不用等下一轮轮询才出现在列表里。
+            self.sync_command_history(cx);
+        }
+        cx.notify();
+    }
+
+    /// 「终端」菜单：打开命令历史管理弹窗。
     pub(super) fn open_history_manager(
         &mut self,
         _: &OpenCommandHistory,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.open_history_manager_impl(window, cx);
+    }
+
+    /// 打开历史弹窗；已打开时只把焦点放回搜索框。
+    pub(super) fn open_history_manager_impl(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.history_clear_confirm = false;
         if let Some(state) = self.history_manager.as_ref() {
             state.search.update(cx, |input, cx| input.focus(window, cx));
             cx.notify();
@@ -121,6 +153,7 @@ impl RuTermApp {
     /// 删除一条历史；下标越界或库未变化时什么也不做。
     pub(super) fn delete_history_entry(&mut self, index: usize, cx: &mut Context<Self>) {
         if self.history.remove(index) {
+            self.history_clear_confirm = false;
             self.persist_history(cx);
             cx.notify();
         }
@@ -144,17 +177,58 @@ impl RuTermApp {
         cx.notify();
     }
 
-    /// 插入 / 执行历史命令到当前活动会话。
-    pub(super) fn send_history_command(&mut self, index: usize, run: bool, cx: &mut Context<Self>) {
-        let Some(command) = self.history.entries().get(index).cloned() else {
-            return;
-        };
-        if !self.send_command_to_terminal(&command, run, cx) {
+    /// 历史面板的清空：与弹窗一致的两步确认，确认态只活在面板上。
+    pub(super) fn request_clear_history_panel(&mut self, cx: &mut Context<Self>) {
+        if !self.history_clear_confirm {
+            self.history_clear_confirm = true;
+            cx.notify();
             return;
         }
-        let key = if run { "已执行历史命令" } else { "已插入历史命令" };
+        self.history_clear_confirm = false;
+        if self.history.clear() {
+            self.persist_history(cx);
+            self.status = tr!(cx, "已清空命令历史");
+        }
+        cx.notify();
+    }
+
+    /// 插入 / 执行历史命令到当前活动会话，返回是否真的送出。
+    pub(super) fn send_history_command(
+        &mut self,
+        index: usize,
+        run: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(command) = self.history.entries().get(index).cloned() else {
+            return false;
+        };
+        if !self.send_command_to_terminal(&command, run, cx) {
+            return false;
+        }
+        let key = if run {
+            "已执行历史命令"
+        } else {
+            "已插入历史命令"
+        };
         self.status = crate::i18n::translate(cx, key, &[]);
         cx.notify();
+        true
+    }
+
+    /// 面板里点一行 / 点 ▶：送出后把焦点交回终端，接着敲键盘就落在会话里。
+    pub(super) fn use_history_entry(
+        &mut self,
+        index: usize,
+        run: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.send_history_command(index, run, cx) {
+            return;
+        }
+        if let Some(view) = self.active_terminal_view() {
+            view.read(cx).focus_handle(cx).focus(window, cx);
+        }
     }
 
     /// 把历史命令复制进片段编辑器：名称默认取命令开头，备注标注来源。
@@ -167,9 +241,8 @@ impl RuTermApp {
         let Some(command) = self.history.entries().get(index).cloned() else {
             return;
         };
-        if self.history_manager.take().is_none() {
-            return;
-        }
+        // 弹窗开着时先收起，避免片段编辑器叠在历史弹窗上；从右侧面板进入时同样适用。
+        self.history_manager = None;
         self.open_snippet_manager_impl(window, cx);
         if let Some(manager) = self.snippet_manager.as_mut() {
             manager.builtin = false;

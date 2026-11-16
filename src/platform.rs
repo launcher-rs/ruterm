@@ -57,9 +57,15 @@ mod tests {
 
     #[test]
     fn uname_names_map_to_platforms() {
-        assert_eq!(Platform::from_uname("Linux 5.15.0-119-generic"), Some(Platform::Linux));
+        assert_eq!(
+            Platform::from_uname("Linux 5.15.0-119-generic"),
+            Some(Platform::Linux)
+        );
         assert_eq!(Platform::from_uname("Darwin 23.6.0"), Some(Platform::Unix));
-        assert_eq!(Platform::from_uname("FreeBSD 14.1-RELEASE"), Some(Platform::Unix));
+        assert_eq!(
+            Platform::from_uname("FreeBSD 14.1-RELEASE"),
+            Some(Platform::Unix)
+        );
         assert_eq!(Platform::from_uname("SunOS 5.11"), Some(Platform::Unix));
         assert_eq!(Platform::from_uname(""), None);
         assert_eq!(Platform::from_uname("Windows_NT"), None);

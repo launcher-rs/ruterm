@@ -215,7 +215,8 @@ mod tests {
     /// 链从最外层开始：目标挂 jump1、jump1 挂 jump2，就先连 jump2。
     #[test]
     fn jump_chain_orders_outermost_first() {
-        let target = plain("target").with_jump(Some(plain("jump1").with_jump(Some(plain("jump2")))));
+        let target =
+            plain("target").with_jump(Some(plain("jump1").with_jump(Some(plain("jump2")))));
         let chain: Vec<String> = target
             .jump_chain()
             .iter()

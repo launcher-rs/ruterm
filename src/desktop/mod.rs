@@ -114,7 +114,12 @@ pub enum Command {
     /// 按键。`down` 区分按下与抬起。
     Key { key: KeyInput, down: bool },
     /// 滚轮（远端像素坐标；向上为 `up`）。VNC 由协议层翻成 4/5 号按钮。
-    Wheel { x: u16, y: u16, up: bool, buttons: u8 },
+    Wheel {
+        x: u16,
+        y: u16,
+        up: bool,
+        buttons: u8,
+    },
     /// 本地剪贴板 → 远端。
     Clipboard(String),
     /// 把本地文件放上系统剪贴板并让远端粘贴（RDP 文件剪贴板；VNC 忽略）。
@@ -124,7 +129,11 @@ pub enum Command {
     /// 请求整帧（切回标签、自适应时用）。
     RequestFull,
     /// 让远端把桌面改成指定像素尺寸（RDP 动态分辨率；VNC 忽略）。
-    Resize { width: u16, height: u16, scale_factor: u32 },
+    Resize {
+        width: u16,
+        height: u16,
+        scale_factor: u32,
+    },
     /// 释放该会话已发送的所有键和鼠标按钮。
     ReleaseAll,
     /// 主动断开。
@@ -135,7 +144,11 @@ pub enum Command {
 #[derive(Debug)]
 pub enum Event {
     /// 握手完成：桌面尺寸与服务器名确定。
-    Connected { width: u16, height: u16, name: String },
+    Connected {
+        width: u16,
+        height: u16,
+        name: String,
+    },
     /// `latest` 里刚放了一帧新画面。
     FrameReady,
     /// 每秒一次的实际帧率（toolbar 的 `Nfps`）。
@@ -216,11 +229,7 @@ where
         .await
         .context("发送编码列表失败")?;
     writer
-        .write_all(&vnc::update_request_message(
-            false,
-            init.width,
-            init.height,
-        ))
+        .write_all(&vnc::update_request_message(false, init.width, init.height))
         .await
         .context("请求首帧失败")?;
 

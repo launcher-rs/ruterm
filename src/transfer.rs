@@ -118,7 +118,9 @@ pub async fn execute(
         // 先 lstat，不能把目标目录的 symlink 悄悄跟随成另一个路径。
         let mut local = local;
         if direction == Direction::Download
-            && local_target_metadata(&local).await?.is_some_and(|m| m.is_dir())
+            && local_target_metadata(&local)
+                .await?
+                .is_some_and(|m| m.is_dir())
             && let Some(name) = Path::new(&remote).file_name()
         {
             local.push(name);
@@ -178,7 +180,10 @@ async fn upload(
         .open_with_flags_and_attributes(
             temp.as_str(),
             OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::EXCLUDE,
-            FileAttributes { permissions: Some(0o600), ..FileAttributes::empty() },
+            FileAttributes {
+                permissions: Some(0o600),
+                ..FileAttributes::empty()
+            },
         )
         .await
         .with_context(|| format!("无法独占创建远端暂存文件 {temp}"))?;
@@ -194,15 +199,22 @@ async fn upload(
             metadata.permissions().mode() & 0o777
         };
         #[cfg(not(unix))]
-        let permissions = if metadata.permissions().readonly() { 0o444 } else { 0o644 };
+        let permissions = if metadata.permissions().readonly() {
+            0o444
+        } else {
+            0o644
+        };
         file.set_metadata(FileAttributes {
             permissions: Some(permissions),
             ..FileAttributes::empty()
-        }).await.context("设置远端文件权限失败")?;
+        })
+        .await
+        .context("设置远端文件权限失败")?;
         file.shutdown().await.context("远端文件关闭失败")?;
         commit_remote_temp(sftp, &temp, remote).await?;
         Ok(done)
-    }.await;
+    }
+    .await;
     if result.is_err() {
         let _ = file.shutdown().await;
     }
@@ -213,7 +225,9 @@ async fn upload(
             let error = transfer_failure(error, done);
             match sftp.remove_file(temp.as_str()).await {
                 Ok(()) => Err(error),
-                Err(cleanup) => Err(error.context(format!("清理远端暂存文件 {temp} 失败：{cleanup}"))),
+                Err(cleanup) => {
+                    Err(error.context(format!("清理远端暂存文件 {temp} 失败：{cleanup}")))
+                }
             }
         }
     }
@@ -225,7 +239,9 @@ async fn download(
     remote: &str,
     progress: &UnboundedSender<(u64, u64)>,
 ) -> Result<u64> {
-    let mut source = sftp.open(remote).await
+    let mut source = sftp
+        .open(remote)
+        .await
         .with_context(|| format!("无法打开远端文件 {remote}"))?;
     let result = async {
         // 以已打开句柄的大小为准，避免 stat/open 之间换源。
@@ -233,20 +249,28 @@ async fn download(
         if metadata.is_dir() {
             anyhow::bail!("远端路径是目录：{remote}");
         }
-        let total = metadata.size.context("远端未返回源文件长度，无法安全校验")?;
+        let total = metadata
+            .size
+            .context("远端未返回源文件长度，无法安全校验")?;
         let (temp, done) = copy_to_local_temp(&mut source, local, total, progress).await?;
         let result = async {
-            let size = source.metadata().await?.size.context("远端未返回源文件长度")?;
+            let size = source
+                .metadata()
+                .await?
+                .size
+                .context("远端未返回源文件长度")?;
             check_length(size, total)?;
             source.shutdown().await.context("远端源文件关闭失败")?;
             commit_local_temp(&temp, local, metadata.permissions).await?;
             Ok(done)
-        }.await;
+        }
+        .await;
         match result {
             Ok(bytes) => Ok(bytes),
             Err(error) => Err(cleanup_local_temp(&temp, transfer_failure(error, done)).await),
         }
-    }.await;
+    }
+    .await;
     let _ = source.shutdown().await;
     result.with_context(|| format!("下载 {remote} 失败"))
 }
@@ -281,10 +305,7 @@ async fn remote_target_metadata(sftp: &SftpSession, path: &str) -> Result<Option
 /// 尽量把旧文件恢复原位，恢复不了也会在错误里给出备份路径。
 async fn commit_remote_temp(sftp: &SftpSession, temp: &str, remote: &str) -> Result<()> {
     let Some(existing) = remote_target_metadata(sftp, remote).await? else {
-        return sftp
-            .rename(temp, remote)
-            .await
-            .context("远端提交失败");
+        return sftp.rename(temp, remote).await.context("远端提交失败");
     };
     if existing.is_dir() {
         anyhow::bail!("远端目标是目录：{remote}");
@@ -303,21 +324,22 @@ async fn commit_remote_temp(sftp: &SftpSession, temp: &str, remote: &str) -> Res
             }
             Ok(())
         }
-        Err(error) => {
-            match sftp.rename(backup.as_str(), remote).await {
-                Ok(()) => Err(error).context("远端提交失败，原文件已恢复"),
-                Err(restore) => Err(error).context(format!(
-                    "远端提交失败，且原文件恢复失败；原文件保存在 {backup}：{restore}"
-                )),
-            }
-        }
+        Err(error) => match sftp.rename(backup.as_str(), remote).await {
+            Ok(()) => Err(error).context("远端提交失败，原文件已恢复"),
+            Err(restore) => Err(error).context(format!(
+                "远端提交失败，且原文件恢复失败；原文件保存在 {backup}：{restore}"
+            )),
+        },
     }
 }
 
 fn temp_name() -> Result<String> {
     let mut random = [0u8; 16];
     getrandom::fill(&mut random).context("生成传输暂存文件随机名失败")?;
-    Ok(format!(".ruterm-transfer-{:032x}.tmp", u128::from_be_bytes(random)))
+    Ok(format!(
+        ".ruterm-transfer-{:032x}.tmp",
+        u128::from_be_bytes(random)
+    ))
 }
 
 /// 在远端目标同目录生成随机文件名；不使用本机 `Path`，因为 Windows 的
@@ -339,7 +361,10 @@ async fn copy_to_local_temp<R: AsyncRead + Unpin>(
     total: u64,
     progress: &UnboundedSender<(u64, u64)>,
 ) -> Result<(PathBuf, u64)> {
-    if local_target_metadata(local).await?.is_some_and(|m| !m.is_file()) {
+    if local_target_metadata(local)
+        .await?
+        .is_some_and(|m| !m.is_file())
+    {
         anyhow::bail!("本地目标不是普通文件：{}", local.display());
     }
     let temp = local.with_file_name(temp_name()?);
@@ -347,7 +372,9 @@ async fn copy_to_local_temp<R: AsyncRead + Unpin>(
     options.write(true).create_new(true);
     #[cfg(unix)]
     options.mode(0o600);
-    let mut out = options.open(&temp).await
+    let mut out = options
+        .open(&temp)
+        .await
         .with_context(|| format!("无法独占创建本地暂存文件 {}", temp.display()))?;
     let mut done = 0;
     let result = async {
@@ -356,7 +383,8 @@ async fn copy_to_local_temp<R: AsyncRead + Unpin>(
         out.sync_all().await.context("同步本地暂存文件失败")?;
         out.shutdown().await.context("本地暂存文件关闭失败")?;
         Ok(())
-    }.await;
+    }
+    .await;
     // Windows 必须释放句柄后才能重命名或清理；flush/sync_all 已检查延迟写错误。
     drop(out);
     match result {
@@ -372,19 +400,22 @@ async fn commit_local_temp(temp: &Path, local: &Path, source_mode: Option<u32>) 
         if !metadata.is_file() {
             anyhow::bail!("本地目标不是普通文件：{}", local.display());
         }
-        tokio::fs::set_permissions(temp, metadata.permissions()).await
+        tokio::fs::set_permissions(temp, metadata.permissions())
+            .await
             .context("保留本地目标权限失败")?;
     } else {
         #[cfg(unix)]
         if let Some(mode) = source_mode {
             use std::os::unix::fs::PermissionsExt;
-            tokio::fs::set_permissions(temp, std::fs::Permissions::from_mode(mode & 0o777)).await
+            tokio::fs::set_permissions(temp, std::fs::Permissions::from_mode(mode & 0o777))
+                .await
                 .context("设置下载文件权限失败")?;
         }
         #[cfg(not(unix))]
         let _ = source_mode;
     }
-    tokio::fs::rename(temp, local).await
+    tokio::fs::rename(temp, local)
+        .await
         .with_context(|| format!("原子提交本地文件 {} 失败（原目标未删除）", local.display()))
 }
 
@@ -438,7 +469,11 @@ fn transfer_failure(error: anyhow::Error, bytes: u64) -> anyhow::Error {
     if error.downcast_ref::<TransferFailure>().is_some() {
         error
     } else {
-        TransferFailure { bytes, cause: error }.into()
+        TransferFailure {
+            bytes,
+            cause: error,
+        }
+        .into()
     }
 }
 
@@ -461,7 +496,10 @@ where
         loop {
             // 到达预期长度后仍读一个字节，增长的源不能被悄悄截成预期大小。
             let limit = (total - done).min(CHUNK as u64).max(1) as usize;
-            let read = reader.read(&mut buffer[..limit]).await.context("读取数据失败")?;
+            let read = reader
+                .read(&mut buffer[..limit])
+                .await
+                .context("读取数据失败")?;
             if read == 0 {
                 check_length(done, total)?;
                 return Ok(done);
@@ -472,7 +510,10 @@ where
             let mut offset = 0;
             while offset < read {
                 // 不能用 write_all：错误前的部分写入也需要准确计数。
-                let written = writer.write(&buffer[offset..read]).await.map_err(write_error)?;
+                let written = writer
+                    .write(&buffer[offset..read])
+                    .await
+                    .map_err(write_error)?;
                 if written == 0 {
                     return Err(write_error(std::io::ErrorKind::WriteZero.into()));
                 }
@@ -484,7 +525,8 @@ where
                 }
             }
         }
-    }.await;
+    }
+    .await;
     let _ = progress.send((done, total));
     result.map_err(|error| transfer_failure(error, done))
 }
@@ -533,12 +575,20 @@ mod tests {
 
     impl Reader {
         fn new(data: &'static [u8], fail_at_end: bool) -> Self {
-            Self { data, fail_at_end, pending: true }
+            Self {
+                data,
+                fail_at_end,
+                pending: true,
+            }
         }
     }
 
     impl AsyncRead for Reader {
-        fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
             if self.pending {
                 self.pending = false;
                 cx.waker().wake_by_ref();
@@ -564,12 +614,21 @@ mod tests {
 
     impl Writer {
         fn new(limit: usize, zero_at_limit: bool) -> Self {
-            Self { data: Vec::new(), limit, zero_at_limit, pending: true }
+            Self {
+                data: Vec::new(),
+                limit,
+                zero_at_limit,
+                pending: true,
+            }
         }
     }
 
     impl AsyncWrite for Writer {
-        fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
             if self.pending {
                 self.pending = false;
                 cx.waker().wake_by_ref();
@@ -602,7 +661,10 @@ mod tests {
     }
 
     fn failure_bytes(error: &anyhow::Error) -> u64 {
-        error.downcast_ref::<TransferFailure>().expect("actual byte count in error").bytes
+        error
+            .downcast_ref::<TransferFailure>()
+            .expect("actual byte count in error")
+            .bytes
     }
 
     struct TestDir(PathBuf);
@@ -616,8 +678,14 @@ mod tests {
 
         async fn assert_only_target(&self) {
             let mut entries = tokio::fs::read_dir(&self.0).await.unwrap();
-            assert_eq!(entries.next_entry().await.unwrap().unwrap().file_name(), "target");
-            assert!(entries.next_entry().await.unwrap().is_none(), "temporary file leaked");
+            assert_eq!(
+                entries.next_entry().await.unwrap().unwrap().file_name(),
+                "target"
+            );
+            assert!(
+                entries.next_entry().await.unwrap().is_none(),
+                "temporary file leaked"
+            );
         }
     }
 
@@ -633,15 +701,29 @@ mod tests {
             assert_eq!(expand_remote_path(path, "/home/user").unwrap(), path);
         }
         assert!(expand_remote_path("", "/home/user").is_err());
-        assert_eq!(expand_remote_path("~", "/home/ user ").unwrap(), "/home/ user ");
-        assert_eq!(expand_remote_path("~/ file \t", "/home/ user /").unwrap(), "/home/ user / file \t");
-        assert_eq!(expand_remote_path("~// file ", "/home/user").unwrap(), "/home/user// file ");
+        assert_eq!(
+            expand_remote_path("~", "/home/ user ").unwrap(),
+            "/home/ user "
+        );
+        assert_eq!(
+            expand_remote_path("~/ file \t", "/home/ user /").unwrap(),
+            "/home/ user / file \t"
+        );
+        assert_eq!(
+            expand_remote_path("~// file ", "/home/user").unwrap(),
+            "/home/user// file "
+        );
         assert_eq!(expand_remote_path("~/ file ", "/").unwrap(), "/ file ");
     }
 
     #[test]
     fn remote_temp_paths_stay_in_posix_parent() {
-        for (path, parent) in [("file", ""), ("/ file ", "/"), (" dir /file ", " dir /"), ("dir/a\\b", "dir/")] {
+        for (path, parent) in [
+            ("file", ""),
+            ("/ file ", "/"),
+            (" dir /file ", " dir /"),
+            ("dir/a\\b", "dir/"),
+        ] {
             let temp = remote_sibling(path, "tmp").unwrap();
             assert!(temp.starts_with(&format!("{parent}.ruterm-transfer-")));
             assert!(temp.ends_with(".tmp"));
@@ -655,10 +737,20 @@ mod tests {
         let (tx, mut rx) = unbounded_channel();
         let mut reader = Reader::new(b"abcdef", false);
         let mut writer = Writer::new(usize::MAX, false);
-        assert_eq!(copy_with_progress(&mut reader, &mut writer, 6, &tx).await.unwrap(), 6);
+        assert_eq!(
+            copy_with_progress(&mut reader, &mut writer, 6, &tx)
+                .await
+                .unwrap(),
+            6
+        );
         assert_eq!(writer.data, b"abcdef");
         assert_eq!(last_progress(&mut rx), (6, 6));
-        assert_eq!(copy_with_progress(&mut &b""[..], &mut writer, 0, &tx).await.unwrap(), 0);
+        assert_eq!(
+            copy_with_progress(&mut &b""[..], &mut writer, 0, &tx)
+                .await
+                .unwrap(),
+            0
+        );
     }
 
     #[tokio::test]
@@ -666,7 +758,9 @@ mod tests {
         let (tx, mut rx) = unbounded_channel();
         let mut reader = Reader::new(b"abc", false);
         let mut writer = Writer::new(usize::MAX, false);
-        let error = copy_with_progress(&mut reader, &mut writer, 6, &tx).await.unwrap_err();
+        let error = copy_with_progress(&mut reader, &mut writer, 6, &tx)
+            .await
+            .unwrap_err();
         assert_eq!(failure_bytes(&error), 3);
         assert!(error.to_string().contains("长度不一致"));
         assert_eq!(writer.data, b"abc");
@@ -678,12 +772,16 @@ mod tests {
         let (tx, mut rx) = unbounded_channel();
         let mut reader = Reader::new(b"abcdef", false);
         let mut writer = Writer::new(usize::MAX, false);
-        let error = copy_with_progress(&mut reader, &mut writer, 3, &tx).await.unwrap_err();
+        let error = copy_with_progress(&mut reader, &mut writer, 3, &tx)
+            .await
+            .unwrap_err();
         assert_eq!(failure_bytes(&error), 3);
         assert!(error.to_string().contains("源已增长"));
         assert_eq!(writer.data, b"abc");
         assert_eq!(last_progress(&mut rx), (3, 3));
-        let error = copy_with_progress(&mut reader, &mut writer, 0, &tx).await.unwrap_err();
+        let error = copy_with_progress(&mut reader, &mut writer, 0, &tx)
+            .await
+            .unwrap_err();
         assert_eq!(failure_bytes(&error), 0);
     }
 
@@ -692,7 +790,9 @@ mod tests {
         let (tx, mut rx) = unbounded_channel();
         let mut reader = Reader::new(b"abc", true);
         let mut writer = Writer::new(usize::MAX, false);
-        let error = copy_with_progress(&mut reader, &mut writer, 3, &tx).await.unwrap_err();
+        let error = copy_with_progress(&mut reader, &mut writer, 3, &tx)
+            .await
+            .unwrap_err();
         assert_eq!(failure_bytes(&error), 3);
         assert!(error.to_string().contains("injected read failure"));
         assert_eq!(last_progress(&mut rx), (3, 3));
@@ -702,20 +802,27 @@ mod tests {
     async fn copy_reports_partial_write_failure_bytes() {
         let (tx, mut rx) = unbounded_channel();
         let mut writer = Writer::new(3, false);
-        let error = copy_with_progress(&mut &b"abcdef"[..], &mut writer, 6, &tx).await.unwrap_err();
+        let error = copy_with_progress(&mut &b"abcdef"[..], &mut writer, 6, &tx)
+            .await
+            .unwrap_err();
         assert_eq!(failure_bytes(&error), 3);
         assert!(error.to_string().contains("injected write failure"));
         assert_eq!(writer.data, b"abc");
         assert_eq!(last_progress(&mut rx), (3, 6));
         // 外层的收尾/清理错误不能把内部已经计数的部分写入重置成零。
-        assert_eq!(failure_bytes(&transfer_failure(error.context("outer"), 0)), 3);
+        assert_eq!(
+            failure_bytes(&transfer_failure(error.context("outer"), 0)),
+            3
+        );
     }
 
     #[tokio::test]
     async fn copy_rejects_write_zero_without_losing_progress() {
         let (tx, mut rx) = unbounded_channel();
         let mut writer = Writer::new(1, true);
-        let error = copy_with_progress(&mut &b"abc"[..], &mut writer, 3, &tx).await.unwrap_err();
+        let error = copy_with_progress(&mut &b"abc"[..], &mut writer, 3, &tx)
+            .await
+            .unwrap_err();
         assert_eq!(failure_bytes(&error), 1);
         assert_eq!(last_progress(&mut rx), (1, 3));
     }
@@ -732,7 +839,9 @@ mod tests {
             (&b"abc"[..], true, 6, 3),
         ] {
             let mut reader = Reader::new(data, fail);
-            let error = copy_to_local_temp(&mut reader, &target, total, &tx).await.unwrap_err();
+            let error = copy_to_local_temp(&mut reader, &target, total, &tx)
+                .await
+                .unwrap_err();
             assert_eq!(failure_bytes(&error), done);
             assert_eq!(tokio::fs::read(&target).await.unwrap(), b"original");
             dir.assert_only_target().await;
@@ -747,19 +856,33 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            tokio::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o751)).await.unwrap();
+            tokio::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o751))
+                .await
+                .unwrap();
         }
         let (tx, _) = unbounded_channel();
-        let (temp, bytes) = copy_to_local_temp(&mut &b"replacement"[..], &target, 11, &tx).await.unwrap();
+        let (temp, bytes) = copy_to_local_temp(&mut &b"replacement"[..], &target, 11, &tx)
+            .await
+            .unwrap();
         assert_eq!(bytes, 11);
         assert_eq!(temp.parent(), target.parent());
         assert_eq!(tokio::fs::read(&target).await.unwrap(), b"original");
-        commit_local_temp(&temp, &target, Some(0o600)).await.unwrap();
+        commit_local_temp(&temp, &target, Some(0o600))
+            .await
+            .unwrap();
         assert_eq!(tokio::fs::read(&target).await.unwrap(), b"replacement");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            assert_eq!(tokio::fs::metadata(&target).await.unwrap().permissions().mode() & 0o777, 0o751);
+            assert_eq!(
+                tokio::fs::metadata(&target)
+                    .await
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o751
+            );
         }
         dir.assert_only_target().await;
     }
@@ -769,13 +892,20 @@ mod tests {
         let dir = TestDir::new().await;
         let target = dir.0.join("target");
         let (tx, _) = unbounded_channel();
-        let (temp, bytes) = copy_to_local_temp(&mut &b"new"[..], &target, 3, &tx).await.unwrap();
+        let (temp, bytes) = copy_to_local_temp(&mut &b"new"[..], &target, 3, &tx)
+            .await
+            .unwrap();
         tokio::fs::create_dir(&target).await.unwrap();
-        tokio::fs::write(target.join("sentinel"), b"original").await.unwrap();
+        tokio::fs::write(target.join("sentinel"), b"original")
+            .await
+            .unwrap();
         let error = commit_local_temp(&temp, &target, None).await.unwrap_err();
         let error = cleanup_local_temp(&temp, transfer_failure(error, bytes)).await;
         assert_eq!(failure_bytes(&error), 3);
-        assert_eq!(tokio::fs::read(target.join("sentinel")).await.unwrap(), b"original");
+        assert_eq!(
+            tokio::fs::read(target.join("sentinel")).await.unwrap(),
+            b"original"
+        );
         dir.assert_only_target().await;
     }
 
@@ -788,14 +918,26 @@ mod tests {
         tokio::fs::write(&original, b"original").await.unwrap();
         std::os::unix::fs::symlink(&original, &target).unwrap();
         let (tx, _) = unbounded_channel();
-        assert!(copy_to_local_temp(&mut &b"new"[..], &target, 3, &tx).await.is_err());
+        assert!(
+            copy_to_local_temp(&mut &b"new"[..], &target, 3, &tx)
+                .await
+                .is_err()
+        );
         tokio::fs::remove_file(&target).await.unwrap();
-        let (temp, _) = copy_to_local_temp(&mut &b"new"[..], &target, 3, &tx).await.unwrap();
+        let (temp, _) = copy_to_local_temp(&mut &b"new"[..], &target, 3, &tx)
+            .await
+            .unwrap();
         std::os::unix::fs::symlink(&original, &target).unwrap();
         let error = commit_local_temp(&temp, &target, None).await.unwrap_err();
         let _ = cleanup_local_temp(&temp, error).await;
         assert_eq!(tokio::fs::read(&original).await.unwrap(), b"original");
-        assert!(tokio::fs::symlink_metadata(&target).await.unwrap().file_type().is_symlink());
+        assert!(
+            tokio::fs::symlink_metadata(&target)
+                .await
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
         assert!(!temp.exists());
         // 悬空链接也必须拒绝，不能当成不存在。
         tokio::fs::remove_file(&original).await.unwrap();

@@ -126,7 +126,11 @@ pub async fn send_file(
         } else {
             started.elapsed()
         };
-        let limit = if got_wire { IDLE_TIMEOUT } else { FIRST_RESPONSE };
+        let limit = if got_wire {
+            IDLE_TIMEOUT
+        } else {
+            FIRST_RESPONSE
+        };
         if waited >= limit {
             sender.abort();
             if got_wire {
@@ -135,9 +139,7 @@ pub async fn send_file(
                     IDLE_TIMEOUT.as_secs()
                 );
             }
-            anyhow::bail!(
-                "远端没有启动 ZMODEM 接收：请确认当前目录的 shell 里已安装 lrzsz（rz）"
-            );
+            anyhow::bail!("远端没有启动 ZMODEM 接收：请确认当前目录的 shell 里已安装 lrzsz（rz）");
         }
         match tokio::time::timeout(TICK.min(limit - waited), downlink.recv()).await {
             Ok(Some(bytes)) => {
@@ -205,10 +207,7 @@ mod tests {
                     }
                     Action::Event(Event::FileStarted(info)) => {
                         name = String::from_utf8_lossy(info.name).into_owned();
-                        assert_eq!(
-                            info.size.map(|size| size.get()),
-                            Some(payload.len() as u32)
-                        );
+                        assert_eq!(info.size.map(|size| size.get()), Some(payload.len() as u32));
                     }
                     Action::Event(Event::FileCompleted) => {}
                     Action::Event(Event::SessionCompleted) => {

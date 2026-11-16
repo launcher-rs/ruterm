@@ -56,8 +56,8 @@ pub(crate) fn tray_enabled() -> bool {
     TRAY_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-// 文件面板自己的图标（来自 lucide，ISC 许可）：rgpui 内置集合里没有合适的
-// 「定位」「跟随」语义。`icon_named!` 会把 assets/lucide 下的 SVG 编译进二进制。
+// 应用自定义图标（来自 lucide，ISC 许可）：rgpui 内置集合里没有合适的
+// 「定位」「跟随」「历史」语义。`icon_named!` 会把 assets/lucide 下的 SVG 编译进二进制。
 icon_named!(FileIcon, "assets/lucide");
 
 impl RenderOnce for FileIcon {
@@ -100,6 +100,7 @@ actions!(
         CloseSnippetManager,
         CommandHistory,
         CloseCommandHistory,
+        ToggleHistoryPanel,
         // 终端剪贴板：Ctrl+C 有选区就复制、没选区把 ^C 送给 shell；
         // Ctrl+Shift+C 只复制（不误发中断），Ctrl+V 粘贴。
         TerminalCopy,
@@ -204,8 +205,8 @@ fn main() {
             // 命令片段管理器：Esc 只关片段弹窗，不影响终端里的 Esc。
             KeyBinding::new("ctrl-shift-s", SnippetManager, None),
             KeyBinding::new("escape", CloseSnippetManager, Some("SnippetManager")),
-            // 命令历史：Esc 只关历史弹窗。
-            KeyBinding::new("ctrl-shift-h", CommandHistory, None),
+            // 命令历史：Ctrl+Shift+H 开关右侧历史面板；弹窗内的 Esc 只关弹窗。
+            KeyBinding::new("ctrl-shift-h", ToggleHistoryPanel, None),
             KeyBinding::new("escape", CloseCommandHistory, Some("CommandHistory")),
             // Tab 在 rgpui 的 Root 上下文里被绑成焦点切换，而按键绑定分发早于 on_key_down，
             // 终端元素因此永远收不到 \x09（shell 补全失效）。在 Terminal 上下文用 NoAction
@@ -279,7 +280,9 @@ fn main() {
             let handle = window_handle;
             cx.spawn(async move |cx| {
                 while rx.recv().await.is_some() {
-                    handle.update(cx, |_, window, _| window.activate_window()).ok();
+                    handle
+                        .update(cx, |_, window, _| window.activate_window())
+                        .ok();
                 }
                 // 守活 knock_loop：Task 被丢弃会连带取消 tokio 侧的监听。
                 drop(knock_loop.await);

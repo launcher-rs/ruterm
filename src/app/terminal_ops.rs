@@ -1,22 +1,20 @@
 //! //! 终端输入侧操作：查找条（Ctrl+F）、同步输入（MirrorInput 中间件）与命令广播。
 
-
 use rgpui::input_ui::{Input, InputEvent, InputState};
 use rgpui::prelude::*;
 use rgpui::{
-    Anchor, AnyElement, Button, ButtonVariants, Checkbox, Context, DismissEvent, Disableable, Entity, Focusable, FontWeight, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement, Pixels, Point, PopupMenu, SharedString,
-    Styled, Window, anchored, deferred, div, h_flex, px, v_flex,
+    Anchor, AnyElement, Button, ButtonVariants, Checkbox, Context, Disableable, DismissEvent,
+    Entity, Focusable, FontWeight, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
+    ParentElement, Pixels, Point, PopupMenu, SharedString, Styled, Window, anchored, deferred, div,
+    h_flex, px, v_flex,
 };
-use rgpui_term::{
-    InputOrigin,
-    TerminalMiddleware, TerminalView,
-};
+use rgpui_term::{InputOrigin, TerminalMiddleware, TerminalView};
 
+use crate::tr;
 use crate::{
     BroadcastCommand, CancelBroadcast, CloseFind, FindInTerminal, TerminalCopy, TerminalCopyText,
     TerminalPaste, ToggleSyncInput,
 };
-use crate::tr;
 
 use super::*;
 
@@ -137,11 +135,14 @@ impl RuTermApp {
         cx.notify();
     }
 
-
-    pub(super) fn close_find(&mut self, _: &CloseFind, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn close_find(
+        &mut self,
+        _: &CloseFind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.do_close_find(window, cx);
     }
-
 
     /// 收起查找条：清掉高亮与定位，焦点交回活动终端。
     pub(super) fn do_close_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -159,7 +160,6 @@ impl RuTermApp {
         cx.notify();
     }
 
-
     /// 活动标签的终端视图；无标签时为 None。
     pub(super) fn active_terminal_view(&self) -> Option<Entity<TerminalView>> {
         let id = self.active_tab?;
@@ -168,7 +168,6 @@ impl RuTermApp {
             .find(|tab| tab.id == id)
             .and_then(|tab| tab.terminal_view.clone())
     }
-
 
     /// 持有键盘焦点的终端视图（分屏时可能是非活动标签）；找不到时回落到活动标签。
     fn focused_terminal(&self, window: &Window, cx: &App) -> Option<Entity<TerminalView>> {
@@ -180,7 +179,6 @@ impl RuTermApp {
             .cloned()
     }
 
-
     /// 按标签 id 找终端视图，并给出会话是否还能收输入。
     fn terminal_view_by_id(&self, tab_id: usize) -> Option<(Entity<TerminalView>, bool)> {
         let tab = self.tabs.iter().find(|tab| tab.id == tab_id)?;
@@ -188,16 +186,11 @@ impl RuTermApp {
         Some((view, !tab.ended && !tab.failed))
     }
 
-
     /// 复制终端当前选区，返回是否真的有选区。
     ///
     /// 走终端自身的 `copy`：它在下次 `sync` 时写剪贴板并清掉选区
     /// （与 Windows Terminal 一致，复制后高亮消失即"已复制"的反馈）。
-    fn copy_terminal_selection(
-        &self,
-        view: &Entity<TerminalView>,
-        cx: &mut Context<Self>,
-    ) -> bool {
+    fn copy_terminal_selection(&self, view: &Entity<TerminalView>, cx: &mut Context<Self>) -> bool {
         let terminal = view.read(cx).terminal().clone();
         if terminal.read(cx).last_content().selection.is_none() {
             return false;
@@ -206,7 +199,6 @@ impl RuTermApp {
         cx.notify();
         true
     }
-
 
     /// 把系统剪贴板里的文本粘进终端（bracketed-paste / CRLF 归一化由终端负责）。
     fn paste_terminal(&self, view: &Entity<TerminalView>, cx: &mut Context<Self>) {
@@ -221,14 +213,12 @@ impl RuTermApp {
         terminal.update(cx, |terminal, _| terminal.paste(&text));
     }
 
-
     fn copy_terminal_by_id(&mut self, tab_id: usize, cx: &mut Context<Self>) {
         let Some((view, _)) = self.terminal_view_by_id(tab_id) else {
             return;
         };
         self.copy_terminal_selection(&view, cx);
     }
-
 
     fn paste_terminal_by_id(&mut self, tab_id: usize, cx: &mut Context<Self>) {
         let Some((view, live)) = self.terminal_view_by_id(tab_id) else {
@@ -239,7 +229,6 @@ impl RuTermApp {
         }
     }
 
-
     fn select_all_terminal(&mut self, tab_id: usize, cx: &mut Context<Self>) {
         let Some((view, _)) = self.terminal_view_by_id(tab_id) else {
             return;
@@ -248,7 +237,6 @@ impl RuTermApp {
         terminal.update(cx, |terminal, _| terminal.select_all());
     }
 
-
     fn clear_terminal_by_id(&mut self, tab_id: usize, cx: &mut Context<Self>) {
         let Some((view, _)) = self.terminal_view_by_id(tab_id) else {
             return;
@@ -256,7 +244,6 @@ impl RuTermApp {
         let terminal = view.read(cx).terminal().clone();
         terminal.update(cx, |terminal, _| terminal.clear());
     }
-
 
     /// Ctrl+C：有选区复制，没有选区就把 ^C 送给 shell（经典终端语义）。
     pub(super) fn terminal_copy_action(
@@ -283,7 +270,6 @@ impl RuTermApp {
         cx.stop_propagation();
     }
 
-
     /// Ctrl+Shift+C：只复制，没有选区就什么都不做（绝不误发中断）。
     pub(super) fn terminal_copy_text_action(
         &mut self,
@@ -300,7 +286,6 @@ impl RuTermApp {
         cx.stop_propagation();
     }
 
-
     /// Ctrl+V / Ctrl+Shift+V / Shift+Insert：把剪贴板文本粘进终端。
     pub(super) fn terminal_paste_action(
         &mut self,
@@ -312,9 +297,10 @@ impl RuTermApp {
             .focused_terminal(window, cx)
             .or_else(|| self.active_terminal_view())
         {
-            let live = self.tabs.iter().any(|tab| {
-                tab.terminal_view.as_ref() == Some(&view) && !tab.ended && !tab.failed
-            });
+            let live = self
+                .tabs
+                .iter()
+                .any(|tab| tab.terminal_view.as_ref() == Some(&view) && !tab.ended && !tab.failed);
             if live {
                 self.paste_terminal(&view, cx);
             }
@@ -322,7 +308,6 @@ impl RuTermApp {
         // 没有可粘贴的会话时也要吞掉按键，避免 ^V 落到 shell。
         cx.stop_propagation();
     }
-
 
     /// 终端区域右键：先于框架的「右键=粘贴」拦下事件，改为弹剪贴板菜单。
     ///
@@ -363,7 +348,6 @@ impl RuTermApp {
         }
         self.open_terminal_menu(tab_id, event.position, window, cx);
     }
-
 
     fn open_terminal_menu(
         &mut self,
@@ -437,7 +421,6 @@ impl RuTermApp {
         cx.notify();
     }
 
-
     /// 右键菜单的独立图层（root 最后绘制，命中区盖在终端与状态栏之上）。
     pub(super) fn render_terminal_menu(&mut self) -> AnyElement {
         // 打开设置等居中模态后收起，避免菜单隔着模态显示、再次关闭时又冒出来。
@@ -459,7 +442,6 @@ impl RuTermApp {
         .with_priority(1)
         .into_any_element()
     }
-
 
     /// 把查找条的关键词下发给活动终端（关键词与匹配方式都没变就不重复入队）。
     pub(super) fn apply_find(&mut self, cx: &mut Context<Self>) {
@@ -488,7 +470,6 @@ impl RuTermApp {
         });
     }
 
-
     /// 回车 / Shift+回车（或上/下按钮）：在匹配之间跳转。
     pub(super) fn step_find(&mut self, backward: bool, cx: &mut Context<Self>) {
         let Some(view) = self.active_terminal_view() else {
@@ -507,7 +488,6 @@ impl RuTermApp {
         });
     }
 
-
     /// 可接收输入的会话数（不含已结束 / 连接失败的标签；远程桌面没有终端输入通道）。
     pub(super) fn live_tab_count(&self) -> usize {
         self.tabs
@@ -515,7 +495,6 @@ impl RuTermApp {
             .filter(|tab| !tab.ended && !tab.failed && tab.terminal_view.is_some())
             .count()
     }
-
 
     /// 同步输入开关：打开后活动终端里的按键会同时写进其它会话。
     pub(super) fn toggle_sync_input(
@@ -526,7 +505,6 @@ impl RuTermApp {
     ) {
         self.set_sync_input(!self.sync_input, cx);
     }
-
 
     pub(super) fn set_sync_input(&mut self, on: bool, cx: &mut Context<Self>) {
         let live = self.live_tab_count();
@@ -543,7 +521,6 @@ impl RuTermApp {
         };
         cx.notify();
     }
-
 
     /// 中间件送来的输入：只转发活动终端的输入，写到其它未结束的会话。
     pub(super) fn mirror_input(
@@ -585,7 +562,6 @@ impl RuTermApp {
         }
     }
 
-
     /// 把一条命令写进活动终端：`run` 时追加回车。返回是否真的送出。
     ///
     /// 片段 / 内置命令 / 历史复用同一条路径；「执行」也会立刻记进命令历史，
@@ -626,7 +602,6 @@ impl RuTermApp {
         true
     }
 
-
     /// 菜单「命令发到所有会话…」：弹出输入框，确认后统一发送。
     pub(super) fn broadcast_command(
         &mut self,
@@ -657,7 +632,6 @@ impl RuTermApp {
         cx.notify();
     }
 
-
     pub(super) fn close_broadcast(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.broadcast.take().is_none() {
             return;
@@ -668,7 +642,6 @@ impl RuTermApp {
         cx.notify();
     }
 
-
     pub(super) fn cancel_broadcast(
         &mut self,
         _: &CancelBroadcast,
@@ -677,7 +650,6 @@ impl RuTermApp {
     ) {
         self.close_broadcast(window, cx);
     }
-
 
     /// 确认发送：命令 + 回车写进每个活动会话，等效于手动逐台输入。
     pub(super) fn commit_broadcast(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -723,7 +695,6 @@ impl RuTermApp {
         }
         cx.notify();
     }
-
 
     /// 命令广播弹窗：列清目标会话，勾选确认后才能发送。
     pub(super) fn render_broadcast_dialog(&self, cx: &Context<Self>) -> AnyElement {
@@ -842,8 +813,6 @@ impl RuTermApp {
             )
             .into_any_element()
     }
-
-
 }
 
 #[cfg(test)]

@@ -1,16 +1,16 @@
 //! //! 新建 / 编辑主机表单：字段收集、私钥（文件 / 内嵌）保存、跳板机与协议偏好持久化。
 
-
 use rgpui::components::Select;
 use rgpui::input_ui::{Input, InputContentType, InputState};
 use rgpui::prelude::*;
 use rgpui::{
-    AnyElement, Button, ButtonVariants, Context, Entity, FontWeight, InteractiveElement, IntoElement, MouseButton, ParentElement, ScrollableElement, SharedString,
+    AnyElement, Button, ButtonVariants, Context, Entity, FontWeight, InteractiveElement,
+    IntoElement, MouseButton, ParentElement, ScrollableElement, SharedString,
     StatefulInteractiveElement, Styled, Window, div, h_flex, px, v_flex,
 };
 
+use crate::NewHost;
 use crate::sessions::{AuthMethod, HostConfig, ProtocolKind};
-use crate::{NewHost};
 use crate::tr;
 
 use super::*;
@@ -49,7 +49,6 @@ impl RuTermApp {
         self.open_form_at(None, None, window, cx);
     }
 
-
     /// 打开新建主机表单并预选分组（分组右键「新建主机…」进入）。
     pub(super) fn open_form_in_group(
         &mut self,
@@ -59,7 +58,6 @@ impl RuTermApp {
     ) {
         self.open_form_at(None, group, window, cx);
     }
-
 
     /// 打开新建 / 编辑表单；edit_index 为 Some 时以该主机字段预填。
     /// `group` 是新建主机的预选分组（编辑时为 None，按原归属预填）。
@@ -190,14 +188,12 @@ impl RuTermApp {
         cx.notify();
     }
 
-
     /// 关闭新建表单（不保存）。
     pub(super) fn cancel_form(&mut self, cx: &mut Context<Self>) {
         self.new_host = None;
         self.status = "就绪".into();
         cx.notify();
     }
-
 
     /// 保存新建/编辑表单到列表并持久化；校验失败则保留表单。
     pub(super) fn save_form(&mut self, cx: &mut Context<Self>) {
@@ -342,7 +338,6 @@ impl RuTermApp {
         cx.notify();
     }
 
-
     /// 把刚保存的主机落到表单选定的分组，并展开该组让新主机立刻可见。
     /// 未分组（None）同时清掉旧归属。
     pub(super) fn apply_form_group(
@@ -358,7 +353,6 @@ impl RuTermApp {
         }
         self.persist_sidebar(cx);
     }
-
 
     /// 表单私钥口令的两档落点：勾选入库（加密库）或仅本次内存缓存。
     /// 空白口令＝不改动既有秘密。返回附注文案（None 表示无需提示）。
@@ -391,7 +385,6 @@ impl RuTermApp {
         self.password_cache.insert(host.addr(), passphrase);
         Some("（口令仅本次内存持有）".to_string())
     }
-
 
     /// 内嵌私钥的落点：新导入的写入加密库，取消内嵌则清除库内旧条目。
     ///
@@ -433,7 +426,6 @@ impl RuTermApp {
         }
         None
     }
-
 
     /// 选择私钥文件并读入表单（只在保存时写入加密库，读取后原文仅存内存）。
     ///
@@ -477,7 +469,6 @@ impl RuTermApp {
         .detach();
     }
 
-
     /// 校验并暂存导入的私钥（UI 线程侧）。
     pub(super) fn apply_imported_key(
         &mut self,
@@ -518,7 +509,6 @@ impl RuTermApp {
         cx.notify();
     }
 
-
     /// 打开系统文件对话框选择私钥文件，回填表单"私钥路径"。
     pub(super) fn browse_key_path(&mut self, cx: &mut Context<Self>) {
         let Some(form) = self.new_host.as_ref() else {
@@ -535,24 +525,23 @@ impl RuTermApp {
         });
         cx.spawn(async move |_, cx| {
             if let Ok(Ok(Some(paths))) = rx.await
-                && let Some(path) = paths.first() {
-                    let value = path.to_string_lossy().into_owned();
-                    let _ = cx.with_window(entity_id, move |window, cx| {
-                        input.update(cx, |state, cx| {
-                            state.set_value(value, window, cx);
-                        });
+                && let Some(path) = paths.first()
+            {
+                let value = path.to_string_lossy().into_owned();
+                let _ = cx.with_window(entity_id, move |window, cx| {
+                    input.update(cx, |state, cx| {
+                        state.set_value(value, window, cx);
                     });
-                }
+                });
+            }
         })
         .detach();
     }
-
 
     /// Ctrl+N / 菜单项：打开新建主机表单。
     pub(super) fn new_host(&mut self, _: &NewHost, window: &mut Window, cx: &mut Context<Self>) {
         self.open_form(window, cx);
     }
-
 
     /// 新建/编辑主机：居中模态弹窗。遮罩只挡交互、点击不关闭（防误丢已填内容），
     /// 关闭仅走"取消"按钮或标题栏 ×。
@@ -1087,7 +1076,6 @@ impl RuTermApp {
             .into_any_element()
     }
 
-
     /// 分组偏好落库；加密库不可用时退回旧 settings.json。
     /// 把跳板机映射回填到主机列表。
     ///
@@ -1102,7 +1090,6 @@ impl RuTermApp {
         }
     }
 
-
     /// 记录主机与跳板机的绑定关系。
     ///
     /// 加密库模式写 `settings` 的 `jumps` 键；降级模式跳板机字段直接随
@@ -1114,7 +1101,6 @@ impl RuTermApp {
         self.jumps.set(host.id, host.proxy_jump);
         self.persist_jumps(cx);
     }
-
 
     /// 跳板机映射落库；加密库不可用时退回旧 settings.json。
     pub(super) fn persist_jumps(&self, cx: &mut Context<Self>) {
@@ -1131,7 +1117,6 @@ impl RuTermApp {
         .detach();
     }
 
-
     /// 把协议映射回填到主机列表（只对加密库模式生效，理由同 [`Self::apply_jumps`]）。
     pub(super) fn apply_protocols(&mut self) {
         if self.vault.is_none() {
@@ -1141,7 +1126,6 @@ impl RuTermApp {
             host.protocol = self.protocols.protocol_of(host.id).unwrap_or_default();
         }
     }
-
 
     /// 记录某主机的协议选择；降级模式下协议已随 sessions.json 落盘，这里不动。
     pub(super) fn note_protocol(&mut self, host: &HostConfig, cx: &mut Context<Self>) {
@@ -1154,7 +1138,6 @@ impl RuTermApp {
             self.persist_protocols(cx);
         }
     }
-
 
     /// 协议映射落库；加密库不可用时退回旧 settings.json。
     pub(super) fn persist_protocols(&self, cx: &mut Context<Self>) {
@@ -1170,6 +1153,4 @@ impl RuTermApp {
         })
         .detach();
     }
-
-
 }

@@ -1,14 +1,14 @@
 //! //! 端口转发页：规则保存与开关启停、活动转发的建立 / 撤除与面板渲染。
 
-
 use rgpui::input_ui::{Input, InputState};
 use rgpui::prelude::*;
 use rgpui::{
-    AnyElement, App, Button, ButtonVariants, ClickEvent, Context, Entity, FontWeight, InteractiveElement, IntoElement, ParentElement, ScrollableElement, SharedString,
+    AnyElement, App, Button, ButtonVariants, ClickEvent, Context, Entity, FontWeight,
+    InteractiveElement, IntoElement, ParentElement, ScrollableElement, SharedString,
     StatefulInteractiveElement, Styled, Window, div, h_flex, px, v_flex,
 };
 
-use crate::{OpenForward};
+use crate::OpenForward;
 use crate::tr;
 
 use super::*;
@@ -76,7 +76,6 @@ impl RuTermApp {
     ) {
         self.open_forward(window, cx);
     }
-
 
     /// 打开转发分区：规则绑定当前 SSH 会话，不新开连接。
     pub(super) fn open_forward(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -149,9 +148,12 @@ impl RuTermApp {
         cx.notify();
     }
 
-
     /// 切换转发方向：只改字段语义，不清空已填内容（本地/远程常用同样的 8080→80）。
-    pub(super) fn set_forward_kind(&mut self, kind: crate::session::ForwardKind, cx: &mut Context<Self>) {
+    pub(super) fn set_forward_kind(
+        &mut self,
+        kind: crate::session::ForwardKind,
+        cx: &mut Context<Self>,
+    ) {
         let Some(dialog) = self.forward.as_mut() else {
             return;
         };
@@ -175,7 +177,6 @@ impl RuTermApp {
         cx.notify();
     }
 
-
     /// 展开 / 收起新增规则表单；列表与添加分开，避免互相挤占。
     pub(super) fn set_forward_editing(&mut self, editing: bool, cx: &mut Context<Self>) {
         if let Some(dialog) = self.forward.as_mut() {
@@ -188,7 +189,6 @@ impl RuTermApp {
         cx.notify();
     }
 
-
     /// 表单里的「连接时自动开启」勾选。
     pub(super) fn set_forward_auto_start(&mut self, on: bool, cx: &mut Context<Self>) {
         if let Some(dialog) = self.forward.as_mut() {
@@ -197,13 +197,11 @@ impl RuTermApp {
         cx.notify();
     }
 
-
     /// 关闭转发表单；已开启的转发继续在后台工作，可在再次打开时停止。
     pub(super) fn close_forward(&mut self, cx: &mut Context<Self>) {
         self.forward = None;
         cx.notify();
     }
-
 
     /// 校验表单字段，折算成规则（弹窗名称与自动开关一并返回）。
     pub(super) fn forward_form_rule(
@@ -239,7 +237,9 @@ impl RuTermApp {
             ));
         }
         let (port_label, host_hint) = match dialog.kind {
-            crate::session::ForwardKind::Local => ("远端端口", "请填写远端主机（服务器视角的地址）"),
+            crate::session::ForwardKind::Local => {
+                ("远端端口", "请填写远端主机（服务器视角的地址）")
+            }
             _ => ("本地目标端口", "请填写本地目标主机（本机视角的地址）"),
         };
         let target_host = dialog.target_host.read(cx).value().trim().to_string();
@@ -259,7 +259,6 @@ impl RuTermApp {
             dialog.auto_start,
         ))
     }
-
 
     /// 把表单里的规则保存到当前连接的规则列表（不动运行状态，开关另行控制）。
     pub(super) fn save_forward(&mut self, cx: &mut Context<Self>) {
@@ -304,7 +303,6 @@ impl RuTermApp {
         cx.notify();
     }
 
-
     /// 按已保存的规则发起转发（开关打开 / 自动开启共用）。
     pub(super) fn start_forward_rule(
         &mut self,
@@ -346,9 +344,13 @@ impl RuTermApp {
         .detach();
     }
 
-
     /// 已保存规则的开关：开＝立即启动，关＝停止（规则本身保留）。
-    pub(super) fn toggle_saved_forward(&mut self, saved: SavedForward, on: bool, cx: &mut Context<Self>) {
+    pub(super) fn toggle_saved_forward(
+        &mut self,
+        saved: SavedForward,
+        on: bool,
+        cx: &mut Context<Self>,
+    ) {
         let Some(tab_id) = self.forward.as_ref().map(|dialog| dialog.tab_id) else {
             return;
         };
@@ -358,7 +360,6 @@ impl RuTermApp {
             self.stop_forward(saved.rule(), cx);
         }
     }
-
 
     /// 删除一条已保存规则；若正在转发先停掉，避免"删了还在跑"。
     pub(super) fn delete_saved_forward(&mut self, saved: SavedForward, cx: &mut Context<Self>) {
@@ -382,7 +383,6 @@ impl RuTermApp {
         cx.notify();
     }
 
-
     /// 会话就绪后自动开启勾选了「连接时自动开启」的规则。
     pub(super) fn auto_start_forwards(&mut self, tab_id: usize, cx: &mut Context<Self>) {
         let Some(addr) = self
@@ -404,7 +404,6 @@ impl RuTermApp {
             self.start_forward_rule(tab_id, rule, cx);
         }
     }
-
 
     /// 开启结果：成功则把生效规则记到标签上（弹窗关掉也不丢），失败写弹窗与状态栏。
     pub(super) fn finish_forward_start(
@@ -442,9 +441,12 @@ impl RuTermApp {
         cx.notify();
     }
 
-
     /// 停止一条转发，并从标签的活动规则列表里移除。
-    pub(super) fn stop_forward(&mut self, rule: crate::session::ForwardRule, cx: &mut Context<Self>) {
+    pub(super) fn stop_forward(
+        &mut self,
+        rule: crate::session::ForwardRule,
+        cx: &mut Context<Self>,
+    ) {
         let Some(dialog) = self.forward.as_ref() else {
             return;
         };
@@ -492,18 +494,24 @@ impl RuTermApp {
         .detach();
     }
 
-
     /// 从标签的活动规则列表里删掉一条（服务端已停止或已失效）。
-    pub(super) fn remove_forward_rule(&mut self, tab_id: usize, rule: &crate::session::ForwardRule) {
+    pub(super) fn remove_forward_rule(
+        &mut self,
+        tab_id: usize,
+        rule: &crate::session::ForwardRule,
+    ) {
         if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) {
             let id = rule.id();
             tab.forwards.retain(|existing| existing.id() != id);
         }
     }
 
-
     /// 端口转发的即时错误：写进弹窗（若还开着）并同步状态栏。
-    pub(super) fn forward_error(&mut self, message: impl Into<SharedString>, cx: &mut Context<Self>) {
+    pub(super) fn forward_error(
+        &mut self,
+        message: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
         let message = message.into();
         if let Some(dialog) = self.forward.as_mut() {
             dialog.error = Some(message.clone());
@@ -512,7 +520,6 @@ impl RuTermApp {
         self.status = message;
         cx.notify();
     }
-
 
     /// 边栏「转发」分区：已保存规则的开关列表 + 新建规则表单。
     pub(super) fn render_forward_section(&self, cx: &Context<Self>) -> AnyElement {
@@ -886,7 +893,6 @@ impl RuTermApp {
             )
             .into_any_element()
     }
-
 
     /// 端口转发规则落库；加密库不可用时退回旧 settings.json。
     pub(super) fn persist_forwards(&self, cx: &mut Context<Self>) {

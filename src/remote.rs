@@ -174,7 +174,10 @@ mod tests {
             Some(Platform::Unix)
         );
         // Windows OpenSSH 的 exec 不认 POSIX 脚本，探测不到 sys：平台保持未知。
-        assert_eq!(RemoteInfo::parse("os=Ubuntu 24.04.1 LTS\n").platform(), None);
+        assert_eq!(
+            RemoteInfo::parse("os=Ubuntu 24.04.1 LTS\n").platform(),
+            None
+        );
         assert_eq!(RemoteInfo::parse("").platform(), None);
     }
 

@@ -5,18 +5,15 @@ use std::sync::Arc;
 use rgpui::input_ui::{Input, InputEvent, InputState};
 use rgpui::prelude::*;
 use rgpui::{
-    AnyElement, Button, ButtonVariants, Context,
-    ContextMenuExt, Entity, Icon, IconName, Image,
-    ImageFormat, InteractiveElement, IntoElement, MouseButton, ParentElement, PopupMenuItem, SharedString,
-    StatefulInteractiveElement, Styled, Window, div, h_flex, img, px, v_flex,
+    AnyElement, Button, ButtonVariants, Context, ContextMenuExt, Entity, Icon, IconName, Image,
+    ImageFormat, InteractiveElement, IntoElement, MouseButton, ParentElement, PopupMenuItem,
+    SharedString, StatefulInteractiveElement, Styled, Window, div, h_flex, img, px, v_flex,
 };
-use rgpui_term::{
-    Event as TerminalEvent, TerminalBuilder, TerminalView,
-};
+use rgpui_term::{Event as TerminalEvent, TerminalBuilder, TerminalView};
 
+use crate::NewLocalTerminal;
 use crate::local_shell::{NetTool, ShellProfile};
 use crate::platform::Platform;
-use crate::{NewLocalTerminal};
 use crate::tr;
 
 use super::*;
@@ -55,7 +52,6 @@ impl RuTermApp {
         }
     }
 
-
     /// 搜索是否命中该 shell（自定义名、系统名或可执行文件名）。
     pub(super) fn shell_matches(&self, profile: &ShellProfile, query: &str) -> bool {
         if query.is_empty() {
@@ -68,7 +64,6 @@ impl RuTermApp {
             .is_some_and(|alias| alias.to_lowercase().contains(&query));
         alias_hit || profile.matches(&query)
     }
-
 
     /// 打开本地 shell 重命名弹窗（预填当前展示名）。
     pub(super) fn open_shell_prompt(
@@ -90,7 +85,6 @@ impl RuTermApp {
             cx,
         );
     }
-
 
     /// 打开「起始目录」弹窗（预填已设置的目录，留空＝进程当前目录）。
     pub(super) fn open_shell_cwd_prompt(
@@ -114,7 +108,6 @@ impl RuTermApp {
             cx,
         );
     }
-
 
     /// 打开「启动参数」弹窗（预填已保存的参数原文，留空＝不加参数）。
     pub(super) fn open_shell_args_prompt(
@@ -141,7 +134,6 @@ impl RuTermApp {
         );
     }
 
-
     /// 打开「环境变量」弹窗（预填已保存的 KEY=VALUE 行，留空＝不注入）。
     pub(super) fn open_shell_env_prompt(
         &mut self,
@@ -161,7 +153,6 @@ impl RuTermApp {
             cx,
         );
     }
-
 
     pub(super) fn open_shell_input(
         &mut self,
@@ -203,7 +194,6 @@ impl RuTermApp {
         });
         cx.notify();
     }
-
 
     /// 确认弹窗：重命名留空/同名即恢复默认；起始目录留空即用进程当前目录。
     pub(super) fn commit_shell_prompt(&mut self, cx: &mut Context<Self>) {
@@ -273,7 +263,6 @@ impl RuTermApp {
         cx.notify();
     }
 
-
     /// 「浏览…」选起始目录（系统目录选择对话框），回填弹窗输入框。
     pub(super) fn browse_shell_cwd(&mut self, cx: &mut Context<Self>) {
         let Some(prompt) = self.shell_prompt.as_ref() else {
@@ -289,25 +278,24 @@ impl RuTermApp {
         });
         cx.spawn(async move |_, cx| {
             if let Ok(Ok(Some(paths))) = rx.await
-                && let Some(path) = paths.first() {
-                    let value = path.to_string_lossy().into_owned();
-                    let _ = cx.with_window(entity_id, move |window, cx| {
-                        input.update(cx, |state, cx| {
-                            state.set_value(value, window, cx);
-                        });
+                && let Some(path) = paths.first()
+            {
+                let value = path.to_string_lossy().into_owned();
+                let _ = cx.with_window(entity_id, move |window, cx| {
+                    input.update(cx, |state, cx| {
+                        state.set_value(value, window, cx);
                     });
-                }
+                });
+            }
         })
         .detach();
     }
-
 
     /// 关闭重命名弹窗，不写入。
     pub(super) fn cancel_shell_prompt(&mut self, cx: &mut Context<Self>) {
         self.shell_prompt = None;
         cx.notify();
     }
-
 
     /// 右键「恢复默认名称」：直接清掉别名，不弹窗。
     pub(super) fn reset_shell_name(&mut self, profile: &ShellProfile, cx: &mut Context<Self>) {
@@ -316,7 +304,6 @@ impl RuTermApp {
         self.persist_local_shells(cx);
         cx.notify();
     }
-
 
     /// 右键「恢复默认起始目录」：清掉该 profile 的目录设置。
     pub(super) fn reset_shell_cwd(&mut self, profile: &ShellProfile, cx: &mut Context<Self>) {
@@ -329,7 +316,6 @@ impl RuTermApp {
         cx.notify();
     }
 
-
     /// 右键「清除启动参数」。
     pub(super) fn reset_shell_args(&mut self, profile: &ShellProfile, cx: &mut Context<Self>) {
         self.local_shell_prefs.set_args(&profile.id(), "");
@@ -338,7 +324,6 @@ impl RuTermApp {
         cx.notify();
     }
 
-
     /// 右键「清除环境变量」。
     pub(super) fn reset_shell_env(&mut self, profile: &ShellProfile, cx: &mut Context<Self>) {
         self.local_shell_prefs.set_env(&profile.id(), "");
@@ -346,7 +331,6 @@ impl RuTermApp {
         self.persist_local_shells(cx);
         cx.notify();
     }
-
 
     /// 保存本机 shell 自定义名（库可用入库，否则退回 settings.json）。
     pub(super) fn persist_local_shells(&mut self, cx: &mut Context<Self>) {
@@ -363,19 +347,16 @@ impl RuTermApp {
         }
     }
 
-
     /// 启动时静默补扫一次：`detect()` 只查文件，WSL 得跑 `wsl.exe -l`，
     /// 不值得卡在启动路径上，但列表应当开箱即完整，所以后台补一次、不打扰状态栏。
     pub(super) fn auto_scan_local_shells(&mut self, cx: &mut Context<Self>) {
         self.fetch_local_shells(true, cx);
     }
 
-
     /// 一键扫描本机 shell（含 WSL）：`wsl.exe -l` 是子进程，丢给阻塞线程池，UI 不卡。
     pub(super) fn scan_local_shells(&mut self, cx: &mut Context<Self>) {
         self.fetch_local_shells(false, cx);
     }
-
 
     /// `quiet` 为真时不动状态栏（启动补扫用），扫到的列表与图标照常刷新。
     pub(super) fn fetch_local_shells(&mut self, quiet: bool, cx: &mut Context<Self>) {
@@ -419,7 +400,6 @@ impl RuTermApp {
         .detach();
     }
 
-
     /// 给列表里每个 shell 取一次系统图标（同一 exe 只取一次，如各 WSL 发行版共用 wsl.exe）。
     pub(super) fn refresh_shell_icons(&mut self) {
         let programs: Vec<String> = self
@@ -441,12 +421,15 @@ impl RuTermApp {
         }
     }
 
-
     /// Ctrl+Shift+T / 菜单项：新开一个本地终端标签。
-    pub(super) fn new_local_terminal(&mut self, _: &NewLocalTerminal, _: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn new_local_terminal(
+        &mut self,
+        _: &NewLocalTerminal,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.open_local_terminal(None, cx);
     }
-
 
     /// 主机右键菜单「Ping」/「路由追踪」：在本地 PTY 里跑系统命令。
     ///
@@ -465,11 +448,14 @@ impl RuTermApp {
         self.open_local_terminal(Some(&profile), cx);
     }
 
-
     /// 打开本地终端（路线图 §五 一期）：交给 rgpui-term 的本地 PTY 后端拉起选定 shell。
     /// 不指定档案时取列表第一项（`detect()` 把 PowerShell 7 排最前）。
     /// 进程拉起与通道握手是异步的：建好才落标签，失败只写状态栏，不留空标签。
-    pub(super) fn open_local_terminal(&mut self, profile: Option<&ShellProfile>, cx: &mut Context<Self>) {
+    pub(super) fn open_local_terminal(
+        &mut self,
+        profile: Option<&ShellProfile>,
+        cx: &mut Context<Self>,
+    ) {
         let chosen = profile
             .cloned()
             .or_else(|| self.local_shells.first().cloned());
@@ -526,7 +512,6 @@ impl RuTermApp {
         .detach();
     }
 
-
     /// 把建好的本地 PTY 终端落成标签；shell 进程退出即自动移除。
     pub(super) fn add_local_tab(
         &mut self,
@@ -562,7 +547,10 @@ impl RuTermApp {
             base_title: label.clone().into(),
             custom_title: None,
             title_ordinal,
-            follow_osc_title: true,
+            // 标签名固定用 shell 档案名：OSC 标题在 Windows 上常是整个
+            // 可执行文件路径（如 C:\Program Files\PowerShell\7\pwsh.exe），
+            // 放进标签里过长；工作目录只留在状态栏的 addr 里。
+            follow_osc_title: false,
             addr,
             auth: None,
             remote_info: None,
@@ -634,7 +622,6 @@ impl RuTermApp {
             )
             .into_any_element()
     }
-
 
     /// 内置「本地终端」分组：父行折叠/展开，子行是扫描到的每个本机 shell，点一下直接开对应终端。
     /// 它不是凭据库里的主机，所以没有 ★ / 编辑 / 删除，也不参与分组与收藏排序；
@@ -885,7 +872,6 @@ impl RuTermApp {
         .into_any_element()
     }
 
-
     /// 本地 shell 重命名弹窗：与分组重命名同款居中模态。
     pub(super) fn render_shell_prompt(&self, cx: &Context<Self>) -> AnyElement {
         let pal = self.palette(cx);
@@ -1022,6 +1008,4 @@ impl RuTermApp {
             )
             .into_any_element()
     }
-
-
 }

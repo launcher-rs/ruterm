@@ -39,10 +39,7 @@ pub fn matches_after(items: &[CompletionItem], token: &str, prefix: &str) -> Vec
         return Vec::new();
     }
     let needle = token.to_lowercase();
-    let prefix_words: Vec<String> = prefix
-        .split_whitespace()
-        .map(str::to_lowercase)
-        .collect();
+    let prefix_words: Vec<String> = prefix.split_whitespace().map(str::to_lowercase).collect();
     let mut scored: Vec<(i16, usize)> = items
         .iter()
         .enumerate()
@@ -71,10 +68,7 @@ pub fn matches_after(items: &[CompletionItem], token: &str, prefix: &str) -> Vec
 
 /// 命令开头的若干词是否正好等于前缀末尾的词（大小写不敏感）。
 fn continues_prefix(command: &str, prefix_words: &[String]) -> bool {
-    let words: Vec<String> = command
-        .split_whitespace()
-        .map(str::to_lowercase)
-        .collect();
+    let words: Vec<String> = command.split_whitespace().map(str::to_lowercase).collect();
     let max = prefix_words.len().min(words.len());
     (1..=max).any(|k| prefix_words[prefix_words.len() - k..] == words[..k])
 }
@@ -116,9 +110,8 @@ pub fn echo_lagging(before: &[char], tracked: &[char], token_chars: usize) -> bo
     }
     // 落后不超过一个词；整行都没回显时没有锚点，不冒险。
     let max_lag = token_chars.min(tracked.len());
-    (1..=max_lag).any(|lag| {
-        lag < tracked.len() && before.ends_with(&tracked[..tracked.len() - lag])
-    })
+    (1..=max_lag)
+        .any(|lag| lag < tracked.len() && before.ends_with(&tracked[..tracked.len() - lag]))
 }
 
 /// 把候选命令接到已有前缀后面：前缀的后缀已经写过命令开头的若干词时（如
@@ -159,8 +152,16 @@ mod tests {
 
     fn sample() -> Vec<CompletionItem> {
         vec![
-            item("系统更新", "sudo apt update && sudo apt upgrade -y", "更新索引并升级"),
-            item("安装软件包", "sudo apt install <包名>", "把包名换成要装的软件"),
+            item(
+                "系统更新",
+                "sudo apt update && sudo apt upgrade -y",
+                "更新索引并升级",
+            ),
+            item(
+                "安装软件包",
+                "sudo apt install <包名>",
+                "把包名换成要装的软件",
+            ),
             item("监听端口", "sudo ss -tlnp", "列出监听端口"),
             item("磁盘余量", "df -h", "按挂载点列出使用率"),
             item(
@@ -217,7 +218,10 @@ mod tests {
             item("安装软件包", "sudo apt install <包名>", ""),
         ];
         // 前缀 `sudo apt ` 正好接上 install 所在命令：即使两条都命中 `in`，也排在前面。
-        assert_eq!(items[matches_after(&items, "in", "sudo apt ")[0]].name, "安装软件包");
+        assert_eq!(
+            items[matches_after(&items, "in", "sudo apt ")[0]].name,
+            "安装软件包"
+        );
         // 没有前缀时按普通打分（命令词前缀）与名称排序，PowerShell 那条在前。
         assert_eq!(items[matches_after(&items, "in", "")[0]].name, "下载文件");
     }
@@ -266,7 +270,11 @@ mod tests {
         // 网格停在词前：连词都没回显，只是看起来像，不能动。
         assert!(!echo_lagging(&chars("root# docker"), &chars("docker p"), 1));
         // 正在输入的词只回显了前半截。
-        assert!(echo_lagging(&chars("root# sudo dock"), &chars("sudo docker"), 6));
+        assert!(echo_lagging(
+            &chars("root# sudo dock"),
+            &chars("sudo docker"),
+            6
+        ));
         // 整行都没回显。
         assert!(!echo_lagging(&chars("root# "), &chars("sudo docker"), 6));
         // 命令词在行首、且一个字符都没回显：没有锚点。

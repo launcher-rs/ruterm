@@ -304,7 +304,7 @@ pub const PRESETS: &[PresetSnippet] = &[
 
 #[cfg(test)]
 mod tests {
-    use super::{PRESETS, PRESET_GROUPS, PresetSnippet, presets_for};
+    use super::{PRESET_GROUPS, PRESETS, PresetSnippet, presets_for};
     use crate::platform::Platform;
     use crate::snippets;
 
@@ -327,7 +327,12 @@ mod tests {
                 "内置命令不合法：{}",
                 preset.name
             );
-            assert!(!preset.command.chars().any(|c| matches!(c, '\r' | '\n' | '\0')));
+            assert!(
+                !preset
+                    .command
+                    .chars()
+                    .any(|c| matches!(c, '\r' | '\n' | '\0'))
+            );
             assert!(!preset.note.chars().any(|c| matches!(c, '\r' | '\n')));
         }
     }
@@ -379,7 +384,11 @@ mod tests {
         let linux: Vec<&str> = presets_for(Some(Platform::Linux))
             .map(|(_, preset)| preset.command)
             .collect();
-        assert!(linux.iter().any(|command| command.contains("ip -brief addr")));
+        assert!(
+            linux
+                .iter()
+                .any(|command| command.contains("ip -brief addr"))
+        );
         assert!(!linux.iter().any(|command| command.contains("Get-")));
         assert!(!linux.iter().any(|command| command.contains("HKLM:")));
         // 跨平台命令（Docker）在 Linux 上仍然可用。
@@ -388,11 +397,17 @@ mod tests {
         let windows: Vec<&str> = presets_for(Some(Platform::Windows))
             .map(|(_, preset)| preset.command)
             .collect();
-        assert!(windows
-            .iter()
-            .any(|command| command.contains("Get-NetIPConfiguration")));
+        assert!(
+            windows
+                .iter()
+                .any(|command| command.contains("Get-NetIPConfiguration"))
+        );
         assert!(!windows.iter().any(|command| command.contains("apt ")));
-        assert!(!windows.iter().any(|command| command.contains("ip -brief addr")));
+        assert!(
+            !windows
+                .iter()
+                .any(|command| command.contains("ip -brief addr"))
+        );
 
         // 平台未知：只剩通用命令。
         let unknown: Vec<&str> = presets_for(None)

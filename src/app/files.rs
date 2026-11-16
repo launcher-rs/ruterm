@@ -8,16 +8,14 @@ use std::time::Duration;
 use rgpui::input_ui::{Input, InputEvent, InputState};
 use rgpui::prelude::*;
 use rgpui::{
-    AnyElement, Button, ButtonVariants, Context,
-    ContextMenuExt, Disableable, DragMoveEvent, Entity,
-    ExternalPaths, FontWeight, Icon, IconName, InteractiveElement, IntoElement, MouseButton,
-    MouseDownEvent, ParentElement, PopupMenuItem,
-    Render, ScrollableElement, SharedString,
-    StatefulInteractiveElement, Styled, Window, div, h_flex, px, v_flex,
+    AnyElement, Button, ButtonVariants, Context, ContextMenuExt, Disableable, DragMoveEvent,
+    Entity, ExternalPaths, FontWeight, Icon, IconName, InteractiveElement, IntoElement,
+    MouseButton, MouseDownEvent, ParentElement, PopupMenuItem, Render, ScrollableElement,
+    SharedString, StatefulInteractiveElement, Styled, Window, div, h_flex, px, v_flex,
 };
 
-use crate::sessions::HostConfig;
 use crate::FileIcon;
+use crate::sessions::HostConfig;
 use crate::tr;
 
 use super::*;
@@ -88,14 +86,12 @@ pub(super) fn open_path_with_default(path: &Path) {
 
 /// 每份新副本独占随机目录；create（非 create_dir_all）不接受预先存在的目录。
 fn create_open_copy(name: &str) -> std::io::Result<PathBuf> {
-    let safe = safe_local_name(name).ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "文件名不合法")
-    })?;
+    let safe = safe_local_name(name)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "文件名不合法"))?;
     for _ in 0..16 {
         let mut random = [0u8; 16];
-        getrandom::fill(&mut random).map_err(|error| {
-            std::io::Error::other(format!("无法生成临时目录随机数：{error}"))
-        })?;
+        getrandom::fill(&mut random)
+            .map_err(|error| std::io::Error::other(format!("无法生成临时目录随机数：{error}")))?;
         let suffix: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
         let dir = std::env::temp_dir().join(format!("ruterm-open-{suffix}"));
         let builder = std::fs::DirBuilder::new();
@@ -155,10 +151,19 @@ fn open_remote_in_editor(path: &Path) -> Result<(), String> {
     {
         let mut errors = Vec::new();
         for editor in [
-            "/usr/bin/gnome-text-editor", "/usr/bin/gedit", "/usr/bin/kate",
-            "/usr/bin/mousepad", "/usr/bin/pluma", "/usr/bin/xed", "/usr/bin/leafpad",
+            "/usr/bin/gnome-text-editor",
+            "/usr/bin/gedit",
+            "/usr/bin/kate",
+            "/usr/bin/mousepad",
+            "/usr/bin/pluma",
+            "/usr/bin/xed",
+            "/usr/bin/leafpad",
         ] {
-            match std::process::Command::new(editor).arg("--").arg(path).spawn() {
+            match std::process::Command::new(editor)
+                .arg("--")
+                .arg(path)
+                .spawn()
+            {
                 Ok(_) => return Ok(()),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => errors.push(format!("{editor}: {error}")),
@@ -166,7 +171,8 @@ fn open_remote_in_editor(path: &Path) -> Result<(), String> {
         }
         Err(format!(
             "无法启动文本编辑器，请安装 gnome-text-editor、gedit、Kate 或 Mousepad；副本保存在 {}。{}",
-            path.display(), errors.join("；")
+            path.display(),
+            errors.join("；")
         ))
     }
 }
@@ -215,7 +221,10 @@ pub(super) struct FileStamp {
 impl OpenedRemote {
     fn new(local: PathBuf, remote: String, name: String, synchronized: FileStamp) -> Self {
         Self {
-            local, remote, name, synchronized,
+            local,
+            remote,
+            name,
+            synchronized,
             pending: None,
             inflight: None,
             ignored: None,
@@ -454,10 +463,18 @@ impl Default for FileBrowser {
 
 impl FileBrowser {
     fn opened_mut(&mut self, local: &Path, remote: &str) -> Option<&mut OpenedRemote> {
-        self.opened.iter_mut().find(|item| item.local == local && item.remote == remote)
+        self.opened
+            .iter_mut()
+            .find(|item| item.local == local && item.remote == remote)
     }
 
-    fn finish_upload(&mut self, local: &Path, remote: &str, stamp: FileStamp, succeeded: bool) -> bool {
+    fn finish_upload(
+        &mut self,
+        local: &Path,
+        remote: &str,
+        stamp: FileStamp,
+        succeeded: bool,
+    ) -> bool {
         self.opened_mut(local, remote)
             .is_some_and(|item| item.finish_upload(stamp, succeeded))
     }
@@ -590,9 +607,13 @@ impl RuTermApp {
         }
     }
 
-
     /// 列出某标签的远端目录；`None` 表示登录主目录。
-    pub(super) fn load_files(&mut self, tab_id: usize, path: Option<String>, cx: &mut Context<Self>) {
+    pub(super) fn load_files(
+        &mut self,
+        tab_id: usize,
+        path: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
         let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) else {
             return;
         };
@@ -652,7 +673,6 @@ impl RuTermApp {
         .detach();
     }
 
-
     /// 刷新当前标签的目录（面板工具栏）。
     pub(super) fn refresh_files(&mut self, tab_id: usize, cx: &mut Context<Self>) {
         let path = self
@@ -662,7 +682,6 @@ impl RuTermApp {
             .and_then(|tab| tab.files.path.clone());
         self.load_files(tab_id, path, cx);
     }
-
 
     /// 进入上级目录。
     pub(super) fn files_up(&mut self, tab_id: usize, cx: &mut Context<Self>) {
@@ -677,11 +696,15 @@ impl RuTermApp {
         }
     }
 
-
     /// 点击路径栏：激活编辑模式，输入框预填当前路径。
     ///
     /// 新框要自己抢焦点并全选——点路径栏的人是想换一条路径，不是想在末尾续字。
-    pub(super) fn start_path_edit(&mut self, target: PaneTarget, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn start_path_edit(
+        &mut self,
+        target: PaneTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let current = self.pane_path(target);
         let input = cx.new(|cx| InputState::new(window, cx).default_value(&current));
         cx.subscribe(&input, |this, _, event: &InputEvent, cx| {
@@ -698,7 +721,6 @@ impl RuTermApp {
         self.path_edit = Some((target, input));
         cx.notify();
     }
-
 
     /// 回车提交路径：跳转到输入的目录。
     pub(super) fn commit_path_edit(&mut self, cx: &mut Context<Self>) {
@@ -717,9 +739,14 @@ impl RuTermApp {
         cx.notify();
     }
 
-
     /// 双击条目：目录就进去，远端文件下载到独占目录并作为文本打开。
-    pub(super) fn open_file_entry(&mut self, tab_id: usize, name: &str, is_dir: bool, cx: &mut Context<Self>) {
+    pub(super) fn open_file_entry(
+        &mut self,
+        tab_id: usize,
+        name: &str,
+        is_dir: bool,
+        cx: &mut Context<Self>,
+    ) {
         let Some(path) = self
             .tabs
             .iter()
@@ -736,7 +763,6 @@ impl RuTermApp {
         self.open_remote_file(tab_id, target, name, cx);
     }
 
-
     /// 同一会话、完整远端路径复用副本；新副本的目录永不按文件名或标签共享。
     pub(super) fn open_remote_file(
         &mut self,
@@ -748,12 +774,20 @@ impl RuTermApp {
         let Some(tab) = self.tabs.iter().find(|tab| tab.id == tab_id) else {
             return;
         };
-        if tab.ended || tab.commands.as_ref().is_none_or(|sender| sender.is_closed()) {
+        if tab.ended
+            || tab
+                .commands
+                .as_ref()
+                .is_none_or(|sender| sender.is_closed())
+        {
             self.file_error(tab_id, "会话已断开，无法打开远端文件", cx);
             return;
         }
         // 重新下载会覆盖尚未回传的修改；只按完整远端路径复用。
-        if let Some(opened) = tab.files.opened.iter()
+        if let Some(opened) = tab
+            .files
+            .opened
+            .iter()
             .find(|item| item.remote == remote && item.local.is_file())
         {
             if let Err(error) = open_remote_in_editor(&opened.local) {
@@ -788,7 +822,6 @@ impl RuTermApp {
         }
     }
 
-
     /// 登记一个已用本地程序打开的远端文件，并确保该标签的巡检循环在跑。
     pub(super) fn track_opened_remote(
         &mut self,
@@ -810,13 +843,20 @@ impl RuTermApp {
         if tab.ended {
             return;
         }
-        if tab.files.opened.iter().any(|item| item.remote == remote && item.local == local) {
+        if tab
+            .files
+            .opened
+            .iter()
+            .any(|item| item.remote == remote && item.local == local)
+        {
             return;
         }
         // 新本地路径代表新副本，不能继承旧副本的「全部是」授权。
         self.file_upload_all.remove(&(tab_id, remote.clone()));
         tab.files.opened.retain(|item| item.remote != remote);
-        tab.files.opened.push(OpenedRemote::new(local, remote, name, stamp));
+        tab.files
+            .opened
+            .push(OpenedRemote::new(local, remote, name, stamp));
         if tab.files.watching {
             return;
         }
@@ -824,30 +864,36 @@ impl RuTermApp {
         cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(OPEN_FILE_POLL).await;
-                let watching = this.update(cx, |this, cx| {
-                    this.prune_remote_uploads(cx);
-                    let Some(tab) = this.tabs.iter_mut().find(|tab| tab.id == tab_id) else {
-                        return false;
-                    };
-                    if !tab.commands.as_ref().is_some_and(|current| current.same_channel(&sender)) {
-                        return false; // 旧巡检不能修改同 id 新会话的 watching。
-                    }
-                    if tab.ended || sender.is_closed() || tab.files.opened.is_empty() {
-                        tab.files.watching = false;
-                        return false;
-                    }
-                    // 忙时保留 pending，空闲后继续推进已确认的上传。
-                    let ready = if tab.files.busy.is_none() {
-                        poll_opened_files(&mut tab.files)
-                    } else {
-                        None
-                    };
-                    if let Some((local, remote, name)) = ready {
-                        this.queue_remote_upload(tab_id, local, remote, name, cx);
-                    }
-                    this.pump_remote_uploads(cx);
-                    true
-                }).unwrap_or(false);
+                let watching = this
+                    .update(cx, |this, cx| {
+                        this.prune_remote_uploads(cx);
+                        let Some(tab) = this.tabs.iter_mut().find(|tab| tab.id == tab_id) else {
+                            return false;
+                        };
+                        if !tab
+                            .commands
+                            .as_ref()
+                            .is_some_and(|current| current.same_channel(&sender))
+                        {
+                            return false; // 旧巡检不能修改同 id 新会话的 watching。
+                        }
+                        if tab.ended || sender.is_closed() || tab.files.opened.is_empty() {
+                            tab.files.watching = false;
+                            return false;
+                        }
+                        // 忙时保留 pending，空闲后继续推进已确认的上传。
+                        let ready = if tab.files.busy.is_none() {
+                            poll_opened_files(&mut tab.files)
+                        } else {
+                            None
+                        };
+                        if let Some((local, remote, name)) = ready {
+                            this.queue_remote_upload(tab_id, local, remote, name, cx);
+                        }
+                        this.pump_remote_uploads(cx);
+                        true
+                    })
+                    .unwrap_or(false);
                 if !watching {
                     break;
                 }
@@ -855,7 +901,6 @@ impl RuTermApp {
         })
         .detach();
     }
-
 
     /// 本地改动被确认后入队：默认先弹窗问用户，选过「全部是」的直接回传。
     pub(super) fn queue_remote_upload(
@@ -870,7 +915,11 @@ impl RuTermApp {
             return;
         };
         let server = tab.addr.clone();
-        let live = !tab.ended && tab.commands.as_ref().is_some_and(|sender| !sender.is_closed());
+        let live = !tab.ended
+            && tab
+                .commands
+                .as_ref()
+                .is_some_and(|sender| !sender.is_closed());
         let Some(item) = tab.files.opened_mut(&local, &remote) else {
             return;
         };
@@ -883,26 +932,47 @@ impl RuTermApp {
             return;
         }
         self.file_upload_queue.push(FileUploadPrompt {
-            tab_id, local, remote, name, server, stamp, approved: false,
+            tab_id,
+            local,
+            remote,
+            name,
+            server,
+            stamp,
+            approved: false,
         });
         cx.notify();
     }
 
     fn upload_prompt_is_current(&self, prompt: &FileUploadPrompt) -> bool {
-        self.tabs.iter().find(|tab| tab.id == prompt.tab_id)
-            .filter(|tab| !tab.ended && tab.commands.as_ref().is_some_and(|sender| !sender.is_closed()))
-            .is_some_and(|tab| tab.files.opened.iter().any(|item| {
-                item.local == prompt.local && item.remote == prompt.remote
-                    && item.pending == Some(prompt.stamp)
-            }))
+        self.tabs
+            .iter()
+            .find(|tab| tab.id == prompt.tab_id)
+            .filter(|tab| {
+                !tab.ended
+                    && tab
+                        .commands
+                        .as_ref()
+                        .is_some_and(|sender| !sender.is_closed())
+            })
+            .is_some_and(|tab| {
+                tab.files.opened.iter().any(|item| {
+                    item.local == prompt.local
+                        && item.remote == prompt.remote
+                        && item.pending == Some(prompt.stamp)
+                })
+            })
     }
 
     fn cancel_remote_upload(&mut self, prompt: &FileUploadPrompt) {
-        if let Some(item) = self.tabs.iter_mut().find(|tab| tab.id == prompt.tab_id)
+        if let Some(item) = self
+            .tabs
+            .iter_mut()
+            .find(|tab| tab.id == prompt.tab_id)
             .and_then(|tab| tab.files.opened_mut(&prompt.local, &prompt.remote))
         {
             item.cancel_pending(prompt.stamp);
-            self.file_upload_all.remove(&(prompt.tab_id, prompt.remote.clone()));
+            self.file_upload_all
+                .remove(&(prompt.tab_id, prompt.remote.clone()));
         }
     }
 
@@ -925,7 +995,12 @@ impl RuTermApp {
         }
         let mut live = HashSet::new();
         for tab in &mut self.tabs {
-            if tab.ended || tab.commands.as_ref().is_none_or(|sender| sender.is_closed()) {
+            if tab.ended
+                || tab
+                    .commands
+                    .as_ref()
+                    .is_none_or(|sender| sender.is_closed())
+            {
                 for item in &mut tab.files.opened {
                     item.pending = None;
                     item.inflight = None;
@@ -938,7 +1013,12 @@ impl RuTermApp {
                     cx.notify();
                 }
             } else {
-                live.extend(tab.files.opened.iter().map(|item| (tab.id, item.remote.clone())));
+                live.extend(
+                    tab.files
+                        .opened
+                        .iter()
+                        .map(|item| (tab.id, item.remote.clone())),
+                );
             }
         }
         self.file_upload_all.retain(|key| live.contains(key));
@@ -954,12 +1034,19 @@ impl RuTermApp {
         let Some(front) = self.file_upload_queue.first() else {
             return;
         };
-        if self.tabs.iter().find(|tab| tab.id == front.tab_id)
+        if self
+            .tabs
+            .iter()
+            .find(|tab| tab.id == front.tab_id)
             .is_none_or(|tab| tab.files.busy.is_some())
         {
             return;
         }
-        if front.approved || self.file_upload_all.contains(&(front.tab_id, front.remote.clone())) {
+        if front.approved
+            || self
+                .file_upload_all
+                .contains(&(front.tab_id, front.remote.clone()))
+        {
             self.start_queued_upload(cx);
             return;
         }
@@ -967,20 +1054,25 @@ impl RuTermApp {
         cx.notify();
     }
 
-
     /// 忙时保留队首及其确认；文件变化则重新巡检，发送失败则撤销自动回传授权。
     fn start_queued_upload(&mut self, cx: &mut Context<Self>) {
         self.prune_remote_uploads(cx);
         let Some(front) = self.file_upload_queue.first() else {
             return;
         };
-        if self.tabs.iter().find(|tab| tab.id == front.tab_id)
+        if self
+            .tabs
+            .iter()
+            .find(|tab| tab.id == front.tab_id)
             .is_none_or(|tab| tab.files.busy.is_some())
         {
             return;
         }
         let prompt = self.file_upload_queue.remove(0);
-        let started = self.tabs.iter_mut().find(|tab| tab.id == prompt.tab_id)
+        let started = self
+            .tabs
+            .iter_mut()
+            .find(|tab| tab.id == prompt.tab_id)
             .and_then(|tab| tab.files.opened_mut(&prompt.local, &prompt.remote))
             .is_some_and(|item| item.begin_upload(prompt.stamp, file_stamp(&prompt.local)));
         if !started {
@@ -996,14 +1088,28 @@ impl RuTermApp {
             true,
             cx,
         ) {
-            self.finish_remote_upload(prompt.tab_id, &prompt.local, &prompt.remote, prompt.stamp, false);
+            self.finish_remote_upload(
+                prompt.tab_id,
+                &prompt.local,
+                &prompt.remote,
+                prompt.stamp,
+                false,
+            );
         }
     }
 
     fn finish_remote_upload(
-        &mut self, tab_id: usize, local: &Path, remote: &str, stamp: FileStamp, succeeded: bool,
+        &mut self,
+        tab_id: usize,
+        local: &Path,
+        remote: &str,
+        stamp: FileStamp,
+        succeeded: bool,
     ) {
-        let matched = self.tabs.iter_mut().find(|tab| tab.id == tab_id)
+        let matched = self
+            .tabs
+            .iter_mut()
+            .find(|tab| tab.id == tab_id)
             .is_some_and(|tab| tab.files.finish_upload(local, remote, stamp, succeeded));
         // 失败保留 dirty，但不允许「全部是」导致无限重试。再次提示后可重新授权。
         if matched && !succeeded {
@@ -1011,15 +1117,9 @@ impl RuTermApp {
         }
     }
 
-
     /// 确认弹窗的回答：`upload` 表示回传当前文件，`all` 表示仅这份文件后续
     /// 改动不再询问（换文件仍弹窗）；两者都 false 即「否」，跳过这一份改动。
-    pub(super) fn answer_remote_upload(
-        &mut self,
-        upload: bool,
-        all: bool,
-        cx: &mut Context<Self>,
-    ) {
+    pub(super) fn answer_remote_upload(&mut self, upload: bool, all: bool, cx: &mut Context<Self>) {
         let Some(mut prompt) = self.file_upload_prompt.take() else {
             return;
         };
@@ -1027,13 +1127,17 @@ impl RuTermApp {
             self.cancel_remote_upload(&prompt);
         } else if upload {
             if all {
-                self.file_upload_all.insert((prompt.tab_id, prompt.remote.clone()));
+                self.file_upload_all
+                    .insert((prompt.tab_id, prompt.remote.clone()));
             }
             prompt.approved = true;
             self.file_upload_queue.insert(0, prompt);
             self.start_queued_upload(cx);
         } else {
-            if let Some(item) = self.tabs.iter_mut().find(|tab| tab.id == prompt.tab_id)
+            if let Some(item) = self
+                .tabs
+                .iter_mut()
+                .find(|tab| tab.id == prompt.tab_id)
                 .and_then(|tab| tab.files.opened_mut(&prompt.local, &prompt.remote))
             {
                 item.ignore_pending(prompt.stamp);
@@ -1043,7 +1147,6 @@ impl RuTermApp {
         self.pump_remote_uploads(cx);
         cx.notify();
     }
-
 
     /// 面板内的一次上传 / 下载。false 表示未发送，调用方必须释放 inflight。
     pub(super) fn file_transfer(
@@ -1064,17 +1167,24 @@ impl RuTermApp {
             cx.notify();
             return false;
         }
-        let Some(sender) = tab.commands.clone().filter(|sender| !tab.ended && !sender.is_closed()) else {
+        let Some(sender) = tab
+            .commands
+            .clone()
+            .filter(|sender| !tab.ended && !sender.is_closed())
+        else {
             tab.files.error = Some("会话已断开，无法传输文件".into());
             cx.notify();
             return false;
         };
         let upload_stamp = if matches!(direction, crate::transfer::Direction::Upload) {
-            tab.files.opened_mut(&local, &remote).and_then(|item| item.inflight)
+            tab.files
+                .opened_mut(&local, &remote)
+                .and_then(|item| item.inflight)
         } else {
             None
         };
-        let name = local.file_name()
+        let name = local
+            .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| remote.clone());
         tab.files.busy = Some(format!("正在{} {name}…", direction.label()).into());
@@ -1100,7 +1210,9 @@ impl RuTermApp {
         }
         self.flash_transfer(
             format!("正在{} {name}…", direction.label()),
-            transfer_icon(direction), false, cx,
+            transfer_icon(direction),
+            false,
+            cx,
         );
         cx.notify();
 
@@ -1186,7 +1298,6 @@ impl RuTermApp {
         .detach();
         true
     }
-
 
     /// 拖入本地文件：逐个上传到当前目录（目录项拖放时传它自己的路径）。
     pub(super) fn upload_paths(
@@ -1346,7 +1457,6 @@ impl RuTermApp {
         .detach();
     }
 
-
     /// 面板「上传」：选本地文件后直接传到当前目录（不再经过传输表单）。
     pub(super) fn browse_files_upload(&mut self, tab_id: usize, cx: &mut Context<Self>) {
         let Some(tab) = self.tabs.iter().find(|tab| tab.id == tab_id) else {
@@ -1384,7 +1494,6 @@ impl RuTermApp {
         .detach();
     }
 
-
     /// 行菜单「下载到…」：选保存位置后把该远端文件拉到本地。
     pub(super) fn download_file(&mut self, tab_id: usize, name: String, cx: &mut Context<Self>) {
         let Some(dir) = self
@@ -1413,7 +1522,6 @@ impl RuTermApp {
         .detach();
     }
 
-
     /// 行菜单「下载到本机面板」：直接落到「本机」页当前目录，省掉保存对话框。
     ///
     /// 落点就是本机页顶部那条路径，看得见才敢写；本机页还没目录时菜单项是灰的。
@@ -1441,7 +1549,6 @@ impl RuTermApp {
         let remote = crate::remote_fs::child(&remote_dir, &name);
         self.start_download(tab_id, local_dir.join(safe), remote, true, cx);
     }
-
 
     /// 单个文件下载：进度写在面板底栏，完成后提示结果。
     ///
@@ -1564,12 +1671,16 @@ impl RuTermApp {
         .detach();
     }
 
-
     /// 拖文件到终端：逐个用 lrzsz（`rz`）上传到 shell 当前目录。
     ///
     /// 与面板上传不同，落点由远端 shell 决定，这里不拼任何路径；
     /// 每个文件一个 `rz` 会话，失败后继续传下一个，最后汇总。
-    pub(super) fn upload_via_terminal(&mut self, tab_id: usize, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+    pub(super) fn upload_via_terminal(
+        &mut self,
+        tab_id: usize,
+        paths: Vec<PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
         let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) else {
             return;
         };
@@ -1708,7 +1819,6 @@ impl RuTermApp {
         .detach();
     }
 
-
     /// 打开文件面板的新建 / 重命名弹窗。
     pub(super) fn open_file_prompt(
         &mut self,
@@ -1744,12 +1854,10 @@ impl RuTermApp {
         cx.notify();
     }
 
-
     pub(super) fn cancel_file_prompt(&mut self, cx: &mut Context<Self>) {
         self.file_prompt = None;
         cx.notify();
     }
-
 
     /// 提交新建 / 重命名；成功后刷新当前目录。
     pub(super) fn commit_file_prompt(&mut self, cx: &mut Context<Self>) {
@@ -1814,7 +1922,8 @@ impl RuTermApp {
                     this.file_error_clear(tab_id);
                 }
                 Err(error) => {
-                    let message = format!("{action}失败：{}", crate::session::error_summary(&error));
+                    let message =
+                        format!("{action}失败：{}", crate::session::error_summary(&error));
                     this.status = message.clone().into();
                     this.file_error(tab_id, message, cx);
                 }
@@ -1834,7 +1943,6 @@ impl RuTermApp {
         })
         .detach();
     }
-
 
     /// 请求删除（先弹二次确认）。
     pub(super) fn ask_delete_file(
@@ -1862,12 +1970,10 @@ impl RuTermApp {
         cx.notify();
     }
 
-
     pub(super) fn cancel_delete_file(&mut self, cx: &mut Context<Self>) {
         self.file_confirm = None;
         cx.notify();
     }
-
 
     pub(super) fn confirm_delete_file(&mut self, cx: &mut Context<Self>) {
         let Some(confirm) = self.file_confirm.take() else {
@@ -1927,7 +2033,6 @@ impl RuTermApp {
         .detach();
     }
 
-
     /// 面板内的错误：写该标签的 files.error 并同步状态栏。
     pub(super) fn file_error(
         &mut self,
@@ -1943,13 +2048,11 @@ impl RuTermApp {
         cx.notify();
     }
 
-
     pub(super) fn file_error_clear(&mut self, tab_id: usize) {
         if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) {
             tab.files.error = None;
         }
     }
-
 
     /// 文件列表表头的一格：点击切换排序；已排序列高亮并显示 ↑ / ↓。
     ///
@@ -1987,9 +2090,11 @@ impl RuTermApp {
             cell = cell.flex_1().min_w(px(48.0)).text_ellipsis();
         }
         let cell = match target {
-            Some(pane) => cell.child(text).on_click(cx.listener(move |this, _, _, cx| {
-                this.set_pane_sort(pane, key, cx);
-            })),
+            Some(pane) => cell
+                .child(text)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.set_pane_sort(pane, key, cx);
+                })),
             // 没有可操作的面板（会话断了 / 还没连上）：表头照常显示，点了没反应。
             None => cell.child(text),
         };
@@ -2036,7 +2141,6 @@ impl RuTermApp {
             .into_any_element()
     }
 
-
     /// 某面板当前的排序状态；面板还没打开过（远端标签已不存在）时为 None。
     pub(super) fn pane_sort(&self, target: PaneTarget) -> Option<(FileSortKey, bool)> {
         match target {
@@ -2048,7 +2152,6 @@ impl RuTermApp {
             PaneTarget::Local => Some((self.local.sort, self.local.sort_desc)),
         }
     }
-
 
     /// 某面板当前的目录字符串（路径栏与弹窗都用它）；还没打开过时为空串。
     pub(super) fn pane_path(&self, target: PaneTarget) -> String {
@@ -2068,9 +2171,13 @@ impl RuTermApp {
         }
     }
 
-
     /// 点列名：同一列翻转升降序，换列则从升序开始；排完立刻重绘。
-    pub(super) fn set_pane_sort(&mut self, target: PaneTarget, key: FileSortKey, cx: &mut Context<Self>) {
+    pub(super) fn set_pane_sort(
+        &mut self,
+        target: PaneTarget,
+        key: FileSortKey,
+        cx: &mut Context<Self>,
+    ) {
         match target {
             PaneTarget::Remote(tab_id) => {
                 let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) else {
@@ -2097,16 +2204,13 @@ impl RuTermApp {
         cx.notify();
     }
 
-
     /// 列宽拖拽落到哪张表上：远端各标签独立记忆，本机一份全局记忆。返回是否真的改了宽度。
     pub(super) fn set_pane_col(&mut self, target: PaneTarget, col: usize, width: f32) -> bool {
         let cols = match target {
-            PaneTarget::Remote(tab_id) => {
-                match self.tabs.iter_mut().find(|tab| tab.id == tab_id) {
-                    Some(tab) => &mut tab.files.cols,
-                    None => return false,
-                }
-            }
+            PaneTarget::Remote(tab_id) => match self.tabs.iter_mut().find(|tab| tab.id == tab_id) {
+                Some(tab) => &mut tab.files.cols,
+                None => return false,
+            },
             PaneTarget::Local => &mut self.local.cols,
         };
         if (cols[col] - width).abs() <= 0.5 {
@@ -2116,14 +2220,12 @@ impl RuTermApp {
         true
     }
 
-
     /// 窄栏判定：边栏面板实测宽度不够摆五列时，整列隐掉时间和权限，
     /// 名称列才有地方喘气（列名与单元格都得跟着少两格）。
     pub(super) fn pane_narrow(&self, cx: &App) -> bool {
         let width = self.split_width.get() * self.panel_ratio(cx);
         width > 0.0 && width < FILE_PANE_NARROW_W
     }
-
 
     /// 一行的可视部分：图标 + 名称 + 类型 / 大小 /（宽栏再加）修改时间 / 权限。
     ///
@@ -2201,7 +2303,6 @@ impl RuTermApp {
         cells
     }
 
-
     /// 文件页：路径栏 + 目录列表 + 底部操作状态。
     ///
     /// 面板跟随活动标签；每个标签各自保留路径与列表，切换回来不重新拉取。
@@ -2230,7 +2331,10 @@ impl RuTermApp {
             FILE_COL_PERM_W,
         ]);
 
-        let up_enabled = path.as_deref().and_then(crate::remote_fs::parent_of).is_some();
+        let up_enabled = path
+            .as_deref()
+            .and_then(crate::remote_fs::parent_of)
+            .is_some();
         // 表格状态记在面板上，路径栏编辑框也按面板认领：本机页与远端页互不打架。
         let pane = live.map(PaneTarget::Remote);
         // 「本机」页有没有目录，决定远端行的「下载到本机面板」能不能用。
@@ -2514,13 +2618,14 @@ impl RuTermApp {
                         } else {
                             let downloading = menu_entity.clone();
                             let download_name = name.clone();
-                            let menu = menu.item(PopupMenuItem::new(download_label.clone()).on_click(
-                                move |_, _, cx| {
-                                    downloading.update(cx, |this, cx| {
-                                        this.download_file(id, download_name.clone(), cx);
-                                    });
-                                },
-                            ));
+                            let menu =
+                                menu.item(PopupMenuItem::new(download_label.clone()).on_click(
+                                    move |_, _, cx| {
+                                        downloading.update(cx, |this, cx| {
+                                            this.download_file(id, download_name.clone(), cx);
+                                        });
+                                    },
+                                ));
                             let to_local = menu_entity.clone();
                             let to_local_name = name.clone();
                             menu.item(
@@ -2586,15 +2691,17 @@ impl RuTermApp {
 
         let hint_entity = entity.clone();
         let hint_dir = dir.clone();
-        let list = div().id("file-list").flex_1().min_h_0().overflow_y_scrollbar();
+        let list = div()
+            .id("file-list")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scrollbar();
         // 没有活的 SFTP 会话就不接拖放：落点提示得有目标目录才有意义。
         let list = if live.is_some() {
             list.drag_over::<ExternalPaths>(move |style, paths, _, cx| {
                 hint_entity.update(cx, |this, _| {
-                    this.drop_hint.set(Some((
-                        hint_dir.clone().into(),
-                        paths.paths().len(),
-                    )));
+                    this.drop_hint
+                        .set(Some((hint_dir.clone().into(), paths.paths().len())));
                 });
                 style.bg(pal.card_hover).border_1().border_color(pal.accent)
             })
@@ -2886,7 +2993,6 @@ impl RuTermApp {
             .into_any_element()
     }
 
-
     /// 本地副本改动后的回传确认（对照 WindTerm 的 Upload File 弹窗）。
     pub(super) fn render_file_upload_prompt(&self, cx: &Context<Self>) -> AnyElement {
         let pal = self.palette(cx);
@@ -2916,7 +3022,14 @@ impl RuTermApp {
                         .text_color(pal.muted)
                         .child(label),
                 )
-                .child(div().flex_1().min_w_0().text_xs().text_ellipsis().child(value))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_xs()
+                        .text_ellipsis()
+                        .child(value),
+                )
         };
         v_flex()
             .id("file-upload-backdrop")
@@ -2987,7 +3100,6 @@ impl RuTermApp {
             )
             .into_any_element()
     }
-
 
     /// 文件面板的新建 / 重命名弹窗。
     pub(super) fn render_file_prompt(&self, cx: &Context<Self>) -> AnyElement {
@@ -3088,7 +3200,6 @@ impl RuTermApp {
             .into_any_element()
     }
 
-
     /// 远端删除的二次确认（目录非空会失败，提示文案同步说明）。
     pub(super) fn render_file_confirm(&self, cx: &Context<Self>) -> AnyElement {
         let pal = self.palette(cx);
@@ -3168,15 +3279,13 @@ impl RuTermApp {
             )
             .into_any_element()
     }
-
-
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        FileBrowser, FileSortKey, FileStamp, OpenedRemote, file_stamp,
-        format_remote_time_short, poll_opened_files, safe_local_name,
+        FileBrowser, FileSortKey, FileStamp, OpenedRemote, file_stamp, format_remote_time_short,
+        poll_opened_files, safe_local_name,
     };
     use crate::remote_fs;
     use std::path::PathBuf;
@@ -3294,11 +3403,8 @@ mod tests {
 
     #[test]
     fn poll_opened_files_uploads_once_after_a_stable_change() {
-        let dir = std::env::temp_dir().join(format!(
-            "ruterm-poll-{}-{}",
-            std::process::id(),
-            line!()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("ruterm-poll-{}-{}", std::process::id(), line!()));
         std::fs::create_dir_all(&dir).unwrap();
         let local = dir.join("a.txt");
         std::fs::write(&local, b"one").unwrap();

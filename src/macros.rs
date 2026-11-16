@@ -14,21 +14,53 @@
 //!   回流镜像中间件）；持久化进加密库 `settings` 表 `macros` 键，
 //!   库不可用时降级 `settings.json`（`Settings::macros`）。
 
-use serde::{Deserialize, Serialize};
 use rgpui::Keystroke;
+use serde::{Deserialize, Serialize};
 
 /// 应用已绑定（见 `main.rs` 的 `bind_keys`）、shell 常用控制字符与系统级
 /// 组合键；键宏触发键不允许与之冲突，避免按下即抢走终端 / 系统的行为。
 const RESERVED_TRIGGERS: &[&str] = &[
     // 应用快捷键。
-    "ctrl-b", "ctrl-shift-b", "ctrl-t", "ctrl-n", "ctrl-shift-t", "ctrl-tab", "ctrl-shift-tab",
-    "ctrl-pageup", "ctrl-pagedown", "ctrl-w", "ctrl-shift-w", "ctrl-f", "ctrl-shift-f",
-    "ctrl-,", "ctrl-shift-d", "ctrl-shift-e", "ctrl-shift-m",
+    "ctrl-b",
+    "ctrl-shift-b",
+    "ctrl-t",
+    "ctrl-n",
+    "ctrl-shift-t",
+    "ctrl-tab",
+    "ctrl-shift-tab",
+    "ctrl-pageup",
+    "ctrl-pagedown",
+    "ctrl-w",
+    "ctrl-shift-w",
+    "ctrl-f",
+    "ctrl-shift-f",
+    "ctrl-,",
+    "ctrl-shift-d",
+    "ctrl-shift-e",
+    "ctrl-shift-m",
     // 终端 / readline 常用控制字符，抢走会让 shell 没法用。
-    "ctrl-a", "ctrl-c", "ctrl-d", "ctrl-e", "ctrl-h", "ctrl-i", "ctrl-j", "ctrl-k", "ctrl-l",
-    "ctrl-m", "ctrl-o", "ctrl-p", "ctrl-q", "ctrl-r", "ctrl-s", "ctrl-u", "ctrl-y", "ctrl-z",
+    "ctrl-a",
+    "ctrl-c",
+    "ctrl-d",
+    "ctrl-e",
+    "ctrl-h",
+    "ctrl-i",
+    "ctrl-j",
+    "ctrl-k",
+    "ctrl-l",
+    "ctrl-m",
+    "ctrl-o",
+    "ctrl-p",
+    "ctrl-q",
+    "ctrl-r",
+    "ctrl-s",
+    "ctrl-u",
+    "ctrl-y",
+    "ctrl-z",
     // 系统级。
-    "alt-f4", "alt-tab", "alt-escape",
+    "alt-f4",
+    "alt-tab",
+    "alt-escape",
 ];
 
 /// 一步要发送的文本与发送完的等待毫秒数。
@@ -84,14 +116,16 @@ impl KeyMacro {
         if !self.enabled {
             return false;
         }
-        let Some(trigger) = self.trigger.as_deref().and_then(|raw| Keystroke::parse(raw).ok())
+        let Some(trigger) = self
+            .trigger
+            .as_deref()
+            .and_then(|raw| Keystroke::parse(raw).ok())
         else {
             return false;
         };
         // 与键映射同规则：修饰键与键名都相等才算命中（key_char 是 IME 细节，不参与）。
         trigger.modifiers == keystroke.modifiers && trigger.key == keystroke.key
     }
-
 }
 
 /// 校验并规范化触发键；空串 = 不绑键。
@@ -102,8 +136,8 @@ pub fn normalize_trigger(raw: &str) -> Result<Option<String>, String> {
     if raw.is_empty() {
         return Ok(None);
     }
-    let keystroke = Keystroke::parse(raw)
-        .map_err(|_| "格式不对：应为 ctrl-alt-1 这样的组合键".to_string())?;
+    let keystroke =
+        Keystroke::parse(raw).map_err(|_| "格式不对：应为 ctrl-alt-1 这样的组合键".to_string())?;
     // `Keystroke::parse` 对 "ctrl-" 这类残缺输入会给空键名，这里显式拦下。
     if keystroke.key.is_empty() {
         return Err("格式不对：应为 ctrl-alt-1 这样的组合键".into());
@@ -211,11 +245,17 @@ mod tests {
 
     #[test]
     fn normalize_trigger_accepts_modified_and_fkeys() {
-        assert_eq!(normalize_trigger("ctrl-alt-1").unwrap(), Some("ctrl-alt-1".into()));
+        assert_eq!(
+            normalize_trigger("ctrl-alt-1").unwrap(),
+            Some("ctrl-alt-1".into())
+        );
         // 大写会被解析成 shift+小写；shift+alt 仍带 alt，允许。
         assert_eq!(normalize_trigger("alt-p").unwrap(), Some("alt-p".into()));
         assert_eq!(normalize_trigger("f5").unwrap(), Some("f5".into()));
-        assert_eq!(normalize_trigger("ctrl-shift-f9").unwrap(), Some("ctrl-shift-f9".into()));
+        assert_eq!(
+            normalize_trigger("ctrl-shift-f9").unwrap(),
+            Some("ctrl-shift-f9".into())
+        );
         // 空串 = 不绑键。
         assert_eq!(normalize_trigger("  ").unwrap(), None);
     }
@@ -229,7 +269,10 @@ mod tests {
         assert!(normalize_trigger("ctrl-b").is_err());
         assert!(normalize_trigger("ctrl-c").is_err());
         assert!(normalize_trigger("alt-f4").is_err());
-        assert!(normalize_trigger("ctrl-shift-m").is_err(), "管理器自己的键要保留");
+        assert!(
+            normalize_trigger("ctrl-shift-m").is_err(),
+            "管理器自己的键要保留"
+        );
         // 键法不对（缺键名）。
         assert!(normalize_trigger("ctrl-").is_err());
     }

@@ -3,9 +3,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
-use rgpui::{
-    Hsla, Rgba,
-};
+use rgpui::{Hsla, Rgba};
 use rgpui_term::TerminalThemeConfig;
 use serde::{Deserialize, Serialize};
 
@@ -53,7 +51,8 @@ pub(super) enum ReadoutKey {
 }
 
 impl ReadoutKey {
-    pub(super) const ALL: [ReadoutKey; 4] = [Self::Size, Self::Cursor, Self::Scrollback, Self::Selection];
+    pub(super) const ALL: [ReadoutKey; 4] =
+        [Self::Size, Self::Cursor, Self::Scrollback, Self::Selection];
 
     /// 设置持久化用的稳定 id。
     pub(super) fn id(self) -> &'static str {
@@ -1026,19 +1025,17 @@ impl SidebarPrefs {
         b: SortableHost<'_>,
         recent: &[i64],
     ) -> std::cmp::Ordering {
-        b.favorite
-            .cmp(&a.favorite)
-            .then_with(|| match self.sort {
-                SidebarSort::Manual => self.rank_of(a.id).cmp(&self.rank_of(b.id)),
-                SidebarSort::Name => a
-                    .title
-                    .to_lowercase()
-                    .cmp(&b.title.to_lowercase())
-                    .then_with(|| self.rank_of(a.id).cmp(&self.rank_of(b.id))),
-                SidebarSort::Recent => recent_rank(a.id, recent)
-                    .cmp(&recent_rank(b.id, recent))
-                    .then_with(|| self.rank_of(a.id).cmp(&self.rank_of(b.id))),
-            })
+        b.favorite.cmp(&a.favorite).then_with(|| match self.sort {
+            SidebarSort::Manual => self.rank_of(a.id).cmp(&self.rank_of(b.id)),
+            SidebarSort::Name => a
+                .title
+                .to_lowercase()
+                .cmp(&b.title.to_lowercase())
+                .then_with(|| self.rank_of(a.id).cmp(&self.rank_of(b.id))),
+            SidebarSort::Recent => recent_rank(a.id, recent)
+                .cmp(&recent_rank(b.id, recent))
+                .then_with(|| self.rank_of(a.id).cmp(&self.rank_of(b.id))),
+        })
     }
 
     /// 序列化为入库/入文件的字符串。
@@ -1398,10 +1395,11 @@ mod tests {
                 favorite: false,
             },
         ];
-        let order = |prefs: &SidebarPrefs, hosts: &mut Vec<SortableHost<'static>>, recent: &[i64]| {
-            hosts.sort_by(|a, b| prefs.compare_hosts(*a, *b, recent));
-            hosts.iter().map(|host| host.id).collect::<Vec<_>>()
-        };
+        let order =
+            |prefs: &SidebarPrefs, hosts: &mut Vec<SortableHost<'static>>, recent: &[i64]| {
+                hosts.sort_by(|a, b| prefs.compare_hosts(*a, *b, recent));
+                hosts.iter().map(|host| host.id).collect::<Vec<_>>()
+            };
 
         // 手动：收藏在前，其余按 order。
         assert_eq!(order(&prefs, &mut hosts, &[]), vec![7, 5, 9, 3]);

@@ -87,7 +87,12 @@ fn build_client_config(config: &Config) -> Result<ironrdp::client::config::Confi
         .with_compression(true)
         // Windows 后端直接挂系统剪贴板：文本与文件（CF_HDROP / 文件流）双向同步。
         .with_clipboard(ironrdp::client::config::ClipboardType::Enable);
-    if let Some(domain) = config.domain.as_deref().map(str::trim).filter(|text| !text.is_empty()) {
+    if let Some(domain) = config
+        .domain
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
         builder = builder.with_domain(domain);
     }
     builder.build().context("RDP 参数无效")

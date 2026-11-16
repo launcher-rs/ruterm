@@ -1,12 +1,12 @@
 //! //! 主机列表：分组树 / 排序 / 收藏 / 删除 / 导入 ssh config，主机行与首页卡片渲染。
 
-
 use rgpui::input_ui::{Input, InputEvent, InputState};
 use rgpui::prelude::*;
 use rgpui::{
-    AnyElement, Button, ButtonVariants, Context,
-    ContextMenuExt, Div, Entity, FontWeight, Icon, IconName, InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels, ScrollableElement, SharedString, Stateful,
-    StatefulInteractiveElement, Styled, Window, div, h_flex, px, v_flex,
+    AnyElement, Button, ButtonVariants, Context, ContextMenuExt, Div, Entity, FontWeight, Icon,
+    IconName, InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels,
+    ScrollableElement, SharedString, Stateful, StatefulInteractiveElement, Styled, Window, div,
+    h_flex, px, v_flex,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -14,8 +14,8 @@ use std::fs;
 
 use crate::desktop::Protocol;
 use crate::sessions::{AuthMethod, HostConfig, ProtocolKind};
-use crate::{NewHost, NewLocalTerminal};
 use crate::tr;
+use crate::{NewHost, NewLocalTerminal};
 
 use super::*;
 
@@ -72,7 +72,6 @@ impl RuTermApp {
             self.store.save(&self.hosts);
         }
     }
-
 
     /// 从 `~/.ssh/config` 导入具体 Host 条目。
     ///
@@ -211,7 +210,9 @@ impl RuTermApp {
         };
         let parsed = fs::read(&path)
             .map_err(anyhow::Error::from)
-            .and_then(|bytes| serde_json::from_slice::<HostConfigBackup>(&bytes).map_err(anyhow::Error::from));
+            .and_then(|bytes| {
+                serde_json::from_slice::<HostConfigBackup>(&bytes).map_err(anyhow::Error::from)
+            });
         let backup = match parsed {
             Ok(backup) if backup.version == 1 => backup,
             Ok(_) => {
@@ -328,7 +329,6 @@ impl RuTermApp {
         cx.notify();
     }
 
-
     /// 扫描局域网（「会话 → 局域网发现…」弹窗打开时触发，弹窗里可重扫）。
     pub(super) fn start_discovery(&mut self, cx: &mut Context<Self>) {
         if self.discovering {
@@ -429,13 +429,13 @@ impl RuTermApp {
         } else if count == 0 && self.discovery_scanned {
             tr!(cx, "未发现开放 22 / 23 / 3389 / 5900 的主机")
         } else {
-            tr!(
-                cx,
-                "共 {count} 台主机，点服务按钮直接打开",
-                count = count
-            )
+            tr!(cx, "共 {count} 台主机，点服务按钮直接打开", count = count)
         };
-        let mut rows = v_flex().id("discovery-list").gap_1().max_h(px(340.0)).overflow_y_scrollbar();
+        let mut rows = v_flex()
+            .id("discovery-list")
+            .gap_1()
+            .max_h(px(340.0))
+            .overflow_y_scrollbar();
         for (index, host) in self.discovered.iter().enumerate() {
             let ip = host.ip.to_string();
             let services = host.services();
@@ -553,9 +553,7 @@ impl RuTermApp {
                                     .gap_2()
                                     .items_center()
                                     .child(
-                                        Icon::new(IconName::Network)
-                                            .small()
-                                            .text_color(pal.link),
+                                        Icon::new(IconName::Network).small().text_color(pal.link),
                                     )
                                     .child(
                                         div()
@@ -564,18 +562,17 @@ impl RuTermApp {
                                             .child(tr!(cx, "局域网发现")),
                                     ),
                             )
-                            .child(Button::new("close-discovery").label("×").ghost().on_click(
-                                cx.listener(|this, _, _, cx| this.close_discovery(cx)),
-                            )),
+                            .child(
+                                Button::new("close-discovery").label("×").ghost().on_click(
+                                    cx.listener(|this, _, _, cx| this.close_discovery(cx)),
+                                ),
+                            ),
                     )
                     .child(
                         div()
                             .text_xs()
                             .text_color(pal.muted)
-                            .child(tr!(
-                                cx,
-                                "扫描本机各网段，探测 SSH / Telnet / RDP / VNC"
-                            )),
+                            .child(tr!(cx, "扫描本机各网段，探测 SSH / Telnet / RDP / VNC")),
                     )
                     .child(div().text_sm().text_color(pal.muted).child(status))
                     .when(!self.discovered.is_empty(), |this| this.child(rows))
@@ -619,7 +616,6 @@ impl RuTermApp {
         }
     }
 
-
     /// 确认删除：走真实删除并持久化（连带清除库内该主机的密码/口令）。
     pub(super) fn confirm_delete_now(&mut self, cx: &mut Context<Self>) {
         let Some(index) = self.confirm_delete.take() else {
@@ -628,13 +624,11 @@ impl RuTermApp {
         self.delete_host(index, cx);
     }
 
-
     /// 取消删除确认。
     pub(super) fn cancel_delete(&mut self, cx: &mut Context<Self>) {
         self.confirm_delete = None;
         cx.notify();
     }
-
 
     /// 删除指定主机并持久化。
     pub(super) fn delete_host(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -672,14 +666,12 @@ impl RuTermApp {
         }
     }
 
-
     /// 折叠 / 展开分组（文件夹）。
     pub(super) fn toggle_group(&mut self, name: &str, cx: &mut Context<Self>) {
         self.sidebar.toggle(name);
         cx.notify();
         self.persist_sidebar(cx);
     }
-
 
     /// 打开分组新建 / 重命名弹窗；`Some(原名)` 表示重命名。
     pub(super) fn open_group_prompt(
@@ -710,13 +702,11 @@ impl RuTermApp {
         cx.notify();
     }
 
-
     /// 关闭分组弹窗，不写入。
     pub(super) fn cancel_group_prompt(&mut self, cx: &mut Context<Self>) {
         self.group_prompt = None;
         cx.notify();
     }
-
 
     /// 确认分组弹窗：新建或重命名。空名 / 重名只提示，不关窗，便于就地改。
     pub(super) fn commit_group_prompt(&mut self, cx: &mut Context<Self>) {
@@ -752,7 +742,6 @@ impl RuTermApp {
         self.persist_sidebar(cx);
     }
 
-
     /// 删除分组：只退回归属，主机本身保留。
     pub(super) fn delete_group(&mut self, name: &str, cx: &mut Context<Self>) {
         self.sidebar.remove(name);
@@ -761,9 +750,13 @@ impl RuTermApp {
         self.persist_sidebar(cx);
     }
 
-
     /// 把主机移入分组（`None` = 未分组）。
-    pub(super) fn move_host(&mut self, index: usize, group: Option<SharedString>, cx: &mut Context<Self>) {
+    pub(super) fn move_host(
+        &mut self,
+        index: usize,
+        group: Option<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
         let Some(id) = self.hosts.get(index).map(|host| host.id) else {
             return;
         };
@@ -772,9 +765,13 @@ impl RuTermApp {
         self.persist_sidebar(cx);
     }
 
-
     /// 组内手动排序：收藏 / 非收藏各自成桶（收藏恒在桶上方，菜单只挪同桶邻居）。
-    pub(super) fn reorder_host(&mut self, index: usize, action: ReorderAction, cx: &mut Context<Self>) {
+    pub(super) fn reorder_host(
+        &mut self,
+        index: usize,
+        action: ReorderAction,
+        cx: &mut Context<Self>,
+    ) {
         let Some(host) = self.hosts.get(index) else {
             return;
         };
@@ -828,7 +825,6 @@ impl RuTermApp {
         cx.notify();
     }
 
-
     /// 切换侧边栏排序方式并持久化。
     pub(super) fn set_host_sort(&mut self, sort: SidebarSort, cx: &mut Context<Self>) {
         if self.sidebar.set_sort(sort) {
@@ -836,7 +832,6 @@ impl RuTermApp {
         }
         cx.notify();
     }
-
 
     /// 切换指定主机的收藏状态并持久化。
     pub(super) fn toggle_favorite(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -847,7 +842,6 @@ impl RuTermApp {
             cx.notify();
         }
     }
-
 
     /// 主机行图标：Telnet 用地球标；SSH 按认证方式区分，一眼看出连这台机器要什么凭据。
     pub(super) fn host_icon(host: &HostConfig) -> IconName {
@@ -863,7 +857,6 @@ impl RuTermApp {
         }
     }
 
-
     /// 列表副标题：Telnet / 远程桌面前缀协议名，避免与 SSH 主机混淆。
     pub(super) fn host_subtitle(host: &HostConfig) -> String {
         match host.protocol {
@@ -874,7 +867,6 @@ impl RuTermApp {
         }
     }
 
-
     /// 列表里显示的主机名：没填展示名时退回 user@host:port。
     pub(super) fn host_title(host: &HostConfig) -> String {
         if host.name.is_empty() {
@@ -884,10 +876,13 @@ impl RuTermApp {
         }
     }
 
-
     /// 列表行的通用外观：透明底 + 悬停高亮（树式，不再是每张卡片一块底），
     /// 左侧留出的缩进由 `indent` 控制，分组下的主机比文件夹行多缩一档。
-    pub(super) fn row_base(id: impl Into<SharedString>, pal: &Palette, indent: Pixels) -> Stateful<Div> {
+    pub(super) fn row_base(
+        id: impl Into<SharedString>,
+        pal: &Palette,
+        indent: Pixels,
+    ) -> Stateful<Div> {
         h_flex()
             .id(id.into())
             .w_full()
@@ -900,7 +895,6 @@ impl RuTermApp {
             .hover(|style| style.bg(pal.card_hover))
             .cursor_pointer()
     }
-
 
     /// 分组（文件夹）行：折叠三角 + 文件夹图标 + 组名 + 数量；
     /// 点整行折叠/展开，右键给出该组的分组管理与新建入口。
@@ -977,9 +971,13 @@ impl RuTermApp {
         .into_any_element()
     }
 
-
     /// 一台主机：认证方式图标 + 展示名 + user@host:port + ★。
-    pub(super) fn render_host_row(&self, index: usize, pal: &Palette, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_host_row(
+        &self,
+        index: usize,
+        pal: &Palette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let host = &self.hosts[index];
         let entity = cx.entity();
         let groups: Vec<SharedString> = self
@@ -1055,7 +1053,6 @@ impl RuTermApp {
         })
         .into_any_element()
     }
-
 
     /// 主机分组树：内置「本地终端」→ 各自定义分组 → 未分组 → 空白区。
     /// 分组为空也照样显示（和参考客户端一致：先建组，再往里挪主机）。
@@ -1184,7 +1181,6 @@ impl RuTermApp {
         list.child(blank).into_any_element()
     }
 
-
     /// 分组新建 / 重命名弹窗：与主机表单同款居中模态。
     /// 遮罩只挡交互不关闭（防止误丢已输入的名称），关闭走"取消"或标题栏 ×。
     pub(super) fn render_group_prompt(&self, cx: &Context<Self>) -> AnyElement {
@@ -1279,7 +1275,6 @@ impl RuTermApp {
             )
             .into_any_element()
     }
-
 
     /// 空工作区首页：品牌 + 主机搜索 + 新建入口 + 最近连接。
     ///
@@ -1412,7 +1407,6 @@ impl RuTermApp {
             .into_any_element()
     }
 
-
     /// 首页里的一台主机：图标 + 展示名 + 地址，双击连接（与侧边栏一致，避免误触连开两次）。
     pub(super) fn render_home_host_row(
         &self,
@@ -1461,7 +1455,6 @@ impl RuTermApp {
         .into_any_element()
     }
 
-
     /// 连接成功（shell 已开）后记一笔最近连接：去重后置顶，超出上限截断。
     /// 降级模式（无加密库）主机 id 不可靠，只保留内存值，不落盘。
     pub(super) fn record_recent_host(&mut self, host_id: i64, cx: &mut Context<Self>) {
@@ -1473,7 +1466,6 @@ impl RuTermApp {
         self.recent_hosts.truncate(RECENT_HOSTS_MAX);
         self.persist_recent_hosts(cx);
     }
-
 
     pub(super) fn persist_recent_hosts(&self, cx: &mut Context<Self>) {
         let Some(vault) = self.vault.clone() else {
@@ -1490,6 +1482,4 @@ impl RuTermApp {
         })
         .detach();
     }
-
-
 }

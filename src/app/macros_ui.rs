@@ -12,8 +12,8 @@ use rgpui::input_ui::{Input, InputEvent, InputState};
 use rgpui::prelude::*;
 use rgpui::{
     AnyElement, Button, ButtonVariants, Context, Disableable, Entity, FontWeight,
-    InteractiveElement, IntoElement, Keystroke, ParentElement,
-    ScrollableElement, SharedString, Styled, Window, div, h_flex, px, v_flex,
+    InteractiveElement, IntoElement, Keystroke, ParentElement, ScrollableElement, SharedString,
+    Styled, Window, div, h_flex, px, v_flex,
 };
 
 use crate::macros::{KeyMacro, MacroStep};
@@ -285,8 +285,11 @@ impl RuTermApp {
         } else {
             delay_ms.to_string()
         };
-        let delay_input =
-            cx.new(|cx| InputState::new(window, cx).default_value(delay).placeholder(tr!(cx, "0")));
+        let delay_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(delay)
+                .placeholder(tr!(cx, "0"))
+        });
         MacroStepEdit {
             text: text_input,
             delay: delay_input,
@@ -410,10 +413,19 @@ impl RuTermApp {
         let mut steps = Vec::new();
         for row in &edit.steps {
             let text = row.text.read(cx).value().to_string();
-            let delay_ms = row.delay.read(cx).value().trim().parse::<u64>().unwrap_or(0);
+            let delay_ms = row
+                .delay
+                .read(cx)
+                .value()
+                .trim()
+                .parse::<u64>()
+                .unwrap_or(0);
             steps.push(MacroStep { text, delay_ms });
         }
-        if steps.iter().all(|step| step.text.is_empty() && step.delay_ms == 0) {
+        if steps
+            .iter()
+            .all(|step| step.text.is_empty() && step.delay_ms == 0)
+        {
             self.set_macro_edit_error("至少要填一步发送内容".into(), cx);
             return;
         }
@@ -577,21 +589,19 @@ impl RuTermApp {
                                             .font_weight(FontWeight(600.0))
                                             .child(tr!(cx, "键宏")),
                                     )
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(pal.muted)
-                                            .child(tr!(
-                                                cx,
-                                                "组合键触发一段固定输入；发送走当前活动会话的写入通道。"
-                                            )),
-                                    ),
+                                    .child(div().text_xs().text_color(pal.muted).child(tr!(
+                                        cx,
+                                        "组合键触发一段固定输入；发送走当前活动会话的写入通道。"
+                                    ))),
                             )
-                            .child(Button::new("close-macro-manager").label("×").ghost().on_click(
-                                cx.listener(|this, _, window, cx| {
-                                    this.close_macro_manager(window, cx);
-                                }),
-                            )),
+                            .child(
+                                Button::new("close-macro-manager")
+                                    .label("×")
+                                    .ghost()
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.close_macro_manager(window, cx);
+                                    })),
+                            ),
                     )
                     .child(body),
             )
@@ -617,16 +627,10 @@ impl RuTermApp {
         };
         let mut list = v_flex().id("macro-list").gap_1().overflow_y_scrollbar();
         if self.macros.is_empty() {
-            list = list.child(
-                div()
-                    .py_6()
-                    .text_sm()
-                    .text_color(pal.muted)
-                    .child(tr!(
-                        cx,
-                        "还没有键宏。点「新建宏」录入一条，或从 JSON 文件导入。"
-                    )),
-            );
+            list = list.child(div().py_6().text_sm().text_color(pal.muted).child(tr!(
+                cx,
+                "还没有键宏。点「新建宏」录入一条，或从 JSON 文件导入。"
+            )));
         }
         let mut shown = 0;
         for (index, mac) in self.macros.iter().enumerate() {
@@ -737,7 +741,11 @@ impl RuTermApp {
                     .w_full()
                     .gap_2()
                     .items_center()
-                    .child(div().flex_1().child(styled_input(Input::new(&state.search), pal)))
+                    .child(
+                        div()
+                            .flex_1()
+                            .child(styled_input(Input::new(&state.search), pal)),
+                    )
                     .child(
                         Button::new("macro-new")
                             .label(tr!(cx, "新建宏"))
@@ -754,15 +762,10 @@ impl RuTermApp {
                     .gap_2()
                     .justify_between()
                     .items_center()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(pal.muted)
-                            .child(tr!(
-                                cx,
-                                "触发键需带 Ctrl / Alt（或 F1–F12）；终端未聚焦时不会触发。"
-                            )),
-                    )
+                    .child(div().text_xs().text_color(pal.muted).child(tr!(
+                        cx,
+                        "触发键需带 Ctrl / Alt（或 F1–F12）；终端未聚焦时不会触发。"
+                    )))
                     .child(
                         h_flex()
                             .gap_2()
@@ -869,7 +872,11 @@ impl RuTermApp {
                             .w_full()
                             .items_center()
                             .justify_between()
-                            .child(div().text_sm().child(tr!(cx, "步骤（发送内容 + 步后延迟毫秒）")))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .child(tr!(cx, "步骤（发送内容 + 步后延迟毫秒）")),
+                            )
                             .child(
                                 Button::new("macro-step-add")
                                     .label(tr!(cx, "+ 添加步骤"))
@@ -881,15 +888,10 @@ impl RuTermApp {
                             ),
                     )
                     .child(steps)
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(pal.muted)
-                            .child(tr!(
-                                cx,
-                                "转义：\\n 回车 · \\t Tab · \\e ESC · \\\\ 反斜杠；其余按字面发送。"
-                            )),
-                    ),
+                    .child(div().text_xs().text_color(pal.muted).child(tr!(
+                        cx,
+                        "转义：\\n 回车 · \\t Tab · \\e ESC · \\\\ 反斜杠；其余按字面发送。"
+                    ))),
             )
             .child(div().text_xs().text_color(pal.danger).child(error))
             .child(

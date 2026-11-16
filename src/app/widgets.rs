@@ -1,10 +1,9 @@
 //! //! 跨模块共用的小部件与帮助函数：输入框样式、步进按钮、右键菜单构建等。
 
-
 use rgpui::input_ui::{Input, InputState};
 use rgpui::{
-    App, Button, ButtonVariants, ClickEvent, Context, Entity, IconName, IntoElement, ParentElement, PopupMenu, PopupMenuItem, SharedString,
-    Styled, Window, div, px, v_flex,
+    App, Button, ButtonVariants, ClickEvent, Context, Entity, IconName, IntoElement, ParentElement,
+    PopupMenu, PopupMenuItem, SharedString, Styled, Window, div, px, v_flex,
 };
 
 use crate::local_shell::NetTool;
@@ -339,7 +338,6 @@ impl RuTermApp {
         }
     }
 
-
     /// 右键菜单的一项：回调要求 `Send + Sync`，故只捕获实体与标签，不捕获 `&self`。
     pub(super) fn menu_item(
         entity: Entity<RuTermApp>,
@@ -358,6 +356,4 @@ impl RuTermApp {
             entity.update(cx, |this, cx| run(this, window, cx));
         })
     }
-
-
 }

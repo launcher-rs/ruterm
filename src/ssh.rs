@@ -141,7 +141,9 @@ impl Osc7Scan {
 
     fn emit(payload: &[u8], cwd: &Option<mpsc::UnboundedSender<CwdHint>>) {
         let Some(tx) = cwd else { return };
-        let Ok(s) = std::str::from_utf8(payload) else { return };
+        let Ok(s) = std::str::from_utf8(payload) else {
+            return;
+        };
         let Some(path) = crate::session::path_from_osc7(s) else {
             log::debug!("[Osc7Scan] 解析 OSC 7 失败: {:?}", s);
             return;
@@ -302,9 +304,7 @@ impl SshTerminalHandler {
         let Some(sink) = self.zmodem.as_ref() else {
             return false;
         };
-        let guard = sink
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let guard = sink.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let Some(sender) = guard.as_ref() else {
             return false;
         };

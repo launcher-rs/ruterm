@@ -1,16 +1,16 @@
 //! //! 设置弹窗：分页导航与各分页（外观 / 状态栏 / 终端 / 会话）渲染，会话偏好持久化。
 
-
 use rgpui::components::Select;
 use rgpui::input_ui::{Input, InputEvent, InputState};
 use rgpui::prelude::*;
 use rgpui::{
-    AnyElement, Button, ButtonVariants, Checkbox, Context, Entity, FontWeight, InteractiveElement, IntoElement, MouseButton, ParentElement, ScrollableElement, SharedString,
+    AnyElement, Button, ButtonVariants, Checkbox, Context, Entity, FontWeight, InteractiveElement,
+    IntoElement, MouseButton, ParentElement, ScrollableElement, SharedString,
     StatefulInteractiveElement, Styled, Window, div, h_flex, px, v_flex,
 };
 
+use crate::OpenSettings;
 use crate::remote::Metric;
-use crate::{OpenSettings};
 use crate::tr;
 
 use super::*;
@@ -67,7 +67,12 @@ impl RuTermApp {
     }
 
     /// 打开设置弹窗并直接停在指定分页（标题栏菜单按入口意图分页）。
-    pub(super) fn open_settings_at(&mut self, tab: usize, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn open_settings_at(
+        &mut self,
+        tab: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // 库内终端偏好可能在上次打开之后才到达，先把自定义色回填到输入框。
         self.sync_custom_color_inputs(window, cx);
         if let Some(state) = self.settings.as_mut() {
@@ -179,7 +184,6 @@ impl RuTermApp {
         cx.notify();
     }
 
-
     /// Ctrl+, / 菜单项与 ⚙：打开设置弹窗。
     pub(super) fn open_settings_action(
         &mut self,
@@ -189,7 +193,6 @@ impl RuTermApp {
     ) {
         self.open_settings(window, cx);
     }
-
 
     /// 设置居中弹窗：左侧竖排分页导航（凭据库与主密码 / 外观 / 状态栏 / 终端 / 会话），右侧为当前分页内容。
     pub(super) fn render_settings_dialog(&self, cx: &Context<Self>) -> AnyElement {
@@ -346,9 +349,13 @@ impl RuTermApp {
             .into_any_element()
     }
 
-
     /// 「外观」分页：明暗主题（与 `Ctrl+T`、标题栏 ☀☾ 同一开关）、边栏位置与界面语言。
-    pub(super) fn render_appearance_tab(&self, pal: &Palette, dark: bool, cx: &Context<Self>) -> AnyElement {
+    pub(super) fn render_appearance_tab(
+        &self,
+        pal: &Palette,
+        dark: bool,
+        cx: &Context<Self>,
+    ) -> AnyElement {
         let locale = crate::i18n::current_locale(cx);
         v_flex()
             .id("settings-tab-appearance")
@@ -461,7 +468,6 @@ impl RuTermApp {
             .into_any_element()
     }
 
-
     /// 「状态栏」分页：勾选底部状态栏要显示哪些条目，改动即时生效并写入凭据库。
     pub(super) fn render_status_tab(&self, pal: &Palette, cx: &Context<Self>) -> AnyElement {
         let entity = cx.entity();
@@ -545,7 +551,6 @@ impl RuTermApp {
             )
             .into_any_element()
     }
-
 
     /// 「终端」分页：字号、行高与配色方案，改动即刻刷到所有已开终端并写入凭据库。
     pub(super) fn render_terminal_tab(&self, pal: &Palette, cx: &Context<Self>) -> AnyElement {
@@ -679,7 +684,6 @@ impl RuTermApp {
             .into_any_element()
     }
 
-
     /// 自定义 16 色编辑器：前景 / 背景两行，下面 8 行「普通 | 明亮」同色成对。
     /// 输入框只认 `#RGB` / `#RRGGBB`，非法内容不提交，色块保持上一个有效颜色。
     pub(super) fn render_custom_colors(&self, pal: &Palette, cx: &Context<Self>) -> AnyElement {
@@ -724,14 +728,8 @@ impl RuTermApp {
             grid = grid.child(
                 h_flex()
                     .gap_3()
-                    .child(labeled(
-                        SharedString::from(*name),
-                        CUSTOM_ANSI_BASE + i,
-                    ))
-                    .child(labeled(
-                        SharedString::from(*name),
-                        CUSTOM_BRIGHT_BASE + i,
-                    )),
+                    .child(labeled(SharedString::from(*name), CUSTOM_ANSI_BASE + i))
+                    .child(labeled(SharedString::from(*name), CUSTOM_BRIGHT_BASE + i)),
             );
         }
         v_flex()
@@ -768,7 +766,6 @@ impl RuTermApp {
             )))
             .into_any_element()
     }
-
 
     /// 「会话」分页：断线自动重连与连接超时，改动即时生效并写入凭据库。
     pub(super) fn render_session_tab(&self, pal: &Palette, cx: &Context<Self>) -> AnyElement {
@@ -854,7 +851,6 @@ impl RuTermApp {
             .into_any_element()
     }
 
-
     /// 会话行为改动：记账 → 持久化（库内优先，降级时写 settings.json）。
     pub(super) fn set_session_prefs(&mut self, mut prefs: SessionPrefs, cx: &mut Context<Self>) {
         prefs.clamp();
@@ -866,7 +862,6 @@ impl RuTermApp {
         self.persist_session(cx);
     }
 
-
     /// 开关断线自动重连。
     pub(super) fn set_auto_reconnect(&mut self, auto_reconnect: bool, cx: &mut Context<Self>) {
         let mut prefs = self.session_prefs.clone();
@@ -874,14 +869,12 @@ impl RuTermApp {
         self.set_session_prefs(prefs, cx);
     }
 
-
     /// 连接超时增减一档。
     pub(super) fn nudge_connect_timeout(&mut self, steps: i32, cx: &mut Context<Self>) {
         let mut prefs = self.session_prefs.clone();
         prefs.nudge_connect_timeout(steps);
         self.set_session_prefs(prefs, cx);
     }
-
 
     /// 开关系统托盘：立即创建 / 置空图标并写启动设置。
     ///
@@ -913,7 +906,6 @@ impl RuTermApp {
         cx.notify();
     }
 
-
     /// 会话行为偏好落库；加密库不可用时退回旧 settings.json。
     pub(super) fn persist_session(&self, cx: &mut Context<Self>) {
         let json = self.session_prefs.to_json();
@@ -928,6 +920,4 @@ impl RuTermApp {
         })
         .detach();
     }
-
-
 }

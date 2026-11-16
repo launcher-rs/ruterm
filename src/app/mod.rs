@@ -15,6 +15,7 @@ mod local_shells;
 mod macros_ui;
 mod prefs;
 mod remote_desktop;
+mod right_dock;
 mod settings;
 mod sidebar;
 mod snippets_ui;
@@ -25,8 +26,8 @@ mod title_bar;
 mod vault_ui;
 mod widgets;
 
-use connect::*;
 use completion::*;
+use connect::*;
 use files::*;
 use forwards::*;
 use history_ui::*;
@@ -37,6 +38,7 @@ use local_shells::*;
 use macros_ui::*;
 use prefs::*;
 use remote_desktop::*;
+use right_dock::*;
 use settings::*;
 use sidebar::*;
 use snippets_ui::*;
@@ -56,24 +58,23 @@ use rgpui::input_ui::{Input, InputEvent, InputState};
 use rgpui::prelude::*;
 use rgpui::tabs::tab_drag::TabDragData;
 use rgpui::{
-    AnyElement, App, Button, ButtonVariants, ClickEvent, Context, Entity, FocusHandle, Focusable, Hsla, Icon, IconName, Image, InteractiveElement, IntoElement, MouseButton, ParentElement, Point,
-    Render, ScrollHandle, SharedString,
-    StatefulInteractiveElement, Styled, Tooltip, Window, canvas, div, h_flex, px, relative, v_flex,
+    AnyElement, App, Button, ButtonVariants, ClickEvent, Context, Entity, FocusHandle, Focusable,
+    Hsla, Icon, IconName, Image, InteractiveElement, IntoElement, MouseButton, ParentElement,
+    Point, Render, ScrollHandle, SharedString, StatefulInteractiveElement, Styled, Tooltip, Window,
+    canvas, div, h_flex, px, relative, v_flex,
 };
-use rgpui_term::{
-    InputOrigin,
-    ThemeManager,
-};
+use rgpui_term::{InputOrigin, ThemeManager};
 
 use crate::config::SshTarget;
 use crate::history::CommandHistory;
 use crate::local_shell::ShellProfile;
 use crate::macros::KeyMacro;
 use crate::paths::StorageMode;
+use crate::platform::Platform;
 use crate::sessions::{AuthMethod, HostConfig, ProtocolKind, SessionStore};
 use crate::snippets::CommandSnippet;
-use crate::vault::Vault;
 use crate::tr;
+use crate::vault::Vault;
 
 /// RuTerm 主视图：左侧主机账号管理，右侧会话标签终端。
 pub(crate) struct RuTermApp {
@@ -222,6 +223,30 @@ pub(crate) struct RuTermApp {
     history_seen: HashMap<usize, usize>,
     /// 命令历史弹窗。
     history_manager: Option<HistoryManager>,
+    /// 右侧命令历史分区是否展开。
+    history_panel_open: bool,
+    /// 右侧命令片段分区是否展开（与历史共用同一块停靠区）。
+    snippets_panel_open: bool,
+    /// 右侧停靠区宽度（px）；拖左缘分隔条即时改写。
+    right_panel_width: f32,
+    /// 停靠区左缘分隔条拖拽起点（指针 x、起始宽度）。
+    right_panel_drag: Option<(f32, f32)>,
+    /// 停靠区上下分界拖拽起点（指针 y、起始占比）。
+    right_split_drag: Option<(f32, f32)>,
+    /// 片段分区占停靠区高度的比例（上下两块都展开时生效）。
+    snippet_share: f32,
+    /// 停靠区实测高度（canvas 回填）：上下拖拽换算占比用。
+    right_panel_height: Rc<Cell<f32>>,
+    /// 历史面板的搜索框（与弹窗搜索互不影响）。
+    history_search: Entity<InputState>,
+    /// 右侧片段分区的搜索框（与管理器搜索互不影响）。
+    snippet_search: Entity<InputState>,
+    /// 右侧片段分区是否切到「内置命令」页。
+    snippet_panel_builtin: bool,
+    /// 右侧片段分区内置页正在查看的平台。
+    snippet_panel_platform: Platform,
+    /// 历史面板「清空」是否已进入确认步。
+    history_clear_confirm: bool,
     /// 终端里正在输入的词；None＝光标被移动过，等回车开新行再跟踪。
     typed_line: Option<String>,
     /// 终端内命令补全浮层（只对正在输入的那个标签生效）。
@@ -305,7 +330,11 @@ impl Palette {
 
 impl RuTermApp {
     /// 载入已保存主机，可选执行命令行快速连接。
-    pub(crate) fn new(quick: Option<SshTarget>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub(crate) fn new(
+        quick: Option<SshTarget>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let mode = StorageMode::detect();
         let store = SessionStore::new(&mode);
         let hosts = store.load();
@@ -372,6 +401,14 @@ impl RuTermApp {
             _ => {}
         })
         .detach();
+        let history_search =
+            cx.new(|cx| InputState::new(window, cx).placeholder(tr!(cx, "搜索命令历史…")));
+        cx.subscribe(&history_search, |_, _, _: &InputEvent, cx| cx.notify())
+            .detach();
+        let snippet_search =
+            cx.new(|cx| InputState::new(window, cx).placeholder(tr!(cx, "搜索命令片段…")));
+        cx.subscribe(&snippet_search, |_, _, _: &InputEvent, cx| cx.notify())
+            .detach();
         // 中间件跑在终端内部（按键路径上），投递到 tokio 通道后由 UI 侧分发：
         // 终端实体之间不能互相直接写，否则借用与通知顺序会互相踩。
         let (mirror_tx, mut mirror_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -453,6 +490,18 @@ impl RuTermApp {
             history,
             history_seen: HashMap::new(),
             history_manager: None,
+            history_panel_open: false,
+            snippets_panel_open: false,
+            right_panel_width: RIGHT_PANEL_DEFAULT_WIDTH,
+            right_panel_drag: None,
+            right_split_drag: None,
+            snippet_share: SNIPPET_SHARE_DEFAULT,
+            right_panel_height: Rc::new(Cell::new(0.0)),
+            history_search,
+            snippet_search,
+            snippet_panel_builtin: false,
+            snippet_panel_platform: Platform::Cross,
+            history_clear_confirm: false,
             typed_line: Some(String::new()),
             completion: None,
             split_state,
@@ -555,7 +604,9 @@ impl RuTermApp {
     /// 口令档（已设置主密码）启动时弹出解锁对话框，口令错误可重试；
     /// keyring 档保持零输入直连。
     pub(super) fn boot_vault(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.vault_opening || self.vault_maintenance { return; }
+        if self.vault_opening || self.vault_maintenance {
+            return;
+        }
         let mode = self.mode.clone();
         if let Err(error) = crate::vault::recover_rekey(&mode) {
             self.status = format!("凭据库事务恢复失败，已禁止连接：{error:#}").into();
@@ -577,7 +628,9 @@ impl RuTermApp {
             self.status =
                 "便携模式正用本机凭据管理器解锁；建议到设置中配置主密码，以便带往其他机器".into();
         }
-        if passphrase_needed { return; }
+        if passphrase_needed {
+            return;
+        }
         self.vault_opening = true;
         cx.spawn(async move |this, cx| {
             // 库文件在数据目录还是原样，先探测主密钥是否可得。
@@ -586,10 +639,13 @@ impl RuTermApp {
                 Err(error) => {
                     let _ = this.update(cx, |this, cx| {
                         this.vault_opening = false;
-                        if this.auth_gate.generation() != generation { return; }
+                        if this.auth_gate.generation() != generation {
+                            return;
+                        }
                         log::warn!("系统凭据管理器不可用: {error}");
-                        this.status =
-                            SharedString::from(format!("凭据管理器不可用（{error}），SSH 连接已禁用"));
+                        this.status = SharedString::from(format!(
+                            "凭据管理器不可用（{error}），SSH 连接已禁用"
+                        ));
                         cx.notify();
                     });
                     return;
@@ -608,7 +664,9 @@ impl RuTermApp {
                 Ok((vault, hosts, key)) => {
                     let _ = this.update(cx, |this, cx| {
                         this.vault_opening = false;
-                        if this.auth_gate.generation() != generation { return; }
+                        if this.auth_gate.generation() != generation {
+                            return;
+                        }
                         this.attach_vault(vault, hosts, Some(key), cx);
                     });
                 }
@@ -616,7 +674,9 @@ impl RuTermApp {
                     log::warn!("加密凭据库不可用: {error}");
                     let _ = this.update(cx, |this, cx| {
                         this.vault_opening = false;
-                        if this.auth_gate.generation() != generation { return; }
+                        if this.auth_gate.generation() != generation {
+                            return;
+                        }
                         if crate::vault::read_unlock_marker(&this.mode)
                             == crate::vault::UnlockBackend::Passphrase
                         {
@@ -880,7 +940,9 @@ impl RuTermApp {
             if let Ok(Some(json)) = vault.setting("macros").await {
                 let macros = crate::macros::from_json(&json);
                 let _ = this.update(cx, |this, cx| {
-                    if this.auth_gate.generation() != generation { return; }
+                    if this.auth_gate.generation() != generation {
+                        return;
+                    }
                     if this.macros != macros {
                         this.macros = macros;
                         cx.notify();
@@ -891,7 +953,9 @@ impl RuTermApp {
             if let Ok(Some(json)) = vault.setting("snippets").await {
                 let snippets = crate::snippets::from_json(&json);
                 let _ = this.update(cx, |this, cx| {
-                    if this.auth_gate.generation() != generation { return; }
+                    if this.auth_gate.generation() != generation {
+                        return;
+                    }
                     if this.snippets != snippets {
                         this.snippets = snippets;
                         cx.notify();
@@ -902,7 +966,9 @@ impl RuTermApp {
             if let Ok(Some(json)) = vault.setting("history").await {
                 let history = CommandHistory::from_json(&json);
                 let _ = this.update(cx, |this, cx| {
-                    if this.auth_gate.generation() != generation { return; }
+                    if this.auth_gate.generation() != generation {
+                        return;
+                    }
                     if this.history != history {
                         this.history = history;
                         cx.notify();
@@ -910,10 +976,14 @@ impl RuTermApp {
                 });
             }
             drop(vault);
-            let Some(entity) = this.upgrade() else { return; };
+            let Some(entity) = this.upgrade() else {
+                return;
+            };
             let _ = cx.with_window(entity.entity_id(), move |window, cx| {
                 entity.update(cx, |this, cx| {
-                    if this.auth_gate.generation() != generation || this.vault.is_none() { return; }
+                    if this.auth_gate.generation() != generation || this.vault.is_none() {
+                        return;
+                    }
                     this.inline_keys = keys.into_iter().collect();
                     this.auth_gate.attach();
                     if let Some(target) = this.auth_gate.take_pending(&mut this.pending_quick) {
@@ -1152,15 +1222,17 @@ impl RuTermApp {
                                 .on_drop(cx.listener(move |this, drag: &TabDragData, _, cx| {
                                     this.reorder_tab(drag.index, index, cx);
                                 }))
-                                .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
-                                    // 双击就地改名，单击仍是切标签（改名时也别丢激活态）。
-                                    if event.click_count() >= 2 {
-                                        this.begin_rename(id, window, cx);
-                                    } else {
-                                        this.activate_tab(id, window, cx);
-                                    }
-                                    cx.notify();
-                                }))
+                                .on_click(cx.listener(
+                                    move |this, event: &ClickEvent, window, cx| {
+                                        // 双击就地改名，单击仍是切标签（改名时也别丢激活态）。
+                                        if event.click_count() >= 2 {
+                                            this.begin_rename(id, window, cx);
+                                        } else {
+                                            this.activate_tab(id, window, cx);
+                                        }
+                                        cx.notify();
+                                    },
+                                ))
                                 // 中键关标签：浏览器/终端用户的肌肉记忆，省一次「先切过去再点 ×」。
                                 .on_mouse_down(
                                     MouseButton::Middle,
@@ -1289,7 +1361,6 @@ impl RuTermApp {
 
         v_flex().flex_1().h_full().child(tab_bar).child(body)
     }
-
 }
 
 impl Render for RuTermApp {
@@ -1333,6 +1404,7 @@ impl Render for RuTermApp {
             .on_action(cx.listener(Self::close_snippet_manager_action))
             .on_action(cx.listener(Self::open_history_manager))
             .on_action(cx.listener(Self::close_history_manager_action))
+            .on_action(cx.listener(Self::toggle_history_panel_action))
             .on_action(cx.listener(Self::terminal_copy_action))
             .on_action(cx.listener(Self::terminal_copy_text_action))
             .on_action(cx.listener(Self::terminal_paste_action))
@@ -1347,21 +1419,18 @@ impl Render for RuTermApp {
                 // 面板自身的最终布局命中缓存后就不再纠正（终端被挤成标签栏那么宽）。
                 let visible = self.sidebar_visible(cx);
                 let panel_ratio = self.panel_ratio(cx);
+                let history_open = self.right_dock_open();
+                let history_width = self.right_panel_width;
                 let width_sink = self.split_width.clone();
-                let row = h_flex()
-                    .relative()
-                    .size_full()
-                    .min_w_0()
-                    .child(
-                        // 回填容器宽度给拖拽换算；绝对定位不参与布局。
-                        canvas(
-                            move |bounds, _, _| width_sink.set(bounds.size.width.as_f32()),
-                            |_, _, _, _| {},
-                        )
-                        .absolute()
-                        .size_full(),
+                let row = h_flex().relative().size_full().min_w_0().child(
+                    // 回填容器宽度给拖拽换算；绝对定位不参与布局。
+                    canvas(
+                        move |bounds, _, _| width_sink.set(bounds.size.width.as_f32()),
+                        |_, _, _, _| {},
                     )
-                    .child(self.render_sidebar_rail(cx));
+                    .absolute()
+                    .size_full(),
+                );
                 // 每个 flex 项都显式 min_w_0：否则 Taffy 会按 min-content 量它，
                 // 量出来的内容宽会被写进子树布局（见上）。
                 let main = div()
@@ -1381,12 +1450,29 @@ impl Render for RuTermApp {
                         .child(self.render_sidebar_panel(cx))
                         .into_any_element()
                 });
+                // 命令片段与命令历史共用窗口右侧的停靠区；两块都收起时终端拿回整块宽度。
+                let history = history_open.then(|| {
+                    div()
+                        .w(px(history_width))
+                        .flex_shrink_0()
+                        .min_w_0()
+                        .h_full()
+                        .overflow_hidden()
+                        .child(self.render_right_dock(cx))
+                        .into_any_element()
+                });
+                // 两侧工具窗口栏都贴各自的外缘：右轨放右侧面板的按钮，收起面板也常驻。
                 match self.sidebar.side {
                     SidebarSide::Left => row
+                        .child(self.render_sidebar_rail(cx))
                         .when_some(panel, |row, panel| {
                             row.child(panel).child(self.render_split_divider(cx))
                         })
                         .child(main)
+                        .when_some(history, |row, history| {
+                            row.child(self.render_right_dock_divider(cx)).child(history)
+                        })
+                        .child(self.render_right_rail(cx))
                         .into_any_element(),
                     SidebarSide::Right => row
                         .child(main)
@@ -1394,6 +1480,10 @@ impl Render for RuTermApp {
                             row.child(self.render_split_divider(cx)).child(panel)
                         })
                         .child(self.render_sidebar_rail(cx))
+                        .when_some(history, |row, history| {
+                            row.child(self.render_right_dock_divider(cx)).child(history)
+                        })
+                        .child(self.render_right_rail(cx))
                         .into_any_element(),
                 }
             })
@@ -1408,4 +1498,3 @@ impl Focusable for RuTermApp {
         self.focus_handle.clone()
     }
 }
-

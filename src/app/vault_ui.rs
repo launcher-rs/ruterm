@@ -4,16 +4,17 @@ use std::sync::Arc;
 
 use rgpui::input_ui::{Input, InputContentType, InputEvent, InputState};
 use rgpui::prelude::*;
-use rgpui::{
-    AnyElement, Button, ButtonVariants, Context, Disableable, Entity, FontWeight, InteractiveElement, IntoElement, MouseButton, ParentElement, SharedString,
-    Styled, Window, div, h_flex, px, v_flex,
-};
 use rgpui::title_bar::TITLE_BAR_HEIGHT;
+use rgpui::{
+    AnyElement, Button, ButtonVariants, Context, Disableable, Entity, FontWeight,
+    InteractiveElement, IntoElement, MouseButton, ParentElement, SharedString, Styled, Window, div,
+    h_flex, px, v_flex,
+};
 
 use crate::paths::StorageMode;
 use crate::sessions::HostConfig;
-use crate::vault::Vault;
 use crate::tr;
+use crate::vault::Vault;
 
 use super::*;
 
@@ -62,10 +63,11 @@ impl RuTermApp {
         cx.notify();
     }
 
-
     /// 打开口令档加密库并完成一次性迁移（解锁弹窗确认后调用）。
     pub(super) fn unlock_passphrase(&mut self, cx: &mut Context<Self>) {
-        if self.vault_opening || self.vault_maintenance || self.vault.is_some() { return; }
+        if self.vault_opening || self.vault_maintenance || self.vault.is_some() {
+            return;
+        }
         if let Err(error) = crate::vault::recover_rekey(&self.mode) {
             self.status = format!("事务恢复失败，拒绝解锁：{error:#}").into();
             cx.notify();
@@ -121,28 +123,29 @@ impl RuTermApp {
             .await;
             let _ = this.update(cx, |this, cx| {
                 this.vault_opening = false;
-                if this.auth_gate.generation() != generation { return; }
+                if this.auth_gate.generation() != generation {
+                    return;
+                }
                 match opened {
-                Ok((vault, hosts, hexkey)) => {
-                    this.attach_vault(vault, hosts, Some(hexkey), cx);
-                }
-                Err(error) => {
-                    if let Some(state) = this.unlock.as_mut() {
-                        state.error = Some(if is_new {
-                            format!("创建加密库失败：{error}").into()
-                        } else {
-                            "主密码不正确，请重试（多次输入错误可退出）".into()
-                        });
-                        log::warn!("解锁加密库失败: {error}");
+                    Ok((vault, hosts, hexkey)) => {
+                        this.attach_vault(vault, hosts, Some(hexkey), cx);
                     }
-                    cx.notify();
-                }
+                    Err(error) => {
+                        if let Some(state) = this.unlock.as_mut() {
+                            state.error = Some(if is_new {
+                                format!("创建加密库失败：{error}").into()
+                            } else {
+                                "主密码不正确，请重试（多次输入错误可退出）".into()
+                            });
+                            log::warn!("解锁加密库失败: {error}");
+                        }
+                        cx.notify();
+                    }
                 }
             });
         })
         .detach();
     }
-
 
     /// 退出解锁弹窗（尚未解锁时保持降级 JSON 行为）。
     pub(super) fn dismiss_unlock(&mut self, cx: &mut Context<Self>) {
@@ -152,7 +155,6 @@ impl RuTermApp {
         self.status = "凭据库未解锁，SSH 连接已禁用".into();
         cx.notify();
     }
-
 
     /// 锁定凭据库：丢弃库句柄与内存中的主密钥，清空主机列表并回到解锁弹窗。
     /// 已建立的终端会话不受影响，但不再能读取保存的凭据。
@@ -241,12 +243,8 @@ impl RuTermApp {
                     let dump = vault.export_all().await?;
                     let staging = portable_dir.join("ruterm.db.new");
                     crate::vault::remove_db_bundle(&staging);
-                    let fresh = Vault::open_at(
-                        &staging.to_string_lossy(),
-                        hexkey,
-                        runtime.clone(),
-                    )
-                    .await?;
+                    let fresh =
+                        Vault::open_at(&staging.to_string_lossy(), hexkey, runtime.clone()).await?;
                     fresh.import_dump(&dump).await?;
                     drop(fresh);
                     crate::vault::rename_db_bundle(
@@ -306,22 +304,23 @@ impl RuTermApp {
         .detach();
     }
 
-
     /// 点击"保存主密码"或回车：设置 / 更换主密码。
     pub(super) fn apply_rekey(&mut self, cx: &mut Context<Self>) {
         self.submit_master_password(MasterPasswordAction::Set, cx);
     }
-
 
     /// 点击"取消主密码"：库密钥换回系统凭据管理器里的随机密钥，此后启动无需输入口令。
     pub(super) fn cancel_master_password(&mut self, cx: &mut Context<Self>) {
         self.submit_master_password(MasterPasswordAction::Cancel, cx);
     }
 
-
     /// 执行主密码设置 / 更换 / 取消：校验当前口令 → 求目标密钥（新口令派生或 keyring）
     /// → 建新库全量搬迁 → 旧库让位 → 新库就位 → 写盐与解锁标记 → 确认数据无损后清理备份。
-    pub(super) fn submit_master_password(&mut self, action: MasterPasswordAction, cx: &mut Context<Self>) {
+    pub(super) fn submit_master_password(
+        &mut self,
+        action: MasterPasswordAction,
+        cx: &mut Context<Self>,
+    ) {
         let Some(state) = self.settings.as_ref() else {
             return;
         };
@@ -502,12 +501,13 @@ impl RuTermApp {
                 }
                 // 新库已就位：此时才可以换盐、换标记。
                 if let Some(salt) = new_salt
-                    && let Err(error) = crate::vault::write_salt(&salt_path, &salt) {
-                        if let Some(previous) = previous_salt.as_deref() {
-                            let _ = std::fs::write(&salt_path, previous);
-                        }
-                        return Err(anyhow::anyhow!("写入新派生盐失败（已还原旧盐）: {error}"));
+                    && let Err(error) = crate::vault::write_salt(&salt_path, &salt)
+                {
+                    if let Some(previous) = previous_salt.as_deref() {
+                        let _ = std::fs::write(&salt_path, previous);
                     }
+                    return Err(anyhow::anyhow!("写入新派生盐失败（已还原旧盐）: {error}"));
+                }
                 crate::vault::write_unlock_marker(&mode, backend)?;
                 let reopened = Vault::open(&mode, hexkey.clone(), runtime.clone()).await?;
                 let hosts = reopened.load_hosts().await?;
@@ -577,7 +577,6 @@ impl RuTermApp {
         .detach();
     }
 
-
     /// 换密钥失败后尽力恢复库句柄：keyring 档直接重开；口令档旧密钥只存在于
     /// 解锁输入中，交回设置里的解锁入口。
     pub(super) fn restore_vault(&mut self, cx: &mut Context<Self>) {
@@ -638,7 +637,6 @@ impl RuTermApp {
         }
         Ok(existing)
     }
-
 
     /// 便携/主密码库的解锁（或首次建库）居中弹窗。
     pub(super) fn render_unlock_dialog(&self, cx: &Context<Self>) -> AnyElement {
@@ -832,7 +830,6 @@ impl RuTermApp {
             .into_any_element()
     }
 
-
     /// 「凭据库与主密码」分页：库位置与解锁方式、主密码设置/更换/取消、一键锁定。
     pub(super) fn render_vault_tab(
         &self,
@@ -1010,6 +1007,4 @@ impl RuTermApp {
             })
             .into_any_element()
     }
-
-
 }

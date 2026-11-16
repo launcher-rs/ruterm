@@ -6,21 +6,20 @@ use rgpui::components::split_pane::{SplitDirection, SplitPaneState};
 use rgpui::input_ui::{Input, InputEvent, InputState};
 use rgpui::prelude::*;
 use rgpui::{
-    AnyElement, Button, ButtonVariants, ClipboardItem, Context, Disableable, Entity,
-    ExternalPaths, Focusable, FontWeight, Hsla, Icon, IconName, InteractiveElement, IntoElement, MouseButton, ParentElement, SharedString,
-    StatefulInteractiveElement, Styled, TrayMenuItem, Window, div, h_flex, px, v_flex,
+    AnyElement, Button, ButtonVariants, ClipboardItem, Context, Disableable, Entity, ExternalPaths,
+    Focusable, FontWeight, Hsla, Icon, IconName, InteractiveElement, IntoElement, MouseButton,
+    ParentElement, SharedString, StatefulInteractiveElement, Styled, TrayMenuItem, Window, div,
+    h_flex, px, v_flex,
 };
-use rgpui_term::{
-    Event as TerminalEvent, SearchStatus, Terminal, TerminalView,
-};
+use rgpui_term::{Event as TerminalEvent, SearchStatus, Terminal, TerminalView};
 
 use crate::config::SshTarget;
 use crate::desktop::Command;
 use crate::platform::Platform;
 use crate::remote::RemoteInfo;
 use crate::sessions::{AuthMethod, HostConfig, ProtocolKind};
-use crate::{CancelRename, CloseTab, SplitRight, SplitDown, CloseSplit, NextTab, PrevTab};
 use crate::tr;
+use crate::{CancelRename, CloseSplit, CloseTab, NextTab, PrevTab, SplitDown, SplitRight};
 
 use super::*;
 
@@ -36,8 +35,8 @@ pub(super) struct SessionTab {
     pub(super) custom_title: Option<SharedString>,
     /// 同名标签的序号（1 起，1 显示原名）：打开时取最小空号，之后不随其它标签关闭而改变。
     pub(super) title_ordinal: u32,
-    /// 是否跟随终端 OSC 0/2 标题改名：本地 shell 跟随（显示当前目录），
-    /// SSH / Telnet 固定用主机展示名，避免标签被 `user@host: ~` 覆盖。
+    /// 是否跟随终端 OSC 0/2 标题改名：当前所有标签都固定用默认名
+    /// （本地 shell 的 OSC 标题常是完整 exe 路径或目录，不宜进标签）。
     pub(super) follow_osc_title: bool,
     /// 连接位置（user@host:port 或本地 shell 的路径），状态栏展示。
     pub(super) addr: SharedString,
@@ -158,7 +157,6 @@ impl RuTermApp {
             .or_else(|| tab.remote_info.as_ref().and_then(RemoteInfo::platform))
     }
 
-
     /// 终端报告会话结束：保留终端内容与标签，展示断开横幅（可重连）。
     pub(super) fn end_session_tab(&mut self, id: usize, cx: &mut Context<Self>) {
         let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) else {
@@ -186,7 +184,6 @@ impl RuTermApp {
         cx.notify();
     }
 
-
     /// 会话减少后收拾依赖多个会话的状态：可用会话不足两个就关掉同步输入，
     /// 一个都不剩就收起广播弹窗（继续留着只会对着空列表发命令）。
     pub(super) fn prune_multi_session_state(&mut self) {
@@ -201,7 +198,6 @@ impl RuTermApp {
             self.broadcast = None;
         }
     }
-
 
     /// 会话以失败收场：标记断开原因，状态栏给出错误摘要（终端里另有完整错误文本）。
     ///
@@ -270,7 +266,6 @@ impl RuTermApp {
         self.prune_multi_session_state();
     }
 
-
     /// 延迟到点后在原标签重连；期间关标签、手动重连、取消或关掉开关都会让本次排定作废。
     pub(super) fn schedule_auto_reconnect(
         &mut self,
@@ -306,7 +301,6 @@ impl RuTermApp {
         .detach();
     }
 
-
     /// 取消本轮自动重连：已排定的那次作废，等待用户按回车或点「重新连接」。
     pub(super) fn cancel_auto_reconnect(&mut self, id: usize, cx: &mut Context<Self>) {
         if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) {
@@ -317,12 +311,10 @@ impl RuTermApp {
         self.status = "已取消自动重连，按回车或点击「重新连接」手动恢复".into();
     }
 
-
     /// 手动重连一个已断开的标签（重置自动重连计数）。
     pub(super) fn reconnect_tab(&mut self, id: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.reconnect_tab_with(id, 0, window, cx);
     }
-
 
     /// 重连一个已断开的标签：优先用列表里的最新主机配置，其余沿用原连接参数。
     /// `retry_attempt` 为自动重连的连续次数（手动重连传 0）。
@@ -414,23 +406,27 @@ impl RuTermApp {
         }
     }
 
-
     /// 用户点击标签关闭按钮。
     /// 订阅终端事件：查找状态变了要重绘查找条，OSC 0/2 标题变了要改标签名。
-    pub(super) fn watch_terminal(&self, tab_id: usize, terminal: &Entity<Terminal>, cx: &mut Context<Self>) {
-        cx.subscribe(terminal, move |this, terminal, event: &TerminalEvent, cx| {
-            match event {
+    pub(super) fn watch_terminal(
+        &self,
+        tab_id: usize,
+        terminal: &Entity<Terminal>,
+        cx: &mut Context<Self>,
+    ) {
+        cx.subscribe(
+            terminal,
+            move |this, terminal, event: &TerminalEvent, cx| match event {
                 TerminalEvent::SearchUpdated(_) => cx.notify(),
                 TerminalEvent::TitleChanged => {
                     let title = terminal.read(cx).breadcrumb_text.clone();
                     this.apply_osc_title(tab_id, &title, cx);
                 }
                 _ => {}
-            }
-        })
+            },
+        )
         .detach();
     }
-
 
     /// 把终端上报的 OSC 标题落到标签上；用户重命名过就不再覆盖。
     pub(super) fn apply_osc_title(&mut self, tab_id: usize, title: &str, cx: &mut Context<Self>) {
@@ -454,7 +450,6 @@ impl RuTermApp {
         };
         cx.notify();
     }
-
 
     /// 双击标签：把标题换成输入框就地改名。只影响这条会话，不落库。
     pub(super) fn begin_rename(
@@ -518,26 +513,32 @@ impl RuTermApp {
         cx.notify();
     }
 
-
-    pub(super) fn cancel_rename(&mut self, _: &CancelRename, _: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn cancel_rename(
+        &mut self,
+        _: &CancelRename,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.renaming.take().is_some() {
             cx.notify();
         }
     }
 
-
-    pub(super) fn close_active_tab(&mut self, _: &CloseTab, _: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn close_active_tab(
+        &mut self,
+        _: &CloseTab,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(id) = self.active_tab else {
             return;
         };
         self.close_tab(id, cx);
     }
 
-
     pub(super) fn close_tab(&mut self, id: usize, cx: &mut Context<Self>) {
         self.remove_tab(id, cx);
     }
-
 
     /// 移除标签并修正选中态；顺带把状态栏切到"已断开"。
     pub(super) fn remove_tab(&mut self, id: usize, cx: &mut Context<Self>) {
@@ -601,7 +602,6 @@ impl RuTermApp {
         self.sync_tray(cx);
         cx.notify();
     }
-
 
     /// 系统剪贴板只属于当前活动的 RDP 桌面会话：切走即撤销，后台会话无法再
     /// 读取本机剪贴板或把内容写给远端。
@@ -677,23 +677,34 @@ impl RuTermApp {
         self.sync_tray(cx);
     }
 
-
     /// Ctrl+Shift+D / 菜单项：左右分屏；已在左右分屏时再按一次即取消。
-    pub(super) fn split_right(&mut self, _: &SplitRight, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn split_right(
+        &mut self,
+        _: &SplitRight,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.toggle_split(SplitDirection::Horizontal, window, cx);
     }
 
-
     /// Ctrl+Shift+E / 菜单项：上下分屏；已在上下分屏时再按一次即取消。
-    pub(super) fn split_down(&mut self, _: &SplitDown, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn split_down(
+        &mut self,
+        _: &SplitDown,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.toggle_split(SplitDirection::Vertical, window, cx);
     }
 
-
-    pub(super) fn close_split_action(&mut self, _: &CloseSplit, _: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn close_split_action(
+        &mut self,
+        _: &CloseSplit,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.close_split("已取消分屏", cx);
     }
-
 
     pub(super) fn close_split(&mut self, status: &str, cx: &mut Context<Self>) {
         if self.view_split.take().is_some() {
@@ -701,7 +712,6 @@ impl RuTermApp {
             cx.notify();
         }
     }
-
 
     /// 分屏开关：同方向＝取消；换方向＝原地换排布；未分屏时把活动标签与下一个标签并排。
     pub(super) fn toggle_split(
@@ -788,7 +798,6 @@ impl RuTermApp {
         cx.notify();
     }
 
-
     /// 把当前会话列表刷到托盘菜单与悬停提示（隐藏到托盘后也能直接跳回某个标签）。
     pub(crate) fn sync_tray(&self, cx: &mut Context<Self>) {
         // 托盘关闭时不能碰：set_tray_menu / set_tooltip 会自动补建一个空图标。
@@ -828,14 +837,12 @@ impl RuTermApp {
         cx.set_tray_tooltip(tooltip.as_str());
     }
 
-
     /// 让标签栏滚到能看见指定标签（不改变选中态）。
     pub(super) fn reveal_tab(&self, id: usize) {
         if let Some(ix) = self.tabs.iter().position(|tab| tab.id == id) {
             self.tab_scroll.scroll_to_item(ix);
         }
     }
-
 
     /// 拖拽排序标签：把第 `from` 个标签移到第 `to` 个标签的位置。
     /// 先取出再插入，`from < to` 时目标下标会左移一位，这里用移出后的下标插入，
@@ -855,7 +862,6 @@ impl RuTermApp {
         cx.notify();
     }
 
-
     /// Ctrl+Tab / Ctrl+Shift+Tab：按标签顺序循环切换（末尾回到开头）。
     pub(super) fn cycle_tab(&mut self, step: isize, window: &mut Window, cx: &mut Context<Self>) {
         if self.tabs.is_empty() {
@@ -871,16 +877,13 @@ impl RuTermApp {
         cx.notify();
     }
 
-
     pub(super) fn next_tab(&mut self, _: &NextTab, window: &mut Window, cx: &mut Context<Self>) {
         self.cycle_tab(1, window, cx);
     }
 
-
     pub(super) fn prev_tab(&mut self, _: &PrevTab, window: &mut Window, cx: &mut Context<Self>) {
         self.cycle_tab(-1, window, cx);
     }
-
 
     /// 主区里的一个会话面板：终端内容 + 内边距 + 断开横幅。
     ///
@@ -929,7 +932,11 @@ impl RuTermApp {
                 style.border_1().border_color(pal.accent)
             })
             .on_drop(cx.listener(move |this, paths: &ExternalPaths, _, cx| {
-                if this.tabs.iter().any(|tab| tab.id == id && tab.desktop.is_some()) {
+                if this
+                    .tabs
+                    .iter()
+                    .any(|tab| tab.id == id && tab.desktop.is_some())
+                {
                     this.desktop_drop_paths(id, paths.paths().to_vec(), cx);
                 } else {
                     this.upload_via_terminal(id, paths.paths().to_vec(), cx);
@@ -1096,14 +1103,17 @@ impl RuTermApp {
             .into_any_element()
     }
 
-
     /// 会话断开横幅：浮在终端顶部，说明连接已结束并提供重连入口。
     ///
     /// 标签不自动关闭（与 WindTerm 一致）：终端内容留在原处可回看，按回车
     /// 或点「重新连接」在原标签内重建会话；开启了自动重连时先按退避等待并显示
     /// 倒计时，可随时取消。凭据已被服务器拒绝时不提供重连（重试同一份秘密只会
     /// 再失败一次），提示回到列表重新点击。
-    pub(super) fn render_ended_banner(&self, tab: &SessionTab, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_ended_banner(
+        &self,
+        tab: &SessionTab,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let pal = self.palette(cx);
         let theme = cx.theme();
         let fg = theme.warning_foreground;
@@ -1226,8 +1236,6 @@ impl RuTermApp {
             })
             .into_any_element()
     }
-
-
 }
 
 /// 把多行错误压成一行并按字符数截断：横幅宽度有限，完整原文交给「复制错误」。

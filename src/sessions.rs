@@ -252,9 +252,7 @@ impl SessionStore {
                 let legacy = std::fs::read_to_string(&self.settings_path)
                     .ok()
                     .and_then(|text| serde_json::from_str::<Settings>(&text).ok());
-                let archived = self
-                    .settings_path
-                    .with_file_name("settings.json.migrated");
+                let archived = self.settings_path.with_file_name("settings.json.migrated");
                 let settings = legacy.or_else(|| {
                     std::fs::read_to_string(archived)
                         .ok()
@@ -301,7 +299,10 @@ impl SessionStore {
 
     /// 仅更新加密库锁定期间可读取的非敏感主题启动镜像。
     pub fn save_theme_mirror(&self, dark: bool) {
-        if let Err(error) = write_atomic(&self.theme_path, if dark { "dark" } else { "light" }.as_bytes()) {
+        if let Err(error) = write_atomic(
+            &self.theme_path,
+            if dark { "dark" } else { "light" }.as_bytes(),
+        ) {
             log::warn!("写入 theme.txt 失败: {error}");
         }
     }

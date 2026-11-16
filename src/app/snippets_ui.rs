@@ -6,14 +6,14 @@
 use rgpui::input_ui::{Input, InputEvent, InputState};
 use rgpui::prelude::*;
 use rgpui::{
-    AnyElement, Button, ButtonVariants, Context, Disableable, Entity, FontWeight,
-    InteractiveElement, IntoElement, ParentElement, ScrollableElement, SharedString, Styled,
-    Window, div, h_flex, px, v_flex,
+    AnyElement, Button, ButtonVariants, Context, ContextMenuExt, Disableable, Entity, FontWeight,
+    IconName, InteractiveElement, IntoElement, MouseButton, ParentElement, ScrollableElement,
+    SharedString, Styled, Tooltip, Window, div, h_flex, px, v_flex,
 };
 
 use crate::platform::Platform;
+use crate::snippet_presets::{PRESET_GROUPS, PRESETS};
 use crate::snippets::CommandSnippet;
-use crate::snippet_presets::{PRESETS, PRESET_GROUPS};
 use crate::tr;
 use crate::{CloseSnippetManager, SnippetManager as OpenSnippetManager};
 
@@ -53,7 +53,11 @@ impl RuTermApp {
     }
 
     /// 打开管理器；已打开时只把焦点放回搜索框。
-    pub(super) fn open_snippet_manager_impl(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn open_snippet_manager_impl(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(state) = self.snippet_manager.as_ref() {
             state.search.update(cx, |input, cx| input.focus(window, cx));
             cx.notify();
@@ -70,6 +74,42 @@ impl RuTermApp {
             builtin: false,
             preset_platform: self.active_session_platform().unwrap_or(Platform::Cross),
         });
+        cx.notify();
+    }
+
+    /// 右侧片段区「新建」：复用管理器的编辑表单，管理器还没开就先开。
+    pub(super) fn new_snippet_from_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.snippet_manager.is_none() {
+            self.open_snippet_manager_impl(window, cx);
+        }
+        self.snippet_panel_builtin = false;
+        self.begin_snippet_new(window, cx);
+    }
+
+    /// 右侧片段区「编辑」：同样落到管理器的编辑表单。
+    pub(super) fn edit_snippet_from_panel(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.snippet_manager.is_none() {
+            self.open_snippet_manager_impl(window, cx);
+        }
+        self.snippet_panel_builtin = false;
+        self.begin_snippet_edit(index, window, cx);
+    }
+
+    /// 面板右键删除：菜单本身就是明确动作，不再走弹窗的两步确认。
+    pub(super) fn delete_snippet_from_panel(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index >= self.snippets.len() {
+            return;
+        }
+        self.snippets.remove(index);
+        if let Some(manager) = self.snippet_manager.as_mut() {
+            manager.confirm_delete = None;
+        }
+        self.persist_snippets(cx);
         cx.notify();
     }
 
@@ -90,6 +130,26 @@ impl RuTermApp {
             && manager.preset_platform != platform
         {
             manager.preset_platform = platform;
+            cx.notify();
+        }
+    }
+
+    /// 右侧片段分区切换「我的片段 / 内置命令」。
+    pub(super) fn set_snippet_panel_tab(&mut self, builtin: bool, cx: &mut Context<Self>) {
+        if self.snippet_panel_builtin != builtin {
+            self.snippet_panel_builtin = builtin;
+            cx.notify();
+        }
+    }
+
+    /// 右侧片段分区内置页切换平台。
+    pub(super) fn set_snippet_panel_platform(
+        &mut self,
+        platform: Platform,
+        cx: &mut Context<Self>,
+    ) {
+        if self.snippet_panel_platform != platform {
+            self.snippet_panel_platform = platform;
             cx.notify();
         }
     }
@@ -217,14 +277,10 @@ impl RuTermApp {
         let Some(preset) = crate::snippet_presets::PRESETS.get(preset_index) else {
             return;
         };
-        self.begin_snippet_edit_values(
-            None,
-            preset.name,
-            preset.command,
-            preset.note,
-            window,
-            cx,
-        );
+        if self.snippet_manager.is_none() {
+            self.open_snippet_manager_impl(window, cx);
+        }
+        self.begin_snippet_edit_values(None, preset.name, preset.command, preset.note, window, cx);
     }
 
     pub(super) fn cancel_snippet_edit(&mut self, cx: &mut Context<Self>) {
@@ -271,11 +327,8 @@ impl RuTermApp {
             manager.editing = None;
         }
         self.persist_snippets(cx);
-        self.status = crate::i18n::translate(
-            cx,
-            "已保存命令片段：{name}",
-            &[("name", &snippet.name)],
-        );
+        self.status =
+            crate::i18n::translate(cx, "已保存命令片段：{name}", &[("name", &snippet.name)]);
         cx.notify();
     }
 
@@ -305,7 +358,11 @@ impl RuTermApp {
         if !self.send_command_to_terminal(&snippet.command, run, cx) {
             return;
         }
-        let key = if run { "已执行片段：{name}" } else { "已插入片段：{name}" };
+        let key = if run {
+            "已执行片段：{name}"
+        } else {
+            "已插入片段：{name}"
+        };
         self.status = crate::i18n::translate(cx, key, &[("name", &snippet.name)]);
         cx.notify();
     }
@@ -319,7 +376,11 @@ impl RuTermApp {
         if !self.send_command_to_terminal(preset.command, run, cx) {
             return;
         }
-        let key = if run { "已执行内置命令：{name}" } else { "已插入内置命令：{name}" };
+        let key = if run {
+            "已执行内置命令：{name}"
+        } else {
+            "已插入内置命令：{name}"
+        };
         self.status = crate::i18n::translate(cx, key, &[("name", name.as_ref())]);
         cx.notify();
     }
@@ -379,15 +440,10 @@ impl RuTermApp {
                                             .font_weight(FontWeight(600.0))
                                             .child(tr!(cx, "命令片段")),
                                     )
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(pal.muted)
-                                            .child(tr!(
-                                                cx,
-                                                "保存常用命令，按需插入或直接执行到当前会话。"
-                                            )),
-                                    ),
+                                    .child(div().text_xs().text_color(pal.muted).child(tr!(
+                                        cx,
+                                        "保存常用命令，按需插入或直接执行到当前会话。"
+                                    ))),
                             )
                             .child(
                                 Button::new("close-snippet-manager")
@@ -670,16 +726,13 @@ impl RuTermApp {
                             .flex_1()
                             .min_w_0()
                             .gap(px(2.0))
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(pal.text)
-                                    .child(if snippet.has_name() {
-                                        snippet.name.clone().into()
-                                    } else {
-                                        tr!(cx, "未命名片段")
-                                    }),
-                            )
+                            .child(div().text_sm().text_color(pal.text).child(
+                                if snippet.has_name() {
+                                    snippet.name.clone().into()
+                                } else {
+                                    tr!(cx, "未命名片段")
+                                },
+                            ))
                             .child(
                                 div()
                                     .text_xs()
@@ -762,7 +815,11 @@ impl RuTermApp {
                     .w_full()
                     .gap_2()
                     .items_center()
-                    .child(div().flex_1().child(styled_input(Input::new(&state.search), pal)))
+                    .child(
+                        div()
+                            .flex_1()
+                            .child(styled_input(Input::new(&state.search), pal)),
+                    )
                     .child(
                         Button::new("snippet-new")
                             .label(tr!(cx, "新建片段"))
@@ -777,10 +834,7 @@ impl RuTermApp {
                 div()
                     .text_xs()
                     .text_color(pal.muted)
-                    .child(tr!(
-                        cx,
-                        "片段保存在加密库；「执行」会自动追加回车。"
-                    )),
+                    .child(tr!(cx, "片段保存在加密库；「执行」会自动追加回车。")),
             )
             .into_any_element()
     }
@@ -814,10 +868,7 @@ impl RuTermApp {
                 div()
                     .text_xs()
                     .text_color(pal.muted)
-                    .child(tr!(
-                        cx,
-                        "单行命令；内容按字面发送，不做变量替换。"
-                    )),
+                    .child(tr!(cx, "单行命令；内容按字面发送，不做变量替换。")),
             )
             .child(div().text_xs().text_color(pal.danger).child(error))
             .child(
@@ -842,6 +893,457 @@ impl RuTermApp {
                             })),
                     ),
             )
+            .into_any_element()
+    }
+
+    /// 右侧停靠区的片段分区：我的片段 / 内置命令两页 + 搜索 + 紧凑列表 + 底栏。
+    pub(super) fn render_snippets_section(&self, width: f32, cx: &mut Context<Self>) -> AnyElement {
+        let pal = self.palette(cx);
+        let query = self.snippet_search.read(cx).value().trim().to_lowercase();
+        let can_send = self
+            .active_tab
+            .and_then(|id| self.tabs.iter().find(|tab| tab.id == id))
+            .is_some_and(|tab| !tab.ended && tab.terminal_view.is_some());
+        let builtin = self.snippet_panel_builtin;
+        let active = self.active_session_platform();
+        let viewing = self.snippet_panel_platform;
+
+        let mut list = v_flex()
+            .id("snippet-panel-list")
+            .flex_1()
+            .min_h_0()
+            .gap_px()
+            .overflow_y_scrollbar();
+        let mut shown = 0;
+        if builtin {
+            let matches = |preset: &crate::snippet_presets::PresetSnippet| {
+                query.is_empty()
+                    || preset.name.to_lowercase().contains(&query)
+                    || preset.command.to_lowercase().contains(&query)
+                    || preset.note.to_lowercase().contains(&query)
+            };
+            let mut rows: Vec<usize> = PRESETS
+                .iter()
+                .enumerate()
+                .filter(|(_, preset)| preset.platform() == viewing && matches(preset))
+                .map(|(index, _)| index)
+                .collect();
+            rows.sort_by_key(|index| {
+                PRESET_GROUPS
+                    .iter()
+                    .position(|group| *group == PRESETS[*index].group)
+                    .unwrap_or(usize::MAX)
+            });
+            let mut group = None;
+            for index in rows {
+                let preset = &PRESETS[index];
+                if group != Some(preset.group) {
+                    group = Some(preset.group);
+                    list = list.child(
+                        div()
+                            .pl_2()
+                            .pt_1()
+                            .text_xs()
+                            .text_color(pal.muted)
+                            .child(crate::i18n::translate(cx, preset.group, &[])),
+                    );
+                }
+                shown += 1;
+                list = list.child(self.render_preset_panel_row(index, preset, &pal, can_send, cx));
+            }
+            if shown == 0 {
+                list = list.child(
+                    div()
+                        .py_4()
+                        .text_sm()
+                        .text_color(pal.muted)
+                        .child(tr!(cx, "没有匹配的内置命令")),
+                );
+            }
+        } else {
+            if self.snippets.is_empty() {
+                list = list.child(div().py_6().text_sm().text_color(pal.muted).child(tr!(
+                    cx,
+                    "还没有命令片段。点「新建片段」添加一条，或切到「内置命令」。"
+                )));
+            }
+            for (index, snippet) in self.snippets.iter().enumerate() {
+                if !query.is_empty()
+                    && !snippet.name.to_lowercase().contains(&query)
+                    && !snippet.command.to_lowercase().contains(&query)
+                    && !snippet.note.to_lowercase().contains(&query)
+                {
+                    continue;
+                }
+                shown += 1;
+                list =
+                    list.child(self.render_snippet_panel_row(index, snippet, &pal, can_send, cx));
+            }
+            if !query.is_empty() && shown == 0 {
+                list = list.child(
+                    div()
+                        .py_4()
+                        .text_sm()
+                        .text_color(pal.muted)
+                        .child(tr!(cx, "没有匹配的命令片段")),
+                );
+            }
+        }
+
+        let tab = |id: &'static str, label: SharedString, selected: bool, target: bool| {
+            Button::new(id)
+                .label(label)
+                .compact()
+                .when(selected, |button| button.primary())
+                .when(!selected, |button| button.ghost())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.set_snippet_panel_tab(target, cx);
+                }))
+        };
+        let tabs = h_flex()
+            .w_full()
+            .gap_1()
+            .child(tab(
+                "snippet-panel-tab-mine",
+                tr!(cx, "我的片段"),
+                !builtin,
+                false,
+            ))
+            .child(tab(
+                "snippet-panel-tab-builtin",
+                tr!(cx, "内置命令"),
+                builtin,
+                true,
+            ));
+        let mut platform_row = h_flex().gap_1().items_center().child(
+            div()
+                .flex_shrink_0()
+                .text_xs()
+                .text_color(pal.muted)
+                .child(tr!(cx, "平台")),
+        );
+        for platform in Platform::ALL {
+            let selected = platform == viewing;
+            let mut chip = Button::new(("snippet-panel-platform", platform as usize))
+                .label(crate::i18n::translate(cx, platform.label(), &[]))
+                .compact()
+                .when(selected, |button| button.primary())
+                .when(!selected, |button| button.ghost())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.set_snippet_panel_platform(platform, cx);
+                }));
+            if active == Some(platform) {
+                chip = chip.tooltip(tr!(cx, "当前会话平台"));
+            }
+            platform_row = platform_row.child(chip);
+        }
+
+        v_flex()
+            .id("snippet-panel")
+            .w(px(width))
+            .h_full()
+            .min_w_0()
+            .bg(pal.sidebar_bg)
+            .p_3()
+            .gap_2()
+            .child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_base()
+                            .font_weight(FontWeight(600.0))
+                            .child(tr!(cx, "命令片段")),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .items_center()
+                            .child(
+                                Button::new("snippet-panel-new")
+                                    .icon(IconName::Plus)
+                                    .ghost()
+                                    .compact()
+                                    .tooltip(tr!(cx, "新建片段"))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.new_snippet_from_panel(window, cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("snippet-panel-close")
+                                    .icon(IconName::Close)
+                                    .ghost()
+                                    .compact()
+                                    .tooltip(tr!(cx, "关闭片段面板"))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.toggle_snippets_panel(cx);
+                                    })),
+                            ),
+                    ),
+            )
+            .child(tabs)
+            .child(styled_input(Input::new(&self.snippet_search), &pal))
+            .when(builtin, |this| this.child(platform_row))
+            .child(list)
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap_2()
+                    .items_center()
+                    .justify_between()
+                    .child(div().text_xs().text_color(pal.muted).text_ellipsis().child(
+                        if builtin {
+                            tr!(cx, "只读 · 单击插入 · ▶ 执行 · 右键存为我的片段")
+                        } else {
+                            tr!(cx, "单击插入 · ▶ 执行 · 右键更多")
+                        },
+                    ))
+                    .child(
+                        Button::new("snippet-panel-manage")
+                            .label(tr!(cx, "管理…"))
+                            .ghost()
+                            .compact()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_snippet_manager_impl(window, cx);
+                            })),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// 右侧内置命令行：单击插入、▶ 执行、右键存为我的片段。
+    fn render_preset_panel_row(
+        &self,
+        index: usize,
+        preset: &crate::snippet_presets::PresetSnippet,
+        pal: &Palette,
+        can_send: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let menu_entity = cx.entity();
+        let note = crate::i18n::translate(cx, preset.note, &[]);
+        let tip: SharedString = format!("{}\n{}", preset.command, note).into();
+        h_flex()
+            .id(("preset-panel-row", index))
+            .w_full()
+            .h(px(28.0))
+            .items_center()
+            .gap_2()
+            .pl_2()
+            .pr_1()
+            .rounded(px(4.0))
+            .hover(|style| style.bg(pal.card_hover))
+            .cursor_pointer()
+            .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.send_preset(index, false, cx);
+            }))
+            .context_menu(move |menu, _, cx| {
+                let insert = menu_entity.clone();
+                let run = menu_entity.clone();
+                let copy = menu_entity.clone();
+                menu.min_w(px(168.0))
+                    .item(Self::menu_item(
+                        insert,
+                        tr!(cx, "插入到当前会话"),
+                        None,
+                        false,
+                        false,
+                        move |this, _, cx| {
+                            this.send_preset(index, false, cx);
+                        },
+                    ))
+                    .item(
+                        Self::menu_item(
+                            run,
+                            tr!(cx, "执行（回车）"),
+                            Some(IconName::Play),
+                            false,
+                            false,
+                            move |this, _, cx| {
+                                this.send_preset(index, true, cx);
+                            },
+                        )
+                        .disabled(!can_send),
+                    )
+                    .separator()
+                    .item(Self::menu_item(
+                        copy,
+                        tr!(cx, "存为我的片段"),
+                        None,
+                        false,
+                        false,
+                        move |this, window, cx| {
+                            this.copy_preset_to_snippets(index, window, cx);
+                        },
+                    ))
+            })
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .max_w(px(110.0))
+                    .text_sm()
+                    .text_color(pal.text)
+                    .text_ellipsis()
+                    .child(crate::i18n::translate(cx, preset.name, &[])),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_xs()
+                    .text_color(pal.muted)
+                    .text_ellipsis()
+                    .child(preset.command),
+            )
+            .when(can_send, |row| {
+                row.child(
+                    Button::new(("preset-panel-run", index))
+                        .icon(IconName::Play)
+                        .ghost()
+                        .xsmall()
+                        .compact()
+                        .tooltip(tr!(cx, "发送到当前会话并回车"))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|_, _, _, cx| {
+                                // 别让 ▶ 的点击冒泡到整行，否则会再插入一遍。
+                                cx.stop_propagation();
+                            }),
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.send_preset(index, true, cx);
+                        })),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn render_snippet_panel_row(
+        &self,
+        index: usize,
+        snippet: &CommandSnippet,
+        pal: &Palette,
+        can_send: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let menu_entity = cx.entity();
+        let name: SharedString = if snippet.has_name() {
+            snippet.name.clone().into()
+        } else {
+            tr!(cx, "未命名片段")
+        };
+        let tip: SharedString = if snippet.note.is_empty() {
+            snippet.command.clone().into()
+        } else {
+            format!("{}\n{}", snippet.command, snippet.note).into()
+        };
+        h_flex()
+            .id(("snippet-panel-row", index))
+            .w_full()
+            .h(px(28.0))
+            .items_center()
+            .gap_2()
+            .pl_2()
+            .pr_1()
+            .rounded(px(4.0))
+            .hover(|style| style.bg(pal.card_hover))
+            .cursor_pointer()
+            .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.send_snippet(index, false, cx);
+            }))
+            .context_menu(move |menu, _, cx| {
+                let insert = menu_entity.clone();
+                let run = menu_entity.clone();
+                let edit = menu_entity.clone();
+                let delete = menu_entity.clone();
+                menu.min_w(px(168.0))
+                    .item(Self::menu_item(
+                        insert,
+                        tr!(cx, "插入到当前会话"),
+                        None,
+                        false,
+                        false,
+                        move |this, _, cx| {
+                            this.send_snippet(index, false, cx);
+                        },
+                    ))
+                    .item(
+                        Self::menu_item(
+                            run,
+                            tr!(cx, "执行（回车）"),
+                            Some(IconName::Play),
+                            false,
+                            false,
+                            move |this, _, cx| {
+                                this.send_snippet(index, true, cx);
+                            },
+                        )
+                        .disabled(!can_send),
+                    )
+                    .separator()
+                    .item(Self::menu_item(
+                        edit,
+                        tr!(cx, "编辑"),
+                        None,
+                        false,
+                        false,
+                        move |this, window, cx| {
+                            this.edit_snippet_from_panel(index, window, cx);
+                        },
+                    ))
+                    .item(Self::menu_item(
+                        delete,
+                        tr!(cx, "删除"),
+                        Some(IconName::Delete),
+                        true,
+                        false,
+                        move |this, _, cx| {
+                            this.delete_snippet_from_panel(index, cx);
+                        },
+                    ))
+            })
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .max_w(px(110.0))
+                    .text_sm()
+                    .text_color(pal.text)
+                    .text_ellipsis()
+                    .child(name),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_xs()
+                    .text_color(pal.muted)
+                    .text_ellipsis()
+                    .child(SharedString::from(snippet.command.clone())),
+            )
+            .when(can_send, |row| {
+                row.child(
+                    Button::new(("snippet-panel-run", index))
+                        .icon(IconName::Play)
+                        .ghost()
+                        .xsmall()
+                        .compact()
+                        .tooltip(tr!(cx, "发送到当前会话并回车"))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|_, _, _, cx| {
+                                // 别让 ▶ 的点击冒泡到整行，否则会再插入一遍。
+                                cx.stop_propagation();
+                            }),
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.send_snippet(index, true, cx);
+                        })),
+                )
+            })
             .into_any_element()
     }
 }

@@ -36,7 +36,9 @@ pub(super) enum DesktopPhase {
     NeedPassword,
     Connecting,
     Live,
-    Failed { message: SharedString },
+    Failed {
+        message: SharedString,
+    },
 }
 
 /// 打开桌面表单时预填的参数（来自已保存主机或局域网发现）。
@@ -267,9 +269,8 @@ impl RuTermApp {
                 .default_value(port_text.clone())
                 .placeholder(port_text.clone())
         });
-        let form_password = cx.new(|cx| {
-            InputState::new(window, cx).placeholder(tr!(cx, "密码（可留空）"))
-        });
+        let form_password =
+            cx.new(|cx| InputState::new(window, cx).placeholder(tr!(cx, "密码（可留空）")));
         let form_username = cx.new(|cx| {
             let input = InputState::new(window, cx).placeholder(tr!(cx, "用户名"));
             if prefilled_username.is_empty() {
@@ -402,7 +403,10 @@ impl RuTermApp {
         if !auto_connect {
             self.status = if saved_host.is_some() {
                 tr!(cx, "已填入主机信息，输入密码后点「连接」")
-            } else if prefilled_host.as_deref().is_some_and(|host| !host.is_empty()) {
+            } else if prefilled_host
+                .as_deref()
+                .is_some_and(|host| !host.is_empty())
+            {
                 tr!(cx, "已填入发现的地址，填写凭据后点「连接」")
             } else {
                 tr!(cx, "填写地址后按回车或点「连接」")
@@ -446,15 +450,16 @@ impl RuTermApp {
                 .find(|tab| tab.id == id)
                 .and_then(|tab| tab.desktop.as_mut())
             {
-                desktop
-                    .form_password
-                    .update(cx, |state, cx| state.set_value(password.clone(), window, cx));
+                desktop.form_password.update(cx, |state, cx| {
+                    state.set_value(password.clone(), window, cx)
+                });
             }
             self.open_desktop_session(id, host, port, password, cx);
             return;
         }
         // 加密库里存过密码（保存主机或上次连接成功时写入）：读出来直接用，重启后也不再问。
-        if let (Some(vault), Some(host_id)) = (self.vault.clone(), saved_host.filter(|id| *id != 0)) {
+        if let (Some(vault), Some(host_id)) = (self.vault.clone(), saved_host.filter(|id| *id != 0))
+        {
             if let Some(desktop) = self
                 .tabs
                 .iter_mut()
@@ -528,9 +533,9 @@ impl RuTermApp {
                 .find(|tab| tab.id == id)
                 .and_then(|tab| tab.desktop.as_mut())
             {
-                desktop
-                    .form_password
-                    .update(cx, |state, cx| state.set_value(password.clone(), window, cx));
+                desktop.form_password.update(cx, |state, cx| {
+                    state.set_value(password.clone(), window, cx)
+                });
             }
             self.open_desktop_session(id, host, port, password, cx);
             return;
@@ -712,11 +717,7 @@ impl RuTermApp {
                 password.clone(),
             )
         });
-        let existing = saved_id.and_then(|id| {
-            self.hosts
-                .iter()
-                .position(|host| host.id == id)
-        });
+        let existing = saved_id.and_then(|id| self.hosts.iter().position(|host| host.id == id));
         let mut host = match existing {
             Some(index) => {
                 let mut host = self.hosts[index].clone();
@@ -746,11 +747,7 @@ impl RuTermApp {
             },
         };
         if let Some(error) = host.validate() {
-            self.desktop_form_error(
-                tab_id,
-                SharedString::from(format!("保存失败：{error}")),
-                cx,
-            );
+            self.desktop_form_error(tab_id, SharedString::from(format!("保存失败：{error}")), cx);
             return;
         }
         let label = format!("{}:{}", host.host, host.port);
@@ -865,11 +862,7 @@ impl RuTermApp {
             self.set_desktop_form(id, cx);
             return;
         }
-        let (host, port, password) = (
-            desktop.host.clone(),
-            desktop.port,
-            desktop.password.clone(),
-        );
+        let (host, port, password) = (desktop.host.clone(), desktop.port, desktop.password.clone());
         self.open_desktop_session(id, host, port, password, cx);
     }
 
@@ -1025,10 +1018,7 @@ impl RuTermApp {
                 };
                 let alive = match event {
                     Event::FrameReady => {
-                        let snapshot = latest_slot
-                            .lock()
-                            .ok()
-                            .and_then(|mut slot| slot.take());
+                        let snapshot = latest_slot.lock().ok().and_then(|mut slot| slot.take());
                         match snapshot {
                             Some(snapshot) => {
                                 let size = (snapshot.width, snapshot.height);
@@ -1067,7 +1057,9 @@ impl RuTermApp {
                         })
                         .is_ok(),
                     Event::Clipboard(text) => this
-                        .update(cx, |this, cx| this.apply_desktop_clipboard(id, token, text, cx))
+                        .update(cx, |this, cx| {
+                            this.apply_desktop_clipboard(id, token, text, cx)
+                        })
                         .is_ok(),
                     Event::Closed { reason } => {
                         let _ = this.update(cx, |this, cx| {
@@ -1396,10 +1388,7 @@ impl RuTermApp {
         tab.last_error = Some(reason.clone());
         if self.active_tab == Some(id) {
             self.status = if auth_failure {
-                desktop
-                    .form_error
-                    .clone()
-                    .unwrap_or_else(|| reason.clone())
+                desktop.form_error.clone().unwrap_or_else(|| reason.clone())
             } else {
                 reason
             };
@@ -1498,7 +1487,13 @@ impl RuTermApp {
         let _ = cx;
     }
 
-    fn set_desktop_button(&mut self, id: usize, button: MouseButton, down: bool, cx: &mut Context<Self>) {
+    fn set_desktop_button(
+        &mut self,
+        id: usize,
+        button: MouseButton,
+        down: bool,
+        cx: &mut Context<Self>,
+    ) {
         let bit = match button {
             MouseButton::Left => 0b001,
             MouseButton::Middle => 0b010,
@@ -1521,7 +1516,13 @@ impl RuTermApp {
         cx.notify();
     }
 
-    fn send_desktop_wheel(&mut self, id: usize, up: bool, position: Point<Pixels>, cx: &mut Context<Self>) {
+    fn send_desktop_wheel(
+        &mut self,
+        id: usize,
+        up: bool,
+        position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
         let Some(desktop) = self
             .tabs
             .iter_mut()
@@ -1726,9 +1727,11 @@ impl RuTermApp {
         if protocol == Some(Protocol::Rdp) {
             // IronRDP 的 WinClipboard 后端直接挂系统剪贴板，文本与文件在会话期间自动双向同步；
             // 这里再手工发一遍反而会覆盖远端刚复制的内容。
-            self.status =
-                tr!(cx, "RDP 剪贴板已随系统自动同步，直接在远端按 Ctrl+V 即可（文件也可直接粘贴）")
-                    .into();
+            self.status = tr!(
+                cx,
+                "RDP 剪贴板已随系统自动同步，直接在远端按 Ctrl+V 即可（文件也可直接粘贴）"
+            )
+            .into();
             cx.notify();
             return;
         }
@@ -1801,7 +1804,12 @@ impl RuTermApp {
             height,
             scale_factor: (scale * 100.0).round() as u32,
         });
-        self.status = tr!(cx, "正在把远端桌面调整为 {width}×{height}…", width = width, height = height);
+        self.status = tr!(
+            cx,
+            "正在把远端桌面调整为 {width}×{height}…",
+            width = width,
+            height = height
+        );
         cx.notify();
     }
 
@@ -2136,7 +2144,10 @@ impl RuTermApp {
             desktop.name.clone()
         };
         let clipboard_tip = if desktop.protocol == Protocol::Rdp {
-            tr!(cx, "RDP 剪贴板随系统自动同步（文本与文件），直接 Ctrl+C / Ctrl+V 即可")
+            tr!(
+                cx,
+                "RDP 剪贴板随系统自动同步（文本与文件），直接 Ctrl+C / Ctrl+V 即可"
+            )
         } else {
             tr!(cx, "把本地剪贴板文本发送到远端")
         };
@@ -2264,7 +2275,12 @@ impl RuTermApp {
             .into_any_element()
     }
 
-    fn render_desktop_form(&self, tab_id: usize, desktop: &DesktopTab, cx: &mut Context<Self>) -> AnyElement {
+    fn render_desktop_form(
+        &self,
+        tab_id: usize,
+        desktop: &DesktopTab,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let pal = self.palette(cx);
         let is_rdp = desktop.protocol == Protocol::Rdp;
         let title = if is_rdp {
@@ -2306,14 +2322,16 @@ impl RuTermApp {
                                         .ghost()
                                         .compact()
                                         .selected(!is_rdp)
-                                        .on_click(cx.listener(move |this, _, window, cx| {
-                                            this.set_desktop_protocol(
-                                                tab_id,
-                                                Protocol::Vnc,
-                                                window,
-                                                cx,
-                                            );
-                                        })),
+                                        .on_click(
+                                            cx.listener(move |this, _, window, cx| {
+                                                this.set_desktop_protocol(
+                                                    tab_id,
+                                                    Protocol::Vnc,
+                                                    window,
+                                                    cx,
+                                                );
+                                            }),
+                                        ),
                                     )
                                     .child(
                                         Button::new(SharedString::from(format!(
@@ -2323,14 +2341,16 @@ impl RuTermApp {
                                         .ghost()
                                         .compact()
                                         .selected(is_rdp)
-                                        .on_click(cx.listener(move |this, _, window, cx| {
-                                            this.set_desktop_protocol(
-                                                tab_id,
-                                                Protocol::Rdp,
-                                                window,
-                                                cx,
-                                            );
-                                        })),
+                                        .on_click(
+                                            cx.listener(move |this, _, window, cx| {
+                                                this.set_desktop_protocol(
+                                                    tab_id,
+                                                    Protocol::Rdp,
+                                                    window,
+                                                    cx,
+                                                );
+                                            }),
+                                        ),
                                     ),
                             ),
                     )
@@ -2342,15 +2362,16 @@ impl RuTermApp {
                                 h_flex()
                                     .gap_2()
                                     .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .child(styled_input(Input::new(&desktop.form_host), &pal)),
+                                        div().flex_1().min_w_0().child(styled_input(
+                                            Input::new(&desktop.form_host),
+                                            &pal,
+                                        )),
                                     )
                                     .child(
-                                        div()
-                                            .w(px(96.0))
-                                            .child(styled_input(Input::new(&desktop.form_port), &pal)),
+                                        div().w(px(96.0)).child(styled_input(
+                                            Input::new(&desktop.form_port),
+                                            &pal,
+                                        )),
                                     ),
                             ),
                     )
@@ -2389,9 +2410,7 @@ impl RuTermApp {
                         let selected = desktop
                             .group
                             .as_ref()
-                            .and_then(|group| {
-                                options.iter().position(|option| option == group)
-                            })
+                            .and_then(|group| options.iter().position(|option| option == group))
                             .or(Some(0));
                         let change_options = options.clone();
                         let entity = cx.entity();
@@ -2581,15 +2600,13 @@ impl RuTermApp {
                             .gap_2()
                             .justify_end()
                             .child(
-                                Button::new(SharedString::from(format!(
-                                    "rd-edit-form-{tab_id}"
-                                )))
-                                .label(tr!(cx, "修改参数"))
-                                .ghost()
-                                .compact()
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.set_desktop_form(tab_id, cx);
-                                })),
+                                Button::new(SharedString::from(format!("rd-edit-form-{tab_id}")))
+                                    .label(tr!(cx, "修改参数"))
+                                    .ghost()
+                                    .compact()
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.set_desktop_form(tab_id, cx);
+                                    })),
                             )
                             .child(
                                 Button::new(SharedString::from(format!("rd-cancel-{tab_id}")))
@@ -2730,10 +2747,7 @@ fn normalize_address(raw: &str, port_text: &str) -> (String, Option<u16>) {
     {
         return (host.to_string(), Some(port));
     }
-    let port = port_text
-        .parse::<u16>()
-        .ok()
-        .filter(|port| *port != 0);
+    let port = port_text.parse::<u16>().ok().filter(|port| *port != 0);
     (raw.to_string(), port)
 }
 
@@ -2962,10 +2976,7 @@ mod tests {
             desktop_cache_key("10.0.0.5", 3389, "alice", "CORP"),
             "CORP\\alice@10.0.0.5:3389"
         );
-        assert_eq!(
-            desktop_cache_key("10.0.0.5", 5900, "", ""),
-            "10.0.0.5:5900"
-        );
+        assert_eq!(desktop_cache_key("10.0.0.5", 5900, "", ""), "10.0.0.5:5900");
         assert_eq!(
             desktop_cache_key("10.0.0.5", 3389, "", "CORP"),
             "CORP@10.0.0.5:3389"

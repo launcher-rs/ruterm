@@ -6,17 +6,20 @@ use rgpui::components::split_pane::CollapsiblePane;
 use rgpui::input_ui::Input;
 use rgpui::prelude::*;
 use rgpui::{
-    AnyElement, App, Context, DragMoveEvent, ElementSize, Empty, Icon, IconName, InteractiveElement, IntoElement, MouseButton,
-    MouseDownEvent, MouseUpEvent, ParentElement,
-    Render, ScrollableElement,
-    StatefulInteractiveElement, Styled, Tooltip, Window, div, px, v_flex,
+    AnyElement, App, Context, DragMoveEvent, ElementSize, Empty, Icon, IconName,
+    InteractiveElement, IntoElement, MouseButton, MouseDownEvent, MouseUpEvent, ParentElement,
+    Render, ScrollableElement, SharedString, StatefulInteractiveElement, Styled, Tooltip, Window,
+    div, px, v_flex,
 };
 use serde::{Deserialize, Serialize};
 
-use crate::{ToggleSidebar, ToggleFilePanel};
 use crate::tr;
+use crate::{FileIcon, ToggleFilePanel, ToggleSidebar};
 
 use super::*;
+
+/// 导航轨宽度＝图标按钮宽度：图标两侧不留空白，轨道尽量窄。
+const RAIL_WIDTH: f32 = 30.0;
 
 /// 边栏分隔条的拖拽载荷。搭 rgpui 原生拖拽会话：面板内的表格等元素会拦下
 /// 冒泡的鼠标移动，只有拖拽会话能在指针划过它们时继续送达移动事件。
@@ -30,6 +33,7 @@ impl Render for SplitDividerDrag {
 }
 
 /// 边栏页面：主机列表、远端文件、本机文件、端口转发共用同一条边栏。
+/// 命令历史不在这里，而是窗口右侧的独立面板（见 `history_ui.rs`）。
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum SidebarPage {
     Hosts,
@@ -77,7 +81,12 @@ impl RuTermApp {
     }
 
     /// 从导航 / 菜单切到某页：需要时展开边栏并准备该页数据。
-    pub(super) fn set_sidebar_page(&mut self, page: SidebarPage, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn set_sidebar_page(
+        &mut self,
+        page: SidebarPage,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.show_sidebar_page(page, cx);
         match page {
             SidebarPage::Hosts => {}
@@ -99,7 +108,6 @@ impl RuTermApp {
         }
         cx.notify();
     }
-
 
     /// 设置边栏贴哪一侧：比例翻到另一头，折叠态也跟着搬到新侧。
     pub(super) fn set_sidebar_side(&mut self, side: SidebarSide, cx: &mut Context<Self>) {
@@ -123,16 +131,19 @@ impl RuTermApp {
         cx.notify();
     }
 
-
     /// Ctrl+B / 菜单项：折叠或展开边栏（折叠当前靠边那一侧）。
-    pub(super) fn toggle_sidebar(&mut self, _: &ToggleSidebar, _: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn toggle_sidebar(
+        &mut self,
+        _: &ToggleSidebar,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let pane = self.sidebar_pane();
         self.split_state.update(cx, |state, cx| {
             state.toggle_collapse(pane, cx);
         });
         cx.notify();
     }
-
 
     /// 边栏面板占分隔容器的宽度比例（边栏在右时，状态里存的是主区份额）。
     pub(super) fn panel_ratio(&self, cx: &App) -> f32 {
@@ -142,7 +153,6 @@ impl RuTermApp {
             SidebarSide::Right => 1.0 - ratio,
         }
     }
-
 
     /// 按面板占比写回分隔状态（边栏在右时翻转成主区份额）。
     pub(super) fn set_panel_ratio(&mut self, panel_ratio: f32, cx: &mut Context<Self>) {
@@ -154,13 +164,16 @@ impl RuTermApp {
             .update(cx, |state, cx| state.set_ratio(ratio, cx));
     }
 
-
     /// 分隔条按下：记下起点，拖动时按容器宽度把指针位移换算成占比。
-    pub(super) fn begin_split_drag(&mut self, event: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn begin_split_drag(
+        &mut self,
+        event: &MouseDownEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.split_drag = Some((event.position.x.as_f32(), self.panel_ratio(cx)));
         cx.notify();
     }
-
 
     pub(super) fn drag_split(
         &mut self,
@@ -191,13 +204,16 @@ impl RuTermApp {
         self.set_panel_ratio(target, cx);
     }
 
-
-    pub(super) fn end_split_drag(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn end_split_drag(
+        &mut self,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.split_drag.take().is_some() {
             cx.notify();
         }
     }
-
 
     /// 边栏与主区之间的分隔条：4px 可见，按下即可拖动。
     pub(super) fn render_split_divider(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -221,7 +237,6 @@ impl RuTermApp {
             .into_any_element()
     }
 
-
     /// `Ctrl+Shift+B`：切到文件页；已在文件页时收起边栏。
     pub(super) fn toggle_file_panel_action(
         &mut self,
@@ -231,7 +246,6 @@ impl RuTermApp {
     ) {
         self.toggle_file_panel(window, cx);
     }
-
 
     /// 宽度与折叠由外层 SplitPane 负责，这里只填充第一面板区域。
     /// 主机列表页：搜索框 + 主机树（待输入密码时换成密码面板）。
@@ -265,7 +279,6 @@ impl RuTermApp {
             .into_any_element()
     }
 
-
     /// 边栏导航条：贴窗口外缘的竖排图标。
     ///
     /// 学RustRover：只画图标，不排文字；文字交给悬停 tooltip。
@@ -280,30 +293,30 @@ impl RuTermApp {
                 SidebarPage::Hosts,
                 "rail-hosts",
                 tr!(cx, "主机"),
-                IconName::User,
+                Icon::new(IconName::User),
             ),
             (
                 SidebarPage::Files,
                 "rail-files",
                 tr!(cx, "文件"),
-                IconName::FolderOpen,
+                Icon::new(IconName::FolderOpen),
             ),
             (
                 SidebarPage::Local,
                 "rail-local",
                 tr!(cx, "本机"),
-                IconName::HardDrive,
+                Icon::new(IconName::HardDrive),
             ),
             (
                 SidebarPage::Forward,
                 "rail-forward",
                 tr!(cx, "转发"),
-                IconName::Network,
+                Icon::new(IconName::Network),
             ),
         ];
         let mut rail = v_flex()
             .id("sidebar-rail")
-            .w(px(42.0))
+            .w(px(RAIL_WIDTH))
             .flex_shrink_0()
             .min_w_0()
             .h_full()
@@ -318,69 +331,18 @@ impl RuTermApp {
             .map_or(0, |tab| tab.forwards.len());
         for (page, id, label, icon) in pages {
             let active = self.sidebar_page == page;
-            let color = if active { pal.accent } else { pal.muted };
             // 转发的生效条数是常驻状态，压成图标角标，不占竖向空间。
             let badge =
                 (page == SidebarPage::Forward && forward_count > 0).then_some(forward_count);
-            let tip = match badge {
-                Some(count) => tr!(
-                    cx,
-                    "{label}（{count} 条生效）",
-                    label = label.clone(),
-                    count = count
-                ),
-                None => label.clone(),
-            };
-            // 活动项的高亮条：RustRover 在选中图标外侧画一道竖条。
-            let stripe = div()
-                .absolute()
-                .top(px(7.0))
-                .bottom(px(7.0))
-                .w(px(2.0))
-                .rounded_full()
-                .bg(pal.accent)
-                .when(stripe_at_left, |this| this.left(px(0.0)))
-                .when(!stripe_at_left, |this| this.right(px(0.0)));
-            let item = v_flex()
-                .id(id)
-                .relative()
-                .w(px(34.0))
-                .h(px(34.0))
-                .items_center()
-                .justify_center()
-                .rounded(px(6.0))
-                .cursor_pointer()
-                .hover(|style| style.bg(pal.card_hover))
-                .when(active, |this| this.bg(pal.card_hover))
-                .child(
-                    Icon::new(icon)
-                        .with_size(ElementSize::ElementSize(px(18.0)))
-                        .text_color(color),
-                )
-                .when_some(badge, |this, count| {
-                    this.child(
-                        div()
-                            .absolute()
-                            .top(px(2.0))
-                            .right(px(2.0))
-                            .h(px(15.0))
-                            .min_w(px(15.0))
-                            .px_1()
-                            .items_center()
-                            .justify_center()
-                            .rounded_full()
-                            // 角标用强调色打底、边栏底色当字色，明暗主题下都读得清。
-                            .bg(pal.accent)
-                            .text_xs()
-                            .text_color(pal.sidebar_bg)
-                            .child(count.to_string()),
-                    )
-                })
-                .when(active, |this| this.child(stripe))
-                .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
-                // 稍作延迟再浮出，避免鼠标路过时闪一下文字。
-                .tooltip_show_delay(Duration::from_millis(300))
-                .on_click(cx.listener(move |this, _, window, cx| {
+            let item = self.render_rail_item(
+                id,
+                label,
+                icon,
+                active,
+                badge,
+                stripe_at_left,
+                &pal,
+                move |this, window, cx| {
                     // 再点当前页的图标＝收起面板，和 IDE 里的工具窗口一个脾气。
                     if this.sidebar_page == page && this.sidebar_visible(cx) {
                         let pane = this.sidebar_pane();
@@ -390,7 +352,9 @@ impl RuTermApp {
                         return;
                     }
                     this.set_sidebar_page(page, window, cx)
-                }));
+                },
+                cx,
+            );
             rail = rail.child(item);
         }
         // 导航贴窗口外缘：左边栏时亮条在左，右边栏时在右。
@@ -406,6 +370,128 @@ impl RuTermApp {
         }
     }
 
+    /// 右侧工具窗口栏：贴窗口右缘，和左侧导航轨同一形状。
+    ///
+    /// 每个按钮控制右侧停靠区里的一个分区（当前是片段、历史）；
+    /// 以后新增右侧面板时，在这里追加一项、并在停靠区里加对应分区即可。
+    pub(super) fn render_right_rail(&self, cx: &mut Context<Self>) -> AnyElement {
+        let pal = self.palette(cx);
+        let mut rail = v_flex()
+            .id("right-rail")
+            .w(px(RAIL_WIDTH))
+            .flex_shrink_0()
+            .min_w_0()
+            .h_full()
+            .items_center()
+            .py_2()
+            .gap_1()
+            .bg(pal.sidebar_bg);
+        let snippets = self.render_rail_item(
+            "rail-snippets",
+            tr!(cx, "命令片段"),
+            Icon::new(FileIcon::Braces),
+            self.snippets_panel_open,
+            None,
+            // 高亮条贴窗口右缘。
+            false,
+            &pal,
+            move |this, _, cx| this.toggle_snippets_panel(cx),
+            cx,
+        );
+        let history = self.render_rail_item(
+            "rail-history",
+            tr!(cx, "历史"),
+            Icon::new(FileIcon::History),
+            self.history_panel_open,
+            None,
+            false,
+            &pal,
+            move |this, _, cx| this.toggle_history_panel(cx),
+            cx,
+        );
+        rail = rail.child(snippets).child(history);
+        rail.border_l_1()
+            .border_color(pal.border)
+            .into_any_element()
+    }
+
+    /// 工具窗口栏上的一个图标按钮：左侧导航轨与右侧面板轨共用。
+    #[allow(clippy::too_many_arguments)]
+    fn render_rail_item(
+        &self,
+        id: &'static str,
+        label: SharedString,
+        icon: Icon,
+        active: bool,
+        badge: Option<usize>,
+        stripe_at_left: bool,
+        pal: &Palette,
+        on_click: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let color = if active { pal.accent } else { pal.muted };
+        let tip = match badge {
+            Some(count) => tr!(
+                cx,
+                "{label}（{count} 条生效）",
+                label = label.clone(),
+                count = count
+            ),
+            None => label.clone(),
+        };
+        // 活动项的高亮条：RustRover 在选中图标外侧画一道竖条。
+        let stripe = div()
+            .absolute()
+            .top(px(7.0))
+            .bottom(px(7.0))
+            .w(px(2.0))
+            .rounded_full()
+            .bg(pal.accent)
+            .when(stripe_at_left, |this| this.left(px(0.0)))
+            .when(!stripe_at_left, |this| this.right(px(0.0)));
+        v_flex()
+            .id(id)
+            .relative()
+            .w(px(RAIL_WIDTH))
+            .h(px(RAIL_WIDTH))
+            .items_center()
+            .justify_center()
+            .rounded(px(6.0))
+            .cursor_pointer()
+            .hover(|style| style.bg(pal.card_hover))
+            .when(active, |this| this.bg(pal.card_hover))
+            .child(
+                icon.with_size(ElementSize::ElementSize(px(18.0)))
+                    .text_color(color),
+            )
+            .when_some(badge, |this, count| {
+                this.child(
+                    div()
+                        .absolute()
+                        .top(px(2.0))
+                        .right(px(2.0))
+                        .h(px(15.0))
+                        .min_w(px(15.0))
+                        .px_1()
+                        .items_center()
+                        .justify_center()
+                        .rounded_full()
+                        // 角标用强调色打底、边栏底色当字色，明暗主题下都读得清。
+                        .bg(pal.accent)
+                        .text_xs()
+                        .text_color(pal.sidebar_bg)
+                        .child(count.to_string()),
+                )
+            })
+            .when(active, |this| this.child(stripe))
+            .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+            // 稍作延迟再浮出，避免鼠标路过时闪一下文字。
+            .tooltip_show_delay(Duration::from_millis(300))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                on_click(this, window, cx);
+            }))
+            .into_any_element()
+    }
 
     /// 边栏面板：按当前页渲染主机列表 / 文件 / 转发。
     pub(super) fn render_sidebar_panel(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -427,7 +513,6 @@ impl RuTermApp {
             .into_any_element()
     }
 
-
     pub(super) fn persist_sidebar(&self, cx: &mut Context<Self>) {
         let json = self.sidebar.to_json();
         let Some(vault) = self.vault.clone() else {
@@ -441,6 +526,4 @@ impl RuTermApp {
         })
         .detach();
     }
-
-
 }

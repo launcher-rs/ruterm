@@ -11,9 +11,9 @@ use rgpui::input_ui::Input;
 use rgpui::prelude::*;
 use rgpui::{
     AnyElement, Button, ButtonVariants, ClipboardItem, Context, ContextMenuExt, Disableable,
-    DragMoveEvent, IconName, InteractiveElement, IntoElement, ParentElement,
-    PopupMenuItem, ScrollableElement, SharedString, StatefulInteractiveElement, Styled, Window,
-    div, h_flex, px, v_flex,
+    DragMoveEvent, IconName, InteractiveElement, IntoElement, ParentElement, PopupMenuItem,
+    ScrollableElement, SharedString, StatefulInteractiveElement, Styled, Window, div, h_flex, px,
+    v_flex,
 };
 use serde::{Deserialize, Serialize};
 
@@ -138,7 +138,10 @@ fn mode_of(metadata: &std::fs::Metadata) -> Option<u32> {
 /// 列一个本机目录，返回规范化后的路径与条目（目录在前、同类按名称升序）。
 ///
 /// 在后台线程里跑：`read_dir` 是同步阻塞调用，落在网络盘或超大目录时会卡住整个 UI。
-fn list_local_dir(path: &Path, show_hidden: bool) -> anyhow::Result<(PathBuf, Vec<crate::remote_fs::Entry>)> {
+fn list_local_dir(
+    path: &Path,
+    show_hidden: bool,
+) -> anyhow::Result<(PathBuf, Vec<crate::remote_fs::Entry>)> {
     // 只做词法规范化（展开 `..`、补成绝对路径），不碰文件系统：`\\?\` 前缀的
     // canonicalize 结果摆在路径栏里没法读。
     let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
@@ -219,8 +222,7 @@ impl RuTermApp {
                         this.persist_local_files(cx);
                     }
                     Err(error) => {
-                        this.local.error =
-                            Some(crate::session::error_summary(&error).into());
+                        this.local.error = Some(crate::session::error_summary(&error).into());
                     }
                 }
                 cx.notify();
@@ -231,7 +233,12 @@ impl RuTermApp {
 
     /// 进入上级目录；已经到顶（盘符根 / 文件系统根）时不动。
     pub(super) fn local_up(&mut self, cx: &mut Context<Self>) {
-        let parent = self.local.path.as_ref().and_then(|path| path.parent()).map(PathBuf::from);
+        let parent = self
+            .local
+            .path
+            .as_ref()
+            .and_then(|path| path.parent())
+            .map(PathBuf::from);
         if parent.is_some() {
             self.local_load(parent, cx);
         }
@@ -478,11 +485,14 @@ impl RuTermApp {
                 .justify_center()
                 .p_3()
                 .child(
-                    div().text_xs().text_color(pal.muted).child(if error.is_some() {
-                        tr!(cx, "目录读取失败")
-                    } else {
-                        tr!(cx, "空目录")
-                    }),
+                    div()
+                        .text_xs()
+                        .text_color(pal.muted)
+                        .child(if error.is_some() {
+                            tr!(cx, "目录读取失败")
+                        } else {
+                            tr!(cx, "空目录")
+                        }),
                 )
                 .into_any_element()
         } else {
@@ -492,8 +502,7 @@ impl RuTermApp {
                 .children(entries.iter().map(|entry| {
                     let name = entry.name.clone();
                     let is_dir = entry.is_dir;
-                    let cells =
-                        RuTermApp::file_row_children(entry, cols, narrow, pal, cx);
+                    let cells = RuTermApp::file_row_children(entry, cols, narrow, pal, cx);
                     let dbl_name = name.clone();
                     let open_label = if is_dir {
                         tr!(cx, "打开目录")

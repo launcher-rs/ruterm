@@ -728,11 +728,11 @@ mod tests {
     #[test]
     fn split_args_handles_quotes_and_empty_segments() {
         assert!(split_args("   ").is_empty());
-        assert_eq!(split_args("  -NoLogo   -NoProfile "), ["-NoLogo", "-NoProfile"]);
         assert_eq!(
-            split_args(r#"-Command "echo hi""#),
-            ["-Command", "echo hi"]
+            split_args("  -NoLogo   -NoProfile "),
+            ["-NoLogo", "-NoProfile"]
         );
+        assert_eq!(split_args(r#"-Command "echo hi""#), ["-Command", "echo hi"]);
         assert_eq!(
             split_args(r#""C:\Program Files\Git\bin\bash.exe" -i -l"#),
             [r"C:\Program Files\Git\bin\bash.exe", "-i", "-l"]
@@ -744,11 +744,7 @@ mod tests {
 
     #[test]
     fn join_args_round_trips_through_split() {
-        let args = vec![
-            "-Command".to_string(),
-            "echo hi".to_string(),
-            String::new(),
-        ];
+        let args = vec!["-Command".to_string(), "echo hi".to_string(), String::new()];
         assert_eq!(split_args(&join_args(&args)), args);
     }
 
@@ -769,7 +765,11 @@ mod tests {
     #[test]
     fn parse_env_rejects_bad_lines() {
         assert!(parse_env("NOVALUE").unwrap_err().contains("第 1 行"));
-        assert!(parse_env("OK=1\nBAD KEY=2").unwrap_err().contains("第 2 行"));
+        assert!(
+            parse_env("OK=1\nBAD KEY=2")
+                .unwrap_err()
+                .contains("第 2 行")
+        );
         assert!(parse_env("=1").is_err());
     }
 
@@ -825,7 +825,10 @@ mod tests {
 
     #[test]
     fn sanitize_host_keeps_hostnames_and_strips_ipv6_brackets() {
-        assert_eq!(sanitize_host(" example.com ").as_deref(), Some("example.com"));
+        assert_eq!(
+            sanitize_host(" example.com ").as_deref(),
+            Some("example.com")
+        );
         assert_eq!(sanitize_host("127.0.0.1").as_deref(), Some("127.0.0.1"));
         assert_eq!(sanitize_host("[::1]").as_deref(), Some("::1"));
         assert_eq!(sanitize_host("fe80::1%eth0"), None, "% 不在白名单里");
@@ -845,9 +848,15 @@ mod tests {
         assert_eq!(ping.name, "Ping example.com");
         assert!(ping.program.to_lowercase().ends_with("cmd.exe"));
         // `cmd /k` 让命令跑完留在提示符上，标签不会被"shell 退出"规则收掉。
-        assert_eq!(ping.args, vec!["/k".to_string(), "ping -t example.com".into()]);
+        assert_eq!(
+            ping.args,
+            vec!["/k".to_string(), "ping -t example.com".into()]
+        );
         let trace = diagnostic_profile(NetTool::TraceRoute, "10.0.0.1").unwrap();
         assert_eq!(trace.name, "路由追踪 10.0.0.1");
-        assert_eq!(trace.args, vec!["/k".to_string(), "tracert 10.0.0.1".into()]);
+        assert_eq!(
+            trace.args,
+            vec!["/k".to_string(), "tracert 10.0.0.1".into()]
+        );
     }
 }

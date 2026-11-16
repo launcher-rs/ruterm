@@ -145,8 +145,12 @@ pub struct AuthGate {
 }
 
 impl AuthGate {
-    pub fn generation(&self) -> u64 { self.generation }
-    pub fn ready(&self) -> bool { self.ready }
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+    pub fn ready(&self) -> bool {
+        self.ready
+    }
     pub fn accepts(&self, generation: u64) -> bool {
         self.ready && self.generation == generation
     }
@@ -154,7 +158,9 @@ impl AuthGate {
         self.ready = false;
         self.generation = self.generation.checked_add(1).expect("认证代次溢出");
     }
-    pub fn attach(&mut self) { self.ready = true; }
+    pub fn attach(&mut self) {
+        self.ready = true;
+    }
     pub fn take_pending<T>(&self, pending: &mut Option<T>) -> Option<T> {
         if self.ready { pending.take() } else { None }
     }
@@ -287,12 +293,19 @@ pub fn load_or_create_master_key() -> Result<String> {
 /// 读取（或首次生成）Argon2 派生盐；盐是公开参数，明文存放即可。
 pub fn load_or_create_salt(path: &Path) -> Result<[u8; 16]> {
     match std::fs::read(path) {
-        Ok(bytes) => return bytes.try_into().map_err(|_| anyhow::anyhow!("派生盐长度错误，拒绝覆盖")),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+        Ok(bytes) => {
+            return bytes
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("派生盐长度错误，拒绝覆盖"));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error).context("读取派生盐失败，拒绝覆盖"),
     }
     if let Some(parent) = path.parent() {
-        anyhow::ensure!(!parent.join(crate::paths::DB_FILE).try_exists()?, "已有凭据库缺少盐，拒绝生成替代盐");
+        anyhow::ensure!(
+            !parent.join(crate::paths::DB_FILE).try_exists()?,
+            "已有凭据库缺少盐，拒绝生成替代盐"
+        );
         std::fs::create_dir_all(parent)?;
     }
     let salt = generate_salt()?;
@@ -663,7 +676,9 @@ impl Vault {
     pub async fn record_known_hosts(&self, entries: Vec<(String, String, String)>) -> Result<()> {
         for (host_port, fingerprint, algorithm) in entries {
             anyhow::ensure!(
-                self.check_or_record_known_host(&host_port, &fingerprint, &algorithm).await? != Trust::Mismatch,
+                self.check_or_record_known_host(&host_port, &fingerprint, &algorithm)
+                    .await?
+                    != Trust::Mismatch,
                 "旧 known_hosts 与凭据库冲突：{host_port}；保留双方记录并拒绝迁移"
             );
         }
@@ -1014,7 +1029,9 @@ pub fn read_legacy_known_hosts(path: &Path) -> Result<Option<String>> {
 }
 
 pub async fn import_legacy_trust(vault: &Vault, text: &str) -> Result<()> {
-    vault.record_known_hosts(parse_legacy_known_hosts(text)).await
+    vault
+        .record_known_hosts(parse_legacy_known_hosts(text))
+        .await
 }
 
 /// 解析旧 known_hosts 文本行：`[host]:port fingerprint [algorithm]`。
@@ -1102,7 +1119,9 @@ pub async fn migrate_legacy(
     // known_hosts 文件 → 表
     let kh_path = mode.legacy_path(crate::paths::LEGACY_KNOWN_HOSTS_FILE);
     if let Some(text) = read_legacy_known_hosts(&kh_path)? {
-        vault.record_known_hosts(parse_legacy_known_hosts(&text)).await?;
+        vault
+            .record_known_hosts(parse_legacy_known_hosts(&text))
+            .await?;
         rename_preserving(&kh_path);
     }
     Ok(migrated_vault)
@@ -1366,7 +1385,7 @@ mod tests {
             auth: AuthMethod::IdentityFile,
             key_path: "C:/keys/id_ed25519".into(),
             key_inline: false,
-             favorite: true,
+            favorite: true,
             proxy_jump: None,
         };
         vault.upsert(&host).await.unwrap();
@@ -1447,7 +1466,7 @@ mod tests {
             auth: AuthMethod::Password,
             key_path: String::new(),
             key_inline: false,
-             favorite: false,
+            favorite: false,
             proxy_jump: None,
         };
         vault.upsert(&host).await.unwrap();
@@ -1575,7 +1594,7 @@ mod tests {
             auth: AuthMethod::Password,
             key_path: String::new(),
             key_inline: false,
-             favorite: false,
+            favorite: false,
             proxy_jump: None,
         };
         std::thread::scope(|scope| {
@@ -1792,7 +1811,7 @@ mod tests {
             auth: AuthMethod::Password,
             key_path: String::new(),
             key_inline: false,
-             favorite: false,
+            favorite: false,
             proxy_jump: None,
         };
         vault.upsert(&host).await.unwrap();
@@ -1848,7 +1867,7 @@ mod tests {
             auth: AuthMethod::IdentityFile,
             key_path: String::new(),
             key_inline: false,
-             favorite: false,
+            favorite: false,
             proxy_jump: None,
         };
         vault.upsert(&host).await.unwrap();

@@ -71,7 +71,10 @@ pub struct Listing {
 
 /// 列出目录内容，目录在前、同类按名称排序。
 pub async fn list(sftp: &SftpSession, path: Option<&str>) -> Result<Listing> {
-    let raw = path.map(str::trim).filter(|path| !path.is_empty()).unwrap_or(".");
+    let raw = path
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .unwrap_or(".");
     let resolved = crate::transfer::resolve_remote(sftp, raw).await?;
     let path = sftp
         .canonicalize(resolved.as_str())
