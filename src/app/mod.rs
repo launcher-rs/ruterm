@@ -215,8 +215,8 @@ pub(crate) struct RuTermApp {
     macro_manager: Option<MacroManager>,
     /// 命令片段列表（名称 + 单行命令 + 备注），同样双层持久化。
     snippets: Vec<CommandSnippet>,
-    /// 命令片段管理器弹窗（列表 ⇄ 编辑表单）。
-    snippet_manager: Option<SnippetManager>,
+    /// 右侧片段区的内联编辑表单；None = 列表视图。
+    snippet_edit: Option<SnippetEdit>,
     /// 命令历史（新 → 旧），来源是终端 block 追踪。
     history: CommandHistory,
     /// 每个标签已收进历史的最后一个 block id，避免重复收录。
@@ -239,7 +239,7 @@ pub(crate) struct RuTermApp {
     right_panel_height: Rc<Cell<f32>>,
     /// 历史面板的搜索框（与弹窗搜索互不影响）。
     history_search: Entity<InputState>,
-    /// 右侧片段分区的搜索框（与管理器搜索互不影响）。
+    /// 右侧片段分区的搜索框。
     snippet_search: Entity<InputState>,
     /// 右侧片段分区是否切到「内置命令」页。
     snippet_panel_builtin: bool,
@@ -486,7 +486,7 @@ impl RuTermApp {
             macros,
             macro_manager: None,
             snippets,
-            snippet_manager: None,
+            snippet_edit: None,
             history,
             history_seen: HashMap::new(),
             history_manager: None,
@@ -1012,7 +1012,6 @@ impl RuTermApp {
             || self.shell_prompt.is_some()
             || self.pending.is_some()
             || self.macro_manager.is_some()
-            || self.snippet_manager.is_some()
             || self.history_manager.is_some()
             || self.show_discovery
     }
@@ -1030,9 +1029,6 @@ impl RuTermApp {
         }
         if self.macro_manager.is_some() {
             return self.render_macro_manager(cx);
-        }
-        if self.snippet_manager.is_some() {
-            return self.render_snippet_manager(cx);
         }
         if self.history_manager.is_some() {
             return self.render_history_manager(cx);
@@ -1400,8 +1396,8 @@ impl Render for RuTermApp {
             .on_action(cx.listener(Self::cancel_broadcast))
             .on_action(cx.listener(Self::open_macro_manager))
             .on_action(cx.listener(Self::close_macro_manager_action))
-            .on_action(cx.listener(Self::open_snippet_manager))
-            .on_action(cx.listener(Self::close_snippet_manager_action))
+            .on_action(cx.listener(Self::toggle_snippet_panel_action))
+            .on_action(cx.listener(Self::close_snippet_editor_action))
             .on_action(cx.listener(Self::open_history_manager))
             .on_action(cx.listener(Self::close_history_manager_action))
             .on_action(cx.listener(Self::toggle_history_panel_action))

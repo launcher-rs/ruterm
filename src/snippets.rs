@@ -78,6 +78,48 @@ pub fn to_json(snippets: &[CommandSnippet]) -> String {
     serde_json::to_string(snippets).unwrap_or_else(|_| "[]".to_string())
 }
 
+/// 导入合并的统计：新增、重复跳过、超出条数上限。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ImportSummary {
+    pub added: usize,
+    pub duplicates: usize,
+    pub over_limit: usize,
+}
+
+/// 去重键：名称与命令都去掉首尾空白后比较；备注不参与。
+fn import_key(snippet: &CommandSnippet) -> (String, String) {
+    (
+        snippet.name.trim().to_string(),
+        snippet.command.trim().to_string(),
+    )
+}
+
+/// 把导入的片段合并进现有列表：同名且同命令视为重复，不覆盖现有条目。
+pub fn merge_imported(
+    existing: &[CommandSnippet],
+    imported: &[CommandSnippet],
+) -> (Vec<CommandSnippet>, ImportSummary) {
+    let mut merged = existing.to_vec();
+    let mut seen: std::collections::HashSet<(String, String)> =
+        existing.iter().map(import_key).collect();
+    let mut summary = ImportSummary::default();
+    for snippet in imported {
+        let key = import_key(snippet);
+        if seen.contains(&key) {
+            summary.duplicates += 1;
+            continue;
+        }
+        if merged.len() >= MAX_SNIPPETS {
+            summary.over_limit += 1;
+            continue;
+        }
+        seen.insert(key);
+        merged.push(snippet.clone());
+        summary.added += 1;
+    }
+    (merged, summary)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,5 +194,64 @@ mod tests {
             })
             .collect();
         assert_eq!(from_json(&to_json(&list)).len(), MAX_SNIPPETS);
+    }
+
+    #[test]
+    fn import_merges_and_dedupes_by_name_and_command() {
+        let snippet = |name: &str, command: &str, note: &str| CommandSnippet {
+            name: name.into(),
+            command: command.into(),
+            note: note.into(),
+        };
+        let existing = vec![snippet("看磁盘", "df -h", "容量")];
+        let imported = vec![
+            // 首尾空白不影响去重。
+            snippet(" 看磁盘 ", "df -h ", "另一条备注"),
+            // 名称相同但命令不同，保留。
+            snippet("看磁盘", "du -sh .", ""),
+            // 文件内部重复只收一条。
+            snippet("看进程", "ps aux", ""),
+            snippet("看进程", "ps aux", "重复"),
+        ];
+        let (merged, summary) = merge_imported(&existing, &imported);
+        assert_eq!(
+            summary,
+            ImportSummary {
+                added: 2,
+                duplicates: 2,
+                over_limit: 0,
+            }
+        );
+        assert_eq!(merged.len(), 3);
+        assert_eq!(merged[0].note, "容量", "已有条目不能被导入覆盖");
+        assert_eq!(merged[1].command, "du -sh .");
+        assert_eq!(merged[2].name, "看进程");
+    }
+
+    #[test]
+    fn import_stops_at_snippet_limit() {
+        let existing: Vec<_> = (0..MAX_SNIPPETS - 1)
+            .map(|index| CommandSnippet {
+                name: format!("s{index}"),
+                command: format!("true {index}"),
+                note: String::new(),
+            })
+            .collect();
+        let imported = vec![
+            CommandSnippet {
+                name: "新片段".into(),
+                command: "echo ok".into(),
+                note: String::new(),
+            },
+            CommandSnippet {
+                name: "再来一条".into(),
+                command: "echo no".into(),
+                note: String::new(),
+            },
+        ];
+        let (merged, summary) = merge_imported(&existing, &imported);
+        assert_eq!(merged.len(), MAX_SNIPPETS);
+        assert_eq!(summary.added, 1);
+        assert_eq!(summary.over_limit, 1);
     }
 }

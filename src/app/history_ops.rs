@@ -241,12 +241,8 @@ impl RuTermApp {
         let Some(command) = self.history.entries().get(index).cloned() else {
             return;
         };
-        // 弹窗开着时先收起，避免片段编辑器叠在历史弹窗上；从右侧面板进入时同样适用。
+        // 历史弹窗先收起，避免盖住右侧片段面板的内联编辑器。
         self.history_manager = None;
-        self.open_snippet_manager_impl(window, cx);
-        if let Some(manager) = self.snippet_manager.as_mut() {
-            manager.builtin = false;
-        }
         let name: String = command.chars().take(32).collect();
         self.begin_snippet_edit_values(None, &name, &command, "来自命令历史", window, cx);
         cx.notify();

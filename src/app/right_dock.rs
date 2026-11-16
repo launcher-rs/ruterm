@@ -57,6 +57,9 @@ impl RuTermApp {
             if self.snippets.is_empty() {
                 self.snippet_panel_builtin = true;
             }
+        } else {
+            // 收起面板也丢弃未保存的编辑，避免下次打开弹出半截表单。
+            self.snippet_edit = None;
         }
         cx.notify();
     }

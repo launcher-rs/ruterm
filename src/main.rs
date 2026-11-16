@@ -96,8 +96,8 @@ actions!(
         CancelBroadcast,
         MacroManager,
         CloseMacroManager,
-        SnippetManager,
-        CloseSnippetManager,
+        ToggleSnippetPanel,
+        CloseSnippetEditor,
         CommandHistory,
         CloseCommandHistory,
         ToggleHistoryPanel,
@@ -202,9 +202,10 @@ fn main() {
             // 键宏管理器：与「会话」菜单里的「键宏…」同一条路径；Esc 只在该弹窗内关闭。
             KeyBinding::new("ctrl-shift-m", MacroManager, None),
             KeyBinding::new("escape", CloseMacroManager, Some("MacroManager")),
-            // 命令片段管理器：Esc 只关片段弹窗，不影响终端里的 Esc。
-            KeyBinding::new("ctrl-shift-s", SnippetManager, None),
-            KeyBinding::new("escape", CloseSnippetManager, Some("SnippetManager")),
+            // 命令片段面板：与「视图」菜单里的「命令片段」同一条路径；Esc 只在
+            // 内联编辑表单里取消，不影响终端里的 Esc。
+            KeyBinding::new("ctrl-shift-s", ToggleSnippetPanel, None),
+            KeyBinding::new("escape", CloseSnippetEditor, Some("SnippetEditor")),
             // 命令历史：Ctrl+Shift+H 开关右侧历史面板；弹窗内的 Esc 只关弹窗。
             KeyBinding::new("ctrl-shift-h", ToggleHistoryPanel, None),
             KeyBinding::new("escape", CloseCommandHistory, Some("CommandHistory")),
