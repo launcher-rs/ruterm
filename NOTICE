@@ -1,0 +1,48 @@
+RuTerm
+Copyright 2025 The RuTerm Authors
+
+This product includes software developed as part of the RuTerm project,
+licensed under the Apache License, Version 2.0.
+
+This product bundles the following third-party components, each under its
+own license. The full license texts are available in the respective
+repositories and, where vendored, under vendor/.
+
+Vendored upstream crates (local patches, see vendor/README.md):
+  - IronRDP (ironrdp-*)            MIT OR Apache-2.0
+    Copyright Devolutions Inc. and contributors
+  - picky                          MIT OR Apache-2.0
+    Copyright Devolutions Inc. and contributors
+  - sspi                           MIT OR Apache-2.0
+    Copyright Devolutions Inc. and contributors
+  - ironrdp-cliprdr-native         MIT OR Apache-2.0
+    Copyright Devolutions Inc. and contributors
+
+Direct dependencies (selected):
+  - rgpui, rgpui-platform, rgpui-term   Apache-2.0
+  - russh, russh-sftp                   Apache-2.0
+  - tokio                               MIT
+  - ironrdp                             MIT OR Apache-2.0
+  - image                               MIT OR Apache-2.0
+  - aes-gcm, argon2, sha2, base64       MIT OR Apache-2.0
+  - zmodem2, rfd, keyring, des          MIT OR Apache-2.0
+
+Transitive dependencies with notable license terms:
+  - MPL-2.0 (file-level copyleft, compatible with Apache-2.0):
+      dwrote 0.11.5 (Windows font backend, via rgpui / zed-font-kit)
+      option-ext 0.2.0 (via dirs-sys)
+    MPL-covered source is available from the upstream crates.io packages.
+  - Unicode-3.0 (data files and derived code, via ICU4X and unicode-*):
+      litemap, yoke, zerovec, unicode-ident, and other ICU4X components.
+    See https://www.unicode.org/license.txt for the Unicode license.
+  - LGPL-2.1-or-later (tri-license option, via getrandom -> r-efi):
+      r-efi. Used under the MIT OR Apache-2.0 arm; LGPL option not exercised.
+
+Assets:
+  - assets/lucide/*.svg  ISC License
+    Copyright (c) Lucide Contributors 2022; portions by Cole Bemis 2013-2022
+    (Feather, MIT). See assets/lucide/LICENSE.
+
+The full text of the Apache-2.0, MIT, ISC, MPL-2.0, and Unicode-3.0
+licenses referenced above is available at their respective upstream
+repositories and at https://opensource.org/licenses/.

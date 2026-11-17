@@ -13,12 +13,12 @@ use rgpui::components::Select;
 use rgpui::input_ui::{Input, InputContentType, InputEvent, InputState};
 use rgpui::prelude::*;
 use rgpui::{
-    AnyElement, Bounds, Button, ButtonVariants, ClipboardEntry, ClipboardItem, Context, Corners,
-    Entity, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, KeyUpEvent, Keystroke,
-    Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    ParentElement, Pixels, Point, RenderImage, ScrollDelta, ScrollWheelEvent, SharedString,
-    StatefulInteractiveElement, Styled, Subscription, Tooltip, Window, canvas, div, h_flex, point,
-    px, v_flex,
+    AnyElement, Bounds, Button, ButtonVariants, Checkbox, ClipboardEntry, ClipboardItem, Context,
+    Corners, Entity, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, KeyUpEvent,
+    Keystroke, Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, ParentElement, Pixels, Point, RenderImage, ScrollDelta, ScrollWheelEvent,
+    SharedString, StatefulInteractiveElement, Styled, Subscription, Tooltip, Window, canvas, div,
+    h_flex, point, px, v_flex,
 };
 
 use crate::desktop::{Command, Event, KeyInput, Protocol, Session, Snapshot};
@@ -85,6 +85,8 @@ pub(super) struct DesktopTab {
     pub(super) form_password: Entity<InputState>,
     pub(super) form_username: Entity<InputState>,
     pub(super) form_domain: Entity<InputState>,
+    /// 表单内「保存密码」开关：与 SSH 一致，仅勾选后才把密码加密入库。
+    pub(super) save_secret: bool,
     /// 表单内的校验 / 认证失败提示（错误只留在标签里，不弹系统对话框）。
     pub(super) form_error: Option<SharedString>,
     /// 画面焦点：点击画面后键盘事件走这个句柄。
@@ -333,6 +335,7 @@ impl RuTermApp {
             form_password,
             form_username,
             form_domain,
+            save_secret: false,
             form_error: None,
             focus,
             image: None,
@@ -711,6 +714,7 @@ impl RuTermApp {
         // 保存时填的密码进内存缓存（本进程内点主机直接复用）；凭据库可用时还会加密入库。
         // 键用合并后的 `user`，与打开已保存主机时拆分再合并的结果一致。
         let has_password = !password.is_empty();
+        let save_secret = has_password && desktop.save_secret;
         let cached = has_password.then(|| {
             (
                 desktop_cache_key(&address, port, &user, ""),
@@ -774,8 +778,8 @@ impl RuTermApp {
         if let Some((key, password)) = cached {
             self.password_cache.insert(key, password);
         }
-        // 填了密码就加密写库：下次（包括重启后）点这台主机直接连，不再追问。
-        let stored = has_password
+        // 仅在用户勾选「保存密码」时才加密写库：下次（包括重启后）点这台主机直接连，不再追问。
+        let stored = save_secret
             && store_desktop_secret_after_save(self.vault.clone(), host.clone(), &password, cx);
         let password_note = if stored {
             "（密码已加密入库）"
@@ -1156,6 +1160,8 @@ impl RuTermApp {
                 .map(|key| (key, connected_password.clone()))
         };
         let saved_host = desktop.saved_host;
+        // 连接成功也只在该主机已勾选「保存密码」（或来自已保存主机）时才回写密码库。
+        let save_secret = desktop.save_secret;
         tab.connected_at = Some(std::time::Instant::now());
         if tab.custom_title.is_none()
             && let Some(title) = title
@@ -1169,7 +1175,9 @@ impl RuTermApp {
         if let Some((key, password)) = cached_password {
             self.password_cache.insert(key, password);
         }
-        store_desktop_secret(self.vault.clone(), saved_host, &connected_password, cx);
+        if save_secret {
+            store_desktop_secret(self.vault.clone(), saved_host, &connected_password, cx);
+        }
         self.status = tr!(cx, "已连接远程桌面");
         self.sync_tray(cx);
         cx.notify();
@@ -2453,12 +2461,37 @@ impl RuTermApp {
                                 &pal,
                             )),
                     )
+                    .when(self.vault.is_some(), |this| {
+                        // 与 SSH 一致：勾选后才把密码加密入库，默认不落盘。
+                        // 点击交给 Checkbox 的 on_change（label 也能点），容器只负责排版。
+                        let entity = cx.entity();
+                        this.child(
+                            Checkbox::new(SharedString::from(format!(
+                                "rd-save-secret-{tab_id}"
+                            )))
+                            .checked(desktop.save_secret)
+                            .label(tr!(cx, "保存密码"))
+                            .on_change(move |value, _window, cx| {
+                                entity.update(cx, |this, cx| {
+                                    if let Some(desktop) = this
+                                        .tabs
+                                        .iter_mut()
+                                        .find(|tab| tab.id == tab_id)
+                                        .and_then(|tab| tab.desktop.as_mut())
+                                    {
+                                        desktop.save_secret = value;
+                                        cx.notify();
+                                    }
+                                });
+                            }),
+                        )
+                    })
                     .child(h_flex().items_center().gap_1().child({
-                        // 密码去向取决于凭据库是否可用：可用就加密入库，否则只留在内存。
+                        // 密码去向取决于凭据库是否可用与是否勾选保存。
                         let hint = if self.vault.is_some() {
                             tr!(
                                 cx,
-                                "保存主机时填写的密码会加密存入凭据库；不点保存则只在本次连接使用"
+                                "勾选「保存密码」后，密码会加密存入凭据库；不勾选则只在本次使用"
                             )
                         } else {
                             tr!(cx, "保存主机只记地址与用户名；密码只在本次连接的内存里使用")

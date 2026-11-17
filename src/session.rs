@@ -1323,10 +1323,6 @@ async fn forward_uplink(
     cwd_hint_tx: mpsc::UnboundedSender<CwdHint>,
 ) {
     let mut tracker = CwdKeystrokes::default();
-    let trace = std::env::var_os("RUTERM_TRACE_EXTERNAL").is_some();
-    let mut input_count = 0usize;
-    let mut input_bytes = 0usize;
-    let mut resize_count = 0usize;
     loop {
         let sent = tokio::select! {
             maybe = ui_rx.recv() => {
@@ -1335,9 +1331,6 @@ async fn forward_uplink(
                 };
                 match message {
                     PtyBoundMessage::Input(bytes) => {
-                        input_count += 1;
-                        input_bytes += bytes.len();
-                        let trace_this = trace;
                         // Key repeats arrive as hundreds of one-byte events. Writing each
                         // event separately can fill russh's bounded channel queue and leave
                         // the forwarding task waiting while the UI keeps enqueueing input.
@@ -1347,28 +1340,18 @@ async fn forward_uplink(
                         while bytes.len() < 64 * 1024 {
                             match ui_rx.try_recv() {
                                 Ok(PtyBoundMessage::Input(next)) => {
-                                    input_count += 1;
-                                    input_bytes += next.len();
                                     bytes.extend_from_slice(&next);
                                 }
                                 Ok(PtyBoundMessage::Resize(size)) => {
-                                    resize_count += 1;
                                     resize_after_batch = Some(size);
                                     break;
                                 }
                                 Err(_) => break,
                             }
                         }
-                        if trace_this {
-                            eprintln!(
-                                "[rt-trace] uplink input batch ending at #{input_count} bytes={} total_bytes={input_bytes} write start",
-                                bytes.len(),
-                            );
-                        }
                         if let Some(arg) = tracker.feed(&bytes) {
                             let _ = cwd_hint_tx.send(CwdHint::Cd(arg));
                         }
-                        let wait_started = std::time::Instant::now();
                         let mut result = channel.data_bytes(Bytes::from(bytes)).await;
                         if result.is_ok()
                             && let Some(size) = resize_after_batch
@@ -1382,38 +1365,17 @@ async fn forward_uplink(
                                 )
                                 .await;
                         }
-                        if trace_this {
-                            eprintln!(
-                                "[rt-trace] uplink input batch ending at #{input_count} write done ok={} elapsed_ms={}",
-                                result.is_ok(), wait_started.elapsed().as_millis()
-                            );
-                        }
                         result
                     }
                     PtyBoundMessage::Resize(size) => {
-                        resize_count += 1;
-                        let trace_this = trace && (resize_count <= 3 || resize_count % 10 == 0);
-                        if trace_this {
-                            eprintln!(
-                                "[rt-trace] uplink resize #{resize_count} {}x{} start",
-                                size.num_cols, size.num_lines
-                            );
-                        }
-                        let result = channel
+                        channel
                             .window_change(
                                 u32::from(size.num_cols),
                                 u32::from(size.num_lines),
                                 u32::from(size.cell_width) * u32::from(size.num_cols),
                                 u32::from(size.cell_height) * u32::from(size.num_lines),
                             )
-                            .await;
-                        if trace_this {
-                            eprintln!(
-                                "[rt-trace] uplink resize #{resize_count} done ok={}",
-                                result.is_ok()
-                            );
-                        }
-                        result
+                            .await
                     }
                 }
             }

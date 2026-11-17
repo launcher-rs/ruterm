@@ -485,8 +485,7 @@ impl Vault {
         self.dispatch(make(self.db.clone())).await
     }
 
-    /// 主机总数（测试与诊断用）。
-    #[allow(dead_code)]
+    /// 主机总数（迁移判定与测试/诊断用）。
     pub async fn count(&self) -> Result<i64> {
         Ok(self.load_hosts().await?.len() as i64)
     }
@@ -1063,7 +1062,14 @@ pub async fn migrate_legacy(
     if legacy_db_path.exists() {
         // 新库里已有主机 = 上次已导入、只是旧库文件当时没改走（句柄未释放）：
         // 跳过导入，免得用旧数据覆盖用户这段时间的新增/修改，仅再试着归档。
-        let already_imported = vault.count().await.unwrap_or(0) > 0;
+        // 读库失败时保守起见视为"已有数据"，避免误覆盖；仅把错误记为 warn。
+        let already_imported = match vault.count().await {
+            Ok(count) => count > 0,
+            Err(error) => {
+                log::warn!("读取新凭据库计数失败，保守跳过旧库导入: {error}");
+                true
+            }
+        };
         // 先读原路径、成功后才改名：中途失败时旧库原样保留，不破坏现场。
         // 旧库走 turso 直连，同样必须在运行时上下文里执行。
         let read = vault

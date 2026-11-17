@@ -50,7 +50,7 @@ cargo test               # 运行测试
 ruterm [user@]host[:port] [-i keyfile]
 ```
 
-用户名缺省取 `$USER` / `$USERNAME`，端口缺省 22；密码通过环境变量 `ruterm_PASSWORD` 提供，不接受命令行密码参数。不带参数启动即进入主界面。
+用户名缺省取 `$USER` / `$USERNAME`，端口缺省 22；密码通过环境变量 `RUTERM_PASSWORD` 提供，不接受命令行密码参数。不带参数启动即进入主界面。
 
 ## 常用快捷键
 

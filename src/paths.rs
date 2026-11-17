@@ -96,6 +96,9 @@ fn global_dir() -> PathBuf {
     let home = std::env::var_os("USERPROFILE")
         .or_else(|| std::env::var_os("HOME"))
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
+        .unwrap_or_else(|| {
+            log::warn!("未设置 USERPROFILE/HOME，全局数据目录回退为当前工作目录");
+            PathBuf::from(".")
+        });
     home.join(".ruterm")
 }

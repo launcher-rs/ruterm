@@ -197,7 +197,8 @@ fn neighbor_addresses() -> Vec<Ipv4Addr> {
     addresses
 }
 
-/// 默认路由出口的本机地址：UDP connect 不发包，只让系统选源地址。
+/// 默认路由出口的本机地址：UDP `connect` 只在系统路由表里查下一跳、不发送任何报文，
+/// 目的地址（公共 DNS）仅用于触发路由查询，不会真正联网，故无机密性顾虑。
 async fn default_local_ip() -> Option<Ipv4Addr> {
     for target in ["8.8.8.8:80", "1.1.1.1:80"] {
         let Ok(socket) = UdpSocket::bind("0.0.0.0:0").await else {

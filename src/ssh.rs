@@ -252,8 +252,8 @@ impl SshTerminalHandler {
         }
 
         if has_entry_for_host {
-            eprintln!(
-                "[ruterm] 警告: {} 的主机密钥指纹与 known_hosts 不符，拒绝连接（可能是中间人攻击）",
+            log::warn!(
+                "{} 的主机密钥指纹与 known_hosts 不符，拒绝连接（可能是中间人攻击）",
                 entry_host
             );
             return false;
@@ -263,10 +263,7 @@ impl SshTerminalHandler {
         if let Some(parent) = path.parent()
             && let Err(error) = std::fs::create_dir_all(parent)
         {
-            eprintln!(
-                "[ruterm] 无法创建 {} 目录（{error}），拒绝连接",
-                parent.display()
-            );
+            log::warn!("无法创建 {} 目录（{error}），拒绝连接", parent.display());
             return false;
         }
         let entry = format!("{entry_host} {fp} {}\n", key.algorithm());
@@ -278,16 +275,16 @@ impl SshTerminalHandler {
             Ok(file) => file,
             Err(error) => {
                 // 写盘失败不能降级为"不校验"，直接拒绝更安全。
-                eprintln!("[ruterm] 无法写入 known_hosts（{error}），拒绝连接");
+                log::warn!("无法写入 known_hosts（{error}），拒绝连接");
                 return false;
             }
         };
         if file.write_all(entry.as_bytes()).is_err() {
-            eprintln!("[ruterm] known_hosts 写入失败，拒绝连接");
+            log::warn!("known_hosts 写入失败，拒绝连接");
             return false;
         }
-        eprintln!(
-            "[ruterm] 首次连接 {}，主机指纹已记入 {}",
+        log::warn!(
+            "首次连接 {}，主机指纹已记入 {}",
             entry_host,
             path.display()
         );
@@ -362,7 +359,7 @@ impl client::Handler for SshTerminalHandler {
             }
             PublicKeyOrCertificate::Certificate(_) => {
                 // 证书认证属于后续能力（见首发清单"安全与密钥"），首版一律拒绝。
-                eprintln!("[ruterm] 暂不支持 SSH 证书主机认证，拒绝连接");
+                log::warn!("暂不支持 SSH 证书主机认证，拒绝连接");
                 Ok(false)
             }
         }

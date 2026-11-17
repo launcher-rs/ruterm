@@ -211,6 +211,8 @@ where
     let security = negotiate_security(stream, minor, password.is_some()).await?;
     match security {
         SecurityType::None => {
+            // 无认证 + 明文：VNC 协议本身如此，但会话可被同网段窃听，明确告警。
+            log::warn!("VNC 服务器选择无认证（安全类型 None），会话未加密，输入与画面可被窃听");
             // 3.8 的安全结果对 None 也会发；3.7 / 3.3 不发，等 ClientInit 即可。
             if minor >= 8 {
                 read_security_result(stream, minor).await?;

@@ -10,7 +10,7 @@ use rand_core::{Rng as _, SeedableRng as _};
 use rustls::client::ClientConfig;
 use rustls::{ClientConnection, Connection};
 
-use self::tls_connection::{TlsConnection, danger};
+use self::tls_connection::TlsConnection;
 use super::ts_request::NONCE_SIZE;
 use super::{CredSspContext, CredSspMode, EndpointType, SspiContext, TsRequest};
 use crate::credssp::sspi_cred_ssp::tls_connection::{DecryptionResult, DecryptionResultBuffers};
@@ -416,26 +416,36 @@ impl SspiCredSsp {
                             )
                         })?)?;
 
+                    // RuTerm 本地补丁：CredSSP 的 TLS 通道承载 NLA 凭据，必须校验服务端证书。
+                    // 上游此处用 NoCertificateVerification 接受任意证书（MITM 可截获凭据），
+                    // 改为 rustls 默认校验器（系统根 CA + 主机名 + 签名），并移除会把会话密钥
+                    // 落盘的 KeyLogFile。目标主机名取自 service principal name（TERMSRV/host）。
+                    let tls_server_name = target_hostname.to_string();
+                    let root_store = crate::rustls::load_native_root_store().ok_or_else(|| {
+                        Error::new(
+                            ErrorKind::CertificateUnknown,
+                            "无法加载系统根证书，拒绝建立 CredSSP TLS（需要受信证书校验）",
+                        )
+                    })?;
                     let mut client_config = ClientConfig::builder()
-                        .dangerous()
-                        .with_custom_certificate_verifier(Arc::new(danger::NoCertificateVerification))
+                        .with_root_certificates(root_store)
                         .with_no_client_auth();
-
-                    client_config.key_log = Arc::new(rustls::KeyLogFile::new());
+                    // CredSSP does not support TLS resumption.
+                    client_config.resumption = rustls::client::Resumption::disabled();
 
                     let config = Arc::new(client_config);
 
+                    let tls_server_name = rustls::pki_types::ServerName::try_from(tls_server_name)
+                        .map_err(|error| {
+                            Error::new(
+                                ErrorKind::InvalidParameter,
+                                format!("provided target name is not valid DNS name: {error:?}"),
+                            )
+                        })?
+                        .to_owned();
                     self.tls_connection = Some(TlsConnection::Rustls(Connection::Client(
-                        ClientConnection::new(
-                            config,
-                            target_hostname.to_owned().try_into().map_err(|e| {
-                                Error::new(
-                                    ErrorKind::InvalidParameter,
-                                    format!("provided target name is not valid DNS name: {e:?}"),
-                                )
-                            })?,
-                        )
-                        .map_err(|err| Error::new(ErrorKind::InternalError, err.to_string()))?,
+                        ClientConnection::new(config, tls_server_name)
+                            .map_err(|err| Error::new(ErrorKind::InternalError, err.to_string()))?,
                     )));
                 }
 

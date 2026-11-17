@@ -43,7 +43,11 @@ aws-lc-rs = [
     "rustls?/aws-lc-rs",
     "__install-crypto-provider",
 ]
-default = ["aws-lc-rs"]
+default = [
+    "aws-lc-rs",
+    # RuTerm 本地补丁：CredSSP 的 TLS 校验需要系统根证书（见 src/rustls.rs）。
+    "dep:rustls-native-certs",
+]
 dns_resolver = [
     "dep:hickory-resolver",
     "dep:hickory-proto",

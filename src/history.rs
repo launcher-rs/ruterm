@@ -180,7 +180,7 @@ mod tests {
         let mut history = CommandHistory::default();
         assert!(!history.push("(base) root@debian:~#"));
         assert!(!history.push("user@host:/var/log$"));
-        assert!(!history.push("PS C:\\Users\\deego>"));
+        assert!(!history.push("PS C:\\Users\\user>"));
         assert!(!history.push("❯"));
         assert!(history.is_empty());
 

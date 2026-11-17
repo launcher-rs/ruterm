@@ -98,18 +98,10 @@ tokio::spawn(forward_uplink(channel, ui_rx, raw_rx, cwd_hint_tx));
 
 修复后同一套操作可以持续产生上千个下行报文，不再有 100 条上限，也没有积压。
 
-## 6. 复现与诊断设施（保留，发布前删除）
-
-| 变量 | 位置 | 作用 |
-| --- | --- | --- |
-| `RUTERM_SMOKE_BACKSPACE=<n>` | `src/app/connect.rs` | 连上 6s 后自动粘贴 payload，再经真实按键路径发 n 次 Backspace；`0` 则只粘贴 |
-| `RUTERM_SMOKE_DELAY_MS=<ms>` | 同上 | 每次按键间隔，默认 8ms |
-| `RUTERM_SMOKE_PREFILL=<n>` | 同上 | 粘贴前先执行 `seq 1 <n>`，把提示符顶到屏幕底部、制造大量下行报文 |
-| `RUTERM_TEST_DOWNLINK_DELAY_MS=<ms>` | `src/ssh.rs` | 在 SSH 下行回调里人为加延迟，拉大按键与回显的交叠窗口 |
-| `RUTERM_TRACE_EXTERNAL=1` | `src/session.rs` / `src/ssh.rs` | 打印上行泵、输入合批、resize、下行字节与解析批次日志 |
+## 6. 复现与诊断设施
 
 复现命令见 §2；截图脚本：`target/shot_ruterm.ps1` → `target/ruterm_shot.png`。
-单实例锁占用 TCP 47122，重跑前先结束旧进程。
+单实例锁占用 TCP 47122（可用 `RUTERM_INSTANCE_PORT` 覆盖），重跑前先结束旧进程。
 
 另有一处「上行输入合批」（`src/session.rs` 的 `forward_uplink`）：把连续的多条
 `PtyBoundMessage::Input` 合并到 64KB 再写通道。它和本问题无关，但能减少上行消息

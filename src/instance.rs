@@ -11,7 +11,22 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::time::Duration;
 
 /// 回环锁端口：挑在常见服务区间之外，降低撞车概率。
-const PORT: u16 = 47_122;
+/// 可用环境变量 `RUTERM_INSTANCE_PORT` 覆盖（端口被占用时便于切换）。
+const DEFAULT_PORT: u16 = 47_122;
+
+/// 锁端口，可被 `RUTERM_INSTANCE_PORT` 覆盖；非法值回退默认并告警。
+fn port() -> u16 {
+    match std::env::var_os("RUTERM_INSTANCE_PORT") {
+        Some(raw) => match raw.to_str().and_then(|s| s.parse::<u16>().ok()) {
+            Some(port) => port,
+            None => {
+                log::warn!("RUTERM_INSTANCE_PORT 非法（{raw:?}），回退默认端口 {DEFAULT_PORT}");
+                DEFAULT_PORT
+            }
+        },
+        None => DEFAULT_PORT,
+    }
+}
 /// 握手口令：两边都核对，确认对面确实是另一个 RuTerm。
 /// 固定长度帧，不做行解析，避免本机进程用超长行撑爆内存。
 const TOKEN: &[u8] = b"ruterm-instance-v1";
@@ -29,7 +44,7 @@ pub enum Claim {
 
 /// 抢锁：成功返回主实例监听，否则说明为什么不做守卫。
 pub fn claim() -> Claim {
-    match TcpListener::bind(("127.0.0.1", PORT)) {
+    match TcpListener::bind(("127.0.0.1", port())) {
         Ok(listener) => {
             // 交给 tokio 之前必须切成非阻塞（`serve` 里会 from_std 接管）。
             match listener.set_nonblocking(true) {
@@ -44,7 +59,7 @@ pub fn claim() -> Claim {
             if knock() {
                 Claim::Activated
             } else {
-                log::warn!("回环端口 {PORT} 被非 RuTerm 程序占用，本次不做单实例守卫");
+                log::warn!("回环端口被非 RuTerm 程序占用，本次不做单实例守卫");
                 Claim::Unprotected
             }
         }
@@ -58,7 +73,7 @@ pub fn claim() -> Claim {
 /// 敲门：递令牌并等主实例回同一个令牌，回得上才认定对面是 RuTerm。
 /// 连接、写入、读取都受总时上限约束；对面只发半截或一直不回就放弃。
 fn knock() -> bool {
-    let addr = SocketAddr::from(([127, 0, 0, 1], PORT));
+    let addr = SocketAddr::from(([127, 0, 0, 1], port()));
     let Ok(mut stream) = TcpStream::connect_timeout(&addr, HANDSHAKE) else {
         return false;
     };

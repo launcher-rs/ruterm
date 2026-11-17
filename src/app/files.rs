@@ -853,7 +853,18 @@ impl RuTermApp {
         }
         // 新本地路径代表新副本，不能继承旧副本的「全部是」授权。
         self.file_upload_all.remove(&(tab_id, remote.clone()));
+        // 移除旧记录前清掉它的临时副本目录，避免远端内容长期残留在 %TEMP%。
+        let stale: Vec<PathBuf> = tab
+            .files
+            .opened
+            .iter()
+            .filter(|item| item.remote == remote && item.local != local)
+            .filter_map(|item| item.local.parent().map(Path::to_path_buf))
+            .collect();
         tab.files.opened.retain(|item| item.remote != remote);
+        for dir in stale {
+            let _ = std::fs::remove_dir_all(dir);
+        }
         tab.files
             .opened
             .push(OpenedRemote::new(local, remote, name, stamp));
