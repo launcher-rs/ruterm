@@ -154,6 +154,7 @@ impl RuTermApp {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn open_shell_input(
         &mut self,
         id: String,

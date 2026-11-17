@@ -113,9 +113,10 @@ fn main() {
     rgpui::init_logging();
 
     // 带目标参数 → 一次性快速连接兜底；无参数 → 纯 GUI 会话管理器。
+    // --help / --version 由 from_args 打印后返回 Ok(None)，这里正常退出（退出码 0）。
     let quick = if std::env::args().nth(1).is_some() {
         match SshTarget::from_args() {
-            Ok(target) => Some(target),
+            Ok(target) => target,
             Err(error) => {
                 eprintln!("{error}");
                 std::process::exit(2);

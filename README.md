@@ -37,7 +37,7 @@ Rust 编写的桌面远程连接工具：SSH 终端、本地 Shell、SFTP 文件
 
 ## 构建与运行
 
-需要 Rust 2024 edition 工具链（Cargo 1.85+）。主要面向 Windows，同时保留 Linux / macOS 构建路径。
+需要 Rust 1.88+（edition 2024；代码用到 let-chains 与 `slice::as_chunks`）。主要面向 Windows，同时保留 Linux / macOS 构建路径。
 
 ```bash
 cargo run --release      # 启动 GUI
@@ -48,6 +48,8 @@ cargo test               # 运行测试
 
 ```bash
 ruterm [user@]host[:port] [-i keyfile]
+ruterm -h | --help       # 用法说明
+ruterm -V | --version    # 打印版本号
 ```
 
 用户名缺省取 `$USER` / `$USERNAME`，端口缺省 22；密码通过环境变量 `RUTERM_PASSWORD` 提供，不接受命令行密码参数。不带参数启动即进入主界面。

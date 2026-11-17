@@ -31,9 +31,12 @@ pub struct SshTarget {
 impl SshTarget {
     /// 从命令行参数解析连接目标。
     ///
-    /// 用法：`ruterm [user@]host[:port] [-i keyfile]`
+    /// 用法：`ruterm [user@]host[:port] [-i keyfile] [-h|--help] [-V|--version]`
     /// 密码经 `RUTERM_PASSWORD` 环境变量传入。
-    pub fn from_args() -> anyhow::Result<Self> {
+    ///
+    /// 返回 `Ok(None)` 表示只打印了帮助/版本信息，调用方应以退出码 0 正常结束
+    /// （CI 的 `--help`/`--version` 冒烟依赖这一点）。
+    pub fn from_args() -> anyhow::Result<Option<Self>> {
         let mut positional: Option<String> = None;
         let mut key_path: Option<PathBuf> = None;
         let mut args = std::env::args().skip(1);
@@ -46,9 +49,17 @@ impl SshTarget {
                     key_path = Some(PathBuf::from(path));
                 }
                 "-h" | "--help" => {
-                    anyhow::bail!(
-                        "用法: ruterm [user@]host[:port] [-i keyfile]\n密码通过环境变量 RUTERM_PASSWORD 提供"
+                    println!(
+                        "用法: ruterm [user@]host[:port] [-i keyfile]\n\
+                         \x20      ruterm -h | --help\n\
+                         \x20      ruterm -V | --version\n\
+                         密码通过环境变量 RUTERM_PASSWORD 提供"
                     );
+                    return Ok(None);
+                }
+                "-V" | "--version" => {
+                    println!("ruterm {}", env!("CARGO_PKG_VERSION"));
+                    return Ok(None);
                 }
                 other => {
                     if other.starts_with('-') {
@@ -88,7 +99,7 @@ impl SshTarget {
             None => (rest, 22),
         };
 
-        Ok(Self {
+        Ok(Some(Self {
             user,
             host,
             port,
@@ -99,7 +110,7 @@ impl SshTarget {
             password: std::env::var("RUTERM_PASSWORD")
                 .ok()
                 .filter(|s| !s.is_empty()),
-        })
+        }))
     }
 
     /// known_hosts 记录用的展示地址（host:port）。

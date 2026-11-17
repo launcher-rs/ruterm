@@ -370,6 +370,7 @@ impl RuTermApp {
     /// 错误文本留在终端里可读，不再一闪而过；需要口令时自动弹口令窗。
     /// 被拒绝的秘密会清掉内存缓存；若来自加密库，库内条目也一并清除，
     /// 下次点击重新询问，而不是拿坏凭据反复直连。
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn connect(
         &mut self,
         title: String,

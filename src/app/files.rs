@@ -487,11 +487,7 @@ impl FileBrowser {
 
 /// 排序规则本体：目录恒在前，其余按所选列比较，同值回落到名称。
 /// 写成自由函数是因为远端与本机两套面板共用同一份规则。
-pub(super) fn sort_entries(
-    entries: &mut Vec<crate::remote_fs::Entry>,
-    key: FileSortKey,
-    desc: bool,
-) {
+pub(super) fn sort_entries(entries: &mut [crate::remote_fs::Entry], key: FileSortKey, desc: bool) {
     entries.sort_by(|left, right| {
         let by_dir = right.is_dir.cmp(&left.is_dir);
         if by_dir != Ordering::Equal {
@@ -815,10 +811,9 @@ impl RuTermApp {
             true,
             false,
             cx,
-        ) {
-            if let Some(dir) = local.parent() {
-                let _ = std::fs::remove_dir(dir);
-            }
+        ) && let Some(dir) = local.parent()
+        {
+            let _ = std::fs::remove_dir(dir);
         }
     }
 
@@ -1160,6 +1155,7 @@ impl RuTermApp {
     }
 
     /// 面板内的一次上传 / 下载。false 表示未发送，调用方必须释放 inflight。
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn file_transfer(
         &mut self,
         tab_id: usize,
@@ -1261,13 +1257,12 @@ impl RuTermApp {
                 else {
                     return;
                 };
-                if let Some(stamp) = upload_stamp {
-                    if !tab.files.opened_mut(&local, &remote)
+                if let Some(stamp) = upload_stamp
+                    && !tab.files.opened_mut(&local, &remote)
                         .is_some_and(|item| item.inflight == Some(stamp))
                     {
                         return;
                     }
-                }
                 let succeeded = outcome.is_ok();
                 let path = tab.files.path.clone();
                 tab.files.busy = None;
@@ -2069,6 +2064,7 @@ impl RuTermApp {
     ///
     /// `width` 为 `Some((列下标, 宽度))` 时右边缘带拖拽手柄；名称列传 `None`，占剩余宽度。
     /// `target` 决定这份排序 / 列宽记在谁身上（远端标签或本机面板）。
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn file_sort_header(
         &self,
         id: &'static str,
@@ -3333,12 +3329,14 @@ mod tests {
 
     #[test]
     fn file_sort_keeps_dirs_first_and_follows_key() {
-        let mut files = FileBrowser::default();
-        files.entries = vec![
-            entry("zeta", true, 0, None),
-            entry("Beta.txt", false, 20, Some(2)),
-            entry("alpha.txt", false, 10, Some(3)),
-        ];
+        let mut files = FileBrowser {
+            entries: vec![
+                entry("zeta", true, 0, None),
+                entry("Beta.txt", false, 20, Some(2)),
+                entry("alpha.txt", false, 10, Some(3)),
+            ],
+            ..FileBrowser::default()
+        };
         files.sort_entries();
         let names = |files: &FileBrowser| {
             files

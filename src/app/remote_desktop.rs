@@ -665,7 +665,7 @@ impl RuTermApp {
     /// 表单「取消」：直接关掉这个桌面标签（尚未建连，不算断开）。
     pub(super) fn cancel_desktop_form(&mut self, tab_id: usize, cx: &mut Context<Self>) {
         self.close_tab(tab_id, cx);
-        self.status = tr!(cx, "已取消远程桌面").into();
+        self.status = tr!(cx, "已取消远程桌面");
     }
 
     /// 表单「保存」：把地址 / 端口 / 协议 / 用户名存成常用主机；填了密码则连同加密入库。
@@ -847,7 +847,7 @@ impl RuTermApp {
             desktop.clear_buttons();
         }
         if self.active_tab == Some(id) {
-            self.status = tr!(cx, "已取消连接").into();
+            self.status = tr!(cx, "已取消连接");
         }
         cx.notify();
     }
@@ -1197,6 +1197,7 @@ impl RuTermApp {
     }
 
     /// 拖放上传进度：传输中刷新进度条，结束（成功或中断）时收起。
+    #[allow(clippy::too_many_arguments)]
     fn apply_desktop_upload(
         &mut self,
         id: usize,
@@ -1228,14 +1229,12 @@ impl RuTermApp {
                             cx,
                             "文件粘贴未开始（本机剪贴板被占用或远端未接收文件列表），可稍后重试；远端内容就绪时可手动按 Ctrl+V"
                         )
-                        .into()
                     } else if done == 0 {
                         // 远端收下了列表却一个字节都没读：最常见就是同名文件覆盖确认框在等人。
                         tr!(
                             cx,
                             "远端还没开始接收：若弹出了同名文件覆盖确认，请在那个窗口里选「替换」，或先删掉远端同名文件"
                         )
-                        .into()
                     } else {
                         format!(
                             "{}：{} / {}",
@@ -1250,8 +1249,7 @@ impl RuTermApp {
                         cx,
                         "文件已发送到远端：{size}",
                         size = crate::transfer::format_bytes(total)
-                    )
-                    .into();
+                    );
                 }
             }
         } else {
@@ -1278,7 +1276,7 @@ impl RuTermApp {
         }
         cx.write_to_clipboard(ClipboardItem::new_string(text));
         if self.active_tab == Some(id) {
-            self.status = tr!(cx, "已收到远端剪贴板").into();
+            self.status = tr!(cx, "已收到远端剪贴板");
         }
         cx.notify();
     }
@@ -1461,7 +1459,7 @@ impl RuTermApp {
         desktop.clear_buttons();
         release_desktop_clipboard(desktop);
         if self.active_tab == Some(id) {
-            self.status = tr!(cx, "正在断开远程桌面…").into();
+            self.status = tr!(cx, "正在断开远程桌面…");
         }
         cx.notify();
     }
@@ -1591,7 +1589,7 @@ impl RuTermApp {
         desktop.capslock = false;
         desktop.clear_buttons();
         if self.active_tab == Some(id) {
-            self.status = tr!(cx, "远程桌面失去焦点，已释放键盘").into();
+            self.status = tr!(cx, "远程桌面失去焦点，已释放键盘");
         }
         cx.notify();
     }
@@ -1640,7 +1638,7 @@ impl RuTermApp {
                 desktop.clear_buttons();
                 desktop.capture_keys = false;
             }
-            self.status = tr!(cx, "已释放键盘，点击画面可重新捕获").into();
+            self.status = tr!(cx, "已释放键盘，点击画面可重新捕获");
             cx.notify();
             return;
         }
@@ -1738,8 +1736,7 @@ impl RuTermApp {
             self.status = tr!(
                 cx,
                 "RDP 剪贴板已随系统自动同步，直接在远端按 Ctrl+V 即可（文件也可直接粘贴）"
-            )
-            .into();
+            );
             cx.notify();
             return;
         }
@@ -1755,7 +1752,7 @@ impl RuTermApp {
             })
         });
         let Some(text) = text.filter(|text| !text.is_empty()) else {
-            self.status = tr!(cx, "剪贴板里没有文本").into();
+            self.status = tr!(cx, "剪贴板里没有文本");
             cx.notify();
             return;
         };
@@ -1768,7 +1765,7 @@ impl RuTermApp {
             return;
         };
         desktop.send(Command::Clipboard(text));
-        self.status = tr!(cx, "已把剪贴板发送到远端").into();
+        self.status = tr!(cx, "已把剪贴板发送到远端");
         cx.notify();
     }
 
@@ -1795,7 +1792,7 @@ impl RuTermApp {
             return;
         };
         let Some(bounds) = desktop.screen_bounds.get() else {
-            self.status = tr!(cx, "窗口还没完成布局，稍后再试").into();
+            self.status = tr!(cx, "窗口还没完成布局，稍后再试");
             cx.notify();
             return;
         };
@@ -1854,9 +1851,9 @@ impl RuTermApp {
             desktop.clear_buttons();
         }
         self.status = if on {
-            tr!(cx, "键盘已捕获（Esc 释放）").into()
+            tr!(cx, "键盘已捕获（Esc 释放）")
         } else {
-            tr!(cx, "已释放键盘").into()
+            tr!(cx, "已释放键盘")
         };
         cx.notify();
     }
@@ -2466,24 +2463,22 @@ impl RuTermApp {
                         // 点击交给 Checkbox 的 on_change（label 也能点），容器只负责排版。
                         let entity = cx.entity();
                         this.child(
-                            Checkbox::new(SharedString::from(format!(
-                                "rd-save-secret-{tab_id}"
-                            )))
-                            .checked(desktop.save_secret)
-                            .label(tr!(cx, "保存密码"))
-                            .on_change(move |value, _window, cx| {
-                                entity.update(cx, |this, cx| {
-                                    if let Some(desktop) = this
-                                        .tabs
-                                        .iter_mut()
-                                        .find(|tab| tab.id == tab_id)
-                                        .and_then(|tab| tab.desktop.as_mut())
-                                    {
-                                        desktop.save_secret = value;
-                                        cx.notify();
-                                    }
-                                });
-                            }),
+                            Checkbox::new(SharedString::from(format!("rd-save-secret-{tab_id}")))
+                                .checked(desktop.save_secret)
+                                .label(tr!(cx, "保存密码"))
+                                .on_change(move |value, _window, cx| {
+                                    entity.update(cx, |this, cx| {
+                                        if let Some(desktop) = this
+                                            .tabs
+                                            .iter_mut()
+                                            .find(|tab| tab.id == tab_id)
+                                            .and_then(|tab| tab.desktop.as_mut())
+                                        {
+                                            desktop.save_secret = value;
+                                            cx.notify();
+                                        }
+                                    });
+                                }),
                         )
                     })
                     .child(h_flex().items_center().gap_1().child({
@@ -2712,7 +2707,7 @@ impl RuTermApp {
                                         cx.write_to_clipboard(ClipboardItem::new_string(
                                             copy_message.to_string(),
                                         ));
-                                        this.status = tr!(cx, "错误已复制到剪贴板").into();
+                                        this.status = tr!(cx, "错误已复制到剪贴板");
                                         cx.notify();
                                     })),
                             )
@@ -2765,13 +2760,12 @@ fn host_port(host: &str, port: u16) -> String {
 /// `host` 字段里带端口时以它为准（支持 `host:5900` 与 `[::1]:5900`）。
 fn normalize_address(raw: &str, port_text: &str) -> (String, Option<u16>) {
     let raw = raw.trim();
-    if let Some(rest) = raw.strip_prefix('[') {
-        if let Some((host, tail)) = rest.split_once("]:") {
-            if let Ok(port) = tail.trim().parse::<u16>() {
-                // 连接用裸 IPv6 字面量，展示时再由 `host_port` 补回方括号。
-                return (host.to_string(), Some(port));
-            }
-        }
+    if let Some(rest) = raw.strip_prefix('[')
+        && let Some((host, tail)) = rest.split_once("]:")
+        && let Ok(port) = tail.trim().parse::<u16>()
+    {
+        // 连接用裸 IPv6 字面量，展示时再由 `host_port` 补回方括号。
+        return (host.to_string(), Some(port));
     }
     if let Some((host, tail)) = raw.rsplit_once(':')
         && !host.contains(':')

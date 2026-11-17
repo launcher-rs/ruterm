@@ -1278,7 +1278,7 @@ impl RuTermApp {
 
     /// 空工作区首页：品牌 + 主机搜索 + 新建入口 + 最近连接。
     ///
-    /// 参照 RustTerm-Egui 的空状态（路线图「界面与交互」①），但配色、图标与控件
+    /// 参照路线图「界面与交互」① 的空状态，但配色、图标与控件
     /// 全部走主题与 `IconName`：搜索里敲字即列匹配主机，清空则回到最近连接。
     pub(super) fn render_empty_state(&self, pal: &Palette, cx: &mut Context<Self>) -> AnyElement {
         let query = self.home_search.read(cx).value().trim().to_lowercase();

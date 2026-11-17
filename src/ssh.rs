@@ -283,11 +283,7 @@ impl SshTerminalHandler {
             log::warn!("known_hosts 写入失败，拒绝连接");
             return false;
         }
-        log::warn!(
-            "首次连接 {}，主机指纹已记入 {}",
-            entry_host,
-            path.display()
-        );
+        log::warn!("首次连接 {}，主机指纹已记入 {}", entry_host, path.display());
         true
     }
 }

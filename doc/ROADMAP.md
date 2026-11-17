@@ -1,30 +1,12 @@
 # RuTerm 路线图
 
-> 对标对象：[RustTerm-Egui](https://github.com/luckbloke/RustTerm-Egui)（egui 0.36 + alacritty_terminal 原型，
-> 源码见 `temp/RustTerm-Egui`）。功能只收**远程连接相关**且我们目前没有的，按「价值 / 成本」排序；
+> 功能只收**远程连接相关**且我们目前没有的，按「价值 / 成本」排序；
 > 界面与交互上的可借鉴点单列一节（见「界面与交互」）。
 > 已具备的能力不重复列，明确不做的见「非目标」。
 >
 > 定位：**远程连接工具，终端为核心**。SSH / Telnet 是远程连接，VNC / RDP / SPICE 也是，
 > 所以远程桌面保留在 P2（不承诺排期）；而 AI 助手、内置浏览器、URL 用浏览器打开属于终端之外
 > 的另一类产品能力，不做。
-
-## 现状对照（速览）
-
-| 能力 | RustTerm-Egui | RuTerm | 结论 |
-|---|---|---|---|
-| 终端内查找 | Ctrl+F 高亮 + 上/下跳转 | Ctrl+F 查找条（字面量 / 正则） | **已补** |
-| 多终端联动 | 批量执行 + 同步输入 | 同步输入 + 命令广播（菜单 + 二次确认） | **已补** |
-| Telnet / Ping | 原始 TCP + 最小 IAC；PTY 跑 ping | Telnet 会话（最小 IAC + NAWS）、主机右键 Ping / 路由追踪 | **已补** |
-| 中英文界面 | i18n 静态词典 + 语言切换 | 简中 / English 即时切换 | **已补** |
-| 键宏 | 组合键 → 字节流，导入导出 | 管理器：触发键 + 多步序列 / 延迟、导入导出 | **已补** |
-| 本地文件页 | 单栏本机目录浏览器 | 只有远端 SFTP | 补 |
-| 远程桌面 | VNC / RDP / SPICE 真实实现 | VNC / RDP 标签，可存为常用主机；RDP 含文本 / 文件双向剪贴板与动态分辨率 | VNC / RDP **已补**（RDP 实机待复核）；SPICE 依赖受阻（见 P2） |
-| 局域网发现 | 无 | 按需扫私有网段，列出开放 22/23/3389/5900 的主机 | **我们领先** |
-| 加密凭据库 | 明文 `sessions.json` | 加密库 + 字段加密 | **我们领先** |
-| 主机指纹 | TOFU（known_hosts 文本） | TOFU 入库、跳板逐跳校验 | **我们领先** |
-| 端口转发 | 仅本机 TCP 直连中转 | -L / -R / -D（SOCKS5） | **我们领先** |
-| 分屏 / 托盘 / WSL / 状态栏指标 / ZMODEM / 单实例 | 无 | 有 | **我们领先** |
 
 ## 界面与交互（可借鉴清单）
 
@@ -91,14 +73,14 @@
 - [x] **Telnet 会话** — `M`
   新增轻量 TCP 后端（最小 IAC 协商：拒绝 0xFF 0xFA 子协商、回 WONT/DONT），
   终端渲染复用 rgpui-term；主机表单增加协议下拉（SSH / Telnet），端口默认 23。
-  参考实现：`temp/RustTerm-Egui/src/backends/tcp.rs`。
+  参考实现已删除（原型 temp/RustTerm-Egui 不在本仓库）。
   落地：`src/telnet.rs`（IAC 过滤器 + 协商应答 + NAWS 尺寸上报 + 上行 0xFF 双写，含 9 项单测），
   协议选择存加密库 `settings` 的 `protocols` 键（不动 hosts 列，沿用 proxy_jump 的既有先例），
   断线横幅 / 回车重连 / 自动重连与 SSH 同形（`Resume::Telnet`）；Telnet 主机不参与跳板机与
   SSH 认证字段，标签也不挂 SFTP/转发能力。侧栏以 Globe 图标 + `Telnet · host:port` 副标题区分。
 - [x] **中英文界面** — `M` — 已完成
   加 `tr!` 宏 + 库内 `language` 设置，先覆盖菜单 / 标题栏 / 设置 / 状态栏 / 文件与转发页，
-  终端内与提示文案后续增量替换。参考词条表：`temp/RustTerm-Egui/src/i18n.rs`（约 90 条）。
+  终端内与提示文案后续增量替换。
   落地：`src/i18n.rs` 用 rgpui `I18nManager`，**中文原文即 key**（`t()` 找不到就回退 key），
   所以漏翻只会露中文、不露 `settings.title` 之类占位符，翻译进度与可用性解耦；
   英文表 `assets/locales/en.json`（219 条 + 动态 key，`include_str!` 编进二进制，发布包不带 locales 目录）。
@@ -107,7 +89,7 @@
   持久化两份：加密库 `settings.language` 是权威值，`~/.ruterm/locale.txt` 是启动镜像
   （窗口首帧早于解锁）。**不要**把镜像写进 `settings.json`：开库迁移会把它当遗留文件归档，
   并把其中未设置的 `theme` 回灌进库、抹掉用户主题（本条即为此踩到后改的）。
-  对账工具 `temp/i18n_check.py`（校验 tr! 与词条表一一对应、占位符两边一致），
+  对账用本地脚本（校验 tr! 与词条表一一对应、占位符两边一致，未随仓库发布），
   单测 `i18n::tests::en_table_is_valid_and_placeholders_match` 守住同一约定。
   已知边界：输入框占位符在创建时取词，切换语言后需重启才更新；状态栏瞬态提示与
   边栏默认分组名「未分组」仍是中文，属本条所述「后续增量替换」。
@@ -133,12 +115,12 @@
   触发用 `App::intercept_keystrokes`（动作分发之前），只在终端聚焦且无浮层时命中，命中后
   `stop_propagation` 并逐步骤 `Terminal::input`（Programmatic，不回流镜像中间件），步间按每步延迟等待。
   数据存加密库 `settings.macros`，库不可用时降级 `settings.json`。
-  参考：`temp/RustTerm-Egui/src/macros.rs`。
+  参考实现已删除（原型 temp/RustTerm-Egui 不在本仓库）。
 - [x] **本地文件页** — `S/M` — 已完成
   边栏第四页（或文件页的「本机」分栏），浏览本机目录；与远端 SFTP 面板组成「本机 ↔ 远端」双栏上传/下载。
   平台件（点击路径栏编辑、双击进入/打开、拖入上传、列宽拖拽）文件面板已有，直接复用表格实现，
   另外补「显示隐藏文件」开关与窄栏隐藏时间/权限列。
-  参考：`temp/RustTerm-Egui/src/filebrowser.rs`。
+  参考实现已删除（原型 temp/RustTerm-Egui 不在本仓库）。
   落地：`src/app/local_files.rs`，表格复用 `PaneTarget::Local` 走同一条 `render_files_section` 路径
   （路径栏 / 列头排序 / 列宽拖拽 / 行右键 / 底部摘要共用，窄栏自动收起时间与权限列）。
   列目录在 `background_spawn` 里跑（`read_dir` 是阻塞调用），隐藏判定 Windows 看文件属性位、
@@ -321,7 +303,7 @@
 - [ ] **远程桌面：SPICE** — `XL` — **依赖受阻，暂缓**
   原型依赖的 capsaicin 未发布到 crates.io（仓库里也没有 vendor 副本，无法构建）；
   crates.io 上的 `spice-client` 0.2 是 **GPL-3.0**，本项目 Apache-2.0，许可不兼容，不能引入。
-  参考：`temp/RustTerm-Egui/src/remote/*`（原型带 vendor 版 capsaicin，本仓库没有 vendor）。
+  参考实现已删除（原型 temp/RustTerm-Egui 不在本仓库）。
 - [x] **网络诊断标签（Ping / Traceroute）** — `S` — 已完成
   主机行右键「Ping」/「路由追踪」，在本地 PTY 里跑 `cmd /k ping -t <host>` / `tracert <host>`，
   输出即终端内容；`/k` 让命令跑完停在提示符，不会被「本地 shell 退出即收标签」规则关掉。

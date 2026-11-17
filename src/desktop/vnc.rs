@@ -728,7 +728,7 @@ impl Framebuffer {
         for row in 0..usize::from(rect.height) {
             let target = (usize::from(rect.y) + row) * stride + usize::from(rect.x) * 4;
             let dst = &mut self.bgra[target..target + usize::from(rect.width) * 4];
-            for chunk in dst.chunks_exact_mut(4) {
+            for chunk in dst.as_chunks_mut::<4>().0 {
                 chunk.copy_from_slice(&color);
             }
         }

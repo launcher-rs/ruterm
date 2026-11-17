@@ -791,10 +791,10 @@ mod tests {
     #[test]
     fn to_bgra_converts_simd_blocks_and_tail() {
         // 7 个像素：SSE2 一次 4 个，剩下的零头走逐像素分支。
-        let bgra = to_bgra(&vec![0x0011_2233; 7]);
+        let bgra = to_bgra(&[0x0011_2233; 7]);
         assert_eq!(bgra.len(), 7 * 4);
-        for pixel in bgra.chunks_exact(4) {
-            assert_eq!(pixel, [0x33, 0x22, 0x11, 0xFF]);
+        for pixel in bgra.as_chunks::<4>().0 {
+            assert_eq!(pixel, &[0x33, 0x22, 0x11, 0xFF]);
         }
     }
 }

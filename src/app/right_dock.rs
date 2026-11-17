@@ -212,9 +212,7 @@ impl RuTermApp {
         };
         let total = self.split_width.get();
         // 左侧给终端至少留 320px；总宽不够时退回最小面板宽，宁可挤终端的标签栏。
-        let max = (total - 320.0)
-            .min(RIGHT_PANEL_MAX_WIDTH)
-            .max(RIGHT_PANEL_MIN_WIDTH);
+        let max = (total - 320.0).clamp(RIGHT_PANEL_MIN_WIDTH, RIGHT_PANEL_MAX_WIDTH);
         let width = (start_width + start_x - x).clamp(RIGHT_PANEL_MIN_WIDTH, max);
         if (width - self.right_panel_width).abs() > f32::EPSILON {
             self.right_panel_width = width;

@@ -428,6 +428,8 @@ async fn cleanup_local_temp(temp: &Path, error: anyhow::Error) -> anyhow::Error 
     {
         // 仅撤销本次暂存文件的只读位；绝不改最终目标来强行覆盖。
         let mut permissions = metadata.permissions();
+        // 故意清除只读位：暂存文件只读时无法删除，需先恢复可写再清理。
+        #[allow(clippy::permissions_set_readonly_false)]
         permissions.set_readonly(false);
         let _ = tokio::fs::set_permissions(temp, permissions).await;
     }

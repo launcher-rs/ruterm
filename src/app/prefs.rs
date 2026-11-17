@@ -1231,8 +1231,10 @@ mod tests {
 
     #[test]
     fn status_bar_prefs_roundtrip_and_tolerate_partial_json() {
-        let mut prefs = StatusBarPrefs::default();
-        prefs.addr = false;
+        let mut prefs = StatusBarPrefs {
+            addr: false,
+            ..StatusBarPrefs::default()
+        };
         prefs.set_metric(Metric::Mem, false);
         let restored = StatusBarPrefs::from_json(&prefs.to_json());
         assert_eq!(restored, prefs);
