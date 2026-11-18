@@ -196,8 +196,6 @@ jobs:
           cp README.md LICENSE stage/
           tar -czf "dist/ruterm-${{ matrix.name }}.tar.gz" -C stage .
 
-      # 冒烟（--version/--help 启动检查、cargo test、glibc 基线）已移到 ci.yml：
-      # push/PR 都会先跑一遍，发版流程只管编译 + 上传，不再重复等待这些检查。
       # 本平台编完立刻上传（--clobber 覆盖同名旧附件，支持单独重跑本 job）。
       - name: 发布附件（Windows）
         if: runner.os == 'Windows'
