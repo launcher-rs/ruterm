@@ -1,5 +1,9 @@
 # RuTerm
 
+[![CI](https://github.com/launcher-rs/ruterm/actions/workflows/ci.yml/badge.svg)](https://github.com/launcher-rs/ruterm/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/launcher-rs/ruterm)](https://github.com/launcher-rs/ruterm/releases)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+
 Rust 编写的桌面远程连接工具：SSH 终端、本地 Shell、SFTP 文件管理、端口转发和远程桌面集中在一个窗口里。基于 [rgpui](https://crates.io/crates/rgpui) 与 [rgpui-term](https://crates.io/crates/rgpui-term) 构建。
 
 ## 主要功能
