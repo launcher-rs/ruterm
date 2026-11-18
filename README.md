@@ -93,7 +93,7 @@ src/
 vendor/           少量上游依赖的本地修补版本（保留原许可证）
 ```
 
-完整设计说明与路线图见 [`doc/design-roadmap.md`](doc/design-roadmap.md)。
+完整设计说明与路线图见 [`docs/design-roadmap.md`](docs/design-roadmap.md)。
 
 ## 许可证
 
