@@ -65,6 +65,7 @@ pub enum NetTool {
 
 impl NetTool {
     /// 标签名与菜单里用的工具名。
+    #[cfg(windows)]
     pub fn label(self) -> &'static str {
         match self {
             Self::Ping => "Ping",
@@ -227,19 +228,17 @@ fn quote_arg(arg: &str) -> String {
     }
 }
 
-/// 在 `PATH` 里查找可执行文件（Windows 下自动补 `.exe`）。
+/// 在 `PATH` 里查找可执行文件（自动补 `.exe`）。
+#[cfg(windows)]
 fn which(program: &str) -> Option<PathBuf> {
-    let name = if cfg!(windows) {
-        format!("{program}.exe")
-    } else {
-        program.to_owned()
-    };
+    let name = format!("{program}.exe");
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
         .map(|dir| dir.join(&name))
         .find(|candidate| candidate.is_file())
 }
 
+#[cfg(windows)]
 fn env_path(name: &str) -> Option<PathBuf> {
     std::env::var_os(name).map(PathBuf::from)
 }
