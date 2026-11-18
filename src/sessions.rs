@@ -476,7 +476,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     options.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
     let result = (|| {

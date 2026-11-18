@@ -116,6 +116,7 @@ fn is_hidden(name: &str, metadata: &std::fs::Metadata) -> bool {
     }
     #[cfg(not(windows))]
     {
+        let _ = metadata;
         false
     }
 }
