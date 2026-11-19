@@ -49,8 +49,9 @@ impl RuTermApp {
     }
 
     /// 点击主机账号：密码/私钥口令按 内存缓存 → 加密库 → 弹窗 的顺序取得；Agent 直接连接。
-    pub(super) fn click_host(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(host) = self.hosts.get(index).cloned() else {
+    /// 凭 id 定位：列表可能在此前被后台 attach_vault 整表替换，下标会指向别的行。
+    pub(super) fn click_host(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(host) = self.hosts.iter().find(|host| host.id == id).cloned() else {
             return;
         };
         // 桌面主机（RDP / VNC）：开桌面标签直接建连，缺密码时只问密码（不入库）。
@@ -470,9 +471,14 @@ impl RuTermApp {
             cx,
         );
         // 会话结束（远端 exit / 断线 / 连接失败）→ 保留标签并展示断开横幅。
-        let close_view = terminal_view.clone();
+        // 捕获弱引用：订阅 detach 后活到终端实体销毁为止，强引用会把
+        // 旧 TerminalView（连同整份回滚网格）钉在闭包里永不释放。
+        let close_view = terminal_view.downgrade();
         cx.subscribe(&terminal, move |this, _, event: &TerminalEvent, cx| {
             // 只认当前标签的终端：重连后旧终端若迟来 CloseTerminal，不能把新会话标成已断开。
+            let Some(close_view) = close_view.upgrade() else {
+                return;
+            };
             if matches!(event, TerminalEvent::CloseTerminal) && this.tab_is_current(id, &close_view)
             {
                 this.end_session_tab(id, cx);
@@ -777,9 +783,12 @@ impl RuTermApp {
             Duration::from_secs(self.session_prefs.connect_timeout),
             cx,
         );
-        // 远端关闭 / 断线 → 保留标签并展示断开横幅。
-        let close_view = terminal_view.clone();
+        // 远端关闭 / 断线 → 保留标签并展示断开横幅。捕获弱引用，理由同 SSH 侧。
+        let close_view = terminal_view.downgrade();
         cx.subscribe(&terminal, move |this, _, event: &TerminalEvent, cx| {
+            let Some(close_view) = close_view.upgrade() else {
+                return;
+            };
             if matches!(event, TerminalEvent::CloseTerminal) && this.tab_is_current(id, &close_view)
             {
                 this.end_session_tab(id, cx);

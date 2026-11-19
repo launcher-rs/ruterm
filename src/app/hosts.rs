@@ -45,8 +45,10 @@ pub(super) enum MenuTarget {
     Blank,
     /// 某个分组（文件夹）：附带重命名 / 删除。
     Group(SharedString),
-    /// 某台主机行（真实下标）：附带编辑、移动分组、删除。
-    Host(usize),
+    /// 某台主机行（凭据库主键）：附带编辑、移动分组、删除。
+    /// 菜单闭包的生命周期可能横跨一次后台 `attach_vault` 整表替换，
+    /// 裸下标在替换后会指向另一台主机——身份必须用 id，动作时再解析。
+    HostId(i64),
 }
 
 /// 组内手动排序动作（收藏 / 非收藏各自成桶，不互相穿插）。
@@ -609,19 +611,19 @@ impl RuTermApp {
     }
 
     /// 右键菜单"删除"：进入二次确认，不直接动手。
-    pub(super) fn ask_delete(&mut self, index: usize, cx: &mut Context<Self>) {
-        if index < self.hosts.len() {
-            self.confirm_delete = Some(index);
+    pub(super) fn ask_delete(&mut self, id: i64, cx: &mut Context<Self>) {
+        if self.hosts.iter().any(|host| host.id == id) {
+            self.confirm_delete = Some(id);
             cx.notify();
         }
     }
 
     /// 确认删除：走真实删除并持久化（连带清除库内该主机的密码/口令）。
     pub(super) fn confirm_delete_now(&mut self, cx: &mut Context<Self>) {
-        let Some(index) = self.confirm_delete.take() else {
+        let Some(id) = self.confirm_delete.take() else {
             return;
         };
-        self.delete_host(index, cx);
+        self.delete_host(id, cx);
     }
 
     /// 取消删除确认。
@@ -630,40 +632,41 @@ impl RuTermApp {
         cx.notify();
     }
 
-    /// 删除指定主机并持久化。
-    pub(super) fn delete_host(&mut self, index: usize, cx: &mut Context<Self>) {
-        if index < self.hosts.len() {
-            let removed = self.hosts.remove(index);
-            let label = removed.name.clone();
-            self.inline_keys.remove(&removed.id);
-            if let Some(vault) = self.vault.clone() {
-                let id = removed.id;
-                cx.spawn(async move |_, _| {
-                    if let Err(error) = vault.remove(id).await {
-                        log::warn!("凭据库删除失败: {error}");
-                    }
-                })
-                .detach();
-            } else {
-                self.store.save(&self.hosts);
-            }
-            self.sidebar.forget(removed.id);
-            self.persist_sidebar(cx);
-            // 跳板机引用一并断掉：删的是跳板机时，原本经由它的主机改回直连。
-            if self.vault.is_some() {
-                let orphaned = self.jumps.forget(removed.id);
-                for host in &mut self.hosts {
-                    if orphaned.contains(&host.id) {
-                        host.proxy_jump = None;
-                    }
+    /// 删除指定主机并持久化。凭 id 定位：列表可能在确认期间被后台整表替换。
+    pub(super) fn delete_host(&mut self, id: i64, cx: &mut Context<Self>) {
+        let Some(index) = self.hosts.iter().position(|host| host.id == id) else {
+            return;
+        };
+        let removed = self.hosts.remove(index);
+        let label = removed.name.clone();
+        self.inline_keys.remove(&removed.id);
+        if let Some(vault) = self.vault.clone() {
+            let id = removed.id;
+            cx.spawn(async move |_, _| {
+                if let Err(error) = vault.remove(id).await {
+                    log::warn!("凭据库删除失败: {error}");
                 }
-                self.persist_jumps(cx);
-                self.protocols.forget(removed.id);
-                self.persist_protocols(cx);
-            }
-            self.status = SharedString::from(format!("已删除主机 {label}"));
-            cx.notify();
+            })
+            .detach();
+        } else {
+            self.store.save(&self.hosts);
         }
+        self.sidebar.forget(removed.id);
+        self.persist_sidebar(cx);
+        // 跳板机引用一并断掉：删的是跳板机时，原本经由它的主机改回直连。
+        if self.vault.is_some() {
+            let orphaned = self.jumps.forget(removed.id);
+            for host in &mut self.hosts {
+                if orphaned.contains(&host.id) {
+                    host.proxy_jump = None;
+                }
+            }
+            self.persist_jumps(cx);
+            self.protocols.forget(removed.id);
+            self.persist_protocols(cx);
+        }
+        self.status = SharedString::from(format!("已删除主机 {label}"));
+        cx.notify();
     }
 
     /// 折叠 / 展开分组（文件夹）。
@@ -753,26 +756,21 @@ impl RuTermApp {
     /// 把主机移入分组（`None` = 未分组）。
     pub(super) fn move_host(
         &mut self,
-        index: usize,
+        id: i64,
         group: Option<SharedString>,
         cx: &mut Context<Self>,
     ) {
-        let Some(id) = self.hosts.get(index).map(|host| host.id) else {
+        if !self.hosts.iter().any(|host| host.id == id) {
             return;
-        };
+        }
         self.sidebar.assign_to(id, group.as_deref());
         cx.notify();
         self.persist_sidebar(cx);
     }
 
     /// 组内手动排序：收藏 / 非收藏各自成桶（收藏恒在桶上方，菜单只挪同桶邻居）。
-    pub(super) fn reorder_host(
-        &mut self,
-        index: usize,
-        action: ReorderAction,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(host) = self.hosts.get(index) else {
+    pub(super) fn reorder_host(&mut self, id: i64, action: ReorderAction, cx: &mut Context<Self>) {
+        let Some(host) = self.hosts.iter().find(|host| host.id == id) else {
             return;
         };
         let (id, favorite) = (host.id, host.favorite);
@@ -834,8 +832,8 @@ impl RuTermApp {
     }
 
     /// 切换指定主机的收藏状态并持久化。
-    pub(super) fn toggle_favorite(&mut self, index: usize, cx: &mut Context<Self>) {
-        if let Some(host) = self.hosts.get_mut(index) {
+    pub(super) fn toggle_favorite(&mut self, id: i64, cx: &mut Context<Self>) {
+        if let Some(host) = self.hosts.iter_mut().find(|host| host.id == id) {
             host.favorite = !host.favorite;
             let host = host.clone();
             self.persist_host(&host, cx);
@@ -979,6 +977,9 @@ impl RuTermApp {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let host = &self.hosts[index];
+        // 闭包的生命周期可能横跨后台 attach_vault 的整表替换，一律凭 id
+        // 定位，动作时再解析成当前下标。
+        let id = host.id;
         let entity = cx.entity();
         let groups: Vec<SharedString> = self
             .sidebar
@@ -1000,7 +1001,7 @@ impl RuTermApp {
         )
         // 双击才连接：手快点两下不会误开两条会话。
         .on_double_click(cx.listener(move |this, _, window, cx| {
-            this.click_host(index, window, cx);
+            this.click_host(id, window, cx);
         }))
         .child(
             Icon::new(Self::host_icon(host))
@@ -1039,11 +1040,11 @@ impl RuTermApp {
                     MouseButton::Left,
                     cx.listener(|_, _, _, cx| cx.stop_propagation()),
                 )
-                .on_click(cx.listener(move |this, _, _, cx| this.toggle_favorite(index, cx))),
+                .on_click(cx.listener(move |this, _, _, cx| this.toggle_favorite(id, cx))),
         )
         .context_menu(move |menu, _, _| {
             Self::context_menu(
-                MenuTarget::Host(index),
+                MenuTarget::HostId(id),
                 groups.clone(),
                 current.clone(),
                 sort,
@@ -1415,6 +1416,7 @@ impl RuTermApp {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let host = &self.hosts[index];
+        let id = host.id;
         let title = if host.name.is_empty() {
             host.addr()
         } else {
@@ -1426,7 +1428,7 @@ impl RuTermApp {
             px(8.0),
         )
         .on_double_click(cx.listener(move |this, _, window, cx| {
-            this.click_host(index, window, cx);
+            this.click_host(id, window, cx);
         }))
         .child(
             Icon::new(Self::host_icon(host))

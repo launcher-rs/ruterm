@@ -75,20 +75,20 @@ impl RuTermApp {
     ) -> PopupMenu {
         let menu = menu.min_w(px(168.0));
         // 主机行右键「远程桌面…」：用该行地址预填；空白 / 分组处则打开空表单。
-        let host_index = match &target {
-            MenuTarget::Host(index) => Some(*index),
+        let host_id = match &target {
+            MenuTarget::HostId(id) => Some(*id),
             _ => None,
         };
         // 「新建主机…」落在右键目标所在的分组：分组上直接进该组，
         // 主机上沿用该主机的组，空白处则是未分组。
         let target_group = match &target {
             MenuTarget::Group(name) if name.as_str() != UNGROUPED => Some(name.clone()),
-            MenuTarget::Host(_) => current_group.clone(),
+            MenuTarget::HostId(_) => current_group.clone(),
             _ => None,
         };
         let menu = match &target {
-            MenuTarget::Host(index) => {
-                let index = *index;
+            MenuTarget::HostId(id) => {
+                let id = *id;
                 menu.item(Self::menu_item(
                     entity.clone(),
                     "编辑",
@@ -96,7 +96,7 @@ impl RuTermApp {
                     false,
                     false,
                     move |this, window, cx| {
-                        this.open_form_at(Some(index), None, window, cx);
+                        this.open_form_at(Some(id), None, window, cx);
                     },
                 ))
                 .separator()
@@ -108,7 +108,7 @@ impl RuTermApp {
                         None,
                         false,
                         false,
-                        move |this, _, cx| this.reorder_host(index, ReorderAction::Up, cx),
+                        move |this, _, cx| this.reorder_host(id, ReorderAction::Up, cx),
                     )
                     .disabled(sort != SidebarSort::Manual),
                 )
@@ -119,7 +119,7 @@ impl RuTermApp {
                         None,
                         false,
                         false,
-                        move |this, _, cx| this.reorder_host(index, ReorderAction::Down, cx),
+                        move |this, _, cx| this.reorder_host(id, ReorderAction::Down, cx),
                     )
                     .disabled(sort != SidebarSort::Manual),
                 )
@@ -130,7 +130,7 @@ impl RuTermApp {
                         None,
                         false,
                         false,
-                        move |this, _, cx| this.reorder_host(index, ReorderAction::Top, cx),
+                        move |this, _, cx| this.reorder_host(id, ReorderAction::Top, cx),
                     )
                     .disabled(sort != SidebarSort::Manual),
                 )
@@ -142,7 +142,12 @@ impl RuTermApp {
                     false,
                     false,
                     move |this, _, cx| {
-                        let Some(host) = this.hosts.get(index).map(|host| host.host.clone()) else {
+                        let Some(host) = this
+                            .hosts
+                            .iter()
+                            .find(|host| host.id == id)
+                            .map(|host| host.host.clone())
+                        else {
                             return;
                         };
                         this.open_network_tool(&host, NetTool::Ping, cx);
@@ -155,7 +160,12 @@ impl RuTermApp {
                     false,
                     false,
                     move |this, _, cx| {
-                        let Some(host) = this.hosts.get(index).map(|host| host.host.clone()) else {
+                        let Some(host) = this
+                            .hosts
+                            .iter()
+                            .find(|host| host.id == id)
+                            .map(|host| host.host.clone())
+                        else {
                             return;
                         };
                         this.open_network_tool(&host, NetTool::TraceRoute, cx);
@@ -182,9 +192,10 @@ impl RuTermApp {
                 Some(IconName::Frame),
                 false,
                 false,
-                move |this, window, cx| match host_index {
-                    Some(index) => {
-                        let Some(host) = this.hosts.get(index).cloned() else {
+                move |this, window, cx| match host_id {
+                    Some(id) => {
+                        let Some(host) = this.hosts.iter().find(|host| host.id == id).cloned()
+                        else {
                             return;
                         };
                         if host.protocol.is_desktop() {
@@ -251,8 +262,8 @@ impl RuTermApp {
             _ => menu,
         };
         let menu = match &target {
-            MenuTarget::Host(index) => {
-                let index = *index;
+            MenuTarget::HostId(id) => {
+                let id = *id;
                 let current = current_group.clone();
                 let mut menu = menu.separator().label("移动到分组").item(Self::menu_item(
                     entity.clone(),
@@ -261,7 +272,7 @@ impl RuTermApp {
                     false,
                     current.is_none(),
                     move |this, _, cx| {
-                        this.move_host(index, None, cx);
+                        this.move_host(id, None, cx);
                     },
                 ));
                 for name in groups {
@@ -274,7 +285,7 @@ impl RuTermApp {
                         false,
                         checked,
                         move |this, _, cx| {
-                            this.move_host(index, Some(group.clone()), cx);
+                            this.move_host(id, Some(group.clone()), cx);
                         },
                     ));
                 }
@@ -324,14 +335,14 @@ impl RuTermApp {
             _ => menu,
         };
         match target {
-            MenuTarget::Host(index) => menu.separator().item(Self::menu_item(
+            MenuTarget::HostId(id) => menu.separator().item(Self::menu_item(
                 entity,
                 "删除",
                 Some(IconName::Delete),
                 true,
                 false,
                 move |this, _, cx| {
-                    this.ask_delete(index, cx);
+                    this.ask_delete(id, cx);
                 },
             )),
             _ => menu,

@@ -39,8 +39,9 @@ pub(super) struct NewHostForm {
     pub(super) group: Option<SharedString>,
     /// 跳板机（另一台已保存主机的 id）；None＝直连。
     pub(super) jump: Option<i64>,
-    /// Some(index)＝编辑既有主机（保存时按该下标原位替换）。
-    pub(super) editing: Option<usize>,
+    /// Some(id)＝编辑既有主机（保存时按该 id 原位替换）。
+    /// 用 id 而非下标：表单开着时列表可能被后台整表替换，下标会指向别的行。
+    pub(super) editing: Option<i64>,
 }
 
 impl RuTermApp {
@@ -59,16 +60,16 @@ impl RuTermApp {
         self.open_form_at(None, group, window, cx);
     }
 
-    /// 打开新建 / 编辑表单；edit_index 为 Some 时以该主机字段预填。
+    /// 打开新建 / 编辑表单；edit_id 为 Some 时以该主机字段预填。
     /// `group` 是新建主机的预选分组（编辑时为 None，按原归属预填）。
     pub(super) fn open_form_at(
         &mut self,
-        edit_index: Option<usize>,
+        edit_id: Option<i64>,
         group: Option<SharedString>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_form_with(edit_index, None, group, window, cx);
+        self.open_form_with(edit_id, None, group, window, cx);
     }
 
     /// 从局域网发现新建主机：协议 / 地址 / 端口预填，认证方式留给表单里的用户。
@@ -85,13 +86,13 @@ impl RuTermApp {
 
     fn open_form_with(
         &mut self,
-        edit_index: Option<usize>,
+        edit_id: Option<i64>,
         seed: Option<(ProtocolKind, String, u16)>,
         group: Option<SharedString>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let existing = edit_index.and_then(|index| self.hosts.get(index).cloned());
+        let existing = edit_id.and_then(|id| self.hosts.iter().find(|host| host.id == id).cloned());
         let editing = existing.is_some();
         let protocol = existing
             .as_ref()
@@ -102,7 +103,7 @@ impl RuTermApp {
             .as_ref()
             .map(|host| host.auth)
             .unwrap_or(AuthMethod::Agent);
-        let edit_index = if editing { edit_index } else { None };
+        let edit_id = if editing { edit_id } else { None };
         // 新建用调用方给的分组；编辑回填主机当前归属（可在表单里改）。
         let group = match existing.as_ref() {
             Some(host) => self
@@ -172,7 +173,7 @@ impl RuTermApp {
             auth,
             group,
             jump: existing.as_ref().and_then(|host| host.proxy_jump),
-            editing: edit_index,
+            editing: edit_id,
         };
         self.new_host = Some(form);
         // 表单打开即把焦点交给"主机地址"输入框：退格/删除等键位动作只在输入框
@@ -249,7 +250,7 @@ impl RuTermApp {
                 return;
             }
             let existing = editing
-                .and_then(|index| self.hosts.get(index))
+                .and_then(|id| self.hosts.iter().find(|host| host.id == id))
                 .is_some_and(|current| current.key_inline);
             if key_data.is_none() && !existing {
                 self.status = "请先导入私钥文件（选择「内嵌到加密库」后点「导入私钥…」）".into();
@@ -266,7 +267,7 @@ impl RuTermApp {
         // 跳板机引用必须是仍存在的另一台主机，且不能自己挂自己或形成两级以上链。
         if let Some(jump_id) = host.proxy_jump {
             let self_id = editing
-                .and_then(|index| self.hosts.get(index))
+                .and_then(|id| self.hosts.iter().find(|host| host.id == id))
                 .map(|host| host.id);
             match self.hosts.iter().find(|item| item.id == jump_id) {
                 None => {
@@ -296,9 +297,11 @@ impl RuTermApp {
             .as_deref()
             .map(|name| format!("（分组：{name}）"))
             .unwrap_or_default();
-        if let Some(index) = editing {
+        if let Some(edit_id) = editing {
             // 原位替换：id 与收藏标记沿用原主机；已保存的密码/口令不受影响。
-            if let Some(current) = self.hosts.get(index).cloned() {
+            // 凭 id 定位——列表可能在表单打开期间被后台整表替换。
+            if let Some(index) = self.hosts.iter().position(|item| item.id == edit_id) {
+                let current = self.hosts[index].clone();
                 host.id = current.id;
                 host.favorite = current.favorite;
                 let was_inline = current.key_inline;
@@ -762,7 +765,9 @@ impl RuTermApp {
                                             // 避免自环与多级链）。降级模式没有稳定的主机 id，只给「直连」。
                                             let self_id = form
                                                 .editing
-                                                .and_then(|index| self.hosts.get(index))
+                                                .and_then(|id| {
+                                                    self.hosts.iter().find(|host| host.id == id)
+                                                })
                                                 .map(|host| host.id);
                                             let mut options: Vec<SharedString> =
                                                 vec![SharedString::from("直连（无跳板机）")];

@@ -150,8 +150,18 @@ impl RuTermApp {
         cx.notify();
     }
 
-    /// 删除一条历史；下标越界或库未变化时什么也不做。
-    pub(super) fn delete_history_entry(&mut self, index: usize, cx: &mut Context<Self>) {
+    /// 删除一条历史。凭命令串定位而非下标：历史列表会被 250ms 轮询不断
+    /// `insert(0, …)` 移位，渲染时捕获的下标在点击时可能指向另一条命令。
+    /// 条目在 `push` 里去重，命令串即身份。
+    pub(super) fn delete_history_entry(&mut self, command: &str, cx: &mut Context<Self>) {
+        let Some(index) = self
+            .history
+            .entries()
+            .iter()
+            .position(|entry| entry == command)
+        else {
+            return;
+        };
         if self.history.remove(index) {
             self.history_clear_confirm = false;
             self.persist_history(cx);
@@ -193,16 +203,23 @@ impl RuTermApp {
     }
 
     /// 插入 / 执行历史命令到当前活动会话，返回是否真的送出。
+    /// 凭命令串取当前条目：条目仍存在时用库内最新内容，已被删除则不动。
     pub(super) fn send_history_command(
         &mut self,
-        index: usize,
+        command: &str,
         run: bool,
         cx: &mut Context<Self>,
     ) -> bool {
-        let Some(command) = self.history.entries().get(index).cloned() else {
+        let Some(current) = self
+            .history
+            .entries()
+            .iter()
+            .find(|entry| entry.as_str() == command)
+            .cloned()
+        else {
             return false;
         };
-        if !self.send_command_to_terminal(&command, run, cx) {
+        if !self.send_command_to_terminal(&current, run, cx) {
             return false;
         }
         let key = if run {
@@ -218,12 +235,12 @@ impl RuTermApp {
     /// 面板里点一行 / 点 ▶：送出后把焦点交回终端，接着敲键盘就落在会话里。
     pub(super) fn use_history_entry(
         &mut self,
-        index: usize,
+        command: &str,
         run: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.send_history_command(index, run, cx) {
+        if !self.send_history_command(command, run, cx) {
             return;
         }
         if let Some(view) = self.active_terminal_view() {
@@ -234,11 +251,17 @@ impl RuTermApp {
     /// 把历史命令复制进片段编辑器：名称默认取命令开头，备注标注来源。
     pub(super) fn save_history_as_snippet(
         &mut self,
-        index: usize,
+        command: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(command) = self.history.entries().get(index).cloned() else {
+        let Some(command) = self
+            .history
+            .entries()
+            .iter()
+            .find(|entry| entry.as_str() == command)
+            .cloned()
+        else {
             return;
         };
         // 历史弹窗先收起，避免盖住右侧片段面板的内联编辑器。

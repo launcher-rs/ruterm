@@ -100,14 +100,13 @@ impl RuTermApp {
         let history_panel_open = self.history_panel_open;
         let snippets_panel_open = self.snippets_panel_open;
         // 菜单打开时把最近连接的 id 解析成当前列表里的条目（主机可能已删除或重排）。
-        let recent_items: Vec<(usize, SharedString)> = self
+        let recent_items: Vec<(i64, SharedString)> = self
             .recent_hosts
             .iter()
             .filter_map(|id| {
-                let index = self.hosts.iter().position(|host| host.id == *id)?;
-                let host = &self.hosts[index];
+                let host = self.hosts.iter().find(|host| host.id == *id)?;
                 Some((
-                    index,
+                    *id,
                     tr!(
                         cx,
                         "{name}（{addr}）",
@@ -157,11 +156,11 @@ impl RuTermApp {
                     sub_items
                         .clone()
                         .into_iter()
-                        .fold(menu, |menu, (index, label)| {
+                        .fold(menu, |menu, (id, label)| {
                             let entity = entity.clone();
                             menu.item(PopupMenuItem::new(label).on_click(move |_, window, cx| {
                                 entity.update(cx, |this, cx| {
-                                    this.click_host(index, window, cx);
+                                    this.click_host(id, window, cx);
                                 });
                             }))
                         })

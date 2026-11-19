@@ -166,6 +166,12 @@ impl RuTermApp {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let menu_entity = cx.entity();
+        // 闭包捕获命令串而非下标：历史列表会被轮询不断 insert(0, …) 移位，
+        // 点击时下标可能指向另一条命令（误执行 / 误删）。条目去重，命令串即身份。
+        let command = command.to_string();
+        let click_command = command.clone();
+        let menu_command = command.clone();
+        let run_command = command.clone();
         h_flex()
             .id(("history-panel-row", index))
             .w_full()
@@ -178,13 +184,17 @@ impl RuTermApp {
             .hover(|style| style.bg(pal.card_hover))
             .cursor_pointer()
             .on_click(cx.listener(move |this, _, window, cx| {
-                this.use_history_entry(index, false, window, cx);
+                this.use_history_entry(&click_command, false, window, cx);
             }))
             .context_menu(move |menu, _, cx| {
                 let insert = menu_entity.clone();
                 let run = menu_entity.clone();
                 let save = menu_entity.clone();
                 let delete = menu_entity.clone();
+                let insert_command = menu_command.clone();
+                let run_command = menu_command.clone();
+                let save_command = menu_command.clone();
+                let delete_command = menu_command.clone();
                 menu.min_w(px(168.0))
                     .item(Self::menu_item(
                         insert,
@@ -193,7 +203,7 @@ impl RuTermApp {
                         false,
                         false,
                         move |this, window, cx| {
-                            this.use_history_entry(index, false, window, cx);
+                            this.use_history_entry(&insert_command, false, window, cx);
                         },
                     ))
                     .item(
@@ -204,7 +214,7 @@ impl RuTermApp {
                             false,
                             false,
                             move |this, window, cx| {
-                                this.use_history_entry(index, true, window, cx);
+                                this.use_history_entry(&run_command, true, window, cx);
                             },
                         )
                         .disabled(!can_send),
@@ -217,7 +227,7 @@ impl RuTermApp {
                         false,
                         false,
                         move |this, window, cx| {
-                            this.save_history_as_snippet(index, window, cx);
+                            this.save_history_as_snippet(&save_command, window, cx);
                         },
                     ))
                     .item(Self::menu_item(
@@ -227,7 +237,7 @@ impl RuTermApp {
                         true,
                         false,
                         move |this, _, cx| {
-                            this.delete_history_entry(index, cx);
+                            this.delete_history_entry(&delete_command, cx);
                         },
                     ))
             })
@@ -238,7 +248,7 @@ impl RuTermApp {
                     .text_sm()
                     .text_color(pal.text)
                     .text_ellipsis()
-                    .child(SharedString::from(command.to_string())),
+                    .child(SharedString::from(command)),
             )
             .when(can_send, |row| {
                 row.child(
@@ -256,7 +266,7 @@ impl RuTermApp {
                             }),
                         )
                         .on_click(cx.listener(move |this, _, window, cx| {
-                            this.use_history_entry(index, true, window, cx);
+                            this.use_history_entry(&run_command, true, window, cx);
                         })),
                 )
             })
@@ -404,6 +414,12 @@ impl RuTermApp {
                 continue;
             }
             shown += 1;
+            // 闭包捕获命令串（列表会被轮询移位，下标可能指向别的命令）。
+            let command = command.clone();
+            let insert_command = command.clone();
+            let run_command = command.clone();
+            let save_command = command.clone();
+            let delete_command = command.clone();
             list = list.child(
                 h_flex()
                     .id(("history-row", index))
@@ -430,7 +446,7 @@ impl RuTermApp {
                             .disabled(!can_send)
                             .tooltip(tr!(cx, "插入到当前会话（不追加回车）"))
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.send_history_command(index, false, cx);
+                                this.send_history_command(&insert_command, false, cx);
                             })),
                     )
                     .child(
@@ -441,7 +457,7 @@ impl RuTermApp {
                             .disabled(!can_send)
                             .tooltip(tr!(cx, "发送到当前会话并回车"))
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.send_history_command(index, true, cx);
+                                this.send_history_command(&run_command, true, cx);
                             })),
                     )
                     .child(
@@ -450,7 +466,7 @@ impl RuTermApp {
                             .ghost()
                             .compact()
                             .on_click(cx.listener(move |this, _, window, cx| {
-                                this.save_history_as_snippet(index, window, cx);
+                                this.save_history_as_snippet(&save_command, window, cx);
                             })),
                     )
                     .child(
@@ -459,7 +475,7 @@ impl RuTermApp {
                             .ghost()
                             .compact()
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.delete_history_entry(index, cx);
+                                this.delete_history_entry(&delete_command, cx);
                             })),
                     ),
             );

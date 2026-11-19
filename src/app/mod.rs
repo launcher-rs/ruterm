@@ -154,8 +154,9 @@ pub(crate) struct RuTermApp {
     protocols: ProtocolPrefs,
     /// 分组新建 / 重命名弹窗（`renaming` 为 None 表示新建）。
     group_prompt: Option<GroupPrompt>,
-    /// 删除二次确认（真实下标；浮层遮挡期间列表不会变）。
-    confirm_delete: Option<usize>,
+    /// 删除二次确认（主机 id；浮层遮挡期间 attach_vault 仍可能整表替换列表，
+    /// 下标会指向别的行，身份必须用 id）。
+    confirm_delete: Option<i64>,
     /// 主密码解锁弹窗（便携模式 / 已设置主密码时启动弹出）。
     unlock: Option<UnlockState>,
     /// 设置弹窗（主密码管理、主题、锁定）。
@@ -251,6 +252,9 @@ pub(crate) struct RuTermApp {
     typed_line: Option<String>,
     /// 终端内命令补全浮层（只对正在输入的那个标签生效）。
     completion: Option<CompletionState>,
+    /// 补全候选列表缓存（键：语言 / 会话平台 / 片段指纹）——每次按键都会取候选，
+    /// 不能每次都重建 200+ 条。
+    completion_cache: Option<(CompletionCacheKey, Vec<crate::completion::CompletionItem>)>,
     /// 侧边栏 ↔ 主区 的分隔面板状态（拖拽调整宽度 + 折叠/展开）。
     split_state: Entity<SplitPaneState>,
     /// 主区分屏（两个标签并排）；None＝单屏显示活动标签。
@@ -504,6 +508,7 @@ impl RuTermApp {
             history_clear_confirm: false,
             typed_line: Some(String::new()),
             completion: None,
+            completion_cache: None,
             split_state,
             view_split: None,
             focus_handle: cx.focus_handle(),
@@ -1043,10 +1048,11 @@ impl RuTermApp {
             return self.render_file_upload_prompt(cx);
         }
         // 删除二次确认：半透明遮罩 + 居中卡片，点遮罩或"取消"关闭。
-        if let Some(index) = self.confirm_delete {
+        if let Some(id) = self.confirm_delete {
             let label = self
                 .hosts
-                .get(index)
+                .iter()
+                .find(|host| host.id == id)
                 .map(|host| {
                     if host.name.is_empty() {
                         host.addr()
