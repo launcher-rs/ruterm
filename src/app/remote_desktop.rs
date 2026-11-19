@@ -41,6 +41,11 @@ pub(super) enum DesktopPhase {
     },
 }
 
+/// 换下来的旧帧最多在 `drop_queue` 里压几张：不渲染（最小化 / 被完全遮挡）
+/// 时队列只进不出，1080p 一张约 8MB，不设上限会随帧数积到 GB 级。
+/// 超限的最老帧就地释放（见 `apply_desktop_frame`）。
+const DESKTOP_DROP_QUEUE_CAP: usize = 4;
+
 /// 打开桌面表单时预填的参数（来自已保存主机或局域网发现）。
 pub(super) struct DesktopPrefill {
     pub(super) protocol: Protocol,
@@ -93,8 +98,7 @@ pub(super) struct DesktopTab {
     pub(super) focus: FocusHandle,
     /// 当前帧（BGRA）。换帧时旧图进 `drop_queue`，在下一次 render 里交给窗口释放。
     pub(super) image: Option<Arc<RenderImage>>,
-    pub(super) drop_queue: Vec<Arc<RenderImage>>,
-    /// 画面实际绘制区域（窗口坐标），由画布 prepaint 回填，指针坐标据此反算远端像素。
+    pub(super) drop_queue: Vec<Arc<RenderImage>>,    /// 画面实际绘制区域（窗口坐标），由画布 prepaint 回填，指针坐标据此反算远端像素。
     pub(super) draw_rect: Rc<Cell<Option<Bounds<Pixels>>>>,
     /// 画面可用区域（整块画布，窗口坐标），「匹配窗口」据此算目标分辨率。
     pub(super) screen_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
@@ -1101,6 +1105,14 @@ impl RuTermApp {
         }
         if let Some(old) = desktop.image.replace(image) {
             desktop.drop_queue.push(old);
+            // 界面长时间不渲染（最小化 / 完全遮挡）时队列只进不出，设上限就地
+            // 释放最老的帧。本回调跑在 App 上下文、不在任何窗口的更新周期里，
+            // `drop_image(.., None)` 能清到所有窗口的精灵图集；对从未绘制过的
+            // 帧是无害 no-op（图集里本来就没有它）。
+            while desktop.drop_queue.len() > DESKTOP_DROP_QUEUE_CAP {
+                let oldest = desktop.drop_queue.remove(0);
+                cx.drop_image(oldest, None);
+            }
         }
         desktop.size = size;
         cx.notify();

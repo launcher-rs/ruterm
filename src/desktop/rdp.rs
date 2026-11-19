@@ -156,7 +156,14 @@ fn run_session(
                     return;
                 }
                 event = output_rx.recv() => {
-                    let Some(event) = event else { return };
+                    let Some(event) = event else {
+                        // 客户端任务退出却没走 Terminated（如内部 panic）：输出
+                        // 通道直接关闭。不补发 Closed，UI 会永远停在 Live 假在线。
+                        let _ = event_tx.send(Event::Closed {
+                            reason: "RDP 客户端输出已中断".to_string(),
+                        });
+                        return;
+                    };
                     match handle_output(event, event_tx, &mut frame, &mut announced, &name, &mut frames) {
                         Output::Ended => return,
                         Output::Dirty => {
@@ -172,8 +179,12 @@ fn run_session(
                 }
                 command = command_rx.recv() => {
                     let Some(command) = command else {
-                        // 界面丢弃了指令通道（标签已关）：直接断开。
+                        // 界面丢弃了指令通道（标签已关）：直接断开。事件接收端
+                        // 多半也已关闭，补发是无害的 no-op，但保险起见路径完整。
                         let _ = input.send(RdpInputEvent::Close);
+                        let _ = event_tx.send(Event::Closed {
+                            reason: "RDP 会话已随标签关闭".to_string(),
+                        });
                         return;
                     };
                     match command {
@@ -226,6 +237,11 @@ fn run_session(
                         std::future::pending::<()>().await;
                     }
                 }, if close_at.is_some() => {
+                    // 服务器没在限时内完成优雅收尾：直接丢连接，但必须让 UI
+                    // 知道会话已经结束，否则状态栏永远停在「正在断开远程桌面…」。
+                    let _ = event_tx.send(Event::Closed {
+                        reason: "RDP 连接关闭超时，已强制断开".to_string(),
+                    });
                     return;
                 }
                 // 上传中的文件：远端确认文件列表后替用户按 Ctrl+V，同时回报进度。

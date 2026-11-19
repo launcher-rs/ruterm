@@ -250,7 +250,8 @@ where
     let writer_task = tokio::spawn(async move {
         let mut input = VncInput::default();
         while let Some(command) = writer_rx.recv().await {
-            let (width, height) = *writer_size.lock().unwrap();
+            let (width, height) =
+                *writer_size.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             let bytes = match command {
                 Command::Pointer { x, y, buttons } => {
                     input.pointer(x, y, buttons);
@@ -309,7 +310,6 @@ where
         };
         let mut frames = 0u32;
         let mut stats_at = Instant::now();
-        let mut last_frame = Instant::now();
         let reason = loop {
             let message = match tokio::time::timeout(
                 vnc::READ_TIMEOUT,
@@ -323,27 +323,51 @@ where
             };
             match message {
                 vnc::Message::Update { resized } => {
-                    frames += 1;
                     if resized {
-                        *reader_size.lock().unwrap() = (state.fb.width, state.fb.height);
+                        // 槽位数据本身没有可破坏的不变量：中毒就照用，
+                        // 别让协议任务因 UI 侧一次 panic 而静默挂死。
+                        *reader_size
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                            (state.fb.width, state.fb.height);
                     }
+                    // 节流锚点按「收到更新」计：上一帧还没被取走（界面忙）时
+                    // 也照常走下面的睡眠，否则会立即再要下一帧，解码线程空烧
+                    // CPU、弱网输入流被移动事件排队在后。
+                    let received_at = Instant::now();
                     // 界面还没取走上一帧就跳过这次拷贝：画面只会追新，不排队。
+                    // 8MB 整帧拷贝放锁外完成：界面取快照只拿一下锁，不被搬运
+                    // 挡住（与 rdp.rs 的 publish_frame 同一模式）。
                     let publish = {
-                        let mut slot = reader_latest.lock().unwrap();
-                        if slot.is_none() {
-                            *slot = Some(Snapshot {
-                                width: state.fb.width,
-                                height: state.fb.height,
-                                bgra: state.fb.bgra.clone(),
-                            });
+                        let slot_free = reader_latest
+                            .lock()
+                            .map_or_else(
+                                |poisoned| poisoned.into_inner().is_none(),
+                                |slot| slot.is_none(),
+                            );
+                        if slot_free {
+                            let bgra = state.fb.bgra.clone();
+                            let mut slot = reader_latest
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            // 槽位只有本任务写；拷贝期间界面只会把它取空，照旧确认。
+                            if slot.is_none() {
+                                *slot = Some(Snapshot {
+                                    width: state.fb.width,
+                                    height: state.fb.height,
+                                    bgra,
+                                });
+                            }
                             true
                         } else {
                             false
                         }
                     };
+                    // fps 只统计真正发布出去的帧：界面没取走的更新不算数，
+                    // 状态栏的数字才是「实际显示帧率」。
                     if publish {
+                        frames += 1;
                         let _ = reader_event.send(Event::FrameReady);
-                        last_frame = Instant::now();
                     }
                     if stats_at.elapsed() >= STATS_INTERVAL {
                         let fps = frames as f32 / stats_at.elapsed().as_secs_f32();
@@ -352,7 +376,7 @@ where
                         stats_at = Instant::now();
                     }
                     // 间隔不够就等一会儿再要下一帧：服务器才不会把 CPU 烧在回帧上。
-                    let elapsed = last_frame.elapsed();
+                    let elapsed = received_at.elapsed();
                     if elapsed < FRAME_INTERVAL {
                         tokio::time::sleep(FRAME_INTERVAL - elapsed).await;
                     }
