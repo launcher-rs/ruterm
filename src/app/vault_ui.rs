@@ -191,10 +191,7 @@ impl RuTermApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.vault.is_some()
-            && crate::vault::read_unlock_marker(&self.mode)
-                == crate::vault::UnlockBackend::Passphrase
-        {
+        if self.vault.is_some() && self.passphrase_backend {
             self.lock_vault(window, cx);
         }
     }
@@ -577,7 +574,10 @@ impl RuTermApp {
                     "已取消主密码，改用本机凭据管理器免密解锁（库文件因此绑定本机）"
                 }
             };
-            let _ = this.update(cx, |this, cx| match result {
+            let _ = this.update(cx, |this, cx| {
+                // 换钥流程刚写过（或已回滚）unlock.txt：无论成败都从盘上刷新缓存。
+                this.refresh_unlock_backend();
+                match result {
                 Ok((vault, hosts, hexkey, kept_backup)) => {
                     this.vault_maintenance = false;
                     this.vault = Some(Arc::new(vault));
@@ -611,6 +611,7 @@ impl RuTermApp {
                     this.restore_vault(cx);
                     cx.notify();
                 }
+                }
             });
         })
         .detach();
@@ -622,7 +623,8 @@ impl RuTermApp {
         if self.vault.is_some() {
             return;
         }
-        if crate::vault::read_unlock_marker(&self.mode) == crate::vault::UnlockBackend::Passphrase {
+        // 调用点（换钥失败）刚刷新过缓存，这里直接读内存。
+        if self.passphrase_backend {
             self.status = "凭据库未就绪，点击侧边栏 🔑 重新解锁".into();
             return;
         }

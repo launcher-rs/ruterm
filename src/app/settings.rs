@@ -83,8 +83,7 @@ impl RuTermApp {
             }
             return;
         }
-        let passphrase_mode =
-            crate::vault::read_unlock_marker(&self.mode) == crate::vault::UnlockBackend::Passphrase;
+        let passphrase_mode = self.passphrase_backend;
         // 已是口令档且处于解锁状态：换密钥必须先证明知道当前主密码。
         let needs_current = passphrase_mode && self.vault.is_some();
         let current = needs_current
@@ -143,8 +142,7 @@ impl RuTermApp {
         {
             return;
         }
-        let passphrase_mode =
-            crate::vault::read_unlock_marker(&self.mode) == crate::vault::UnlockBackend::Passphrase;
+        let passphrase_mode = self.passphrase_backend;
         let current = passphrase_mode
             .then(|| cx.new(|cx| InputState::new(window, cx).placeholder(tr!(cx, "当前主密码"))));
         let password = cx.new(|cx| {
@@ -200,8 +198,7 @@ impl RuTermApp {
         let Some(state) = self.settings.as_ref() else {
             return div().into_any_element();
         };
-        let passphrase_mode =
-            crate::vault::read_unlock_marker(&self.mode) == crate::vault::UnlockBackend::Passphrase;
+        let passphrase_mode = self.passphrase_backend;
         let unlocked = self.vault.is_some();
         let dark = cx.theme().is_dark();
         let body = match state.tab {

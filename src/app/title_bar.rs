@@ -165,8 +165,8 @@ impl RuTermApp {
         let dark = cx.theme().is_dark();
         let maximized = window.is_maximized();
         // 只有口令档（已设置主密码）才有"锁定/解锁"概念，keyring 档免密无锁可上。
-        let passphrase_mode =
-            crate::vault::read_unlock_marker(&self.mode) == crate::vault::UnlockBackend::Passphrase;
+        // 读内存缓存而非 unlock.txt：这是每帧执行的渲染路径，不做磁盘 IO。
+        let passphrase_mode = self.passphrase_backend;
         let locked = passphrase_mode && self.vault.is_none();
         let vault_state = if !passphrase_mode {
             tr!(cx, "免主密码（系统密钥环）")

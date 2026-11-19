@@ -89,6 +89,10 @@ pub(crate) struct RuTermApp {
     pending_quick: Option<SshTarget>,
     vault_opening: bool,
     vault_maintenance: bool,
+    /// 解锁标记（unlock.txt）的内存缓存：当前是否为口令档。只在启动恢复、
+    /// 开库、换钥这些低频事件后从盘上刷新；title_bar 与 settings 的渲染路径
+    /// 只读这里，避免每帧一次磁盘 IO。
+    passphrase_backend: bool,
     /// 本次解锁所用的库主密钥（十六进制）。只存活在内存，绝不入库、入日志、入命令行；
     /// 换主密码前用它校验"当前主密码"，锁定/退出即丢弃。
     unlocked_key: Option<String>,
@@ -419,6 +423,10 @@ impl RuTermApp {
         // 中间件跑在终端内部（按键路径上），投递到 tokio 通道后由 UI 侧分发：
         // 终端实体之间不能互相直接写，否则借用与通知顺序会互相踩。
         let (mirror_tx, mut mirror_rx) = tokio::sync::mpsc::unbounded_channel();
+        // 开库前的一次真读：boot_vault 里 recover_rekey 之后还会再刷新，
+        // 这里先保证首帧渲染（标题栏）就有正确的口令档判定。
+        let passphrase_backend =
+            crate::vault::read_unlock_marker(&mode) == crate::vault::UnlockBackend::Passphrase;
         let mut app = Self {
             store,
             mode,
@@ -427,6 +435,7 @@ impl RuTermApp {
             pending_quick: quick,
             vault_opening: false,
             vault_maintenance: false,
+            passphrase_backend,
             hosts,
             recent_hosts: Vec::new(),
             search,
@@ -608,6 +617,13 @@ impl RuTermApp {
         cx.notify();
     }
 
+    /// 从盘上刷新解锁标记缓存。只在开库、换钥、崩溃恢复这些低频事件后调用；
+    /// 渲染路径（title_bar / settings）一律读 [`Self::passphrase_backend`]。
+    fn refresh_unlock_backend(&mut self) {
+        self.passphrase_backend =
+            crate::vault::read_unlock_marker(&self.mode) == crate::vault::UnlockBackend::Passphrase;
+    }
+
     /// 异步打开加密凭据库：成功则接管主机列表（含一次性迁移旧库/JSON 并改名保留），
     /// 失败则降级回旧 JSON 存储并提示（降级模式下密码只留在内存）。
     ///
@@ -623,14 +639,16 @@ impl RuTermApp {
             cx.notify();
             return;
         }
+        // recover_rekey 可能在崩溃恢复里补写 unlock.txt：这里读到的就是恢复后
+        // 的真值，顺手刷新进内存缓存（每帧渲染不再读盘）。
+        self.refresh_unlock_backend();
         let generation = self.auth_gate.generation();
         let json_hosts = self.hosts.clone();
         // 凭据库（toasty/turso）必须跑在 tokio 运行时上，句柄在此处取出后交给任务。
         let runtime = rgpui::tokio::Tokio::handle(cx);
         // 只有口令档才弹解锁框：便携模式不再强制设密码，默认可免密使用，
         // 是否配置主密码交由设置界面决定。
-        let passphrase_needed =
-            crate::vault::read_unlock_marker(&mode) == crate::vault::UnlockBackend::Passphrase;
+        let passphrase_needed = self.passphrase_backend;
         if passphrase_needed {
             self.open_unlock_dialog(window, cx);
         } else if mode.is_portable() {
@@ -687,9 +705,7 @@ impl RuTermApp {
                         if this.auth_gate.generation() != generation {
                             return;
                         }
-                        if crate::vault::read_unlock_marker(&this.mode)
-                            == crate::vault::UnlockBackend::Passphrase
-                        {
+                        if this.passphrase_backend {
                             // 口令档打不开：交回解锁弹窗处理，不降级 JSON。
                             cx.notify();
                         } else {
@@ -717,6 +733,8 @@ impl RuTermApp {
         key: Option<String>,
         cx: &mut Context<Self>,
     ) {
+        // 开库前可能写过 unlock.txt（首次设主密码）：刷新缓存供渲染路径使用。
+        self.refresh_unlock_backend();
         let vault = Arc::new(vault);
         let generation = self.auth_gate.generation();
         self.unlock = None;
