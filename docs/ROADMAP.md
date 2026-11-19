@@ -135,6 +135,22 @@
   底部项目数均按截图核对；本机 → 远端上传已确认落到远端目录。
   待复核：「下载到本机面板」的落盘确认在联调时会话中途掉线（面板变成「没有活动会话」）没跑完，
   下次联调补一次干净会话下的下载截图。
+- [x] **文件面板跟随终端目录 + 下载记忆落点** — `M` — 已完成（SSH 实机待复核）
+  起因：「定位到终端当前目录」与「跟随」点了没反应——面板只有按键解析这一条线索，`cd /var\x1b[A`
+  这类带 Tab / 方向键的行认不出来，多数服务器也不会自己发 OSC 7，于是 `terminal_cwd` 基本是空，
+  定位只能回落到登录主目录、跟随永远不触发；下载又每个文件都弹一次保存对话框。
+  目录来源改为 WindTerm 做法：建连后另开 exec 通道 `echo $SHELL` 探测登录 shell，只对 bash / zsh
+  注入一行自检测钩子（bash 追加 `PROMPT_COMMAND`、zsh `add-zsh-hook precmd`，两者都保留用户原有钩子，
+  行首空格避开 `HISTCONTROL=ignorespace`，末尾立即上报一次），经 `raw_tx` 写进 shell 标准输入；
+  fish / csh / PowerShell 不注入，仍走 `CwdKeystrokes` 兜底。设置 → 终端新增「让远端 shell 上报当前目录」
+  （默认开，只影响之后建立的会话）。底栏两按钮的提示改为显示识别到的路径 / 未识别的原因。
+  下载：行右键「下载」直接落上次的目录（`unique_local_path` 防覆盖，完成提示带全路径），
+  「下载到…（换目录）」弹框并把新目录记进加密库 `settings.local_files`。
+  验证：注入片段在真实 bash（Git Bash）里跑通——`bash -n` 通过、初始与每次提示符前都发出
+  `ESC]7;file://host/path BEL`、原有 `PROMPT_COMMAND` 仍执行；`reports_cwd` 与下载落点存取有单测；
+  协议层用本地 SSH 测试容器跑真实链路（`cargo test -- --ignored cwd_report`，默认跳过）：
+  exec 通道探测到 `/bin/bash`、注入行执行、`cd /etc` 后收到 `file://host/etc` 并被解析成 `/etc`。
+  待复核：应用内点击「定位 / 跟随」与连续两次下载的面板表现（合成输入进不了 rgpui 窗口，需手点）。
 - [x] **局域网主机发现** — `M` — 已完成（界面待实机复核）
   入口在「会话 → 局域网发现…」，打开小工具弹窗时扫一遍本机各私有网段的 /24，探测
   `22 / 23 / 3389 / 5900`；每行按开放服务给出 RDP / VNC / SSH / Telnet 按钮，点了即关弹窗并打开预填表单。
@@ -194,16 +210,52 @@
   Tab 落到 shell、重新开启后恢复；Linux SSH 里输入 `ip` 只给出 `ip -brief addr`、输入 `do` 只给
   Docker 与 Linux 命令，本地 PowerShell 里不出现 Linux 命令；片段面板在 Linux 会话里默认选中
   「Linux」并标出「（当前会话）」，点「Windows / Unix / 通用」可切到对应平台查看，切回 Linux 恢复标记。
-  已知限制：只匹配片段库，不读 shell 自身的 $PATH 命令表；参数位不补文件路径与变量，选项候选也只看
-  片段库里出现过的写法（`Get-ChildItem -` 这类库里没写选项的命令给不出候选）。
+  历史命令同样进候选（`CommandHistory` 里的整条命令行，`CompletionKind::History`，浮层标「历史」）：
+  候选池按「历史（新→旧）→ 我的片段 → 内置命令」排，命中同一个词时最近用过的那条排最前
+  （`recent_first`）；整行既能前缀命中也能模糊命中，`git commit -m "fix login crash"` 跑过一次后，
+  下次只敲 `commit` 或参数里的 `login` 就能把整条补回来（触发词得是 ASCII：输入法组合中的输入不进
+  跟踪行，这是补全既有的限制，中文只参与候选一侧的匹配），参数位照旧按位置续写（`git remote ` 后敲 `ad` → `add origin …`、
+  `git commit ` 后敲 `-` → `-m`，选项的来源命令显示在第二列）。跟某条片段 / 内置命令完全相同的
+  历史行跳过，不在浮层里占两行；名称只留前 80 个字符用于显示（`MAX_NAME_CHARS`，超长整行会撑破
+  浮层），写回终端的仍是完整一条。候选缓存键加上历史指纹（`history_fingerprint`），每回车一条命令
+  就失效重算；开关仍只有「终端内自动补全」一个，历史候选不单独设置。
+  已知限制：只匹配片段库与历史命令，不读 shell 自身的 $PATH 命令表；参数位不补文件路径与变量，选项候选也只看
+  片段库与历史里出现过的写法（`Get-ChildItem -` 这类库里没写选项的命令给不出候选）；历史本身不分主机与
+  平台记录，所以本地 PowerShell 里跑过的命令也会出现在某个 Linux 会话的候选里（片段与内置命令仍按平台过滤）。
   位置感知这轮的判定（命令位 / 参数位、对齐续写、`-` 选项）由 `src/completion.rs` 与
   `snippet_presets::tests::completion_stays_in_the_word_position` 用真实片段表覆盖；应用内键盘注入
-  在本机不可用（见 UI 自动验证限制），实际敲键效果待手按复核。
+  在本机不可用（见 UI 自动验证限制），实际敲键效果（含历史候选的排序与整条补齐）待手按复核。
 - [x] **侧边栏排序模式** — `S` — 已完成（菜单交互待实机复核）
   列表空白处右键「排序方式」：手动 / 按名称（大小写不敏感）/ 按最近连接（未连过的回落到手动序），
   收藏桶恒置顶。手动模式仍是主机行右键「上移一位 / 下移一位 / 移到组内最前」，其余模式下这三项置灰。
   排序方式与手动序一起存 `sidebar` 键（`sort` / `order` 字段），旧 JSON 缺字段读回手动排序。
   比较逻辑为 `SidebarPrefs::compare_hosts`（含单测），渲染侧只负责取展示名与最近连接列表。
+- [x] **终端拖选到视口边缘自动滚动** — `S` — 已完成（实机已核对，改动在 rgpui-term 上游）
+  现象：内容长到要滚动时，鼠标拖选一出当前视口就选不动、也滚不动。
+  根因在 rgpui-term：那段边缘滚动代码要求指针落在网格之外，而 rgpui 的元素鼠标监听
+  只在 hitbox 被 hover 时派发，网格铺满整个元素 → 指针一出界事件就不再送到终端，
+  那段逻辑其实是死代码；指针停在边缘不动时也没有定时器补滚。
+  改动（`crates/rgpui-term/src/terminal_element.rs`、`terminal.rs`，不动 rgpui 核心）：
+  拖选中由 `TerminalElement::paint` 注册窗口级 `on_mouse_event`（只认 Bubble 阶段与
+  `dragging()`，界内仍交给元素自己），界外的移动照样延伸选区、界外松开也能结束拖选；
+  `Terminal` 里 `drag_edge` + `drag_edge_task` 每次拖拽事件重起一拍 100ms 定时器，
+  指针停住也按 `DRAG_EDGE_TICK` 继续滚；触发带从「网格之外」扩到首行 / 末行各一行
+  （界内 ±1 行），界外仍按原 1.1 次幂公式随距离加速、钳在 ±3 行；
+  `Scroll` 排在 `UpdateSelection` 之前下发，选区焦点用滚动后的 `display_offset` 反推行号，
+  否则焦点会留在旧视口、追不上滚出去的行。`drag_scroll_lines` / `outside_lines` 是自由函数，
+  带三组单测（界内不滚、首末行仍滚、随距离加速并钳位）。
+  验证：本地 PowerShell 会话里连跑 6 次 `dir` 造出回滚，拖选越出顶缘停手 →
+  回滚 20 → 84 → 107 行、选区 39 → 103 → 126 行，滚到历史顶部即停；反向拖到底缘 →
+  回滚 107 → 23 → 8 行；在标签栏 / 状态栏上（终端界外）松开鼠标即结束拖选，
+  松开后再等 3s 画面不再自滚、选区保留（截图核对）。
+  **发布依赖**：修复推到 rgpui 仓库的 `feat/diff`（上游日常改动都走这条分支），
+  `cargo test -p rgpui-term` 在该分支 47 项全绿。`ruterm/Cargo.toml` 用 git 源把
+  rgpui / rgpui-platform / rgpui-term 一起指到 `branch = "feat/diff"`
+  （`Cargo.lock` 锁在当前 `4f8c1f3f`，上游有新提交时 `cargo update -p rgpui-term` 跟进）——
+  不能只换 rgpui-term：rgpui 对 rgpui-platform / rgpui-windows 等是 path 依赖，
+  只换一个会出现两份 rgpui 类型、`Global` / `EventEmitter` 全部对不上。
+  不用本地 path patch 是为了别人 clone 本仓库能原样构建；上游发一版 rgpui-term
+  之后这三行整体换回版本号。
 
 
 ## P2 · 远期（大工程）
