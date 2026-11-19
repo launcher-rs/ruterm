@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -557,7 +557,11 @@ async fn run(
     let mut dynamic_forwards: HashMap<u16, ActiveForward> = HashMap::new();
     // 文件面板专用 SFTP：浏览 / 新建 / 重命名 / 删除共用一条子系统通道，
     // 不随每次点击重开（否则每次目录操作都要多一轮握手）。
-    let mut fs_sftp: Option<Arc<SftpSession>> = None;
+    // 缓存放共享锁里：Fs* 命令的实际操作全部 spawn 到会话循环之外执行
+    // （单请求内部超时 120 秒，大目录可能串行多轮），慢请求不能再堵住
+    // disconnect / 转发派发 / 健康检查；开启子系统（≤10 秒）留在循环内，
+    // 因为 Handle 不能克隆进任务。
+    let fs_sftp: Arc<Mutex<Option<Arc<SftpSession>>>> = Arc::new(Mutex::new(None));
     let (accepted_tx, mut accepted_rx) = mpsc::unbounded_channel::<AcceptedForward>();
     let mut health = tokio::time::interval(Duration::from_secs(1));
     loop {
@@ -573,15 +577,20 @@ async fn run(
             Some(command) = commands.recv() => {
                 match command {
                     SessionCommand::Home { reply } => {
-                        let result = match open_sftp(&handle, &side).await {
+                        // open_sftp 自带 10 秒超时；remote_home 的单次请求内部
+                        // 超时 120 秒——spawn 出去，别让慢服务器堵住会话循环。
+                        match open_sftp(&handle, &side).await {
                             Ok(sftp) => {
-                                let home = transfer::remote_home(&sftp).await;
-                                let _ = sftp.close().await;
-                                home
+                                tokio::spawn(async move {
+                                    let home = transfer::remote_home(&sftp).await;
+                                    let _ = sftp.close().await;
+                                    let _ = reply.send(home);
+                                });
                             }
-                            Err(error) => Err(error),
-                        };
-                        let _ = reply.send(result);
+                            Err(error) => {
+                                let _ = reply.send(Err(error));
+                            }
+                        }
                     }
                     SessionCommand::Transfer(task) => {
                         match open_sftp(&handle, &side).await {
@@ -607,42 +616,63 @@ async fn run(
                         }
                     }
                     SessionCommand::FsList { path, reply } => {
-                        let result = async {
-                            let sftp = cached_sftp(&handle, &side, &mut fs_sftp).await?;
-                            crate::remote_fs::list(&sftp, path.as_deref()).await
+                        match cached_sftp(&handle, &side, &fs_sftp).await {
+                            Ok(sftp) => {
+                                let cache = fs_sftp.clone();
+                                tokio::spawn(async move {
+                                    let result =
+                                        crate::remote_fs::list(&sftp, path.as_deref()).await;
+                                    if result.is_err() {
+                                        drop_cached_sftp(&cache);
+                                    }
+                                    let _ = reply.send(result);
+                                });
+                            }
+                            Err(error) => {
+                                drop_cached_sftp(&fs_sftp);
+                                let _ = reply.send(Err(error));
+                            }
                         }
-                        .await;
-                        // 失败后丢掉缓存：下次点击重开子系统，避免抱着坏通道反复报错。
-                        if result.is_err() {
-                            fs_sftp = None;
-                        }
-                        let _ = reply.send(result);
                     }
                     SessionCommand::FsStat { path, reply } => {
-                        let result = async {
-                            let sftp = cached_sftp(&handle, &side, &mut fs_sftp).await?;
-                            let meta = sftp
-                                .metadata(&path)
-                                .await
-                                .context("无法读取远端路径信息")?;
-                            Ok(meta.is_dir())
+                        match cached_sftp(&handle, &side, &fs_sftp).await {
+                            Ok(sftp) => {
+                                let cache = fs_sftp.clone();
+                                tokio::spawn(async move {
+                                    let result = sftp
+                                        .metadata(&path)
+                                        .await
+                                        .map(|meta| meta.is_dir())
+                                        .context("无法读取远端路径信息");
+                                    if result.is_err() {
+                                        drop_cached_sftp(&cache);
+                                    }
+                                    let _ = reply.send(result);
+                                });
+                            }
+                            Err(error) => {
+                                drop_cached_sftp(&fs_sftp);
+                                let _ = reply.send(Err(error));
+                            }
                         }
-                        .await;
-                        if result.is_err() {
-                            fs_sftp = None;
-                        }
-                        let _ = reply.send(result);
                     }
                     SessionCommand::FsMkdir { dir, name, reply } => {
-                        let result = async {
-                            let sftp = cached_sftp(&handle, &side, &mut fs_sftp).await?;
-                            crate::remote_fs::mkdir(&sftp, &dir, &name).await
+                        match cached_sftp(&handle, &side, &fs_sftp).await {
+                            Ok(sftp) => {
+                                let cache = fs_sftp.clone();
+                                tokio::spawn(async move {
+                                    let result = crate::remote_fs::mkdir(&sftp, &dir, &name).await;
+                                    if result.is_err() {
+                                        drop_cached_sftp(&cache);
+                                    }
+                                    let _ = reply.send(result);
+                                });
+                            }
+                            Err(error) => {
+                                drop_cached_sftp(&fs_sftp);
+                                let _ = reply.send(Err(error));
+                            }
                         }
-                        .await;
-                        if result.is_err() {
-                            fs_sftp = None;
-                        }
-                        let _ = reply.send(result);
                     }
                     SessionCommand::FsRename {
                         dir,
@@ -650,26 +680,41 @@ async fn run(
                         to,
                         reply,
                     } => {
-                        let result = async {
-                            let sftp = cached_sftp(&handle, &side, &mut fs_sftp).await?;
-                            crate::remote_fs::rename(&sftp, &dir, &from, &to).await
+                        match cached_sftp(&handle, &side, &fs_sftp).await {
+                            Ok(sftp) => {
+                                let cache = fs_sftp.clone();
+                                tokio::spawn(async move {
+                                    let result =
+                                        crate::remote_fs::rename(&sftp, &dir, &from, &to).await;
+                                    if result.is_err() {
+                                        drop_cached_sftp(&cache);
+                                    }
+                                    let _ = reply.send(result);
+                                });
+                            }
+                            Err(error) => {
+                                drop_cached_sftp(&fs_sftp);
+                                let _ = reply.send(Err(error));
+                            }
                         }
-                        .await;
-                        if result.is_err() {
-                            fs_sftp = None;
-                        }
-                        let _ = reply.send(result);
                     }
                     SessionCommand::FsDelete { path, reply } => {
-                        let result = async {
-                            let sftp = cached_sftp(&handle, &side, &mut fs_sftp).await?;
-                            crate::remote_fs::delete(&sftp, &path).await
+                        match cached_sftp(&handle, &side, &fs_sftp).await {
+                            Ok(sftp) => {
+                                let cache = fs_sftp.clone();
+                                tokio::spawn(async move {
+                                    let result = crate::remote_fs::delete(&sftp, &path).await;
+                                    if result.is_err() {
+                                        drop_cached_sftp(&cache);
+                                    }
+                                    let _ = reply.send(result);
+                                });
+                            }
+                            Err(error) => {
+                                drop_cached_sftp(&fs_sftp);
+                                let _ = reply.send(Err(error));
+                            }
                         }
-                        .await;
-                        if result.is_err() {
-                            fs_sftp = None;
-                        }
-                        let _ = reply.send(result);
                     }
                     SessionCommand::ZmodemUpload {
                         local,
@@ -1251,14 +1296,29 @@ async fn open_sftp(
 async fn cached_sftp(
     handle: &Handle<SshTerminalHandler>,
     side: &SideChannels,
-    cache: &mut Option<Arc<SftpSession>>,
+    cache: &Mutex<Option<Arc<SftpSession>>>,
 ) -> Result<Arc<SftpSession>> {
-    if let Some(sftp) = cache.as_ref() {
-        return Ok(sftp.clone());
+    {
+        let guard = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(sftp) = guard.as_ref() {
+            return Ok(sftp.clone());
+        }
     }
+    // 打开期间不持锁（内含 await）；并发第二条命令会各自开通道，谁先放进
+    // 缓存谁赢，输家用完随任务回收（多余的通道由 Drop 关闭）。
     let sftp = Arc::new(open_sftp(handle, side).await?);
-    *cache = Some(sftp.clone());
+    let mut guard = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if guard.is_none() {
+        *guard = Some(sftp.clone());
+    }
+    drop(guard);
     Ok(sftp)
+}
+
+/// 丢弃文件面板的 SFTP 缓存：通道出错后下次点击重开子系统，
+/// 避免抱着坏通道反复报错。循环内与 spawn 出去的任务都会用到。
+fn drop_cached_sftp(cache: &Mutex<Option<Arc<SftpSession>>>) {
+    *cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
 }
 
 /// 另开一条 exec 通道采集远程主机基本信息，连接期间周期回传状态栏需要刷新的指标。
