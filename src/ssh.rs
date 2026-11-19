@@ -79,6 +79,58 @@ pub fn zmodem_sink() -> ZmodemSink {
     Arc::new(Mutex::new(None))
 }
 
+/// 终端通道登记。
+///
+/// `direct-tcpip` 旁路通道（端口转发 / 跳板）存在一个空窗：russh 处理完
+/// 开通道确认包就唤醒调用方（仅调度、尚未运行），若对端「先说话」（telnet /
+/// SMTP 等先发 banner 的服务，或跳板链下一跳的 sshd），第一个数据包可能已在
+/// 同一轮被 `Handler::data` 收到——此时调用方还没来得及把通道登记进
+/// `SideChannels`，字节会被灌进终端。登记终端通道 id 后，非终端通道的字节
+/// 一概不进终端，空窗封死。
+#[derive(Clone, Default)]
+pub struct TerminalChannel(Arc<Mutex<TerminalChannelState>>);
+
+/// 登记状态。
+#[derive(Debug, Default)]
+enum TerminalChannelState {
+    /// 尚未登记：行为与旧版一致，所有非旁路字节都进终端（握手期的暂态）。
+    #[default]
+    Unregistered,
+    /// 本连接没有终端（跳板机连接只跑 direct-tcpip 字节流）：
+    /// 非旁路字节一律丢弃。
+    Disabled,
+    /// 已登记终端通道：只有该通道的字节进终端。
+    Registered(ChannelId),
+}
+
+impl TerminalChannel {
+    /// 登记终端通道 id（shell 通道打开后立即调用）。
+    pub fn set(&self, channel: ChannelId) {
+        *self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            TerminalChannelState::Registered(channel);
+    }
+
+    /// 标记本连接没有终端通道（跳板机用）：所有非旁路字节都不进终端。
+    pub fn disable(&self) {
+        *self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            TerminalChannelState::Disabled;
+    }
+
+    fn registered(&self) -> bool {
+        !matches!(
+            *self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
+            TerminalChannelState::Unregistered
+        )
+    }
+
+    fn is(&self, channel: ChannelId) -> bool {
+        matches!(
+            *self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
+            TerminalChannelState::Registered(id) if id == channel
+        )
+    }
+}
+
 /// 降级模式（无加密库）使用的旧 known_hosts 文件路径。
 pub fn legacy_known_hosts_path() -> PathBuf {
     StorageMode::detect().legacy_path(crate::paths::LEGACY_KNOWN_HOSTS_FILE)
@@ -210,6 +262,8 @@ pub struct SshTerminalHandler {
     cwd: Option<mpsc::UnboundedSender<CwdHint>>,
     /// OSC 7 状态机：跨 `data()` 调用保持，处理分片到达的序列。
     osc7: Osc7Scan,
+    /// 终端通道登记：非终端通道的字节不进终端（见 [`TerminalChannel`]）。
+    terminal: TerminalChannel,
 }
 
 impl SshTerminalHandler {
@@ -225,6 +279,7 @@ impl SshTerminalHandler {
         forwarded: mpsc::UnboundedSender<ForwardedTcpip>,
         zmodem: Option<ZmodemSink>,
         cwd: Option<mpsc::UnboundedSender<CwdHint>>,
+        terminal: TerminalChannel,
     ) -> Self {
         Self {
             feed,
@@ -237,6 +292,7 @@ impl SshTerminalHandler {
             zmodem,
             cwd,
             osc7: Osc7Scan::default(),
+            terminal,
         }
     }
 
@@ -423,6 +479,10 @@ impl client::Handler for SshTerminalHandler {
         if self.side.contains(channel) {
             return Ok(());
         }
+        // 终端通道登记后，只有它自己的字节进终端（见 [`TerminalChannel`]）。
+        if self.terminal.registered() && !self.terminal.is(channel) {
+            return Ok(());
+        }
         // 先扫描 OSC 7（shell 工作目录上报），再决定是否转交 zmodem / 终端。
         self.osc7.feed(data, &self.cwd);
         if !self.divert_zmodem(data) {
@@ -439,6 +499,9 @@ impl client::Handler for SshTerminalHandler {
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
         if self.side.contains(channel) {
+            return Ok(());
+        }
+        if self.terminal.registered() && !self.terminal.is(channel) {
             return Ok(());
         }
         // stderr 与 stdout 在远端 PTY 下本就是同一条流，统一灌入终端；

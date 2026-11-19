@@ -412,6 +412,8 @@ async fn run(
         // 已建立的跳板机连接必须活到会话结束（句柄一丢，通道随之关闭），
         // 所以收集在这里、最后连同主会话句柄一起带出 setup。
         let mut hops: Vec<(Handle<SshTerminalHandler>, SideChannels)> = Vec::new();
+        // 终端通道登记：direct-tcpip 旁路「先说话」的字节不灌进终端。
+        let terminal_channel = crate::ssh::TerminalChannel::default();
         let nodes: Vec<&SshTarget> = chain.iter().chain(std::iter::once(&target)).collect();
         for (index, node) in nodes.iter().enumerate() {
             let is_target = index + 1 == nodes.len();
@@ -430,6 +432,8 @@ async fn run(
             } else {
                 SideChannels::default()
             };
+            // 终端通道登记只有目标连接有意义（跳板的 feed 不渲染）：跳板各自
+            // 用一个空的登记，永远不会命中。
             let handler = SshTerminalHandler::new(
                 feed.clone(),
                 node.host.clone(),
@@ -455,6 +459,15 @@ async fn run(
                     Some(cwd_hint_tx.clone())
                 } else {
                     None
+                },
+                if is_target {
+                    terminal_channel.clone()
+                } else {
+                    // 跳板机连接没有终端：非旁路字节（下一跳 sshd 的 banner
+                    // 等）一概丢弃，不再可能漏进共享的终端 feed。
+                    let jump_terminal = crate::ssh::TerminalChannel::default();
+                    jump_terminal.disable();
+                    jump_terminal
                 },
             );
             let hop = if index == 0 {
@@ -496,6 +509,9 @@ async fn run(
 
         let (handle, _) = hops.pop().expect("链上至少有最终目标一个节点");
         let channel = handle.channel_open_session().await?;
+        // shell 通道打开即登记为终端通道：旁路通道（转发 / 跳板）「先说话」的
+        // 字节不再可能灌进终端（direct-tcpip 登记 side 之前存在空窗）。
+        terminal_channel.set(channel.id());
         // 声明 locale：vim 等按 locale 决定内部编码，POSIX 会退成 latin1，
         // 重绘时把多字节字符拆散穿插转义序列，任何 UTF-8 终端都显示成乱码。
         // 对齐 OpenSSH 的 `SendEnv LANG LC_*`：本地显式设置就透传；没有则默认
