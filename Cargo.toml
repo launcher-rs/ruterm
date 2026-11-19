@@ -1,8 +1,9 @@
 [package]
 name = "ruterm"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "Apache-2.0"
+repository = "https://github.com/launcher-rs/ruterm"
 readme = "README.md"
 description = "Rust 远程连接工具，集成 SSH、本地终端、SFTP 与远程桌面"
 
