@@ -515,7 +515,12 @@ impl RuTermApp {
         }
         self.sync_input = on;
         self.status = if on {
-            SharedString::from(format!("同步输入：开（{live} 个会话）"))
+            // 开启即警示：镜像在输入路径上，回显与否无关，sudo/口令提示符下
+            // 敲的密码同样会被转发并回显到其它会话的屏幕上（可被历史收录）。
+            // 前缀须保持「同步输入」，tabs.rs 的 prune 靠它识别并覆盖本条消息。
+            SharedString::from(format!(
+                "同步输入：开（{live} 个会话）——所有按键都会原样转发到其它会话，密码输入也不例外，敲敏感信息前请先关闭"
+            ))
         } else {
             "同步输入：关".into()
         };
