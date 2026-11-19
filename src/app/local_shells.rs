@@ -536,6 +536,10 @@ impl RuTermApp {
         let terminal = cx.new(|cx| builder.subscribe(cx));
         let mirror_tx = self.mirror_tx.clone();
         terminal.update(cx, |terminal, _| {
+            // 与 SSH / Telnet（connect.rs）保持一致：先归一化粘贴行尾再镜像。
+            // Windows 剪贴板的多行文本是 CRLF，bracketed-paste 下原样转发会把
+            // \r 留在 PowerShell（PSReadLine）的行缓冲里（回显 ^M、续行失效）。
+            terminal.add_middleware(Arc::new(NormalizePastedLineEndings));
             terminal.add_middleware(Arc::new(MirrorInput {
                 tab_id: id,
                 tx: mirror_tx,

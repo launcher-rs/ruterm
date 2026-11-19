@@ -224,18 +224,29 @@ impl RuTermApp {
         let key_data = form.key_data.clone();
         let host_raw = form.host.read(cx).value().trim().to_string();
         let key_path = form.key_path.read(cx).value().trim().to_string();
+        // 端口留空沿用协议默认；填了但解析不出（如 22q2、超 u16 的 99999）必须
+        // 显式报错——静默改写成默认端口会让「保存的」和「输入的」悄悄不一致，
+        // 之后连接失败极难归因。
+        let port_raw = form.port.read(cx).value().trim().to_string();
+        let port = if port_raw.is_empty() {
+            protocol.default_port()
+        } else {
+            match port_raw.parse::<u16>() {
+                Ok(port) if port != 0 => port,
+                _ => {
+                    self.status =
+                        SharedString::from(format!("保存失败：端口「{port_raw}」无效（应为 1-65535 的数字）"));
+                    cx.notify();
+                    return;
+                }
+            }
+        };
         let mut host = HostConfig {
             protocol,
             id: 0,
             name: form.name.read(cx).value().trim().to_string(),
             host: host_raw.clone(),
-            port: form
-                .port
-                .read(cx)
-                .value()
-                .trim()
-                .parse::<u16>()
-                .unwrap_or_else(|_| protocol.default_port()),
+            port,
             user: form.user.read(cx).value().trim().to_string(),
             auth,
             key_path: if key_inline { String::new() } else { key_path },
