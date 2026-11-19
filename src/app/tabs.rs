@@ -23,6 +23,46 @@ use crate::{CancelRename, CloseSplit, CloseTab, NextTab, PrevTab, SplitDown, Spl
 
 use super::*;
 
+/// 标签拖拽数据：携带稳定的标签 id 而非当帧下标。
+///
+/// rgpui 自带的 `TabDragData` 只有 index——拖动期间标签列表可能被后台
+/// 事件改动（本地 shell 退出走 remove_tab），落点时旧下标会指向另一条
+/// 标签；用 id 在落点时重新解析位置才稳。渲染样式与库内实现保持一致。
+pub(super) struct TabDrag {
+    pub(super) id: usize,
+    pub(super) title: SharedString,
+    pub(super) position: rgpui::Point<rgpui::Pixels>,
+}
+
+impl rgpui::Render for TabDrag {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        div()
+            .pl(self.position.x)
+            .pt(self.position.y)
+            .child(
+                div()
+                    .px(px(12.0))
+                    .py(px(6.0))
+                    .bg(theme.tokens.popover.opacity(0.95))
+                    .border_1()
+                    .border_color(theme.tokens.primary)
+                    .rounded(theme.radius)
+                    .shadow(vec![rgpui::BoxShadow {
+                        color: rgpui::hsla(0.0, 0.0, 0.0, 0.25),
+                        offset: rgpui::point(px(0.0), px(4.0)),
+                        blur_radius: px(12.0),
+                        spread_radius: px(0.0),
+                        inset: false,
+                    }])
+                    .text_size(px(13.0))
+                    .text_color(theme.tokens.foreground)
+                    .font_family(theme.font_family.clone())
+                    .child(self.title.clone()),
+            )
+    }
+}
+
 /// 一个已连接的会话标签（持有终端视图）。
 pub(super) struct SessionTab {
     /// 稳定标签 id（会话结束或用户关闭时据此定位）。
@@ -869,6 +909,16 @@ impl RuTermApp {
         let insert_at = to.min(self.tabs.len());
         self.tabs.insert(insert_at, tab);
         cx.notify();
+    }
+
+    /// 按标签 id 挪动（拖拽排序用）：拖动可能跨越多次重绘，标签列表期间
+    /// 可能被后台事件改动（本地 shell 退出走 remove_tab），旧下标会指向
+    /// 别的标签——落点时按 id 重新解析当前位置再挪。
+    pub(super) fn move_tab(&mut self, drag_id: usize, to: usize, cx: &mut Context<Self>) {
+        let Some(from) = self.tabs.iter().position(|tab| tab.id == drag_id) else {
+            return;
+        };
+        self.reorder_tab(from, to, cx);
     }
 
     /// Ctrl+Tab / Ctrl+Shift+Tab：按标签顺序循环切换（末尾回到开头）。

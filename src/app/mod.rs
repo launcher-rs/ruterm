@@ -57,7 +57,6 @@ use std::sync::Arc;
 use rgpui::components::split_pane::{SplitPane, SplitPaneState};
 use rgpui::input_ui::{Input, InputEvent, InputState};
 use rgpui::prelude::*;
-use rgpui::tabs::tab_drag::TabDragData;
 use rgpui::{
     AnyElement, App, Button, ButtonVariants, ClickEvent, Context, Entity, FocusHandle, Focusable,
     Hsla, Icon, IconName, Image, InteractiveElement, IntoElement, MouseButton, ParentElement,
@@ -162,6 +161,12 @@ pub(crate) struct RuTermApp {
     /// 删除二次确认（主机 id；浮层遮挡期间 attach_vault 仍可能整表替换列表，
     /// 下标会指向别的行，身份必须用 id）。
     confirm_delete: Option<i64>,
+    /// 多行粘贴确认：目标标签 id 与待粘文本。
+    confirm_paste: Option<(usize, String)>,
+    /// 确认弹窗里「本次运行不再提示」的勾选态（打开弹窗时重置）。
+    paste_confirm_checked: bool,
+    /// 勾选过一次「不再提示」后，本次运行内跳过多行粘贴确认。
+    paste_confirm_disabled: bool,
     /// 「帮助 → 关于」浮层开关。
     about_open: bool,
     /// 主密码解锁弹窗（便携模式 / 已设置主密码时启动弹出）。
@@ -475,6 +480,9 @@ impl RuTermApp {
             protocols,
             group_prompt: None,
             confirm_delete: None,
+            confirm_paste: None,
+            paste_confirm_checked: false,
+            paste_confirm_disabled: false,
             about_open: false,
             unlock: None,
             settings: None,
@@ -1042,6 +1050,7 @@ impl RuTermApp {
         self.unlock.is_some()
             || self.settings.is_some()
             || self.confirm_delete.is_some()
+            || self.confirm_paste.is_some()
             || self.about_open
             || self.new_host.is_some()
             || self.group_prompt.is_some()
@@ -1162,6 +1171,100 @@ impl RuTermApp {
                 )
                 .into_any_element();
         }
+        // 多行粘贴确认：目标未开 bracketed-paste 时换行＝逐行回车立即执行
+        //（iTerm2 式危险粘贴保护），可勾选本次运行不再提示。
+        if self.confirm_paste.is_some() {
+            let lines = self
+                .confirm_paste
+                .as_ref()
+                .map(|(_, text)| text.lines().count())
+                .unwrap_or(0);
+            return v_flex()
+                .id("paste-backdrop")
+                .absolute()
+                .top(px(0.0))
+                .left(px(0.0))
+                .size_full()
+                .items_center()
+                .justify_center()
+                .bg(rgpui::hsla(0.0, 0.0, 0.0, 0.45))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.cancel_paste_confirm(cx);
+                    }),
+                )
+                .child(
+                    v_flex()
+                        .id("paste-dialog")
+                        .w(px(360.0))
+                        .gap_3()
+                        .p_4()
+                        .rounded(px(8.0))
+                        .bg(pal.card_bg)
+                        .border_1()
+                        .border_color(pal.border)
+                        .child(
+                            div()
+                                .text_base()
+                                .font_weight(rgpui::FontWeight(600.0))
+                                .child(tr!(cx, "粘贴多行内容？")),
+                        )
+                        .child(
+                            div().text_xs().text_color(pal.muted).child(tr!(
+                                cx,
+                                "剪贴板含 {lines} 行文本。目标若未开启 bracketed-paste，粘贴会像逐行按下回车一样立即执行。",
+                                lines = lines
+                            )),
+                        )
+                        .child(
+                            div()
+                                .id("paste-confirm-check")
+                                .cursor_pointer()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .text_xs()
+                                .text_color(pal.text)
+                                .hover(|style| style.text_color(pal.accent))
+                                .child(if self.paste_confirm_checked { "☑" } else { "☐" })
+                                .child(tr!(cx, "本次运行不再提示"))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.paste_confirm_checked = !this.paste_confirm_checked;
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .justify_end()
+                                .child(
+                                    Button::new("cancel-paste")
+                                        .label(tr!(cx, "取消"))
+                                        .ghost()
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.cancel_paste_confirm(cx);
+                                        })),
+                                )
+                                .child(
+                                    Button::new("confirm-paste")
+                                        .label(tr!(cx, "粘贴"))
+                                        .primary()
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.confirm_paste_now(cx);
+                                        })),
+                                ),
+                        )
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|_, _, _, cx| {
+                                // 阻止卡片内点击冒泡到遮罩（否则点对话框也会关闭）。
+                                cx.stop_propagation();
+                            }),
+                        ),
+                )
+                .into_any_element();
+        }
         // 新建/编辑主机：居中模态弹窗（不再挤占侧边栏窄面板）。
         if self.new_host.is_some() {
             return self.render_form_dialog(window, cx);
@@ -1238,27 +1341,27 @@ impl RuTermApp {
                                 // 拖拽排序：拖动超过阈值后出现跟随光标的缩略标签，
                                 // 松手落到哪个标签上就占它的位置（空白处＝移到最末）。
                                 .on_drag(
-                                    TabDragData {
-                                        index,
-                                        title: self.tab_display_title(id).to_string(),
+                                    tabs::TabDrag {
+                                        id,
+                                        title: self.tab_display_title(id),
                                         position: Point::default(),
                                     },
-                                    |drag: &TabDragData, position, _window, cx| {
-                                        cx.new(|_| TabDragData {
-                                            index: drag.index,
+                                    |drag: &tabs::TabDrag, position, _window, cx| {
+                                        cx.new(|_| tabs::TabDrag {
+                                            id: drag.id,
                                             title: drag.title.clone(),
                                             position,
                                         })
                                     },
                                 )
-                                .drag_over::<TabDragData>(move |style, _, _, _| {
+                                .drag_over::<tabs::TabDrag>(move |style, _, _, _| {
                                     style
                                         .bg(pal.card_hover)
                                         .border_l(px(2.0))
                                         .border_color(pal.accent)
                                 })
-                                .on_drop(cx.listener(move |this, drag: &TabDragData, _, cx| {
-                                    this.reorder_tab(drag.index, index, cx);
+                                .on_drop(cx.listener(move |this, drag: &tabs::TabDrag, _, cx| {
+                                    this.move_tab(drag.id, index, cx);
                                 }))
                                 .on_click(cx.listener(
                                     move |this, event: &ClickEvent, window, cx| {
@@ -1347,9 +1450,9 @@ impl RuTermApp {
                                 })
                         }))
                         // 拖到标签栏空白处＝挪到最末，避免只能落到某个标签上。
-                        .on_drop(cx.listener(|this, drag: &TabDragData, _, cx| {
+                        .on_drop(cx.listener(|this, drag: &tabs::TabDrag, _, cx| {
                             let last = this.tabs.len().saturating_sub(1);
-                            this.reorder_tab(drag.index, last, cx);
+                            this.move_tab(drag.id, last, cx);
                         })),
                 )
                 .into_any_element()

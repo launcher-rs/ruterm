@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
 use bytes::Bytes;
@@ -536,7 +536,15 @@ async fn run(
     drop(channel_read);
 
     // 上行转发先落地：探测通道握手即使被慢服务器拖住，也不能延迟按键转发。
-    tokio::spawn(forward_uplink(channel, ui_rx, raw_rx, cwd_hint_tx));
+    // last_input 记录用户最后一次敲键时刻：shell 集成注入靠它避开正在输入的人。
+    let last_input: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
+    tokio::spawn(forward_uplink(
+        channel,
+        ui_rx,
+        raw_rx,
+        cwd_hint_tx,
+        last_input.clone(),
+    ));
 
     // 目录线索校验：cd 猜测与 OSC 7 上报都先经 SFTP 确认"确为目录"，
     // 只有确认成功才回传 UI 并推进本地跟踪状态（失败=cd 没成功，面板原地不动）。
@@ -547,7 +555,7 @@ async fn run(
     // 文件面板「跟随 / 定位」的目录来源：让远端 shell 自己用 OSC 7 上报 $PWD。
     // 只追加提示符钩子，失败或 shell 不认就原样留着按键解析兜底。
     if shell_integration {
-        install_cwd_report(&handle, &side, &raw_tx).await;
+        install_cwd_report(&handle, &side, &raw_tx, &last_input).await;
     }
 
     // 三条收场路径：远端通道结束、本地关标签、连接本身异常终止。
@@ -1437,6 +1445,7 @@ async fn install_cwd_report(
     handle: &Handle<SshTerminalHandler>,
     side: &SideChannels,
     raw_tx: &mpsc::UnboundedSender<Vec<u8>>,
+    last_input: &Arc<Mutex<Option<Instant>>>,
 ) {
     let Some(shell) = login_shell(handle, side).await else {
         log::debug!("[shell_integration] 探测登录 shell 失败，沿用按键解析");
@@ -1447,9 +1456,24 @@ async fn install_cwd_report(
         return;
     }
     let tx = raw_tx.clone();
+    let last_input = last_input.clone();
     // 提示符（含 MOTD）落地后再写这行：太早发会接在用户已经敲了半行的命令后面。
+    // 固定延时只对"连上就干等"的用户成立；用户已经开始敲键时推迟到输入静默
+    // 一段时间再写，否则注入行会拼进半行命令、或写进已经进入的 vim / 嵌套
+    // 会话里。宁可一直等（面板的 cd 按键解析兜底不受影响），也不污染输入。
     tokio::spawn(async move {
         tokio::time::sleep(SHELL_INTEGRATION_DELAY).await;
+        loop {
+            let quiet = last_input
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .map(|at| at.elapsed() >= SHELL_INTEGRATION_QUIET)
+                .unwrap_or(true);
+            if quiet {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
         let _ = tx.send(format!("{SHELL_INTEGRATION}\r").into_bytes());
     });
 }
@@ -1506,6 +1530,8 @@ fn reports_cwd(shell: &str) -> bool {
 
 /// 注入等待提示符的时间。
 const SHELL_INTEGRATION_DELAY: Duration = Duration::from_millis(1200);
+/// 用户输入要静默多久才允许注入 OSC 7 钩子。
+const SHELL_INTEGRATION_QUIET: Duration = Duration::from_secs(5);
 
 /// 同一份代码兼顾 bash（追加 `PROMPT_COMMAND`）与 zsh（`precmd` 钩子），两者都在
 /// 每次显示提示符前上报 `$PWD`；末尾那次调用立即报一次，连接上就能看到当前目录。
@@ -1543,6 +1569,7 @@ async fn forward_uplink(
     mut ui_rx: mpsc::UnboundedReceiver<PtyBoundMessage>,
     mut raw_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     cwd_hint_tx: mpsc::UnboundedSender<CwdHint>,
+    last_input: Arc<Mutex<Option<Instant>>>,
 ) {
     let mut tracker = CwdKeystrokes::default();
     loop {
@@ -1553,6 +1580,11 @@ async fn forward_uplink(
                 };
                 match message {
                     PtyBoundMessage::Input(bytes) => {
+                        // shell 集成注入的避让信号：用户动过键盘就先别注入。
+                        *last_input
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                            Some(Instant::now());
                         // Key repeats arrive as hundreds of one-byte events. Writing each
                         // event separately can fill russh's bounded channel queue and leave
                         // the forwarding task waiting while the UI keeps enqueueing input.

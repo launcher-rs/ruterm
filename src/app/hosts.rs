@@ -158,76 +158,113 @@ impl RuTermApp {
     }
 
     /// 导出主机配置 JSON。保存密码与内嵌私钥只留在凭据库中，不写入明文备份。
+    ///
+    /// 文件对话框走异步版（同步 rfd 会卡住整个前台执行器），写盘交后台线程。
     pub(super) fn export_host_configs(&mut self, cx: &mut Context<Self>) {
-        let Some(path) = rfd::FileDialog::new()
-            .add_filter("RuTerm 主机配置", &["json"])
-            .set_file_name("ruterm-hosts.json")
-            .save_file()
-        else {
-            return;
-        };
-        let mut hosts = self.hosts.clone();
-        let mut inline_keys = 0usize;
-        for host in &mut hosts {
-            if host.key_inline {
-                host.key_inline = false;
-                host.auth = AuthMethod::Agent;
-                host.key_path.clear();
-                inline_keys += 1;
+        let entity = cx.entity();
+        // 弹窗前做快照：导出内容不随等待期间的主机列表变化。
+        let hosts = self.hosts.clone();
+        let sidebar = self.sidebar.clone();
+        let rx = cx.prompt_for_new_path(&super::files::downloads_dir(), Some("ruterm-hosts.json"));
+        cx.spawn(async move |_, cx| {
+            let Ok(Ok(Some(path))) = rx.await else {
+                return;
+            };
+            let mut hosts = hosts;
+            let mut inline_keys = 0usize;
+            for host in &mut hosts {
+                if host.key_inline {
+                    host.key_inline = false;
+                    host.auth = AuthMethod::Agent;
+                    host.key_path.clear();
+                    inline_keys += 1;
+                }
             }
-        }
-        let backup = HostConfigBackup {
-            version: 1,
-            hosts,
-            sidebar: self.sidebar.clone(),
-        };
-        match serde_json::to_vec_pretty(&backup)
-            .map_err(anyhow::Error::from)
-            .and_then(|json| fs::write(&path, json).map_err(anyhow::Error::from))
-        {
-            Ok(()) => {
-                self.status = SharedString::from(format!(
-                    "已导出 {} 台主机配置到 {}；密码与内嵌私钥未导出",
-                    backup.hosts.len(),
-                    path.display()
-                ));
+            let backup = HostConfigBackup {
+                version: 1,
+                hosts,
+                sidebar,
+            };
+            let count = backup.hosts.len();
+            let shown_path = path.display().to_string();
+            let written = tokio::task::spawn_blocking(move || {
+                serde_json::to_vec_pretty(&backup)
+                    .map_err(anyhow::Error::from)
+                    .and_then(|json| fs::write(&path, json).map_err(anyhow::Error::from))
+            })
+            .await;
+            if inline_keys > 0 {
+                log::info!("主机配置导出省略了 {inline_keys} 个内嵌私钥");
             }
-            Err(error) => {
-                self.status = SharedString::from(format!("导出主机配置失败：{error}"));
-            }
-        }
-        if inline_keys > 0 {
-            log::info!("主机配置导出省略了 {inline_keys} 个内嵌私钥");
-        }
-        cx.notify();
+            entity.update(cx, |this, cx| {
+                this.status = match written {
+                    Ok(Ok(())) => SharedString::from(format!(
+                        "已导出 {count} 台主机配置到 {shown_path}；密码与内嵌私钥未导出"
+                    )),
+                    Ok(Err(error)) => SharedString::from(format!("导出主机配置失败：{error}")),
+                    Err(error) => SharedString::from(format!("导出主机配置失败：{error}")),
+                };
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// 从 RuTerm 主机 JSON 导入，按源主机 id 重映射跳板机引用。
+    ///
+    /// 文件对话框与读盘都走后台，解析完在 UI 线程合并（见 `apply_host_backup`）。
     pub(super) fn import_host_configs(&mut self, cx: &mut Context<Self>) {
-        let Some(path) = rfd::FileDialog::new()
-            .add_filter("RuTerm 主机配置", &["json"])
-            .pick_file()
-        else {
-            return;
-        };
-        let parsed = fs::read(&path)
-            .map_err(anyhow::Error::from)
-            .and_then(|bytes| {
-                serde_json::from_slice::<HostConfigBackup>(&bytes).map_err(anyhow::Error::from)
+        let entity = cx.entity();
+        let rx = cx.prompt_for_paths(rgpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some(tr!(cx, "选择主机配置 JSON 文件")),
+        });
+        cx.spawn(async move |_, cx| {
+            let Ok(Ok(Some(paths))) = rx.await else {
+                return;
+            };
+            let Some(path) = paths.into_iter().next() else {
+                return;
+            };
+            let parsed = tokio::task::spawn_blocking(move || {
+                fs::read(&path)
+                    .map_err(anyhow::Error::from)
+                    .and_then(|bytes| {
+                        serde_json::from_slice::<HostConfigBackup>(&bytes)
+                            .map_err(anyhow::Error::from)
+                    })
+            })
+            .await;
+            entity.update(cx, |this, cx| {
+                let backup = match parsed {
+                    Ok(Ok(backup)) => backup,
+                    Ok(Err(error)) => {
+                        this.status = SharedString::from(format!("读取主机配置失败：{error}"));
+                        cx.notify();
+                        return;
+                    }
+                    Err(error) => {
+                        this.status = SharedString::from(format!("读取主机配置失败：{error}"));
+                        cx.notify();
+                        return;
+                    }
+                };
+                if backup.version != 1 {
+                    this.status = "主机配置文件版本不受支持".into();
+                    cx.notify();
+                    return;
+                }
+                this.apply_host_backup(backup, cx);
             });
-        let backup = match parsed {
-            Ok(backup) if backup.version == 1 => backup,
-            Ok(_) => {
-                self.status = "主机配置文件版本不受支持".into();
-                cx.notify();
-                return;
-            }
-            Err(error) => {
-                self.status = SharedString::from(format!("读取主机配置失败：{error}"));
-                cx.notify();
-                return;
-            }
-        };
+        })
+        .detach();
+    }
+
+    /// 把一份主机备份合并进当前列表：逐台校验、按内容判重、重映射跳板机
+    /// 引用与分组归属。
+    fn apply_host_backup(&mut self, backup: HostConfigBackup, cx: &mut Context<Self>) {
         let HostConfigBackup {
             hosts,
             sidebar: imported_sidebar,
@@ -303,8 +340,19 @@ impl RuTermApp {
         }
         if !imported_ids.is_empty() {
             for group in &imported_sidebar.groups {
-                if !self.sidebar.names().any(|name| name == group.name) {
-                    self.sidebar.groups.push(group.clone());
+                // 走与手动新建同一套校验（拒空名、保留名「未分组」、重名）：
+                // 直接 push 会让备份文件里的保留名 / 空白组名混进分组树，
+                // 与内置未分组桶并排出现两个「未分组」。
+                if self.sidebar.add(&group.name) {
+                    // add() 固定展开；沿用备份里的折叠偏好。
+                    if let Some(entry) = self
+                        .sidebar
+                        .groups
+                        .iter_mut()
+                        .find(|entry| entry.name == group.name.trim())
+                    {
+                        entry.collapsed = group.collapsed;
+                    }
                 }
             }
             for (source_id, group) in &imported_sidebar.assign {
@@ -998,7 +1046,7 @@ impl RuTermApp {
         let title = Self::host_title(host);
         let sort = self.sidebar.sort;
         Self::row_base(
-            SharedString::from(format!("host-row-{index}")),
+            SharedString::from(format!("host-row-{id}")),
             pal,
             px(22.0),
         )
@@ -1032,7 +1080,7 @@ impl RuTermApp {
         )
         .child(
             div()
-                .id(SharedString::from(format!("host-fav-{index}")))
+                .id(SharedString::from(format!("host-fav-{id}")))
                 .flex_shrink_0()
                 .text_sm()
                 .px_1()

@@ -201,7 +201,15 @@ impl RuTermApp {
     }
 
     /// 把系统剪贴板里的文本粘进终端（bracketed-paste / CRLF 归一化由终端负责）。
-    fn paste_terminal(&self, view: &Entity<TerminalView>, cx: &mut Context<Self>) {
+    ///
+    /// 多行文本先弹确认：未开 bracketed-paste 的目标会把换行当逐行回车立即
+    /// 执行（iTerm2 式危险粘贴保护）。`tab_id` 解析不出时跳过确认直接粘。
+    fn paste_terminal(
+        &mut self,
+        tab_id: Option<usize>,
+        view: &Entity<TerminalView>,
+        cx: &mut Context<Self>,
+    ) {
         let Some(text) = cx
             .read_from_clipboard()
             .and_then(|item| item.text())
@@ -209,8 +217,42 @@ impl RuTermApp {
         else {
             return;
         };
+        if let Some(tab_id) = tab_id
+            && !self.paste_confirm_disabled
+            && text.lines().count() >= 2
+        {
+            self.confirm_paste = Some((tab_id, text));
+            self.paste_confirm_checked = false;
+            cx.notify();
+            return;
+        }
         let terminal = view.read(cx).terminal().clone();
         terminal.update(cx, |terminal, _| terminal.paste(&text));
+    }
+
+    /// 确认粘贴：执行确认时存下的文本；勾选了「不再提示」则本次运行关闭询问。
+    pub(super) fn confirm_paste_now(&mut self, cx: &mut Context<Self>) {
+        let Some((tab_id, text)) = self.confirm_paste.take() else {
+            return;
+        };
+        if self.paste_confirm_checked {
+            self.paste_confirm_disabled = true;
+        }
+        let Some((view, live)) = self.terminal_view_by_id(tab_id) else {
+            return;
+        };
+        if live {
+            let terminal = view.read(cx).terminal().clone();
+            terminal.update(cx, |terminal, _| terminal.paste(&text));
+        }
+        cx.notify();
+    }
+
+    pub(super) fn cancel_paste_confirm(&mut self, cx: &mut Context<Self>) {
+        if self.confirm_paste.take().is_some() {
+            self.paste_confirm_checked = false;
+            cx.notify();
+        }
     }
 
     fn copy_terminal_by_id(&mut self, tab_id: usize, cx: &mut Context<Self>) {
@@ -225,7 +267,7 @@ impl RuTermApp {
             return;
         };
         if live {
-            self.paste_terminal(&view, cx);
+            self.paste_terminal(Some(tab_id), &view, cx);
         }
     }
 
@@ -297,12 +339,17 @@ impl RuTermApp {
             .focused_terminal(window, cx)
             .or_else(|| self.active_terminal_view())
         {
+            let tab_id = self
+                .tabs
+                .iter()
+                .find(|tab| tab.terminal_view.as_ref() == Some(&view))
+                .map(|tab| tab.id);
             let live = self
                 .tabs
                 .iter()
                 .any(|tab| tab.terminal_view.as_ref() == Some(&view) && !tab.ended && !tab.failed);
             if live {
-                self.paste_terminal(&view, cx);
+                self.paste_terminal(tab_id, &view, cx);
             }
         }
         // 没有可粘贴的会话时也要吞掉按键，避免 ^V 落到 shell。

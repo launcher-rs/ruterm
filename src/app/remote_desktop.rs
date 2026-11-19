@@ -2620,11 +2620,13 @@ impl RuTermApp {
                             )),
                     )
                     .child({
-                        // 直连成功后密码会加密入库：这里说明下次不用再输。
+                        // 直连标签的 save_secret 恒为 false（表单里勾选的
+                        // 「保存密码」只在主机编辑表单生效）：这里如实说明，
+                        // 不承诺「会保存到凭据库」。
                         let hint = if self.vault.is_some() {
                             tr!(
                                 cx,
-                                "密码会加密保存到凭据库，下次点该主机直接复用；留空表示不带密码"
+                                "密码只在本次连接的内存里复用；想让它记住密码，编辑该主机并勾选「保存密码」；留空表示不带密码"
                             )
                         } else {
                             tr!(cx, "密码只在本次连接的内存里使用；留空表示不带密码")
@@ -2967,6 +2969,9 @@ fn clear_desktop_secret(
 /// 比停在失败卡片上更接近系统远程桌面的体验。
 fn looks_like_auth_failure(message: &str) -> bool {
     let text = message.to_lowercase();
+    // 只认足够具体的凭据错误词。像 "password" / "authenticat" / "凭据" 这类
+    // 泛化子串会把密码过期、账号锁定甚至含 credentials 的网络错误都误判成
+    // 认证失败，进而清掉内存缓存和加密库里的密码——宁可漏判也不误清。
     [
         "credssp",
         "access denied",
@@ -2976,11 +2981,8 @@ fn looks_like_auth_failure(message: &str) -> bool {
         "status_logon",
         "0xc000006d",
         "0xc000006a",
-        "password",
-        "authenticat",
         "登录失败",
         "用户名或密码",
-        "凭据",
     ]
     .iter()
     .any(|needle| text.contains(needle))
