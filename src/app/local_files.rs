@@ -79,13 +79,16 @@ impl LocalBrowser {
     }
 }
 
-/// 本机文件页偏好（隐藏文件开关 + 最后停留的目录），存加密库 `settings.local_files`。
+/// 本机文件页偏好（隐藏文件开关 + 最后停留的目录 + 上次下载落点），存加密库 `settings.local_files`。
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub(super) struct LocalFilesPrefs {
     #[serde(default)]
     pub(super) show_hidden: bool,
     #[serde(default)]
     pub(super) path: Option<String>,
+    /// 远端文件下载的落点目录；下次下载直接用它，不再弹保存对话框。
+    #[serde(default)]
+    pub(super) download_dir: Option<String>,
 }
 
 impl LocalFilesPrefs {
@@ -335,6 +338,10 @@ impl RuTermApp {
                 .path
                 .as_ref()
                 .map(|path| path.to_string_lossy().into_owned()),
+            download_dir: self
+                .download_dir
+                .as_ref()
+                .map(|dir| dir.to_string_lossy().into_owned()),
         };
         let json = prefs.to_json();
         let Some(vault) = self.vault.clone() else {
@@ -752,5 +759,17 @@ mod tests {
         assert_eq!(sorted, ["sub", ".secret", "note.txt"]);
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 下载落点随本机页偏好一起存取；旧 JSON 没这个字段时按「没记过」处理。
+    #[test]
+    fn download_dir_roundtrips_and_legacy_json_defaults_to_none() {
+        let prefs = LocalFilesPrefs {
+            show_hidden: true,
+            path: Some("/home/deego/notes".into()),
+            download_dir: Some("D:\\下载".into()),
+        };
+        assert_eq!(LocalFilesPrefs::from_json(&prefs.to_json()), prefs);
+        assert_eq!(LocalFilesPrefs::from_json("{}").download_dir, None);
     }
 }

@@ -1568,8 +1568,40 @@ impl RuTermApp {
         .detach();
     }
 
-    /// 行菜单「下载到…」：选保存位置后把该远端文件拉到本地。
+    /// 行菜单「下载」：默认落到上次的下载目录，不再每个文件都弹保存对话框。
+    ///
+    /// 没记过目录（或记着的目录已被删）才弹对话框选位置，选完记下；同名文件
+    /// 自动加序号——这条路没有对话框兜底，用户看不见"将要覆盖"这件事。
     pub(super) fn download_file(&mut self, tab_id: usize, name: String, cx: &mut Context<Self>) {
+        let remembered = self.download_dir.clone().filter(|dir| dir.is_dir());
+        let Some(dir) = remembered else {
+            self.prompt_download_file(tab_id, name, cx);
+            return;
+        };
+        let Some(remote_dir) = self
+            .tabs
+            .iter()
+            .find(|tab| tab.id == tab_id)
+            .and_then(|tab| tab.files.path.clone())
+        else {
+            return;
+        };
+        let Some(safe) = safe_local_name(&name) else {
+            self.file_error(tab_id, "文件名不合法，无法在本机保存", cx);
+            return;
+        };
+        let remote = crate::remote_fs::child(&remote_dir, &name);
+        let target = unique_local_path(dir.join(&safe));
+        self.start_download(tab_id, target, remote, false, cx);
+    }
+
+    /// 行菜单「下载到…（换目录）」：弹保存对话框选位置和文件名，并把目录记成下次默认。
+    pub(super) fn prompt_download_file(
+        &mut self,
+        tab_id: usize,
+        name: String,
+        cx: &mut Context<Self>,
+    ) {
         let Some(dir) = self
             .tabs
             .iter()
@@ -1579,7 +1611,11 @@ impl RuTermApp {
             return;
         };
         let remote = crate::remote_fs::child(&dir, &name);
-        let start = downloads_dir();
+        let start = self
+            .download_dir
+            .clone()
+            .filter(|dir| dir.is_dir())
+            .unwrap_or_else(downloads_dir);
         let entity = cx.entity();
         let entity_id = entity.entity_id();
         let rx = cx.prompt_for_new_path(&start, Some(&name));
@@ -1589,6 +1625,14 @@ impl RuTermApp {
             };
             let _ = cx.with_window(entity_id, move |_window, cx| {
                 entity.update(cx, move |this, cx| {
+                    // 记住这次选的目录：连着下载多个文件不必反复挑位置。
+                    if let Some(parent) = path.parent() {
+                        let parent = parent.to_path_buf();
+                        if this.download_dir.as_deref() != Some(parent.as_path()) {
+                            this.download_dir = Some(parent);
+                            this.persist_local_files(cx);
+                        }
+                    }
                     this.start_download(tab_id, path, remote, false, cx);
                 });
             });
@@ -1658,6 +1702,8 @@ impl RuTermApp {
         tab.files.busy = Some(format!("正在下载 {name}…").into());
         tab.files.progress = Some((0, 0));
         tab.files.error = None;
+        // 「下载」不再弹对话框，落点只能靠完成提示交代——把保存路径写进去。
+        let landed = local.display().to_string();
         self.status = format!("正在下载 {name}…").into();
         self.flash_transfer(format!("正在下载 {name}…"), IconName::ArrowDown, false, cx);
         cx.notify();
@@ -1717,7 +1763,7 @@ impl RuTermApp {
             let (message, error) = match outcome {
                 Ok(summary) => (
                     format!(
-                        "下载完成 · {} · {:.1} 秒",
+                        "下载完成 · {} · {:.1} 秒 · 保存到 {landed}",
                         crate::transfer::format_bytes(summary.bytes),
                         summary.elapsed.as_secs_f64()
                     ),
@@ -2686,7 +2732,8 @@ impl RuTermApp {
                     } else {
                         tr!(cx, "打开")
                     };
-                    let download_label = tr!(cx, "下载到…");
+                    let download_label = tr!(cx, "下载");
+                    let download_pick_label = tr!(cx, "下载到…（换目录）");
                     let to_local_label = if local_pane_ready {
                         tr!(cx, "下载到本机面板")
                     } else {
@@ -2718,6 +2765,17 @@ impl RuTermApp {
                                         });
                                     },
                                 ));
+                            let picking = menu_entity.clone();
+                            let pick_name = name.clone();
+                            let menu = menu.item(
+                                PopupMenuItem::new(download_pick_label.clone()).on_click(
+                                    move |_, _, cx| {
+                                        picking.update(cx, |this, cx| {
+                                            this.prompt_download_file(id, pick_name.clone(), cx);
+                                        });
+                                    },
+                                ),
+                            );
                             let to_local = menu_entity.clone();
                             let to_local_name = name.clone();
                             menu.item(
@@ -2965,15 +3023,18 @@ impl RuTermApp {
                 .justify_between()
                 .child(div().text_xs().text_color(pal.muted).child(summary))
                 .child({
-                    // 优先使用 terminal_cwd（来自 cd/OSC7），回退到 files.home（SFTP 初始目录），
-                    // 再回退到 None（主目录）。
-                    let target_path = tab
-                        .and_then(|tab| tab.terminal_cwd.clone())
-                        .or_else(|| tab.and_then(|tab| tab.files.home.clone()));
-                    let follow_tooltip = if follow_on {
-                        tr!(cx, "跟随终端：开（点击关闭）")
-                    } else {
-                        tr!(cx, "跟随终端目录")
+                    // 定位目标：终端上报的目录（cd 猜测 / OSC 7）；没有上报时不猜，
+                    // 明确回落到登录主目录，并在提示里说清当前识别到了哪个目录。
+                    let detected = tab.and_then(|tab| tab.terminal_cwd.clone());
+                    let target_path = detected.clone();
+                    let locate_tooltip = match detected.as_deref() {
+                        Some(path) => tr!(cx, "定位到终端当前目录：{path}", path = path),
+                        None => tr!(cx, "终端还没上报当前目录，点击跳到登录主目录"),
+                    };
+                    let follow_tooltip = match (follow_on, detected.as_deref()) {
+                        (true, Some(path)) => tr!(cx, "跟随终端：开，当前 {path}", path = path),
+                        (true, None) => tr!(cx, "跟随终端：开（等待终端上报目录）"),
+                        (false, _) => tr!(cx, "跟随终端目录"),
                     };
                     // 跟随开＝钉住的图钉；关＝同一图钉加斜杠（lucide 没有官方 off 版，按家族风格补的）。
                     let follow_icon = if follow_on {
@@ -2991,7 +3052,7 @@ impl RuTermApp {
                                 .compact()
                                 .ghost()
                                 .tab_index(-1)
-                                .tooltip(tr!(cx, "定位到终端当前目录"))
+                                .tooltip(locate_tooltip)
                                 .disabled(live.is_none())
                                 .on_click(cx.listener({
                                     let target = target_path.clone();
@@ -3029,15 +3090,16 @@ impl RuTermApp {
                                         {
                                             tab.files.follow = turn_on;
                                         }
-                                        // 开启跟随时立刻对齐到终端目录
-                                        if turn_on {
+                                        // 开启跟随时立刻对齐到终端目录；还没上报就不跳
+                                        // （跳到主目录会被当成「跟到了」，反而看不出没生效）。
+                                        if turn_on && let Some(target) = target.as_deref() {
                                             let current = this
                                                 .tabs
                                                 .iter()
                                                 .find(|t| t.id == id)
                                                 .and_then(|t| t.files.path.clone());
-                                            if current.as_deref() != target.as_deref() {
-                                                this.load_files(id, target.clone(), cx);
+                                            if current.as_deref() != Some(target) {
+                                                this.load_files(id, Some(target.to_string()), cx);
                                                 return;
                                             }
                                         }

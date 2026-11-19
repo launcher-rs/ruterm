@@ -293,6 +293,7 @@ pub fn start<C: AppContext>(
     handles: ExternalHandles,
     vault: Option<Arc<crate::vault::Vault>>,
     connect_timeout: Duration,
+    shell_integration: bool,
     cx: &C,
 ) -> SshSession {
     let ExternalHandles { feed, rx } = handles;
@@ -327,6 +328,7 @@ pub fn start<C: AppContext>(
             command_rx,
             command_keepalive,
             connect_timeout,
+            shell_integration,
             ready_tx,
         )
         .await;
@@ -365,6 +367,7 @@ async fn run(
     mut commands: mpsc::UnboundedReceiver<SessionCommand>,
     command_keepalive: mpsc::UnboundedSender<SessionCommand>,
     connect_timeout: Duration,
+    shell_integration: bool,
     ready: oneshot::Sender<()>,
 ) -> Result<()> {
     // 终端目录线索：上行键入解析（cd 参数）与下行 OSC 7 上报汇入同一条队列，
@@ -535,6 +538,12 @@ async fn run(
     tokio::spawn(follow_cwd(cwd_hint_rx, command_keepalive, cwd_tx));
 
     probe_remote_info(&handle, side.clone(), info_tx).await;
+
+    // 文件面板「跟随 / 定位」的目录来源：让远端 shell 自己用 OSC 7 上报 $PWD。
+    // 只追加提示符钩子，失败或 shell 不认就原样留着按键解析兜底。
+    if shell_integration {
+        install_cwd_report(&handle, &side, &raw_tx).await;
+    }
 
     // 三条收场路径：远端通道结束、本地关标签、连接本身异常终止。
     // 连接是否还活着改为每秒查一次 `is_closed()`（`Handle` 作为 Future 消费后
@@ -1327,6 +1336,100 @@ async fn probe_remote_info(
     });
 }
 
+/// 让远端 shell 自己上报工作目录（OSC 7 `file://host/$PWD`），文件面板的
+/// 「跟随终端 / 定位到终端目录」才有确定来源：靠解析按键里的 `cd` 只能猜，
+/// 带 Tab 补全、方向键调历史、变量替换的行一律认不出来。
+///
+/// 先另开一条 exec 通道读 `$SHELL`（sshd 按 passwd 起交互 shell，这个变量对
+/// csh / fish 也照样能 echo 出来），确认是 bash / zsh 才注入钩子；其余 shell
+/// 语法不同（fish 无 `()` 函数定义、csh 无 PROMPT_COMMAND），注入会刷一屏报错，
+/// 就退回按键解析。
+async fn install_cwd_report(
+    handle: &Handle<SshTerminalHandler>,
+    side: &SideChannels,
+    raw_tx: &mpsc::UnboundedSender<Vec<u8>>,
+) {
+    let Some(shell) = login_shell(handle, side).await else {
+        log::debug!("[shell_integration] 探测登录 shell 失败，沿用按键解析");
+        return;
+    };
+    if !reports_cwd(&shell) {
+        log::debug!("[shell_integration] {shell} 不支持 OSC 7 注入，沿用按键解析");
+        return;
+    }
+    let tx = raw_tx.clone();
+    // 提示符（含 MOTD）落地后再写这行：太早发会接在用户已经敲了半行的命令后面。
+    tokio::spawn(async move {
+        tokio::time::sleep(SHELL_INTEGRATION_DELAY).await;
+        let _ = tx.send(format!("{SHELL_INTEGRATION}\r").into_bytes());
+    });
+}
+
+/// 探测登录 shell 的路径：exec 通道跑 `echo $SHELL`，取输出的第一行。
+///
+/// 通道登记进 [`SideChannels`]，探测输出不会灌进终端；服务器分段回数据，所以要
+/// 读到换行（或通道收尾）为止，只拿第一条 DATA 会把 `/bin/bash` 截成 `/bin/ba`。
+/// 探测不可用（禁 exec、超时、输出不是绝对路径）统一返回 None。
+async fn login_shell(handle: &Handle<SshTerminalHandler>, side: &SideChannels) -> Option<String> {
+    let probe = handle.channel_open_session().await.ok()?;
+    side.add(probe.id());
+    let (mut read, write) = probe.split();
+    if write.exec(false, b"echo $SHELL".to_vec()).await.is_err() {
+        return None;
+    }
+    let deadline = tokio::time::Instant::now() + PROBE_TIMEOUT;
+    let mut output: Vec<u8> = Vec::new();
+    while !output.contains(&b'\n') && output.len() < 4096 {
+        let Ok(Some(msg)) = tokio::time::timeout_at(deadline, read.wait()).await else {
+            break;
+        };
+        match msg {
+            ChannelMsg::Data { data } | ChannelMsg::ExtendedData { data, .. } => {
+                output.extend_from_slice(&data);
+            }
+            ChannelMsg::Eof | ChannelMsg::Close => break,
+            _ => {}
+        }
+    }
+    let _ = write.close().await;
+    shell_path_from_output(&output)
+}
+
+/// 探测输出的第一行：是绝对路径才认，Windows 上 `echo $SHELL` 回显字面量就是 None。
+fn shell_path_from_output(output: &[u8]) -> Option<String> {
+    let line = String::from_utf8_lossy(output)
+        .lines()
+        .next()?
+        .trim()
+        .to_string();
+    line.starts_with('/').then_some(line)
+}
+
+/// 只有 bash / zsh 会注入：登录 shell 名带前导 `-`（login shell 的写法）也要认。
+fn reports_cwd(shell: &str) -> bool {
+    let name = shell
+        .rsplit('/')
+        .next()
+        .unwrap_or(shell)
+        .trim_start_matches('-');
+    matches!(name, "bash" | "zsh")
+}
+
+/// 注入等待提示符的时间。
+const SHELL_INTEGRATION_DELAY: Duration = Duration::from_millis(1200);
+
+/// 同一份代码兼顾 bash（追加 `PROMPT_COMMAND`）与 zsh（`precmd` 钩子），两者都在
+/// 每次显示提示符前上报 `$PWD`；末尾那次调用立即报一次，连接上就能看到当前目录。
+///
+/// 开头的空格让 bash 在 `HISTCONTROL=ignorespace` 下不把这行记进历史；已有的
+/// `PROMPT_COMMAND` 保留在后面，不覆盖用户自己的钩子。
+const SHELL_INTEGRATION: &str = concat!(
+    " __rc(){ printf '\\033]7;file://%s%s\\007' \"${HOSTNAME:-localhost}\" \"$PWD\"; }; ",
+    "if [ -n \"$ZSH_VERSION\" ]; then autoload -U add-zsh-hook 2>/dev/null; ",
+    "add-zsh-hook precmd __rc 2>/dev/null; ",
+    "else PROMPT_COMMAND=\"__rc${PROMPT_COMMAND:+;$PROMPT_COMMAND}\"; fi; __rc",
+);
+
 /// SSH 会话要声明的 locale 变量：本地显式设置的优先透传，否则默认 C.UTF-8。
 fn ssh_locale_env() -> Vec<(&'static str, String)> {
     let mut env = Vec::new();
@@ -1950,7 +2053,40 @@ mod tests {
         assert!(server.await.unwrap().is_err());
     }
 
-    use super::{CwdKeystrokes, cd_arg_from_line, lex_join, path_from_osc7, percent_decode};
+    use super::{
+        CwdKeystrokes, cd_arg_from_line, lex_join, path_from_osc7, percent_decode, reports_cwd,
+        shell_path_from_output,
+    };
+
+    #[test]
+    fn cwd_report_only_targets_bash_and_zsh() {
+        assert!(reports_cwd("/bin/bash"));
+        assert!(reports_cwd("/usr/local/bin/zsh"));
+        // login shell 以 `-bash` 形式启动。
+        assert!(reports_cwd("-bash"));
+        assert!(!reports_cwd("/usr/bin/fish"));
+        assert!(!reports_cwd("/bin/csh"));
+        assert!(!reports_cwd("C:\\Windows\\System32\\cmd.exe"));
+        assert!(!reports_cwd(""));
+    }
+
+    #[test]
+    fn login_shell_takes_the_first_absolute_line() {
+        assert_eq!(
+            shell_path_from_output(b"/bin/bash\n"),
+            Some("/bin/bash".into())
+        );
+        // login shell 以 `-bash` 起，路径形式照样要认。
+        assert_eq!(
+            shell_path_from_output(b"/usr/local/bin/zsh"),
+            Some("/usr/local/bin/zsh".into())
+        );
+        // Windows 服务器上 `echo $SHELL` 回显字面量；没有输出也没有行。
+        assert_eq!(shell_path_from_output(b"$SHELL\n"), None);
+        assert_eq!(shell_path_from_output(b"\n"), None);
+        let empty: &[u8] = b"";
+        assert_eq!(shell_path_from_output(empty), None);
+    }
 
     #[test]
     fn cd_arg_plain_and_quoted() {
@@ -2038,5 +2174,98 @@ mod tests {
         // Ctrl+C 清空
         assert_eq!(t.feed(b"garbage\x03"), None);
         assert_eq!(t.feed(b"cd /etc\r"), Some("/etc".into()));
+    }
+
+    /// 真实 SSH 下的目录上报联调（默认跳过）：`cargo test -- --ignored cwd_report`。
+    ///
+    /// 需要本地测试服务器（Docker 容器 `localhost:2222`，test / test123，OpenSSH + bash）。
+    /// 覆盖三段：exec 通道探测 `$SHELL`、把注入行写进交互 shell、确认每个提示符前
+    /// 都回一条能被 [`path_from_osc7`] 解析的 OSC 7（换目录后上报的是新目录）。
+    #[tokio::test]
+    #[ignore = "需要本地 SSH 测试服务器 localhost:2222 (test/test123)"]
+    async fn cwd_report_over_real_ssh() {
+        use super::{ChannelMsg, SHELL_INTEGRATION, SshConfig};
+        use bytes::Bytes;
+        use russh::keys::PublicKeyOrCertificate;
+        use std::time::Duration;
+
+        struct TrustAll;
+        impl russh::client::Handler for TrustAll {
+            type Error = russh::Error;
+            async fn check_server_key(
+                &mut self,
+                _key: &PublicKeyOrCertificate,
+            ) -> Result<bool, Self::Error> {
+                Ok(true)
+            }
+        }
+
+        let mut handle = russh::client::connect(
+            std::sync::Arc::new(SshConfig::default()),
+            ("127.0.0.1", 2222u16),
+            TrustAll,
+        )
+        .await
+        .expect("测试服务器没起来？先启动容器再跑本测试");
+        assert!(
+            handle
+                .authenticate_password("test", "test123")
+                .await
+                .is_ok()
+        );
+
+        // 探测：sshd 会把 SHELL 写进会话环境，所以 exec 通道读得到登录 shell。
+        let probe = handle.channel_open_session().await.unwrap();
+        let (mut read, write) = probe.split();
+        write.exec(false, b"echo $SHELL".to_vec()).await.unwrap();
+        let mut shell = Vec::new();
+        while let Some(msg) = read.wait().await {
+            match msg {
+                ChannelMsg::Data { data } => shell.extend_from_slice(&data),
+                ChannelMsg::Eof | ChannelMsg::Close => break,
+                _ => {}
+            }
+        }
+        drop(write);
+        let shell = shell_path_from_output(&shell).unwrap_or_default();
+        assert!(reports_cwd(&shell), "ssh 会话里 $SHELL = {shell:?}");
+
+        // 注入：交互 shell 里跑注入行，再 cd，等下行里出现新目录的上报。
+        let chan = handle.channel_open_session().await.unwrap();
+        chan.request_pty(true, "xterm-256color", 80, 24, 0, 0, &[])
+            .await
+            .unwrap();
+        chan.request_shell(true).await.unwrap();
+        let (mut read, write) = chan.split();
+        for command in [format!("{SHELL_INTEGRATION}\r"), "cd /etc\r".to_string()] {
+            write.data_bytes(Bytes::from(command)).await.unwrap();
+        }
+        let mut reported: Vec<String> = Vec::new();
+        let mut pending: Vec<u8> = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !reported.iter().any(|path| path == "/etc") {
+            let msg = tokio::time::timeout_at(deadline, read.wait())
+                .await
+                .expect("shell 没有上报任何 OSC 7");
+            if let Some(ChannelMsg::Data { data }) = msg {
+                pending.extend_from_slice(&data);
+            }
+            // 逐条摘出上报；payload 可能跨数据分片，没等到收尾符就先攒着。
+            while let Some(start) = pending.windows(4).position(|w| w == b"\x1b]7;") {
+                // BEL 或 ESC(ST) 收尾，两种终止写法都要认。
+                let Some(end) = pending[start + 4..]
+                    .iter()
+                    .position(|&b| b == 0x07 || b == 0x1b)
+                else {
+                    break;
+                };
+                let payload =
+                    String::from_utf8_lossy(&pending[start + 4..start + 4 + end]).to_string();
+                pending = pending[start + 4 + end + 1..].to_vec();
+                if let Some(path) = path_from_osc7(&payload) {
+                    reported.push(path);
+                }
+            }
+        }
     }
 }

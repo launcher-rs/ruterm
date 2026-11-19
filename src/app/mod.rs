@@ -50,6 +50,7 @@ use widgets::*;
 
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -165,6 +166,8 @@ pub(crate) struct RuTermApp {
     sidebar_page: SidebarPage,
     /// 本机文件页的浏览状态（当前目录、条目、排序与列宽、隐藏文件开关）。
     local: LocalBrowser,
+    /// 上次下载远端文件的落点目录；行菜单「下载」默认直接用它。
+    download_dir: Option<PathBuf>,
     /// 正在拖拽的文件列宽（起点指针位置 + 起始宽度）。
     col_drag: Option<ColumnDragState>,
     /// 文件面板的新建目录 / 重命名弹窗。
@@ -473,6 +476,7 @@ impl RuTermApp {
             transfer_flash_seq: 0,
             path_edit: None,
             local: LocalBrowser::from_prefs(&local_files),
+            download_dir: local_files.download_dir.as_deref().map(PathBuf::from),
             split_drag: None,
             split_width: Rc::new(Cell::new(0.0)),
             forward: None,
@@ -934,6 +938,11 @@ impl RuTermApp {
                 let _ = this.update(cx, |this, cx| {
                     if !this.local.listed && this.local.path.is_none() {
                         this.local.path = prefs.path.as_deref().map(std::path::PathBuf::from);
+                    }
+                    // 下载落点只在内存里没记过时回填，别覆盖本次运行已经选过的目录。
+                    if this.download_dir.is_none() {
+                        this.download_dir =
+                            prefs.download_dir.as_deref().map(std::path::PathBuf::from);
                     }
                     if this.local.show_hidden != prefs.show_hidden {
                         this.local.show_hidden = prefs.show_hidden;

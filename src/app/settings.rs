@@ -667,6 +667,21 @@ impl RuTermApp {
                     .text_color(pal.muted)
                     .child(tr!(cx, "输入命令时自动弹出片段候选：↑↓ 选择、Tab / Enter 补全、Esc 关闭；补全只替换正在输入的那个词，不会执行命令。关闭后按键完全交给 shell。")),
             )
+            .child({
+                let entity = cx.entity();
+                Checkbox::new("terminal-shell-integration")
+                    .label(tr!(cx, "让远端 shell 上报当前目录"))
+                    .checked(self.terminal.shell_integration)
+                    .on_change(move |value, _window, cx| {
+                        entity.update(cx, |this, cx| this.set_shell_integration(value, cx));
+                    })
+            })
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(pal.muted)
+                    .child(tr!(cx, "连上 bash / zsh 会话时追加一条提示符钩子，用 OSC 7 上报 $PWD；文件面板的「定位 / 跟随」据此跳到终端所在目录。关掉或换成别的 shell 时，仍按命令行里的 cd 猜测目录。改动只对之后建立的会话生效。")),
+            )
             .child(self.render_local_shell_row(pal, cx))
             .child(
                 div()

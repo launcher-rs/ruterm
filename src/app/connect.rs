@@ -468,6 +468,7 @@ impl RuTermApp {
             handles,
             self.vault.clone(),
             Duration::from_secs(self.session_prefs.connect_timeout),
+            self.terminal.shell_integration,
             cx,
         );
         // 会话结束（远端 exit / 断线 / 连接失败）→ 保留标签并展示断开横幅。

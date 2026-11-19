@@ -172,6 +172,13 @@ impl RuTermApp {
         }
     }
 
+    /// 开关 shell 目录上报：只影响之后建立的 SSH 会话（已连上的不追溯）。
+    pub(super) fn set_shell_integration(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        let mut prefs = self.terminal.clone();
+        prefs.shell_integration = enabled;
+        self.set_terminal_prefs(prefs, cx);
+    }
+
     /// 把「自定义」配色注册进全局 `ThemeManager`（重复调用即覆盖）。
     pub(super) fn register_custom_theme(colors: &TerminalColors, cx: &mut App) {
         if !cx.has_global::<ThemeManager>() {

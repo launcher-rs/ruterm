@@ -322,6 +322,13 @@ pub struct TerminalPrefs {
     /// 输入命令时自动弹出片段候选（Tab / Enter 补全）。
     #[serde(default = "inline_completion_default")]
     pub inline_completion: bool,
+    /// 向远端 shell 注入 OSC 7 目录上报（文件面板「跟随 / 定位」的来源）。
+    #[serde(default = "shell_integration_default")]
+    pub shell_integration: bool,
+}
+
+pub(super) fn shell_integration_default() -> bool {
+    true
 }
 
 pub(super) fn inline_completion_default() -> bool {
@@ -348,6 +355,7 @@ impl Default for TerminalPrefs {
             theme: TERMINAL_THEME_DEFAULT.to_string(),
             custom: TerminalColors::default(),
             inline_completion: true,
+            shell_integration: true,
         }
     }
 }
@@ -1471,6 +1479,7 @@ mod tests {
         prefs.nudge_line_height(2);
         prefs.theme = "Dracula".into();
         prefs.inline_completion = false;
+        prefs.shell_integration = false;
         prefs
             .custom
             .set_hex_field(CUSTOM_BRIGHT_BASE + 3, "#123456".into());
@@ -1480,10 +1489,13 @@ mod tests {
         assert_eq!(restored.theme, "Dracula");
         assert_eq!(restored.custom, prefs.custom);
         assert!(!restored.inline_completion);
-        // 旧版 JSON 没有 custom / inline_completion：补默认值（One Dark、自动补全开启）。
+        assert!(!restored.shell_integration);
+        // 旧版 JSON 没有 custom / inline_completion / shell_integration：补默认值
+        // （One Dark、自动补全与目录上报都开启）。
         let legacy = TerminalPrefs::from_json(r#"{"font_size":16.0}"#);
         assert_eq!(legacy.custom, TerminalColors::default());
         assert!(legacy.inline_completion);
+        assert!(legacy.shell_integration);
     }
 
     #[test]
