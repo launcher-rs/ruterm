@@ -74,6 +74,8 @@ pub(super) struct SessionTab {
     pub(super) zmodem: Option<SharedString>,
     /// lrzsz 上传进度 (已传, 总量)。
     pub(super) zmodem_progress: Option<(u64, u64)>,
+    /// 本轮 lrzsz 批次上传的取消标记：UI 取消时置位并下发 ZmodemCancel。
+    pub(super) zmodem_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// 本轮连续自动重连已尝试次数（0＝不在自动重连中，手动重连会清零）。
     pub(super) auto_retry_attempt: u32,
     /// 已排定一次自动重连（横幅展示等待与取消入口）。
@@ -973,6 +975,7 @@ impl RuTermApp {
                 } else {
                     0.0
                 };
+                let cancel_label = tr!(cx, "取消");
                 this.child(
                     v_flex()
                         .absolute()
@@ -987,15 +990,36 @@ impl RuTermApp {
                         .border_1()
                         .border_color(pal.border)
                         .shadow_md()
-                        .child(div().text_xs().text_color(pal.text).child(if total > 0 {
-                            format!(
-                                "{text} {} / {}",
-                                crate::transfer::format_bytes(done),
-                                crate::transfer::format_bytes(total)
-                            )
-                        } else {
-                            text.to_string()
-                        }))
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .justify_between()
+                                .gap_2()
+                                .child(div().text_xs().text_color(pal.text).child(if total > 0 {
+                                    format!(
+                                        "{text} {} / {}",
+                                        crate::transfer::format_bytes(done),
+                                        crate::transfer::format_bytes(total)
+                                    )
+                                } else {
+                                    text.to_string()
+                                }))
+                                .child(
+                                    // 取消入口：拖错文件 / 远端没装 lrzsz 时不必干等
+                                    // 超时，也不必关掉整个标签。
+                                    div()
+                                        .id("zmodem-cancel")
+                                        .cursor_pointer()
+                                        .px_1()
+                                        .text_xs()
+                                        .text_color(pal.muted)
+                                        .hover(|style| style.text_color(pal.danger))
+                                        .child(cancel_label)
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.cancel_zmodem(id, cx);
+                                        })),
+                                ),
+                        )
                         .child(
                             div()
                                 .h(px(4.0))

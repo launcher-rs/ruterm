@@ -8,6 +8,7 @@
 use std::collections::HashSet;
 use std::io::Write as _;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
@@ -51,11 +52,27 @@ impl SideChannels {
     }
 }
 
+/// 一条进行中的 ZMODEM 上传的接管信息。
+pub struct ZmodemTransfer {
+    /// 上传任务的下行接管通道（`rz` 的 ZRINIT / ZDATA 应答都从这走）。
+    pub downlink: mpsc::UnboundedSender<Vec<u8>>,
+    /// 取消标记：UI 取消时置位，`send_file` 每轮循环检查后主动收场。
+    pub cancel: Arc<AtomicBool>,
+}
+
+impl ZmodemTransfer {
+    /// 请求取消：置位标记。
+    pub fn cancel(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
 /// ZMODEM（lrzsz）拖拽上传期间的下行接管点。
 ///
 /// 安装时终端通道的输出不再喂给终端视图，而是转交上传任务（`rz` 的
-/// ZRINIT/ZDATA 应答都在这条流里）；上传结束必须置回 None 恢复终端。
-pub type ZmodemSink = Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>>>;
+/// ZRINIT/ZDATA 应答都在这条流里）；上传结束或被取消必须置回 None
+/// 恢复终端。
+pub type ZmodemSink = Arc<Mutex<Option<ZmodemTransfer>>>;
 
 /// 新建一个未安装的接管点。
 pub fn zmodem_sink() -> ZmodemSink {
@@ -298,10 +315,10 @@ impl SshTerminalHandler {
             return false;
         };
         let guard = sink.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let Some(sender) = guard.as_ref() else {
+        let Some(transfer) = guard.as_ref() else {
             return false;
         };
-        sender.send(data.to_vec()).is_ok()
+        transfer.downlink.send(data.to_vec()).is_ok()
     }
 }
 

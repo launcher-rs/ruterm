@@ -59,6 +59,7 @@ impl Direction {
 }
 
 /// 一次传输的完成信息。
+#[derive(Debug)]
 pub struct Summary {
     pub bytes: u64,
     pub elapsed: Duration,

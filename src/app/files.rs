@@ -1849,9 +1849,13 @@ impl RuTermApp {
         } else {
             format!("，跳过 {} 项", skipped.len())
         };
+        // 批次级取消标记：UI 的「取消」置位它，剩余文件不再发起；
+        // 单个传输的取消经 SessionCommand::ZmodemCancel 下发到会话。
+        let batch_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
         if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) {
             tab.zmodem = Some(format!("正在通过 lrzsz 上传 {total} 个文件…").into());
             tab.zmodem_progress = Some((0, 0));
+            tab.zmodem_cancel = Some(batch_cancel.clone());
         }
         self.status = format!("正在通过 lrzsz 上传 {total} 个文件…{note}").into();
         self.flash_transfer(
@@ -1864,7 +1868,12 @@ impl RuTermApp {
 
         cx.spawn(async move |this, cx| {
             let mut failed = Vec::new();
+            let mut done_count = 0usize;
             for path in files {
+                // 批次取消：剩余文件不再发起，已传完的保留在远端。
+                if batch_cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
                 let Some(name) = path
                     .file_name()
                     .map(|name| name.to_string_lossy().into_owned())
@@ -1923,9 +1932,14 @@ impl RuTermApp {
                 };
                 if let Err(error) = outcome {
                     failed.push(format!("{name}（{error}）"));
+                } else {
+                    done_count += 1;
                 }
             }
-            let message = if failed.is_empty() {
+            let canceled = batch_cancel.load(std::sync::atomic::Ordering::Relaxed);
+            let message = if canceled {
+                format!("lrzsz 上传已取消（成功 {done_count} / {total} 个文件）")
+            } else if failed.is_empty() {
                 format!("lrzsz 上传完成 · {total} 个文件")
             } else {
                 format!(
@@ -1938,11 +1952,12 @@ impl RuTermApp {
                 if let Some(tab) = this.tabs.iter_mut().find(|tab| tab.id == tab_id) {
                     tab.zmodem = None;
                     tab.zmodem_progress = None;
+                    tab.zmodem_cancel = None;
                 }
                 this.status = message.clone().into();
                 this.flash_transfer(
                     message,
-                    if failed.is_empty() {
+                    if failed.is_empty() && !canceled {
                         IconName::CircleCheck
                     } else {
                         IconName::TriangleAlert
@@ -1954,6 +1969,28 @@ impl RuTermApp {
             });
         })
         .detach();
+    }
+
+    /// 取消本轮 lrzsz 上传：置位批次取消标记（剩余文件不再发起），并给
+    /// 会话下发 `ZmodemCancel` 让当前传输尽快收场（摘掉下行接管点恢复
+    /// 终端输出、往远端发 Ctrl+C）。
+    pub(super) fn cancel_zmodem(&mut self, tab_id: usize, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) else {
+            return;
+        };
+        if tab.zmodem.is_none() {
+            return;
+        }
+        if let Some(flag) = tab.zmodem_cancel.as_ref() {
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        if let Some(sender) = tab.commands.as_ref() {
+            let (reply, _rx) = tokio::sync::oneshot::channel();
+            let _ = sender.send(crate::session::SessionCommand::ZmodemCancel { reply });
+        }
+        tab.zmodem = Some("正在取消 lrzsz 上传…".into());
+        self.status = "正在取消 lrzsz 上传…".into();
+        cx.notify();
     }
 
     /// 打开文件面板的新建 / 重命名弹窗。

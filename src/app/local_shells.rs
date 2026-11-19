@@ -581,6 +581,7 @@ impl RuTermApp {
             terminal_cwd: None,
             zmodem: None,
             zmodem_progress: None,
+            zmodem_cancel: None,
             auto_retry_attempt: 0,
             auto_retry_pending: false,
             connected_at: None,

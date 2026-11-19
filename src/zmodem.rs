@@ -4,6 +4,7 @@
 //! 在握手期间接管；协议状态机由 `zmodem2` 驱动，本模块只负责文件读写、超时与进度。
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result};
@@ -19,14 +20,19 @@ const FIRST_RESPONSE: Duration = Duration::from_secs(15);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// 空闲等待切片：定时调用 `timeout()` 重发握手，又不能刷得太密。
 const TICK: Duration = Duration::from_secs(3);
+/// ZDLE 字节：ZMODEM 帧定界与控制字节转义的起始（CAN，0x18）。shell 的
+/// 回显与报错文本永远不含它，以此区分「协议流量」和「普通终端输出」。
+const ZDLE: u8 = 0x18;
 
 /// 通过 ZMODEM 上传一个文件；`remote_name` 只允许是文件名（rz 写进当前目录）。
+/// `cancel` 置位后每轮循环检查，尽快收场并返回「已取消」错误。
 pub async fn send_file(
     path: &Path,
     remote_name: &str,
     downlink: &mut UnboundedReceiver<Vec<u8>>,
     uplink: &UnboundedSender<Vec<u8>>,
     progress: &UnboundedSender<(u64, u64)>,
+    cancel: &AtomicBool,
 ) -> Result<transfer::Summary> {
     let started = Instant::now();
     let mut file = tokio::fs::File::open(path)
@@ -69,6 +75,10 @@ pub async fn send_file(
     let mut got_wire = false;
     let mut last_rx = Instant::now();
     loop {
+        if cancel.load(Ordering::Relaxed) {
+            sender.abort();
+            anyhow::bail!("ZMODEM 传输已取消");
+        }
         match sender.poll() {
             Action::WriteWire(bytes) => {
                 let chunk = bytes.to_vec();
@@ -143,9 +153,20 @@ pub async fn send_file(
         }
         match tokio::time::timeout(TICK.min(limit - waited), downlink.recv()).await {
             Ok(Some(bytes)) => {
-                got_wire = true;
+                // 只把含 ZDLE 的流量当「协议应答」：远端没有 rz 时，shell 的
+                // 回显与 command not found 文本不含 ZDLE，不会再把判定切换到
+                // IDLE 路径并不断重置空闲计时——那会形成无限重发的活锁，
+                // 终端输出也被整体吞掉、又没有取消入口。FIRST_RESPONSE 到点
+                // 即可干净报错「远端没有启动 ZMODEM 接收」。
+                if bytes.contains(&ZDLE) {
+                    got_wire = true;
+                }
                 last_rx = Instant::now();
-                pending.extend_from_slice(&bytes);
+                // 握手完成前只收协议流量（回显文本不进状态机）；拿到真实
+                // 应答后照单全收——大块文件数据可能整段不含 ZDLE，不能再滤。
+                if got_wire || bytes.contains(&ZDLE) {
+                    pending.extend_from_slice(&bytes);
+                }
             }
             Ok(None) => anyhow::bail!("会话下行通道已关闭"),
             Err(_) => {
@@ -158,6 +179,7 @@ pub async fn send_file(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::time::Duration;
 
     use tokio::sync::mpsc;
@@ -181,9 +203,11 @@ mod tests {
         let (down_tx, mut down_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let (up_tx, mut up_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<(u64, u64)>();
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let local = path.clone();
         let sender = tokio::spawn(async move {
-            send_file(&local, "payload.bin", &mut down_rx, &up_tx, &progress_tx).await
+            let cancel = &cancel;
+            send_file(&local, "payload.bin", &mut down_rx, &up_tx, &progress_tx, cancel).await
         });
 
         // 同一进程里跑一个接收端，验证发送端的握手、读文件、进度与收尾。
@@ -253,5 +277,31 @@ mod tests {
             last = Some(progress);
         }
         assert_eq!(last, Some((payload.len() as u64, payload.len() as u64)));
+    }
+
+    /// 取消标记预置位时，`send_file` 应立刻收场并报「已取消」，
+    /// 不能继续推进协议状态机。
+    #[tokio::test]
+    async fn cancel_flag_aborts_promptly() {
+        let path = std::env::temp_dir().join(format!(
+            "ruterm-zmodem-cancel-{}-{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        tokio::fs::write(&path, b"payload").await.unwrap();
+
+        let (_down_tx, mut down_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (up_tx, _up_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (progress_tx, _progress_rx) = mpsc::unbounded_channel::<(u64, u64)>();
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let local = path.clone();
+        let result = send_file(&local, "payload.bin", &mut down_rx, &up_tx, &progress_tx, &cancel)
+            .await
+            .expect_err("预置取消应直接报错");
+        tokio::fs::remove_file(&path).await.ok();
+        assert!(result.to_string().contains("已取消"));
     }
 }

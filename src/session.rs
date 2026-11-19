@@ -233,6 +233,11 @@ pub enum SessionCommand {
         progress: mpsc::UnboundedSender<(u64, u64)>,
         reply: oneshot::Sender<Result<transfer::Summary>>,
     },
+    /// 取消进行中的 lrzsz 上传：置位取消标记、摘掉下行接管点并往远端发
+    /// Ctrl+C。没有进行中的传输时也安全（no-op）。
+    ZmodemCancel {
+        reply: oneshot::Sender<()>,
+    },
     /// 开始一条转发（本机监听，或请求服务器监听）。
     ///
     /// 回传生效规则：远程转发请求端口 0 时服务器会分配实际端口。
@@ -737,7 +742,11 @@ async fn run(
                             continue;
                         }
                         let (down_tx, mut down_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-                        *sink_slot = Some(down_tx.clone());
+                        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                        *sink_slot = Some(crate::ssh::ZmodemTransfer {
+                            downlink: down_tx.clone(),
+                            cancel: cancel.clone(),
+                        });
                         drop(sink_slot);
                         let sink = zmodem_sink.clone();
                         let raw = raw_tx.clone();
@@ -747,7 +756,7 @@ async fn run(
                                 raw.send(b"rz -y\r".to_vec())
                                     .map_err(|_| anyhow::anyhow!("会话上行通道已关闭"))?;
                                 crate::zmodem::send_file(
-                                    &local, &name, &mut down_rx, &raw, &progress,
+                                    &local, &name, &mut down_rx, &raw, &progress, &cancel,
                                 )
                                 .await
                             }
@@ -758,7 +767,10 @@ async fn run(
                                 .lock()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                                 .as_ref()
-                                .map(|tx| tx.same_channel(&down_tx))
+                                .map(|transfer| {
+                                    transfer.downlink.same_channel(&down_tx)
+                                        && !transfer.cancel.load(std::sync::atomic::Ordering::Relaxed)
+                                })
                                 .unwrap_or(false);
                             if owns_sink {
                                 // 先恢复终端输出，再回执：UI 收到结果即可继续输入。
@@ -777,6 +789,23 @@ async fn run(
                             }
                             let _ = reply.send(result);
                         });
+                    }
+                    SessionCommand::ZmodemCancel { reply } => {
+                        // 先置位取消标记（send_file 每轮循环检查），再摘接管点
+                        // 恢复终端输出，最后发 Ctrl+C 让远端 rz 退出回 shell。
+                        // 顺序保证 send_file 收场时接管点已不在，不会重复发 ^C。
+                        if let Some(slot) = zmodem_sink
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .as_ref()
+                        {
+                            slot.cancel();
+                        }
+                        *zmodem_sink
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                        let _ = raw_tx.send(vec![0x03]);
+                        let _ = reply.send(());
                     }
                     SessionCommand::ForwardStart { rule, reply } => {
                         let result = match rule.kind {
