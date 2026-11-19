@@ -12,9 +12,11 @@ pub enum CompletionKind {
     Command,
     /// 从接得上前文的命令里抽出的选项（参数位输入 `-` 时）。
     Flag,
+    /// 这条会话以外也记下来的历史命令行。
+    History,
 }
 
-/// 参与补全的一条候选：自己的片段、内置命令，或命令里用过的选项。
+/// 参与补全的一条候选：自己的片段、内置命令、命令里用过的选项，或历史命令行。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompletionItem {
     pub name: String,
@@ -47,6 +49,46 @@ impl CompletionItem {
 pub const MIN_TOKEN_CHARS: usize = 2;
 /// 浮层最多展示的候选数。
 pub const MAX_MATCHES: usize = 8;
+/// 历史命令行在浮层上最多显示多少个字符：整条命令可能长达几千字符，
+/// 名称列不参与省略，全铺会把浮层撑出屏幕。
+pub const MAX_NAME_CHARS: usize = 80;
+
+/// 历史命令行变成候选：整条就是接受补全时写进终端的文本，最新一条排最前。
+///
+/// 片段 / 内置命令里已有的同一条命令跳过，免得浮层里同一行出现两遍；
+/// 名称只留开头若干字符用于显示，`command` 仍是完整一条。
+pub fn history_items(entries: &[String], presets: &[CompletionItem]) -> Vec<CompletionItem> {
+    let taken: std::collections::HashSet<&str> =
+        presets.iter().map(|item| item.command.as_str()).collect();
+    entries
+        .iter()
+        .filter(|entry| !taken.contains(entry.as_str()))
+        .map(|entry| {
+            CompletionItem::new(
+                ellipsis(entry, MAX_NAME_CHARS),
+                entry.clone(),
+                String::new(),
+                CompletionKind::History,
+            )
+        })
+        .collect()
+}
+
+/// 历史列表的内容指纹：每回车一条命令都会变，候选缓存要跟着失效。
+pub fn history_fingerprint(entries: &[String]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    entries.iter().for_each(|entry| entry.hash(&mut hasher));
+    hasher.finish()
+}
+
+/// 超过 `max_chars` 就截到该字符数并加省略号（按字符切，不切在多字节中间）。
+fn ellipsis(text: &str, max_chars: usize) -> String {
+    match text.char_indices().nth(max_chars) {
+        Some((index, _)) => format!("{}…", &text[..index]),
+        None => text.to_string(),
+    }
+}
 
 /// 文本里最后一个词（按空白 / 分隔符切分）。
 pub fn last_token(text: &str) -> &str {
@@ -172,17 +214,30 @@ fn flag_options(items: &[CompletionItem], token: &str, segment: &[&str]) -> Vec<
 /// 按词在命令行里的位置给候选：命令位整库模糊搜索，参数位只接受接得上前文的
 /// 续写与选项，参数填的是路径 / 包名之类的东西，命中不了就完全不弹（Tab 交回
 /// shell 自己的补全）。
+///
+/// 候选池里除了片段和内置命令还有历史命令行：命中同样的词时，最近用过的排最前。
 pub fn complete(items: &[CompletionItem], token: &str, before_token: &str) -> Vec<CompletionItem> {
     let token = token.trim();
     let segment = segment_words(before_token);
     let slots = match token_slot(before_token) {
-        TokenSlot::Command => fuzzy_matches(items, token),
+        TokenSlot::Command => recent_first(fuzzy_matches(items, token), items),
         TokenSlot::Argument if token.starts_with('-') => {
             return flag_options(items, token, &segment);
         }
-        TokenSlot::Argument => continuations(items, token, &segment),
+        TokenSlot::Argument => recent_first(continuations(items, token, &segment), items),
     };
     slots.into_iter().map(|slot| items[slot].clone()).collect()
+}
+
+/// 历史候选提到最前：最近用过的写法往往就是这次要敲的，剩下的候选保持匹配度顺序。
+///
+/// 候选池里历史条目本身按新→旧排列，所以组内只按下标排即可。
+fn recent_first(slots: Vec<usize>, items: &[CompletionItem]) -> Vec<usize> {
+    let (mut recent, rest): (Vec<usize>, Vec<usize>) = slots
+        .into_iter()
+        .partition(|slot| items[*slot].kind == CompletionKind::History);
+    recent.sort_unstable();
+    recent.into_iter().chain(rest).collect()
 }
 
 /// 命令位候选：整库模糊匹配，返回 items 下标（已按匹配度排序）。
@@ -275,8 +330,9 @@ pub fn merged_command(prefix: &str, command: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        CompletionItem, CompletionKind, MAX_MATCHES, MIN_TOKEN_CHARS, TokenSlot, complete,
-        echo_lagging, fuzzy_matches, last_token, merged_command, token_slot,
+        CompletionItem, CompletionKind, MAX_MATCHES, MAX_NAME_CHARS, MIN_TOKEN_CHARS, TokenSlot,
+        complete, echo_lagging, fuzzy_matches, history_fingerprint, history_items, last_token,
+        merged_command, token_slot,
     };
 
     fn item(name: &str, command: &str, note: &str) -> CompletionItem {
@@ -460,6 +516,119 @@ mod tests {
         // 单独的 `-` 与 `--` 本身不是选项。
         let bare = vec![item("过滤", "grep - pattern", "")];
         assert!(complete(&bare, "-", "grep ").is_empty());
+    }
+
+    fn history(entries: &[&str]) -> Vec<CompletionItem> {
+        let entries: Vec<String> = entries.iter().map(|entry| (*entry).to_string()).collect();
+        history_items(&entries, &[])
+    }
+
+    #[test]
+    fn history_lines_rank_newest_first_and_beat_snippets() {
+        let recent_first = [
+            &history(&["git commit -m '修复登录崩溃'", "git status"])[..],
+            &sample()[..],
+        ]
+        .concat();
+        let hits = complete(&recent_first, "git", "");
+        assert_eq!(hits[0].kind, CompletionKind::History);
+        assert_eq!(hits[0].command, "git commit -m '修复登录崩溃'");
+        assert_eq!(hits[1].command, "git status");
+        // 历史顺序反过来，候选顺序跟着变：靠的是新旧次序，不是名称字母序。
+        let older_first = history(&["git status", "git commit -m '修复登录崩溃'"]);
+        let hits = complete(&older_first, "git", "");
+        assert_eq!(hits[0].command, "git status");
+    }
+
+    #[test]
+    fn history_line_matches_on_any_word_of_the_line() {
+        let items = history(&["git commit -m '修复登录崩溃'"]);
+        // 中间词、乃至注释里的字都在候选一侧参与匹配（输入法上屏的中文不作为触发词）。
+        let hits = complete(&items, "登录", "");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].command, "git commit -m '修复登录崩溃'");
+        // 整条命令照旧写回终端（前缀已有的词不重复）。
+        assert_eq!(
+            merged_command("", &hits[0].command),
+            "git commit -m '修复登录崩溃'"
+        );
+    }
+
+    #[test]
+    fn history_continues_the_argument_position() {
+        let items = history(&["git remote add origin git@example.com:repo.git"]);
+        let hits = complete(&items, "ad", "git remote ");
+        assert_eq!(hits.len(), 1, "参数位要接得上上次那条");
+        assert_eq!(hits[0].kind, CompletionKind::History);
+        assert_eq!(
+            merged_command("git remote ", &hits[0].command),
+            "add origin git@example.com:repo.git"
+        );
+        // 接不上的参数位仍什么都不给。
+        assert!(complete(&items, "ad", "cd ").is_empty());
+        // 参数位输入 `-`：选项取自上次那条命令，浮层第二列显示它来自哪条。
+        let flagged = history(&["git commit -m '修复登录崩溃'"]);
+        let hits = complete(&flagged, "-", "git commit ");
+        assert_eq!(hits[0].command, "-m");
+        assert_eq!(hits[0].note, "git commit -m '修复登录崩溃'");
+    }
+
+    #[test]
+    fn snippet_command_already_saved_is_not_shown_twice() {
+        let presets = vec![item("磁盘余量", "df -h", "按挂载点列出使用率")];
+        let entries: Vec<String> = ["df -h", "df -i"]
+            .iter()
+            .map(|entry| (*entry).to_string())
+            .collect();
+        let hits = history_items(&entries, &presets);
+        assert_eq!(
+            hits.iter()
+                .map(|hit| hit.command.as_str())
+                .collect::<Vec<_>>(),
+            ["df -i"]
+        );
+    }
+
+    #[test]
+    fn long_history_line_only_truncates_its_display_name() {
+        let long = format!("echo {}", "x".repeat(300));
+        let entries = vec![long.clone()];
+        let hits = history_items(&entries, &[]);
+        assert!(hits[0].name.chars().count() <= MAX_NAME_CHARS + 1);
+        assert!(hits[0].name.ends_with('…'));
+        assert_eq!(hits[0].command, long);
+    }
+
+    #[test]
+    fn history_fingerprint_follows_content_and_order() {
+        let empty = history_fingerprint(&[]);
+        let one = history_fingerprint(&[String::from("ls")]);
+        let two = history_fingerprint(&[String::from("ls"), String::from("pwd")]);
+        assert_ne!(empty, one);
+        assert_ne!(one, two);
+        assert_ne!(
+            two,
+            history_fingerprint(&[String::from("pwd"), String::from("ls")])
+        );
+    }
+
+    #[test]
+    fn history_and_snippets_share_the_argument_slot() {
+        let history = history(&["git commit -m 'fix login crash'", "git commit --amend"]);
+        let presets = sample();
+        let pool = [history.as_slice(), presets.as_slice()].concat();
+        // 刚敲完 `git commit `：最近用过的那条接在最前，补的是它剩下的部分。
+        let hits = complete(&pool, "", "git commit ");
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].kind, CompletionKind::History);
+        assert_eq!(
+            merged_command("git commit ", &hits[0].command),
+            "-m 'fix login crash'"
+        );
+        // 候选总数仍受 MAX_MATCHES 约束。
+        let chatty: Vec<String> = (0..12).map(|n| format!("echo step {n}")).collect();
+        let loud = [history_items(&chatty, &[]).as_slice(), presets.as_slice()].concat();
+        assert_eq!(complete(&loud, "echo", "").len(), MAX_MATCHES);
     }
 
     #[test]

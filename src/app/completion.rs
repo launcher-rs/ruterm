@@ -43,6 +43,8 @@ pub(super) struct CompletionCacheKey {
     platform: Option<Platform>,
     /// 用户片段的内容指纹（哈希）：片段增删改都会变。
     snippets: u64,
+    /// 命令历史的内容指纹：每回车一条命令都会变，候选里的历史条目要跟着换。
+    history: u64,
 }
 
 /// 片段列表的内容指纹：只哈希字段字节，不分配。
@@ -167,16 +169,17 @@ impl RuTermApp {
         self.refresh_completion(cx);
     }
 
-    /// 候选：自己的片段在前，内置命令在后；名称与说明按当前界面语言翻译。
+    /// 候选：最近用过的历史命令在前，自己的片段其次，内置命令最后；名称与说明按当前界面语言翻译。
     /// 内置命令只取当前会话平台的：Linux 上不提示注册表命令，Windows 上不提示 apt。
     ///
-    /// 列表按（语言、会话平台、片段内容指纹）缓存：补全在每次按键时重建，
+    /// 列表按（语言、会话平台、片段内容指纹、历史内容指纹）缓存：补全在每次按键时重建，
     /// 200+ 内置命令逐条翻译加三条小写拷贝是热路径上纯浪费的分配。
     fn completion_items(&mut self, cx: &Context<Self>) -> Vec<CompletionItem> {
         let key = CompletionCacheKey {
             locale: crate::i18n::current_locale(cx),
             platform: self.active_session_platform(),
             snippets: snippet_fingerprint(&self.snippets),
+            history: crate::completion::history_fingerprint(self.history.entries()),
         };
         if let Some((cached, items)) = &self.completion_cache
             && *cached == key
@@ -199,7 +202,10 @@ impl RuTermApp {
                 CompletionKind::Command,
             )
         });
-        let items: Vec<CompletionItem> = mine.chain(builtin).collect();
+        let presets: Vec<CompletionItem> = mine.chain(builtin).collect();
+        // 历史放池子最前：参数位的续写按池子顺序取前若干条，最近用过的写法要排在片段前面。
+        let mut items = crate::completion::history_items(self.history.entries(), &presets);
+        items.extend(presets);
         self.completion_cache = Some((key, items.clone()));
         items
     }
@@ -345,7 +351,7 @@ impl RuTermApp {
             tracked.into_iter().collect::<String>(),
             merged
         ));
-        self.status = crate::i18n::translate(cx, "已补全片段：{name}", &[("name", &item.name)]);
+        self.status = crate::i18n::translate(cx, "已补全：{name}", &[("name", &item.name)]);
         cx.notify();
     }
 
@@ -401,16 +407,18 @@ impl RuTermApp {
         let mut rows = v_flex().gap(px(1.0)).py(px(2.0));
         for (slot, item) in state.items.iter().enumerate() {
             let selected = slot == state.selected;
-            // 选项候选补的就是它自己，第二列改放它来自哪条命令，免得两列重复。
-            let detail = if item.kind == CompletionKind::Flag {
-                item.note.as_str()
-            } else {
-                item.command.as_str()
+            // 选项候选补的就是它自己，第二列改放它来自哪条命令，免得两列重复；
+            // 历史候选的名称就是整条命令，第二列再放一遍只是占地方。
+            let detail = match item.kind {
+                CompletionKind::Flag => item.note.as_str(),
+                CompletionKind::History => "",
+                _ => item.command.as_str(),
             };
             let badge = match item.kind {
                 CompletionKind::Snippet => "",
                 CompletionKind::Command => "内置",
                 CompletionKind::Flag => "选项",
+                CompletionKind::History => "历史",
             };
             rows = rows.child(
                 h_flex()
@@ -427,14 +435,20 @@ impl RuTermApp {
                         MouseButton::Left,
                         cx.listener(move |this, _, _, cx| this.pick_completion(slot, cx)),
                     )
-                    .child(
-                        div()
-                            .flex_shrink_0()
+                    .child({
+                        // 历史候选的名称是整条命令行，可能长过浮层宽度：让它参与
+                        // 收缩并省略，别的候选保持按名称宽度占位。
+                        let name = div()
                             .text_sm()
                             .font_weight(FontWeight(600.0))
                             .text_color(pal.text)
-                            .child(SharedString::from(item.name.clone())),
-                    )
+                            .child(SharedString::from(item.name.clone()));
+                        if item.kind == CompletionKind::History {
+                            name.flex_1().min_w_0().text_ellipsis()
+                        } else {
+                            name.flex_shrink_0()
+                        }
+                    })
                     .when(!detail.is_empty(), |this| {
                         this.child(
                             div()
