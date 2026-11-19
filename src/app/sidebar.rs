@@ -2,6 +2,8 @@
 
 use std::time::Duration;
 
+use crate::tr;
+use crate::{FileIcon, ToggleFilePanel, ToggleSidebar};
 use rgpui::components::split_pane::CollapsiblePane;
 use rgpui::input_ui::Input;
 use rgpui::prelude::*;
@@ -11,10 +13,6 @@ use rgpui::{
     Render, ScrollableElement, SharedString, StatefulInteractiveElement, Styled, Tooltip, Window,
     div, px, v_flex,
 };
-use serde::{Deserialize, Serialize};
-
-use crate::tr;
-use crate::{FileIcon, ToggleFilePanel, ToggleSidebar};
 
 use super::*;
 
@@ -42,30 +40,12 @@ pub(super) enum SidebarPage {
     Forward,
 }
 
-/// 边栏靠哪一侧：贴着窗口左缘还是右缘。
-#[derive(Clone, Copy, PartialEq, Eq, Default, Debug, Serialize, Deserialize)]
-pub enum SidebarSide {
-    #[default]
-    Left,
-    Right,
-}
-
-/// 边栏默认宽度占位（约 1/3）；边栏在右时「第一面板」是终端，比例要翻过来。
-pub fn default_sidebar_ratio(side: SidebarSide) -> f32 {
-    match side {
-        SidebarSide::Left => 0.32,
-        SidebarSide::Right => 0.68,
-    }
-}
+/// 边栏默认宽度占位（约 1/3）。边栏恒在窗口左侧，比例即面板份额。
+pub(super) const DEFAULT_SIDEBAR_RATIO: f32 = 0.32;
 
 impl RuTermApp {
-    /// 边栏折叠时隐藏的是当前靠边那一侧的面板。
-    pub(super) fn sidebar_pane(&self) -> CollapsiblePane {
-        match self.sidebar.side {
-            SidebarSide::Left => CollapsiblePane::First,
-            SidebarSide::Right => CollapsiblePane::Second,
-        }
-    }
+    /// 边栏面板是分隔容器的第一面板，折叠它即收起边栏。
+    pub(super) const SIDEBAR_PANE: CollapsiblePane = CollapsiblePane::First;
 
     /// 边栏是否可见（由分隔面板的折叠状态决定）。
     pub(super) fn sidebar_visible(&self, cx: &App) -> bool {
@@ -100,7 +80,7 @@ impl RuTermApp {
     /// 切换「文件」页；已经停留在文件页时再按一次收起边栏。
     pub(super) fn toggle_file_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.sidebar_visible(cx) && self.sidebar_page == SidebarPage::Files {
-            let pane = self.sidebar_pane();
+            let pane = Self::SIDEBAR_PANE;
             self.split_state
                 .update(cx, |state, cx| state.toggle_collapse(pane, cx));
         } else {
@@ -109,59 +89,29 @@ impl RuTermApp {
         cx.notify();
     }
 
-    /// 设置边栏贴哪一侧：比例翻到另一头，折叠态也跟着搬到新侧。
-    pub(super) fn set_sidebar_side(&mut self, side: SidebarSide, cx: &mut Context<Self>) {
-        if self.sidebar.side == side {
-            return;
-        }
-        let was_collapsed = self.split_state.read(cx).is_collapsed();
-        self.sidebar.side = side;
-        self.split_state.update(cx, |state, cx| {
-            state.expand(cx);
-            state.set_ratio(1.0 - state.ratio(), cx);
-            if was_collapsed {
-                let pane = match side {
-                    SidebarSide::Left => CollapsiblePane::First,
-                    SidebarSide::Right => CollapsiblePane::Second,
-                };
-                state.collapse(pane, cx);
-            }
-        });
-        self.persist_sidebar(cx);
-        cx.notify();
-    }
-
-    /// Ctrl+B / 菜单项：折叠或展开边栏（折叠当前靠边那一侧）。
+    /// Ctrl+B / 菜单项：折叠或展开边栏。
     pub(super) fn toggle_sidebar(
         &mut self,
         _: &ToggleSidebar,
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let pane = self.sidebar_pane();
+        let pane = Self::SIDEBAR_PANE;
         self.split_state.update(cx, |state, cx| {
             state.toggle_collapse(pane, cx);
         });
         cx.notify();
     }
 
-    /// 边栏面板占分隔容器的宽度比例（边栏在右时，状态里存的是主区份额）。
+    /// 边栏面板占分隔容器的宽度比例。
     pub(super) fn panel_ratio(&self, cx: &App) -> f32 {
-        let ratio = self.split_state.read(cx).ratio();
-        match self.sidebar.side {
-            SidebarSide::Left => ratio,
-            SidebarSide::Right => 1.0 - ratio,
-        }
+        self.split_state.read(cx).ratio()
     }
 
-    /// 按面板占比写回分隔状态（边栏在右时翻转成主区份额）。
+    /// 按面板占比写回分隔状态。
     pub(super) fn set_panel_ratio(&mut self, panel_ratio: f32, cx: &mut Context<Self>) {
-        let ratio = match self.sidebar.side {
-            SidebarSide::Left => panel_ratio,
-            SidebarSide::Right => 1.0 - panel_ratio,
-        };
         self.split_state
-            .update(cx, |state, cx| state.set_ratio(ratio, cx));
+            .update(cx, |state, cx| state.set_ratio(panel_ratio, cx));
     }
 
     /// 分隔条按下：记下起点，拖动时按容器宽度把指针位移换算成占比。
@@ -193,10 +143,6 @@ impl RuTermApp {
             return;
         }
         let delta = (x - start_x) / width;
-        let delta = match self.sidebar.side {
-            SidebarSide::Left => delta,
-            SidebarSide::Right => -delta,
-        };
         // 两侧都留 260px：拖到最小即停住，完全收起交给 Ctrl+B。
         let min_ratio = 260.0 / width;
         let max_ratio = 1.0 - min_ratio;
@@ -286,8 +232,6 @@ impl RuTermApp {
     /// 相当于 IDE 左侧那条工具窗口栏。
     pub(super) fn render_sidebar_rail(&self, cx: &mut Context<Self>) -> AnyElement {
         let pal = self.palette(cx);
-        // 高亮条画在贴窗口外缘的那一侧：边栏在左则亮条在左，反之在右。
-        let stripe_at_left = self.sidebar.side == SidebarSide::Left;
         let pages = [
             (
                 SidebarPage::Hosts,
@@ -340,12 +284,13 @@ impl RuTermApp {
                 icon,
                 active,
                 badge,
-                stripe_at_left,
+                // 高亮条画在贴窗口外缘的那一侧，这条轨恒在左缘。
+                true,
                 &pal,
                 move |this, window, cx| {
                     // 再点当前页的图标＝收起面板，和 IDE 里的工具窗口一个脾气。
                     if this.sidebar_page == page && this.sidebar_visible(cx) {
-                        let pane = this.sidebar_pane();
+                        let pane = Self::SIDEBAR_PANE;
                         this.split_state
                             .update(cx, |state, cx| state.toggle_collapse(pane, cx));
                         cx.notify();
@@ -357,17 +302,10 @@ impl RuTermApp {
             );
             rail = rail.child(item);
         }
-        // 导航贴窗口外缘：左边栏时亮条在左，右边栏时在右。
-        match self.sidebar.side {
-            SidebarSide::Left => rail
-                .border_r_1()
-                .border_color(pal.border)
-                .into_any_element(),
-            SidebarSide::Right => rail
-                .border_l_1()
-                .border_color(pal.border)
-                .into_any_element(),
-        }
+        // 导航轨贴窗口左缘，右边框把它和面板分开。
+        rail.border_r_1()
+            .border_color(pal.border)
+            .into_any_element()
     }
 
     /// 右侧工具窗口栏：贴窗口右缘，和左侧导航轨同一形状。

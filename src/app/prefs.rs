@@ -832,9 +832,6 @@ pub struct SidebarPrefs {
     /// 用户分组，按此顺序显示（未分组恒在末尾，不占位）。
     #[serde(default)]
     pub(super) groups: Vec<GroupEntry>,
-    /// 边栏贴着窗口的哪一侧（贴边渲染，导航栏恒在最外侧）。
-    #[serde(default)]
-    pub(super) side: SidebarSide,
     /// 主机 id → 组名。组被删除后残留的映射按未分组处理，不报错。
     #[serde(default)]
     pub(super) assign: HashMap<i64, String>,

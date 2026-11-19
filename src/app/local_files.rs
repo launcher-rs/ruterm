@@ -365,7 +365,7 @@ impl RuTermApp {
     ) {
         let _ = action;
         if self.sidebar_visible(cx) && self.sidebar_page == SidebarPage::Local {
-            let pane = self.sidebar_pane();
+            let pane = Self::SIDEBAR_PANE;
             self.split_state
                 .update(cx, |state, cx| state.toggle_collapse(pane, cx));
         } else {

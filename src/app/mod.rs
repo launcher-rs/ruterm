@@ -158,6 +158,8 @@ pub(crate) struct RuTermApp {
     /// 删除二次确认（主机 id；浮层遮挡期间 attach_vault 仍可能整表替换列表，
     /// 下标会指向别的行，身份必须用 id）。
     confirm_delete: Option<i64>,
+    /// 「帮助 → 关于」浮层开关。
+    about_open: bool,
     /// 主密码解锁弹窗（便携模式 / 已设置主密码时启动弹出）。
     unlock: Option<UnlockState>,
     /// 设置弹窗（主密码管理、主题、锁定）。
@@ -382,10 +384,8 @@ impl RuTermApp {
             .collect::<Vec<_>>();
         // 侧边栏 ↔ 主区 分隔面板：默认边栏约占 0.32，够放下文件表格的五列。
         let split_state = cx.new(SplitPaneState::new);
-        // 边栏在右时「第一面板」是终端：比例翻过来，边栏仍占约 0.32。
-        let sidebar_ratio = default_sidebar_ratio(sidebar.side);
         split_state.update(cx, |state, cx| {
-            state.set_ratio(sidebar_ratio, cx);
+            state.set_ratio(DEFAULT_SIDEBAR_RATIO, cx);
             // WindTerm 式拖动：拖到最小宽度即停住，分隔线仍可抓住往大拖；
             // 完全收起交给 Ctrl+B，不靠拖拽阈值自动折叠。
             state.set_min_first(260.0, cx);
@@ -463,6 +463,7 @@ impl RuTermApp {
             protocols,
             group_prompt: None,
             confirm_delete: None,
+            about_open: false,
             unlock: None,
             settings: None,
             sidebar_page: SidebarPage::Hosts,
@@ -852,10 +853,9 @@ impl RuTermApp {
                 let prefs = SidebarPrefs::from_json(&json);
                 let _ = this.update(cx, |this, cx| {
                     if this.sidebar != prefs {
-                        let side = prefs.side;
                         this.sidebar = prefs;
                         this.split_state.update(cx, |state, cx| {
-                            state.set_ratio(default_sidebar_ratio(side), cx);
+                            state.set_ratio(DEFAULT_SIDEBAR_RATIO, cx);
                         });
                         cx.notify();
                     }
@@ -1021,6 +1021,7 @@ impl RuTermApp {
         self.unlock.is_some()
             || self.settings.is_some()
             || self.confirm_delete.is_some()
+            || self.about_open
             || self.new_host.is_some()
             || self.group_prompt.is_some()
             || self.shell_prompt.is_some()
@@ -1055,6 +1056,10 @@ impl RuTermApp {
         }
         if self.file_upload_prompt.is_some() {
             return self.render_file_upload_prompt(cx);
+        }
+        // 「帮助 → 关于」：半透明遮罩 + 居中卡片，点遮罩或「确定」关闭。
+        if self.about_open {
+            return self.render_about_dialog(cx);
         }
         // 删除二次确认：半透明遮罩 + 居中卡片，点遮罩或"取消"关闭。
         if let Some(id) = self.confirm_delete {
@@ -1472,31 +1477,18 @@ impl Render for RuTermApp {
                         .child(self.render_right_dock(cx))
                         .into_any_element()
                 });
-                // 两侧工具窗口栏都贴各自的外缘：右轨放右侧面板的按钮，收起面板也常驻。
-                match self.sidebar.side {
-                    SidebarSide::Left => row
-                        .child(self.render_sidebar_rail(cx))
-                        .when_some(panel, |row, panel| {
-                            row.child(panel).child(self.render_split_divider(cx))
-                        })
-                        .child(main)
-                        .when_some(history, |row, history| {
-                            row.child(self.render_right_dock_divider(cx)).child(history)
-                        })
-                        .child(self.render_right_rail(cx))
-                        .into_any_element(),
-                    SidebarSide::Right => row
-                        .child(main)
-                        .when_some(panel, |row, panel| {
-                            row.child(self.render_split_divider(cx)).child(panel)
-                        })
-                        .child(self.render_sidebar_rail(cx))
-                        .when_some(history, |row, history| {
-                            row.child(self.render_right_dock_divider(cx)).child(history)
-                        })
-                        .child(self.render_right_rail(cx))
-                        .into_any_element(),
-                }
+                // 两侧工具窗口栏都贴各自的外缘：左轨是边栏页的入口，右轨是右侧面板的按钮，
+                // 面板收起也常驻；边栏恒在左侧，右侧只留停靠区与右轨。
+                row.child(self.render_sidebar_rail(cx))
+                    .when_some(panel, |row, panel| {
+                        row.child(panel).child(self.render_split_divider(cx))
+                    })
+                    .child(main)
+                    .when_some(history, |row, history| {
+                        row.child(self.render_right_dock_divider(cx)).child(history)
+                    })
+                    .child(self.render_right_rail(cx))
+                    .into_any_element()
             })
             .child(self.render_status_bar(cx).flex_shrink_0().w_full())
             .child(self.render_overlay(window, cx))

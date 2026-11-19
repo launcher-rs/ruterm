@@ -69,6 +69,9 @@ pub(super) struct TransferFlash {
 
 impl RuTermApp {
     /// 底部状态栏：左侧瞬态状态 + 活动会话信息（按用户勾选的显示项拼装），右侧会话计数。
+    ///
+    /// 可点的开关不放这里——状态栏两侧都被会话读数占着，会话一多按钮就被挤掉，
+    /// 输入提示与同步输入的开关在「终端」菜单里。
     pub(super) fn render_status_bar(&self, cx: &Context<Self>) -> StatusBar {
         let active = self
             .active_tab
@@ -131,21 +134,6 @@ impl RuTermApp {
             }
         }
         let mut right = Vec::new();
-        if self.sync_input {
-            let entity = cx.entity().downgrade();
-            right.push(
-                StatusBarItem::new(tr!(cx, "同步输入"))
-                    .id("sync-input")
-                    .icon(IconName::Replace)
-                    .active(true)
-                    .tooltip(tr!(cx, "按键正在同步到所有会话，点击关闭"))
-                    .on_click(move |_, _, cx| {
-                        if let Some(this) = entity.upgrade() {
-                            this.update(cx, |this, cx| this.set_sync_input(false, cx));
-                        }
-                    }),
-            );
-        }
         right.push(
             StatusBarItem::new(tr!(cx, "会话 {count}", count = self.tabs.len()))
                 .id("sessions")

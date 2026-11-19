@@ -384,11 +384,8 @@ impl RuTermApp {
                         this.local_shells = found;
                         this.refresh_shell_icons();
                         if !quiet {
-                            // 主机列表跟着边栏走，文案里的方位也要跟着变。
-                            let side = match this.sidebar.side {
-                                SidebarSide::Left => "左侧",
-                                SidebarSide::Right => "右侧",
-                            };
+                            // 主机列表恒在左侧边栏，文案里的方位照实写。
+                            let side = "左侧";
                             this.status = if count == 0 {
                                 "扫描完成：没找到可用的本机 shell".into()
                             } else {

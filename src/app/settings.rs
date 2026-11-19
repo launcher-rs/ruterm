@@ -349,7 +349,7 @@ impl RuTermApp {
             .into_any_element()
     }
 
-    /// 「外观」分页：明暗主题（与 `Ctrl+T`、标题栏 ☀☾ 同一开关）、边栏位置与界面语言。
+    /// 「外观」分页：明暗主题（与 `Ctrl+T`、标题栏 ☀☾ 同一开关）与界面语言。
     pub(super) fn render_appearance_tab(
         &self,
         pal: &Palette,
@@ -391,47 +391,6 @@ impl RuTermApp {
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.toggle_theme(window, cx);
                             })),
-                    ),
-            )
-            .child(
-                h_flex()
-                    .gap_2()
-                    .items_center()
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(pal.muted)
-                            .child(tr!(cx, "边栏位置")),
-                    )
-                    .child({
-                        let left = self.sidebar.side == SidebarSide::Left;
-                        let button = Button::new("settings-side-left").label(tr!(cx, "左侧"));
-                        let button = if left {
-                            button.primary()
-                        } else {
-                            button.secondary().outline()
-                        };
-                        button.on_click(cx.listener(|this, _, _, cx| {
-                            this.set_sidebar_side(SidebarSide::Left, cx);
-                        }))
-                    })
-                    .child({
-                        let right = self.sidebar.side == SidebarSide::Right;
-                        let button = Button::new("settings-side-right").label(tr!(cx, "右侧"));
-                        let button = if right {
-                            button.primary()
-                        } else {
-                            button.secondary().outline()
-                        };
-                        button.on_click(cx.listener(|this, _, _, cx| {
-                            this.set_sidebar_side(SidebarSide::Right, cx);
-                        }))
-                    })
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(pal.muted)
-                            .child(tr!(cx, "导航栏始终贴在窗口外缘")),
                     ),
             )
             .child(
@@ -690,10 +649,7 @@ impl RuTermApp {
                     .child(tr!(
                         cx,
                         "「一键扫描」会实际调用 wsl.exe 列出 WSL 发行版，故放在按钮后面而不是启动时；扫描结果列在{side}「本地终端」分组里，点一下即开对应终端。",
-                        side = match self.sidebar.side {
-                            SidebarSide::Left => tr!(cx, "左侧"),
-                            SidebarSide::Right => tr!(cx, "右侧"),
-                        }
+                        side = tr!(cx, "左侧")
                     )),
             )
             .into_any_element()

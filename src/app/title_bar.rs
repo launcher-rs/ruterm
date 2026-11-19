@@ -4,8 +4,9 @@ use rgpui::prelude::*;
 use rgpui::title_bar::TITLE_BAR_HEIGHT;
 use rgpui::{
     AnyElement, Button, ButtonVariants, Context, DropdownMenu, FontWeight, Hsla, Icon, IconName,
-    InteractiveElement, IntoElement, ParentElement, PopupMenu, PopupMenuItem, SharedString,
-    StatefulInteractiveElement, Styled, Window, WindowControlArea, div, h_flex, px,
+    InteractiveElement, IntoElement, MouseButton, ParentElement, PopupMenu, PopupMenuItem,
+    SharedString, StatefulInteractiveElement, Styled, Window, WindowControlArea, div, h_flex, px,
+    v_flex,
 };
 
 use crate::CommandHistory as OpenCommandHistory;
@@ -20,6 +21,96 @@ use crate::{
 use super::*;
 
 impl RuTermApp {
+    /// 「帮助 → 关于」浮层：版本、源码仓库（点击用浏览器打开）、许可证与数据存放位置。
+    /// 版本与许可证取自 `Cargo.toml`，仓库地址取自其 `repository` 字段，免得几处各写一份。
+    /// 本窗口的根视图就是 `RuTermApp`、不套框架 `Root`，所以这里用自家遮罩卡片（同删除确认框），
+    /// `window.open_dialog` 在这条路径上不会被渲染。
+    pub(super) fn render_about_dialog(&self, cx: &Context<Self>) -> AnyElement {
+        let pal = self.palette(cx);
+        let name = SharedString::from(format!("RuTerm {}", env!("CARGO_PKG_VERSION")));
+        let summary = tr!(
+            cx,
+            "Rust 编写的桌面远程连接工具：SSH 终端、本地 Shell、SFTP 文件管理、端口转发与远程桌面。"
+        );
+        let repo = tr!(cx, "源码仓库");
+        let url = SharedString::from(env!("CARGO_PKG_REPOSITORY"));
+        let license = tr!(cx, "许可证 {license}", license = env!("CARGO_PKG_LICENSE"));
+        let data = tr!(
+            cx,
+            "主机配置、设置与密码存放在本机加密库 ruterm.db，不联网上传。"
+        );
+        let ok = tr!(cx, "确定");
+        let note = |text: SharedString| div().text_xs().text_color(pal.muted).child(text);
+        v_flex()
+            .id("about-backdrop")
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .size_full()
+            .items_center()
+            .justify_center()
+            .bg(rgpui::hsla(0.0, 0.0, 0.0, 0.45))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.about_open = false;
+                    cx.notify();
+                }),
+            )
+            .child(
+                v_flex()
+                    .id("about-dialog")
+                    .occlude()
+                    .w(px(420.0))
+                    .gap_3()
+                    .p_4()
+                    .rounded(px(8.0))
+                    .bg(pal.card_bg)
+                    .border_1()
+                    .border_color(pal.border)
+                    .child(
+                        div()
+                            .text_base()
+                            .font_weight(FontWeight(600.0))
+                            .child(tr!(cx, "关于 RuTerm")),
+                    )
+                    .child(div().text_sm().font_weight(FontWeight(700.0)).child(name))
+                    .child(note(summary))
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .text_xs()
+                            .text_color(pal.muted)
+                            .child(SharedString::from(format!("{repo}:")))
+                            .child(
+                                div()
+                                    .id("about-repository-link")
+                                    .cursor_pointer()
+                                    .text_color(pal.link)
+                                    .underline()
+                                    .child(url)
+                                    .on_click(move |_, _, cx| {
+                                        cx.open_url(env!("CARGO_PKG_REPOSITORY"));
+                                    }),
+                            ),
+                    )
+                    .child(note(license))
+                    .child(note(data))
+                    .child(
+                        h_flex().gap_2().justify_end().child(
+                            Button::new("about-ok")
+                                .label(ok)
+                                .primary()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.about_open = false;
+                                    cx.notify();
+                                })),
+                        ),
+                    ),
+            )
+            .into_any_element()
+    }
+
     /// 标题栏右侧的窗口控制按钮：登记为 `WindowControlArea`，交给系统
     /// HTMINBUTTON / HTMAXBUTTON / HTCLOSE（关闭仍会走 `on_window_should_close`，
     /// 即隐藏到托盘）。
@@ -91,6 +182,7 @@ impl RuTermApp {
         // Ctrl+N / Ctrl+Shift+T / Ctrl+Tab / Ctrl+,。
         let split_open = self.view_split.is_some();
         let sync_on = self.sync_input;
+        let completion_on = self.terminal.inline_completion;
         let live_tabs = self.live_tab_count();
         let any_tab = !self.tabs.is_empty();
         let sidebar_open = self.sidebar_visible(cx);
@@ -266,7 +358,15 @@ impl RuTermApp {
                 )
         };
 
-        let terminal_menu = move |menu: PopupMenu, _: &mut Window, cx: &mut Context<PopupMenu>| {
+        // 输入提示（补全浮层）：开关放进子菜单，状态用勾显示，两个档位各自可点。
+        // 状态栏和右侧导航轨都不放这个开关——那里两侧都被会话读数与面板按钮占满，
+        // 会话一多就被挤掉，菜单里的位置是固定的。
+        let completion = entity.clone();
+        let terminal_menu = move |menu: PopupMenu,
+                                  window: &mut Window,
+                                  cx: &mut Context<PopupMenu>| {
+            // 构建器会被反复调用（菜单重建），每次拿一份实体副本再交给子菜单闭包。
+            let sub_completion = completion.clone();
             menu.item(PopupMenuItem::new(tr!(cx, "终端内查找…")).action(Box::new(FindInTerminal)))
                 .item(
                     PopupMenuItem::new(tr!(cx, "同步输入"))
@@ -274,6 +374,24 @@ impl RuTermApp {
                         .disabled(live_tabs < 2)
                         .action(Box::new(ToggleSyncInput)),
                 )
+                .submenu(tr!(cx, "输入提示"), window, cx, move |menu, _, cx| {
+                    let on = sub_completion.clone();
+                    let off = sub_completion.clone();
+                    menu.item(
+                        PopupMenuItem::new(tr!(cx, "输入时弹出候选"))
+                            .checked(completion_on)
+                            .on_click(move |_, _, cx| {
+                                on.update(cx, |this, cx| this.set_inline_completion(true, cx));
+                            }),
+                    )
+                    .item(
+                        PopupMenuItem::new(tr!(cx, "关闭输入提示"))
+                            .checked(!completion_on)
+                            .on_click(move |_, _, cx| {
+                                off.update(cx, |this, cx| this.set_inline_completion(false, cx));
+                            }),
+                    )
+                })
                 .item(
                     PopupMenuItem::new(tr!(cx, "命令发到所有会话…"))
                         .disabled(live_tabs == 0)
@@ -383,16 +501,18 @@ impl RuTermApp {
                     ))
             };
 
-        // 帮助菜单只留版本信息：快捷键已随各菜单项右侧显示，不再单列一份文字清单。
+        // 帮助菜单只有「关于」：版本、仓库与许可证都在对话框里；
+        // 快捷键已随各菜单项右侧显示，不再单列一份文字清单。
+        let app = cx.entity();
         let help_menu = move |menu: PopupMenu, _: &mut Window, cx: &mut Context<PopupMenu>| {
-            menu.label("RuTerm").item(
-                PopupMenuItem::new(tr!(
-                    cx,
-                    "版本 {version}",
-                    version = env!("CARGO_PKG_VERSION")
-                ))
-                .disabled(true),
-            )
+            let about = tr!(cx, "关于 RuTerm…");
+            let app = app.clone();
+            menu.item(PopupMenuItem::new(about).on_click(move |_, _, cx| {
+                app.update(cx, |this, cx| {
+                    this.about_open = true;
+                    cx.notify();
+                });
+            }))
         };
 
         let menu_button = |id: &'static str, label: SharedString| {
