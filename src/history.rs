@@ -62,6 +62,21 @@ impl CommandHistory {
         serde_json::to_string(&self.entries).unwrap_or_default()
     }
 
+    /// 明文降级路径专用序列化：先剔除疑似内联凭据的条目。
+    ///
+    /// 加密库里有页级 + 字段两层加密，内联了密码的命令可以放心保留；但降级
+    /// 落到 settings.json 是明文，宁可历史断档也不把密文变明文。判定刻意
+    /// 从宽（这是兜底不是分类器），误杀 `-p 2222` 这类端口写法可接受——
+    /// 真正常用且无害的命令下次照常进历史。
+    pub fn to_json_scrubbed(&self) -> String {
+        let scrubbed: Vec<&String> = self
+            .entries
+            .iter()
+            .filter(|entry| !looks_like_embedded_secret(entry))
+            .collect();
+        serde_json::to_string(&scrubbed).unwrap_or_default()
+    }
+
     /// 解析库内 / settings.json 的历史；坏数据与不合格条目直接丢弃。
     pub fn from_json(text: &str) -> Self {
         let parsed: Vec<String> = serde_json::from_str(text).unwrap_or_default();
@@ -132,6 +147,44 @@ fn looks_like_password_prompt(command: &str) -> bool {
             || command.contains("口令"))
 }
 
+/// 疑似「命令行里直接带了凭据」：`mysql -uroot -p'xx'`、`--password=xx`、
+/// `PGPASSWORD=xx psql`、`sshpass -p xx`、`http://user:pass@host`。
+/// 仅供明文降级序列化兜底，判定从宽。
+fn looks_like_embedded_secret(command: &str) -> bool {
+    let lower = command.to_lowercase();
+    let tokens: Vec<&str> = lower.split_whitespace().collect();
+    for token in &tokens {
+        // 环境变量 / 长选项式：VAR=值，VAR 以 password/passwd/pwd/token/secret 结尾
+        //（PGPASSWORD=、MYSQL_PWD=、--password=、GIT_TOKEN=…）；等号后必须有值。
+        if let Some((name, value)) = token.split_once('=')
+            && !value.is_empty()
+            && (name.ends_with("password")
+                || name.ends_with("passwd")
+                || name.ends_with("pwd")
+                || name.ends_with("token")
+                || name.ends_with("secret"))
+        {
+            return true;
+        }
+        // 同 token 内联的短选项：`-p'xx'` / `-pxx`。`ssh -p 2222` 这类端口写法
+        // -p 是独立 token，落不到这里；`-p2222` 会被误杀，可接受。
+        if token.len() > 2 && token.starts_with("-p") && !token.starts_with("--") {
+            return true;
+        }
+        // URL 内嵌凭据：scheme://user:pass@host（RFC 3986 userinfo）。
+        if let Some((_, rest)) = token.split_once("://")
+            && let Some(at) = rest.split('/').next().and_then(|a| a.rfind('@'))
+            && rest[..at].contains(':')
+        {
+            return true;
+        }
+    }
+    // 分写的 `sshpass -p xx`：-p 与密码各占一个 token。
+    tokens.windows(2).any(|pair| {
+        (pair[0] == "sshpass" || pair[0].ends_with("sshpass")) && pair[1].starts_with("-p")
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CommandHistory, MAX_COMMAND_BYTES, MAX_HISTORY};
@@ -198,6 +251,33 @@ mod tests {
         let mut history = CommandHistory::default();
         assert!(!history.push(&"x".repeat(MAX_COMMAND_BYTES + 1)));
         assert!(history.push(&"x".repeat(MAX_COMMAND_BYTES)));
+    }
+
+    #[test]
+    fn scrubbed_json_drops_commands_with_embedded_secrets() {
+        let mut history = CommandHistory::default();
+        for command in [
+            "mysql -uroot -p's3cret' -h db",
+            "pg_dump --password=abc postgres://u@h/d",
+            "PGPASSWORD=abc psql -h db",
+            "GIT_TOKEN=abc git push",
+            "sshpass -p hunter2 scp f host:/f",
+            "curl http://user:pw@example.com/x",
+            // 端口 / 普通词 / 无凭据命令不误杀。
+            "ssh -p 2222 root@host",
+            "grep password /etc/app.conf",
+            "mysql -h db -P 3306",
+            "ls -la",
+        ] {
+            history.push(command);
+        }
+        let restored = CommandHistory::from_json(&history.to_json_scrubbed());
+        assert_eq!(
+            restored.entries(),
+            ["ls -la", "mysql -h db -P 3306", "grep password /etc/app.conf", "ssh -p 2222 root@host"]
+        );
+        // 不清洗的完整序列化保持全部条目（加密库路径用）。
+        assert_eq!(CommandHistory::from_json(&history.to_json()), history);
     }
 
     #[test]

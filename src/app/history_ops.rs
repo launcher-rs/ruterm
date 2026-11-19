@@ -14,11 +14,13 @@ use super::*;
 impl RuTermApp {
     /// 历史落库：加密库 `settings.history`，库不可用时降级 `settings.json`。
     pub(super) fn persist_history(&self, cx: &mut Context<Self>) {
-        let json = self.history.to_json();
         let Some(vault) = self.vault.clone() else {
-            self.store.save_history(&json);
+            // 明文降级：settings.json 不加密，剔除疑似内联凭据的条目——
+            // 宁可历史断档，也不把密文落成明文（见 history.rs 的判定说明）。
+            self.store.save_history(&self.history.to_json_scrubbed());
             return;
         };
+        let json = self.history.to_json();
         cx.spawn(async move |_, _| {
             if let Err(error) = vault.set_setting("history", &json).await {
                 log::warn!("写入库内命令历史失败: {error}");
