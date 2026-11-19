@@ -110,12 +110,17 @@ actions!(
 );
 
 fn main() {
+    // 快速连接密码的唯一入口：在建立任何线程之前读出并立刻从进程环境中
+    // 移除。无论后面走快速连接、--help/--version 还是纯 GUI，密码都不会
+    // 留在环境里被随后派生的子进程（本地 shell、编辑器、探测任务）继承。
+    let quick_password = SshTarget::take_password_from_env();
+
     rgpui::init_logging();
 
     // 带目标参数 → 一次性快速连接兜底；无参数 → 纯 GUI 会话管理器。
     // --help / --version 由 from_args 打印后返回 Ok(None)，这里正常退出（退出码 0）。
     let quick = if std::env::args().nth(1).is_some() {
-        match SshTarget::from_args() {
+        match SshTarget::from_args(quick_password) {
             Ok(target) => target,
             Err(error) => {
                 eprintln!("{error}");

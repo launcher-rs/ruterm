@@ -29,14 +29,28 @@ pub struct SshTarget {
 }
 
 impl SshTarget {
+    /// 读出并移除 `RUTERM_PASSWORD`：快速连接密码只允许经环境变量进入一次，
+    /// 此后进程环境中不再持有明文，随后派生的子进程（本地 shell、编辑器、
+    /// 局域网探测等）不会继承到它。
+    ///
+    /// 必须在 main 最前（任何线程/运行时建立之前）调用。
+    pub fn take_password_from_env() -> Option<String> {
+        let password = std::env::var("RUTERM_PASSWORD").ok().filter(|s| !s.is_empty());
+        // SAFETY: 唯一调用点在 main 开头、rgpui 与 tokio 初始化之前，
+        // 进程内尚无并发线程，独占访问环境变量是安全的。
+        unsafe { std::env::remove_var("RUTERM_PASSWORD") };
+        password
+    }
+
     /// 从命令行参数解析连接目标。
     ///
     /// 用法：`ruterm [user@]host[:port] [-i keyfile] [-h|--help] [-V|--version]`
-    /// 密码经 `RUTERM_PASSWORD` 环境变量传入。
+    /// 密码经 `RUTERM_PASSWORD` 环境变量传入，由调用方先用
+    /// [`take_password_from_env`](Self::take_password_from_env) 取出后传进来。
     ///
     /// 返回 `Ok(None)` 表示只打印了帮助/版本信息，调用方应以退出码 0 正常结束
     /// （CI 的 `--help`/`--version` 冒烟依赖这一点）。
-    pub fn from_args() -> anyhow::Result<Option<Self>> {
+    pub fn from_args(password: Option<String>) -> anyhow::Result<Option<Self>> {
         let mut positional: Option<String> = None;
         let mut key_path: Option<PathBuf> = None;
         let mut args = std::env::args().skip(1);
@@ -130,9 +144,7 @@ impl SshTarget {
             key_data: None,
             passphrase: None,
             jump: None,
-            password: std::env::var("RUTERM_PASSWORD")
-                .ok()
-                .filter(|s| !s.is_empty()),
+            password,
         }))
     }
 
