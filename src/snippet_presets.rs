@@ -1667,6 +1667,43 @@ mod tests {
         }
     }
 
+    /// 真实片段表上复核位置感知：`cd find` 是 cd 的参数，不该冒出 `sudo find …`。
+    #[test]
+    fn completion_stays_in_the_word_position() {
+        let items: Vec<crate::completion::CompletionItem> = presets_for(Some(Platform::Linux))
+            .map(|(_, preset)| {
+                crate::completion::CompletionItem::new(
+                    preset.name.to_string(),
+                    preset.command.to_string(),
+                    preset.note.to_string(),
+                    crate::completion::CompletionKind::Command,
+                )
+            })
+            .collect();
+        let commands = |token: &str, before: &str| -> Vec<String> {
+            crate::completion::complete(&items, token, before)
+                .iter()
+                .map(|item| item.command.clone())
+                .collect()
+        };
+        // 参数位：不接前文的命令一条都不给，交给 shell 自己的补全。
+        assert!(commands("find", "cd ").is_empty());
+        assert!(commands("docker", "cd ").is_empty());
+        // 同一个词落在命令位，照旧能找到 find / docker 的命令。
+        assert!(
+            commands("find", "")
+                .iter()
+                .any(|command| command.contains("find"))
+        );
+        // 参数位接得上前文时给续写与选项。
+        assert!(
+            commands("up", "sudo apt ")
+                .iter()
+                .all(|command| command.starts_with("sudo apt update"))
+        );
+        assert!(commands("-", "docker ").contains(&"-a".to_string()));
+    }
+
     #[test]
     fn completion_never_crosses_platforms() {
         let linux: Vec<&str> = presets_for(Some(Platform::Linux))

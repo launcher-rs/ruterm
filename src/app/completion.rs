@@ -1,7 +1,10 @@
-//! 终端内命令补全：边输入边在光标下方浮出命令片段候选，Tab / Enter 补全。
+//! 终端内命令补全：边输入边在光标下方浮出候选，Tab / Enter 补全。
 //!
 //! 按键在 `App::intercept_keystrokes` 阶段处理（早于动作分发），所以有候选时
 //! Tab / Enter / Esc / ↑↓ 不会被终端先吃掉；候选为空时全部原样放行。
+//! 候选按词在命令行里的位置来给：命令位搜整库（敲「磁盘」能找到 `df -h`），
+//! 参数位只接得上前文的写法（`git re` → `git remote …`、`git -` → 该命令的选项），
+//! 接不上就不弹，把 Tab 交回 shell 自己的路径补全。
 //! 补全只替换正在输入的那个词，替换前用终端网格核对，对不上就放弃。
 
 use rgpui::prelude::*;
@@ -11,7 +14,7 @@ use rgpui::{
 use rgpui_term::TerminalContent;
 
 use crate::completion::{
-    CompletionItem, MIN_TOKEN_CHARS, echo_lagging, last_token, matches_after, merged_command,
+    CompletionItem, CompletionKind, complete, echo_lagging, last_token, merged_command,
 };
 use crate::snippet_presets::presets_for;
 use crate::tr;
@@ -32,6 +35,30 @@ pub(super) struct CompletionState {
 const POPUP_WIDTH: f32 = 440.0;
 const ROW_HEIGHT: f32 = 26.0;
 const FOOTER_HEIGHT: f32 = 26.0;
+
+/// 补全候选列表的缓存键：语言、会话平台或片段内容任一变化即失效。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct CompletionCacheKey {
+    locale: &'static str,
+    platform: Option<Platform>,
+    /// 用户片段的内容指纹（哈希）：片段增删改都会变。
+    snippets: u64,
+}
+
+/// 片段列表的内容指纹：只哈希字段字节，不分配。
+fn snippet_fingerprint(snippets: &[CommandSnippet]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    snippets.iter().for_each(|snippet| {
+        (
+            snippet.name.as_str(),
+            snippet.command.as_str(),
+            snippet.note.as_str(),
+        )
+            .hash(&mut hasher)
+    });
+    hasher.finish()
+}
 
 impl RuTermApp {
     /// 安装按键拦截器；实体销毁后自动失效。
@@ -142,48 +169,50 @@ impl RuTermApp {
 
     /// 候选：自己的片段在前，内置命令在后；名称与说明按当前界面语言翻译。
     /// 内置命令只取当前会话平台的：Linux 上不提示注册表命令，Windows 上不提示 apt。
-    fn completion_items(&self, cx: &Context<Self>) -> Vec<CompletionItem> {
-        let mine = self
-            .snippets
-            .iter()
-            .enumerate()
-            .map(|(index, snippet)| CompletionItem {
-                name: snippet.name.clone(),
-                command: snippet.command.clone(),
-                note: snippet.note.clone(),
-                builtin: false,
-                index,
-            });
-        let builtin =
-            presets_for(self.active_session_platform()).map(|(index, preset)| CompletionItem {
-                name: crate::i18n::translate(cx, preset.name, &[]).to_string(),
-                command: preset.command.to_string(),
-                note: crate::i18n::translate(cx, preset.note, &[]).to_string(),
-                builtin: true,
-                index,
-            });
-        mine.chain(builtin).collect()
+    ///
+    /// 列表按（语言、会话平台、片段内容指纹）缓存：补全在每次按键时重建，
+    /// 200+ 内置命令逐条翻译加三条小写拷贝是热路径上纯浪费的分配。
+    fn completion_items(&mut self, cx: &Context<Self>) -> Vec<CompletionItem> {
+        let key = CompletionCacheKey {
+            locale: crate::i18n::current_locale(cx),
+            platform: self.active_session_platform(),
+            snippets: snippet_fingerprint(&self.snippets),
+        };
+        if let Some((cached, items)) = &self.completion_cache
+            && *cached == key
+        {
+            return items.clone();
+        }
+        let mine = self.snippets.iter().map(|snippet| {
+            CompletionItem::new(
+                snippet.name.clone(),
+                snippet.command.clone(),
+                snippet.note.clone(),
+                CompletionKind::Snippet,
+            )
+        });
+        let builtin = presets_for(self.active_session_platform()).map(|(_, preset)| {
+            CompletionItem::new(
+                crate::i18n::translate(cx, preset.name, &[]).to_string(),
+                preset.command.to_string(),
+                crate::i18n::translate(cx, preset.note, &[]).to_string(),
+                CompletionKind::Command,
+            )
+        });
+        let items: Vec<CompletionItem> = mine.chain(builtin).collect();
+        self.completion_cache = Some((key, items.clone()));
+        items
     }
 
-    /// 重新算候选；词太短、没命中或命令还在跑时收起浮层。
+    /// 重新算候选；命令位词太短、参数位接不上前文、命令还在跑时都会收起浮层。
     fn refresh_completion(&mut self, cx: &mut Context<Self>) {
         let Some(line) = self.typed_line.clone() else {
             self.close_completion(cx);
             return;
         };
-        // 替换目标是行尾正在敲的那个词；词还太短时退回上一个词做查询，
-        // 这样 `docker p` / `docker ` 仍能列出 docker 相关命令。
+        // 替换目标是行尾正在敲的那个词，它前面的文本决定这个词是命令还是参数。
         let token = last_token(&line).to_string();
-        let query = if token.chars().count() >= MIN_TOKEN_CHARS {
-            token.clone()
-        } else {
-            let before = line[..line.len().saturating_sub(token.len())].trim_end();
-            last_token(before).to_string()
-        };
-        if query.chars().count() < MIN_TOKEN_CHARS {
-            self.close_completion(cx);
-            return;
-        }
+        let before = line[..line.len().saturating_sub(token.len())].to_string();
         let Some(tab_id) = self.active_tab else {
             self.close_completion(cx);
             return;
@@ -199,23 +228,21 @@ impl RuTermApp {
             return;
         }
         let items = self.completion_items(cx);
-        let prefix = &line[..line.len().saturating_sub(token.len())];
-        let hits = matches_after(&items, &query, prefix);
+        let hits = complete(&items, &token, &before);
         if hits.is_empty() {
             self.close_completion(cx);
             return;
         }
-        let items: Vec<CompletionItem> = hits.into_iter().map(|slot| items[slot].clone()).collect();
         let previous = self
             .completion
             .as_ref()
             .map(|state| state.selected)
             .unwrap_or(0);
-        let selected = previous.min(items.len().saturating_sub(1));
+        let selected = previous.min(hits.len().saturating_sub(1));
         self.completion = Some(CompletionState {
             tab_id,
             token,
-            items,
+            items: hits,
             selected,
         });
         cx.notify();
@@ -277,7 +304,12 @@ impl RuTermApp {
                 let line = content.cursor.point.line.0;
                 let column = content.cursor.point.column.0;
                 let before = line_chars_before(content, line, column);
-                if before.len() >= token.len() && before[before.len() - token.len()..] == token[..]
+                // 词为空（刚敲完空格）时「退掉几个字符」是 0，网格对上与否失去锚点，
+                // 只能再核对整行的记录；否则一旦网格与记录无关就会把整条命令插进去。
+                let anchored = !token.is_empty() || before.ends_with(&tracked);
+                if anchored
+                    && before.len() >= token.len()
+                    && before[before.len() - token.len()..] == token[..]
                 {
                     Some(
                         before[..before.len() - token.len()]
@@ -369,6 +401,17 @@ impl RuTermApp {
         let mut rows = v_flex().gap(px(1.0)).py(px(2.0));
         for (slot, item) in state.items.iter().enumerate() {
             let selected = slot == state.selected;
+            // 选项候选补的就是它自己，第二列改放它来自哪条命令，免得两列重复。
+            let detail = if item.kind == CompletionKind::Flag {
+                item.note.as_str()
+            } else {
+                item.command.as_str()
+            };
+            let badge = match item.kind {
+                CompletionKind::Snippet => "",
+                CompletionKind::Command => "内置",
+                CompletionKind::Flag => "选项",
+            };
             rows = rows.child(
                 h_flex()
                     .id(("completion-row", slot))
@@ -392,22 +435,24 @@ impl RuTermApp {
                             .text_color(pal.text)
                             .child(SharedString::from(item.name.clone())),
                     )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .text_xs()
-                            .text_color(pal.muted)
-                            .text_ellipsis()
-                            .child(SharedString::from(item.command.clone())),
-                    )
-                    .when(item.builtin, |this| {
+                    .when(!detail.is_empty(), |this| {
+                        this.child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_xs()
+                                .text_color(pal.muted)
+                                .text_ellipsis()
+                                .child(SharedString::from(detail.to_string())),
+                        )
+                    })
+                    .when(!badge.is_empty(), |this| {
                         this.child(
                             div()
                                 .flex_shrink_0()
                                 .text_xs()
                                 .text_color(pal.muted)
-                                .child(tr!(cx, "内置")),
+                                .child(crate::i18n::translate(cx, badge, &[])),
                         )
                     }),
             );

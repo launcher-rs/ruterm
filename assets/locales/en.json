@@ -418,6 +418,7 @@
  "已插入内置命令：{name}": "Inserted built-in command: {name}",
  "已补全片段：{name}": "Completed snippet: {name}",
  "内置": "Built-in",
+ "选项": "Option",
  "↑↓ 选择 · Tab 补全 · Esc 关闭": "↑↓ select · Tab complete · Esc dismiss",
  "终端内自动补全": "Inline completion in terminal",
  "输入命令时自动弹出片段候选：↑↓ 选择、Tab / Enter 补全、Esc 关闭；补全只替换正在输入的那个词，不会执行命令。关闭后按键完全交给 shell。": "Show snippet candidates while typing: ↑↓ to select, Tab / Enter to complete, Esc to dismiss. Completion only replaces the current word and never runs the command. When off, keystrokes go straight to the shell.",

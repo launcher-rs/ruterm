@@ -1,18 +1,46 @@
 //! 终端内命令补全：按正在输入的词匹配命令片段，像 IDE 的补全一样浮在光标下方。
 //!
-//! 这里只做纯文本部分（匹配打分、把前缀和命令合并）；按键状态跟踪与终端写入
-//! 在 `app::completion`，避免这份逻辑依赖 `cx` 而无法单测。
+//! 这里只做纯文本部分（判定词在命令行里的位置、匹配打分、把前缀和命令合并）；
+//! 按键状态跟踪与终端写入在 `app::completion`，避免这份逻辑依赖 `cx` 而无法单测。
 
-/// 参与补全的一条候选：自己的片段或内置命令。
+/// 候选的来源，决定浮层上的徽标。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompletionKind {
+    /// 用户自己保存的片段。
+    Snippet,
+    /// 内置命令表里的命令。
+    Command,
+    /// 从接得上前文的命令里抽出的选项（参数位输入 `-` 时）。
+    Flag,
+}
+
+/// 参与补全的一条候选：自己的片段、内置命令，或命令里用过的选项。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompletionItem {
     pub name: String,
+    /// 接受补全时写进终端的文本；选项候选就是选项本身。
     pub command: String,
     pub note: String,
-    /// true＝内置命令（只读），false＝用户保存的片段。
-    pub builtin: bool,
-    /// 在片段列表 / 内置命令表里的下标，接受补全时用来取命令原文。
-    pub index: usize,
+    /// 预计算的小写形式：匹配在每次按键时全表扫描，现场 `to_lowercase`
+    /// 会对每个条目分配 2-3 个堆字符串，构造时算一次就能省掉。
+    pub name_lower: String,
+    pub command_lower: String,
+    pub note_lower: String,
+    pub kind: CompletionKind,
+}
+
+impl CompletionItem {
+    pub fn new(name: String, command: String, note: String, kind: CompletionKind) -> Self {
+        Self {
+            name_lower: name.to_lowercase(),
+            command_lower: command.to_lowercase(),
+            note_lower: note.to_lowercase(),
+            name,
+            command,
+            note,
+            kind,
+        }
+    }
 }
 
 /// 当前词达到这个长度才浮出候选：一两个字符就弹会太吵。
@@ -27,32 +55,151 @@ pub fn last_token(text: &str) -> &str {
         .unwrap_or("")
 }
 
-/// 按输入词挑候选，返回 items 下标（已按匹配度排序）。
+/// 正在输入的词在命令行里的角色。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TokenSlot {
+    /// 命令段的第一个词：填的是命令本身。
+    Command,
+    /// 命令段其后的词：填的是参数，不能再拿它去撞命令名。
+    Argument,
+}
+
+/// 正在输入的词落在命令位还是参数位。
+///
+/// `before_token` 是光标前、不含正在输入那个词的文本：按 `; | & ( )` 切成命令段，
+/// 词落在段首就是命令位。`cd find` 里的 `find` 在 `cd` 之后，是参数位，
+/// 不该再因为片段库里有 `sudo find / -name …` 就把它当命令提示出来。
+fn token_slot(before_token: &str) -> TokenSlot {
+    if segment_words(before_token).is_empty() {
+        TokenSlot::Command
+    } else {
+        TokenSlot::Argument
+    }
+}
+
+/// `before_token` 里当前命令段已经写下的词（不含正在输入的词）。
+fn segment_words(before_token: &str) -> Vec<&str> {
+    before_token
+        .rsplit([';', '|', '&', '(', ')'])
+        .next()
+        .unwrap_or("")
+        .split_whitespace()
+        .collect()
+}
+
+/// 命令开头的若干词是否与段末尾的词一一对齐，返回对齐的词数。
+///
+/// 只认「对齐到段尾」的情况，也就是候选命令正好接在正在输入的词前面：
+/// 段末尾是 `cd` 时，`sudo find / -name …` 对不上（开头是 `sudo`），
+/// 段末尾是 `sudo apt` 时 `sudo apt install …` 对得上（2 个词）。
+fn aligned_word_count(command: &str, segment: &[&str]) -> Option<usize> {
+    let words: Vec<&str> = command.split_whitespace().collect();
+    (1..=segment.len().min(words.len())).rev().find(|&k| {
+        words[..k]
+            .iter()
+            .zip(&segment[segment.len() - k..])
+            .all(|(head, typed)| head.eq_ignore_ascii_case(typed))
+    })
+}
+
+/// 参数位候选：命令接得上前文，且紧接正在输入的词的那个词以它开头。
+///
+/// 词为空（刚敲完空格）时列出这条命令后面的所有写法，等于「接着能填什么」的
+/// 速查；片段本身的顺序保留（我的片段在前）。
+fn continuations(items: &[CompletionItem], token: &str, segment: &[&str]) -> Vec<usize> {
+    let needle = token.to_lowercase();
+    items
+        .iter()
+        .enumerate()
+        .filter_map(|(slot, item)| {
+            let words: Vec<&str> = item.command.split_whitespace().collect();
+            let aligned = aligned_word_count(&item.command, segment)?;
+            let next = words.get(aligned)?.to_lowercase();
+            next.starts_with(&needle).then_some(slot)
+        })
+        .take(MAX_MATCHES)
+        .collect()
+}
+
+/// `-y` / `--all` / `-k5` 这样以 `-` 开头、紧跟字母数字的词才算选项；
+/// 单独的 `-` 与 `--`（读 stdin / 选项结束标记）不算。
+fn is_flag(word: &str) -> bool {
+    let body = word.trim_start_matches('-');
+    word.starts_with('-')
+        && word.len() > body.len()
+        && body.chars().next().is_some_and(|c| c.is_alphanumeric())
+}
+
+/// 参数位输入 `-` 时的候选：从接得上前文的命令里，取接上位置之后出现的选项。
+///
+/// 候选没有选项表可依，就按片段库里出现的次数排；小写用于比较与去重，
+/// 写回终端的仍是片段里的原大小写。
+fn flag_options(items: &[CompletionItem], token: &str, segment: &[&str]) -> Vec<CompletionItem> {
+    let needle = token.to_lowercase();
+    let mut found: Vec<(String, u32, String)> = Vec::new();
+    for item in items {
+        let words: Vec<&str> = item.command.split_whitespace().collect();
+        let Some(aligned) = aligned_word_count(&item.command, segment) else {
+            continue;
+        };
+        for word in &words[aligned..] {
+            if !is_flag(word) || !word.to_lowercase().starts_with(&needle) {
+                continue;
+            }
+            match found
+                .iter_mut()
+                .find(|(flag, _, _)| flag.to_lowercase() == word.to_lowercase())
+            {
+                Some((_, count, _)) => *count += 1,
+                None => found.push((word.to_string(), 1, item.command.clone())),
+            }
+        }
+    }
+    found.sort_by(|(a_flag, a_count, _), (b_flag, b_count, _)| {
+        b_count
+            .cmp(a_count)
+            .then_with(|| a_flag.to_lowercase().cmp(&b_flag.to_lowercase()))
+    });
+    found
+        .into_iter()
+        .take(MAX_MATCHES)
+        .map(|(flag, _, origin)| {
+            CompletionItem::new(flag.clone(), flag, origin, CompletionKind::Flag)
+        })
+        .collect()
+}
+
+/// 按词在命令行里的位置给候选：命令位整库模糊搜索，参数位只接受接得上前文的
+/// 续写与选项，参数填的是路径 / 包名之类的东西，命中不了就完全不弹（Tab 交回
+/// shell 自己的补全）。
+pub fn complete(items: &[CompletionItem], token: &str, before_token: &str) -> Vec<CompletionItem> {
+    let token = token.trim();
+    let segment = segment_words(before_token);
+    let slots = match token_slot(before_token) {
+        TokenSlot::Command => fuzzy_matches(items, token),
+        TokenSlot::Argument if token.starts_with('-') => {
+            return flag_options(items, token, &segment);
+        }
+        TokenSlot::Argument => continuations(items, token, &segment),
+    };
+    slots.into_iter().map(|slot| items[slot].clone()).collect()
+}
+
+/// 命令位候选：整库模糊匹配，返回 items 下标（已按匹配度排序）。
 ///
 /// 打分顺序：名称前缀 → 名称包含 → 命令里某个词的前缀 → 命令包含 → 备注包含。
-/// 命令词前面可能带管道/引号之类的符号，比较前先剥掉。`prefix` 是行内已输入的
-/// 前文：命令开头正好接上前缀时排到最前，例如 `sudo apt in` 优先「安装软件包」
-/// （`sudo apt install …`），而不是只碰巧某个词以 `in` 开头（如 `Invoke-WebRequest`）。
-pub fn matches_after(items: &[CompletionItem], token: &str, prefix: &str) -> Vec<usize> {
+/// 命令词前面可能带管道/引号之类的符号，比较前先剥掉。只有命令位走这里——
+/// 「敲『磁盘』能找到 `df -h`」靠的就是这种宽松匹配，参数位不能用。
+fn fuzzy_matches(items: &[CompletionItem], token: &str) -> Vec<usize> {
     let token = token.trim();
     if token.chars().count() < MIN_TOKEN_CHARS {
         return Vec::new();
     }
     let needle = token.to_lowercase();
-    let prefix_words: Vec<String> = prefix.split_whitespace().map(str::to_lowercase).collect();
     let mut scored: Vec<(i16, usize)> = items
         .iter()
         .enumerate()
-        .filter_map(|(slot, item)| {
-            item_score(item, &needle).map(|score| {
-                let bonus = if continues_prefix(&item.command, &prefix_words) {
-                    -8
-                } else {
-                    0
-                };
-                (i16::from(score) + bonus, slot)
-            })
-        })
+        .filter_map(|(slot, item)| item_score(item, &needle).map(|score| (i16::from(score), slot)))
         .collect();
     scored.sort_by(|(a_score, a_slot), (b_score, b_slot)| {
         a_score
@@ -66,32 +213,24 @@ pub fn matches_after(items: &[CompletionItem], token: &str, prefix: &str) -> Vec
         .collect()
 }
 
-/// 命令开头的若干词是否正好等于前缀末尾的词（大小写不敏感）。
-fn continues_prefix(command: &str, prefix_words: &[String]) -> bool {
-    let words: Vec<String> = command.split_whitespace().map(str::to_lowercase).collect();
-    let max = prefix_words.len().min(words.len());
-    (1..=max).any(|k| prefix_words[prefix_words.len() - k..] == words[..k])
-}
-
 fn item_score(item: &CompletionItem, needle: &str) -> Option<u8> {
-    let name = item.name.to_lowercase();
-    if name.starts_with(needle) {
+    // 小写形式在构造时算好（见 `CompletionItem::new`），这里直接用。
+    if item.name_lower.starts_with(needle) {
         return Some(0);
     }
-    if name.contains(needle) {
+    if item.name_lower.contains(needle) {
         return Some(1);
     }
-    let command = item.command.to_lowercase();
-    if command.split_whitespace().any(|word| {
+    if item.command_lower.split_whitespace().any(|word| {
         word.trim_start_matches(|c: char| !c.is_alphanumeric())
             .starts_with(needle)
     }) {
         return Some(2);
     }
-    if command.contains(needle) {
+    if item.command_lower.contains(needle) {
         return Some(3);
     }
-    if item.note.to_lowercase().contains(needle) {
+    if item.note_lower.contains(needle) {
         Some(4)
     } else {
         None
@@ -136,18 +275,17 @@ pub fn merged_command(prefix: &str, command: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        CompletionItem, MAX_MATCHES, MIN_TOKEN_CHARS, echo_lagging, last_token, matches_after,
-        merged_command,
+        CompletionItem, CompletionKind, MAX_MATCHES, MIN_TOKEN_CHARS, TokenSlot, complete,
+        echo_lagging, fuzzy_matches, last_token, merged_command, token_slot,
     };
 
     fn item(name: &str, command: &str, note: &str) -> CompletionItem {
-        CompletionItem {
-            name: name.to_string(),
-            command: command.to_string(),
-            note: note.to_string(),
-            builtin: true,
-            index: 0,
-        }
+        CompletionItem::new(
+            name.to_string(),
+            command.to_string(),
+            note.to_string(),
+            CompletionKind::Command,
+        )
     }
 
     fn sample() -> Vec<CompletionItem> {
@@ -172,18 +310,25 @@ mod tests {
         ]
     }
 
+    fn names(hits: &[CompletionItem]) -> Vec<String> {
+        hits.iter().map(|hit| hit.name.clone()).collect()
+    }
+
     #[test]
     fn short_token_shows_nothing() {
         let items = sample();
-        assert!(matches_after(&items, "", "").is_empty());
-        assert!(matches_after(&items, "a".repeat(MIN_TOKEN_CHARS - 1).as_str(), "").is_empty());
-        assert!(!matches_after(&items, "ap", "").is_empty());
+        assert!(fuzzy_matches(&items, "").is_empty());
+        assert!(
+            fuzzy_matches(&items, "a".repeat(MIN_TOKEN_CHARS - 1).as_str()).is_empty(),
+            "命令位一两个字符就弹太吵"
+        );
+        assert!(!fuzzy_matches(&items, "ap").is_empty());
     }
 
     #[test]
     fn command_word_prefix_wins_over_note() {
         let items = sample();
-        let hits = matches_after(&items, "apt", "");
+        let hits = fuzzy_matches(&items, "apt");
         assert_eq!(hits.len(), 2);
         // 「安装软件包」与「系统更新」都在命令里出现 apt，按名称稳定排序。
         let names: Vec<&str> = hits.iter().map(|&i| items[i].name.as_str()).collect();
@@ -193,10 +338,10 @@ mod tests {
     #[test]
     fn name_and_note_are_searchable() {
         let items = sample();
-        assert_eq!(matches_after(&items, "磁盘", ""), vec![3]);
+        assert_eq!(fuzzy_matches(&items, "磁盘"), vec![3]);
         // 备注里也有「端口」，仍应命中同名条目。
-        assert_eq!(matches_after(&items, "端口", ""), vec![2]);
-        assert_eq!(matches_after(&items, "docker", ""), vec![4]);
+        assert_eq!(fuzzy_matches(&items, "端口"), vec![2]);
+        assert_eq!(fuzzy_matches(&items, "docker"), vec![4]);
     }
 
     #[test]
@@ -204,12 +349,47 @@ mod tests {
         let items: Vec<CompletionItem> = (0..32)
             .map(|n| item(&format!("命令 {n:02}"), "echo hi", ""))
             .collect();
-        assert_eq!(matches_after(&items, "命令", "").len(), MAX_MATCHES);
+        assert_eq!(fuzzy_matches(&items, "命令").len(), MAX_MATCHES);
     }
 
     #[test]
-    fn typed_prefix_ranks_continuation_first() {
+    fn slot_follows_the_command_segment() {
+        assert_eq!(token_slot(""), TokenSlot::Command);
+        assert_eq!(token_slot("cd "), TokenSlot::Argument);
+        assert_eq!(token_slot("sudo apt "), TokenSlot::Argument);
+        // 分隔符之后是新的命令段，段首又是命令位。
+        assert_eq!(token_slot("ls -la | "), TokenSlot::Command);
+        assert_eq!(token_slot("cd /tmp && cd "), TokenSlot::Argument);
+        assert_eq!(token_slot("echo hi;"), TokenSlot::Command);
+    }
+
+    #[test]
+    fn argument_position_does_not_suggest_other_commands() {
         let items = vec![
+            item("进入目录", "cd /var/log", "去看系统日志"),
+            item(
+                "按名查找",
+                "sudo find / -name '<文件名>' 2>/dev/null",
+                "全盘找文件",
+            ),
+        ];
+        // `cd find`：`find` 是 cd 的参数，不该因为片段里有 `sudo find …` 就命中。
+        assert!(complete(&items, "find", "cd ").is_empty());
+        // 同一个词落在命令位，照旧整库搜索。
+        assert_eq!(names(&complete(&items, "find", "")), ["按名查找"]);
+        // 参数位也不许拿参数去撞别的命令名（`cd docker` 不等于要找 docker 命令）。
+        assert!(complete(&items, "docker", "cd ").is_empty());
+    }
+
+    #[test]
+    fn argument_position_only_takes_aligned_continuation() {
+        let items = sample();
+        // 段末尾正好是候选命令的开头：`sudo apt up` → `sudo apt update …`。
+        assert_eq!(names(&complete(&items, "up", "sudo apt ")), ["系统更新"]);
+        // 只对齐一个词的 `apt up` 接不上以 sudo 开头的片段。
+        assert!(complete(&items, "up", "apt ").is_empty());
+        // 命令位仍会把 Invoke-WebRequest 这类含 `in` 的排前面。
+        let with_powershell = vec![
             item(
                 "下载文件",
                 "Invoke-WebRequest -Uri <URL> -OutFile <文件名>",
@@ -217,27 +397,86 @@ mod tests {
             ),
             item("安装软件包", "sudo apt install <包名>", ""),
         ];
-        // 前缀 `sudo apt ` 正好接上 install 所在命令：即使两条都命中 `in`，也排在前面。
+        assert_eq!(names(&complete(&with_powershell, "in", ""))[0], "下载文件");
         assert_eq!(
-            items[matches_after(&items, "in", "sudo apt ")[0]].name,
+            names(&complete(&with_powershell, "in", "sudo apt "))[0],
             "安装软件包"
         );
-        // 没有前缀时按普通打分（命令词前缀）与名称排序，PowerShell 那条在前。
-        assert_eq!(items[matches_after(&items, "in", "")[0]].name, "下载文件");
     }
 
     #[test]
-    fn previous_word_query_skips_trailing_space() {
-        // UI 在词太短时用前一个词查询：`docker p` 要能回退到 `docker`。
+    fn empty_token_at_argument_lists_whats_next() {
+        let items = sample();
+        // 刚敲完 `sudo apt `：列出这条命令后面能接的写法。
+        assert_eq!(
+            names(&complete(&items, "", "sudo apt ")),
+            ["系统更新", "安装软件包"]
+        );
+        // 没有接得上的命令就什么都不列。
+        assert!(complete(&items, "", "cd ").is_empty());
+    }
+
+    #[test]
+    fn subcommand_continues_its_command() {
+        let items = vec![
+            item("提交改动", "git commit -m '<说明>'", "提交到当前分支"),
+            item("查看改动", "git status", "看工作区状态"),
+            item("添加远程", "git remote add <名> <地址>", "接远程仓库"),
+        ];
+        assert_eq!(names(&complete(&items, "re", "git ")), ["添加远程"]);
+        assert_eq!(names(&complete(&items, "s", "git ")), ["查看改动"]);
+        // 子命令之后的参数不再去撞别的 git 命令：`git commit msg` 什么都不提示。
+        assert!(complete(&items, "msg", "git commit ").is_empty());
+    }
+
+    #[test]
+    fn dash_offers_options_of_the_command_in_position() {
+        let items = vec![
+            item("提交改动", "git commit -m '<说明>'", ""),
+            item("打标签", "git tag -a -m '<说明>'", ""),
+            item("改写上次提交", "git commit --amend", ""),
+            item("忽略大小写比较", "git diff -i --no-index", ""),
+        ];
+        // 用得多的排前面，同频按字母；来源命令留在 note 里给浮层显示。
+        let hits = complete(&items, "-", "git ");
+        assert_eq!(
+            hits.iter()
+                .map(|hit| hit.command.as_str())
+                .collect::<Vec<_>>(),
+            ["-m", "--amend", "--no-index", "-a", "-i"]
+        );
+        assert_eq!(hits[0].note, "git commit -m '<说明>'");
+        assert_eq!(hits[0].kind, CompletionKind::Flag);
+        // `--` 只留长选项。
+        assert_eq!(
+            complete(&items, "--", "git ")
+                .iter()
+                .map(|hit| hit.command.as_str())
+                .collect::<Vec<_>>(),
+            ["--amend", "--no-index"]
+        );
+        // 命令对不上就没有选项可给。
+        assert!(complete(&items, "-", "cd ").is_empty());
+        // 单独的 `-` 与 `--` 本身不是选项。
+        let bare = vec![item("过滤", "grep - pattern", "")];
+        assert!(complete(&bare, "-", "grep ").is_empty());
+    }
+
+    #[test]
+    fn trailing_space_hands_the_previous_words_to_the_matcher() {
+        // UI 交给匹配层的只有「正在输入的词」和它之前的文本：`docker p` 里词是 `p`，
+        // 前文 `docker ` 决定这是 docker 的参数位。
         let line = "docker p";
         let token = last_token(line);
         assert_eq!(token, "p");
-        let before = line[..line.len() - token.len()].trim_end();
-        assert_eq!(last_token(before), "docker");
-        // 行尾只有一个空格时同样回退到最后一个完整词。
-        let line = "sudo apt ";
-        assert_eq!(last_token(line), "");
-        assert_eq!(last_token(line.trim_end()), "apt");
+        assert_eq!(
+            token_slot(&line[..line.len() - token.len()]),
+            TokenSlot::Argument
+        );
+        // 行尾只有一个空格时词为空，前文仍是整段命令；分隔符之后重新算命令位。
+        assert_eq!(last_token("sudo apt "), "");
+        assert_eq!(token_slot("sudo apt "), TokenSlot::Argument);
+        assert_eq!(token_slot("cd /tmp && "), TokenSlot::Command);
     }
 
     #[test]
