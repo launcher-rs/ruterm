@@ -166,7 +166,7 @@ mod tests {
     #[test]
     fn port_offsets_by_user_and_stays_in_range() {
         let port = default_port();
-        assert!(port >= DEFAULT_PORT && port < DEFAULT_PORT + PORT_SPREAD);
+        assert!((DEFAULT_PORT..DEFAULT_PORT + PORT_SPREAD).contains(&port));
     }
 
     #[test]
