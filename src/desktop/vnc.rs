@@ -93,7 +93,10 @@ impl PixelFormat {
             used |= mask;
             depth += bits;
         }
-        if depth != u32::from(self.depth) {
+        // 通道位数之和与 depth 不必精确相等：不少服务器把保留 / alpha 位算进
+        // depth=32（三通道和只有 24），解码只按 RGB 三通道取值，照常工作。
+        // depth 比通道和还小＝报告自相矛盾，才拒绝。
+        if u32::from(self.depth) < depth {
             bail!("服务器上报的颜色深度无效");
         }
         Ok(())

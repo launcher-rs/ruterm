@@ -551,11 +551,18 @@ unsafe fn icon_to_png(hicon: windows::Win32::UI::WindowsAndMessaging::HICON) -> 
             Some(&mut metrics as *mut BITMAP as *mut c_void),
         ) == 0
         {
+            // GetIconInfo 已成功：两个 HBITMAP 由调用方负责删除，提前返回
+            // 也要清理，否则每次失败泄漏 1-2 个 GDI 句柄（上限 10000，
+            // 长期运行的 GUI 会逐渐耗尽）。
+            let _ = DeleteObject(HGDIOBJ(icon_info.hbmColor.0));
+            let _ = DeleteObject(HGDIOBJ(icon_info.hbmMask.0));
             return None;
         }
         let (width, height) = (metrics.bmWidth.max(1), metrics.bmHeight.abs().max(1));
         let memory = CreateCompatibleDC(None);
         if memory.is_invalid() {
+            let _ = DeleteObject(HGDIOBJ(icon_info.hbmColor.0));
+            let _ = DeleteObject(HGDIOBJ(icon_info.hbmMask.0));
             return None;
         }
         let header = BITMAPINFOHEADER {

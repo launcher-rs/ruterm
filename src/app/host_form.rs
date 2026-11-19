@@ -473,7 +473,15 @@ impl RuTermApp {
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_else(|| path.display().to_string());
-            let read = std::fs::read_to_string(&path);
+            // 先按文件大小预检再整读：误选 ISO / 视频等大文件时，不至于把
+            // 几 GB 先同步读进内存再做 64 KB 上限判定。
+            let read = match std::fs::metadata(&path) {
+                Ok(metadata) if metadata.len() > MAX_INLINE_KEY_BYTES as u64 => Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "文件过大",
+                )),
+                _ => std::fs::read_to_string(&path),
+            };
             let _ = cx.with_window(entity_id, move |_, cx| {
                 entity.update(cx, move |this, cx| {
                     this.apply_imported_key(label, read, cx);
@@ -499,7 +507,7 @@ impl RuTermApp {
             Ok(text) => text,
             Err(error) => {
                 log::warn!("读取私钥 {label} 失败: {error}");
-                self.status = format!("读取私钥文件 {label} 失败").into();
+                self.status = format!("读取私钥文件 {label} 失败：{error}").into();
                 cx.notify();
                 return;
             }

@@ -134,9 +134,28 @@ pub(super) fn open_path_with_default(path: &Path) {
     }
 }
 
+/// 启动时清理上次进程遗留的「打开远端文件」临时目录：进程崩溃 / 断电走
+/// 不到删除路径，`ruterm-open-*` 会永久残留在系统临时目录里。新进程刚
+/// 启动时不可能还有属于本进程的副本目录，现存的全是残骸，整目录删除
+/// 即可（对不存在的条目是无害 no-op）。
+pub(super) fn cleanup_stale_open_copies() {
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if name.starts_with("ruterm-open-")
+            && let Err(error) = std::fs::remove_dir_all(entry.path())
+        {
+            log::warn!("清理残留临时目录 {} 失败: {error}", entry.path().display());
+        }
+    }
+}
+
 /// 每份新副本独占随机目录；create（非 create_dir_all）不接受预先存在的目录。
-fn create_open_copy(name: &str) -> std::io::Result<PathBuf> {
-    let safe = safe_local_name(name)
+fn create_open_copy(name: &str) -> std::io::Result<PathBuf> {    let safe = safe_local_name(name)
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "文件名不合法"))?;
     for _ in 0..16 {
         let mut random = [0u8; 16];

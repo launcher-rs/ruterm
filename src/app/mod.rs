@@ -350,6 +350,9 @@ impl RuTermApp {
     ) -> Self {
         let mode = StorageMode::detect();
         let store = SessionStore::new(&mode);
+        // 上次进程崩溃 / 断电遗留下的「打开远端文件」副本目录，此时清掉
+        // （新进程不可能还有属于自己未删的副本目录）。
+        files::cleanup_stale_open_copies();
         let hosts = store.load();
         // 开库前先用旧 settings.json 里的状态栏偏好，库打开后再被库内值覆盖。
         let settings = store.load_settings();
@@ -1046,6 +1049,7 @@ impl RuTermApp {
             || self.pending.is_some()
             || self.macro_manager.is_some()
             || self.history_manager.is_some()
+            || self.broadcast.is_some()
             || self.show_discovery
     }
 

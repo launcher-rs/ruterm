@@ -45,7 +45,7 @@ pub async fn connect(config: Config) -> Result<Session> {
     let clipboard_token = ironrdp_cliprdr_native::allocate_clipboard_session();
 
     let thread_latest = latest.clone();
-    std::thread::Builder::new()
+    let spawned = std::thread::Builder::new()
         .name("ruterm-rdp".to_string())
         .spawn(move || {
             // WinClipboard is built on this thread inside `RdpClient::run`.
@@ -57,8 +57,12 @@ pub async fn connect(config: Config) -> Result<Session> {
                     reason: format!("{error:#}"),
                 });
             }
-        })
-        .context("创建 RDP 会话线程失败")?;
+        });
+    if let Err(error) = spawned {
+        // 线程没起来，剪贴板会话登记就没人释放了：确定性泄漏路径，补上。
+        ironrdp_cliprdr_native::release_clipboard_session(clipboard_token);
+        return Err(anyhow::Error::new(error).context("创建 RDP 会话线程失败"));
+    }
 
     Ok(Session {
         command: command_tx,
@@ -189,6 +193,11 @@ fn run_session(
                     };
                     match command {
                         Command::PasteFiles(paths) => {
+                            // 连续两次拖放：先取消上一批还挂着的登记，别让两批
+                            // 文件流的进度在剪贴板线程里搅在一起。
+                            if let Some(previous) = upload.take() {
+                                previous.progress.abort();
+                            }
                             // 放进本机剪贴板即可：剪贴板线程的监听窗口会把文件列表报给远端。
                             // 先登记进度再写剪贴板，剪贴板线程才认领得到。
                             let progress = begin_upload(&paths);

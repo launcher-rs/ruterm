@@ -570,6 +570,8 @@ impl RuTermApp {
                 cx.drop_image(image, None);
             }
         }
+        // 关闭位置记下来：移除后右邻会顶到这个下标，激活优先取它。
+        let closed_index = self.tabs.iter().position(|tab| tab.id == id);
         self.tabs.retain(|tab| tab.id != id);
         if self.tabs.len() == before {
             return;
@@ -594,7 +596,12 @@ impl RuTermApp {
             self.status = SharedString::from(format!("已断开 {title}"));
         }
         if self.active_tab == Some(id) {
-            self.active_tab = self.tabs.last().map(|tab| tab.id);
+            // 优先激活关闭位置上的右邻（浏览器 / Windows Terminal 惯例），
+            // 关的是最后一签就取新的末尾；跳到末尾会显得突兀。
+            let target = closed_index
+                .map(|index| index.min(self.tabs.len().saturating_sub(1)))
+                .unwrap_or(0);
+            self.active_tab = self.tabs.get(target).map(|tab| tab.id);
             if let Some(active) = self.active_tab {
                 self.reveal_tab(active);
             }

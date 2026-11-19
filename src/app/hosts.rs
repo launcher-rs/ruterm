@@ -640,6 +640,9 @@ impl RuTermApp {
         let removed = self.hosts.remove(index);
         let label = removed.name.clone();
         self.inline_keys.remove(&removed.id);
+        // 最近连接里也清掉死 id：所有使用点虽有过滤自愈，但脏数据会随
+        // persist_recent_hosts 一路写回库，不如删的时候顺手清干净。
+        self.recent_hosts.retain(|recent| *recent != removed.id);
         if let Some(vault) = self.vault.clone() {
             let id = removed.id;
             cx.spawn(async move |_, _| {

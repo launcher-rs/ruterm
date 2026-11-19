@@ -20,9 +20,12 @@ use serde::{Deserialize, Serialize};
 /// 应用已绑定（见 `main.rs` 的 `bind_keys`）、shell 常用控制字符与系统级
 /// 组合键；键宏触发键不允许与之冲突，避免按下即抢走终端 / 系统的行为。
 const RESERVED_TRIGGERS: &[&str] = &[
-    // 应用快捷键。
+    // 应用快捷键（与 main.rs 的 bind_keys 对齐，新增全局键位记得同步这里）。
     "ctrl-b",
     "ctrl-shift-b",
+    "ctrl-shift-l",
+    "ctrl-shift-k",
+    "ctrl-shift-r",
     "ctrl-t",
     "ctrl-n",
     "ctrl-shift-t",
@@ -38,9 +41,15 @@ const RESERVED_TRIGGERS: &[&str] = &[
     "ctrl-shift-d",
     "ctrl-shift-e",
     "ctrl-shift-m",
+    "ctrl-shift-s",
+    "ctrl-shift-h",
+    // 终端上下文里被应用抢占的键（绑定分发先于宏匹配，收不到就永远不触发）。
+    "ctrl-c",
+    "ctrl-v",
+    "ctrl-shift-c",
+    "ctrl-shift-v",
     // 终端 / readline 常用控制字符，抢走会让 shell 没法用。
     "ctrl-a",
-    "ctrl-c",
     "ctrl-d",
     "ctrl-e",
     "ctrl-h",

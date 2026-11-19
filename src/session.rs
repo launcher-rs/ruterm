@@ -1996,11 +1996,14 @@ async fn authenticate(handle: &mut Handle<SshTerminalHandler>, target: &SshTarge
         .context("未提供密码/私钥，且无法连接 SSH Agent")?;
     #[cfg(windows)]
     let mut agent = {
+        // OpenSSH for Windows 的 agent 服务监听固定命名管道，且不设
+        // SSH_AUTH_SOCK（那是 Unix 的约定）——没设就回退默认管道，让
+        // Windows 上选 Agent 认证的用户开箱可用，而不是必须手动 setx。
         let pipe = std::env::var_os("SSH_AUTH_SOCK")
-            .context("未提供密码/私钥，且 SSH_AUTH_SOCK 未设置，无法使用 SSH Agent")?;
+            .unwrap_or_else(|| std::ffi::OsString::from(r"\\.\pipe\openssh-ssh-agent"));
         AgentClient::connect_named_pipe(pipe)
             .await
-            .context("无法连接 SSH Agent 命名管道")?
+            .context("无法连接 SSH Agent（默认管道连不上：openssh-ssh-agent 服务可能未运行）")?
     };
     let identities = agent.request_identities().await?;
     anyhow::ensure!(!identities.is_empty(), "SSH Agent 中没有可用密钥");

@@ -1287,10 +1287,14 @@ impl RuTermApp {
         if !current {
             return;
         }
-        cx.write_to_clipboard(ClipboardItem::new_string(text));
-        if self.active_tab == Some(id) {
-            self.status = tr!(cx, "已收到远端剪贴板");
+        // 只有活动标签的会话才写本机剪贴板：后台 VNC 标签若也照写，两个
+        // VNC 会话会互相覆盖用户正在用的剪贴板。RDP 侧用 clipboard_token
+        // 保证了这一点，VNC 的 token 恒为 None，这里补上同一约束。
+        if self.active_tab != Some(id) {
+            return;
         }
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        self.status = tr!(cx, "已收到远端剪贴板");
         cx.notify();
     }
 
@@ -2771,11 +2775,14 @@ fn host_port(host: &str, port: u16) -> String {
 }
 
 /// `host` 字段里带端口时以它为准（支持 `host:5900` 与 `[::1]:5900`）。
+/// 端口 0 一律拒绝（连接只会报晦涩错误）；`host:`（尾冒号没数字）剥掉
+/// 尾冒号按纯主机名处理，不把整串丢给 DNS。
 fn normalize_address(raw: &str, port_text: &str) -> (String, Option<u16>) {
     let raw = raw.trim();
     if let Some(rest) = raw.strip_prefix('[')
         && let Some((host, tail)) = rest.split_once("]:")
         && let Ok(port) = tail.trim().parse::<u16>()
+        && port != 0
     {
         // 连接用裸 IPv6 字面量，展示时再由 `host_port` 补回方括号。
         return (host.to_string(), Some(port));
@@ -2784,8 +2791,13 @@ fn normalize_address(raw: &str, port_text: &str) -> (String, Option<u16>) {
         && !host.contains(':')
         && !host.is_empty()
         && let Ok(port) = tail.trim().parse::<u16>()
+        && port != 0
     {
         return (host.to_string(), Some(port));
+    }
+    if raw.ends_with(':') {
+        // `host:`：尾冒号解析不出端口，剥掉避免整串被当主机名。
+        return normalize_address(raw.trim_end_matches(':'), port_text);
     }
     let port = port_text.parse::<u16>().ok().filter(|port| *port != 0);
     (raw.to_string(), port)
