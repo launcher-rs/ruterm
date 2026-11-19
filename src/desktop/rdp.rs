@@ -641,6 +641,10 @@ fn send_input(
 
 fn pointer_operations(database: &Database, x: u16, y: u16, buttons: u8) -> Vec<Operation> {
     let mut operations = Vec::with_capacity(5);
+    // 先移动再按键：按下/释放必须落在本次事件携带的坐标上。按钮过渡排在
+    // MouseMove 之前的话，服务器会在"上一个已知光标位置"处理点击，首击
+    // 会点错地方。Wheel 路径已经是这个顺序。
+    operations.push(Operation::MouseMove(MousePosition { x, y }));
     for (bit, button) in [
         (0b001, MouseButton::Left),
         (0b010, MouseButton::Middle),
@@ -655,7 +659,6 @@ fn pointer_operations(database: &Database, x: u16, y: u16, buttons: u8) -> Vec<O
             });
         }
     }
-    operations.push(Operation::MouseMove(MousePosition { x, y }));
     operations
 }
 

@@ -335,11 +335,10 @@ pub fn generate_salt() -> Result<[u8; 16]> {
 }
 
 /// 写入派生盐（公开参数，明文存放）。
+/// 必须走临时文件 + 原子改名：这是整个库最要命的小文件，rekey 中途被
+/// 半截覆盖（`fs::write` 直接截断重写）会导致任何口令都派生不出密钥。
 pub fn write_salt(path: &Path, salt: &[u8; 16]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).ok();
-    }
-    std::fs::write(path, salt).with_context(|| format!("写入 {} 失败", path.display()))
+    write_new_synced(path, salt)
 }
 
 /// 首次写盘：独占建临时文件、落盘后原子改名，避免半截文件被当成有效内容。
@@ -385,7 +384,14 @@ fn write_new_synced(path: &Path, bytes: &[u8]) -> Result<()> {
 pub fn read_unlock_marker(mode: &StorageMode) -> UnlockBackend {
     match std::fs::read_to_string(mode.unlock_marker_path()) {
         Ok(text) if text.trim() == "passphrase" => UnlockBackend::Passphrase,
-        _ => UnlockBackend::Keyring,
+        Ok(_) => UnlockBackend::Keyring,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => UnlockBackend::Keyring,
+        Err(error) => {
+            // 权限 / IO 类错误不该无声地落回 keyring：passphrase 用户的解锁
+            // 流程会走错分支，最后报出的加密错误与真实原因对不上。
+            log::warn!("读取解锁标记失败（{error}），按 keyring 档处理");
+            UnlockBackend::Keyring
+        }
     }
 }
 
@@ -393,7 +399,7 @@ pub fn read_unlock_marker(mode: &StorageMode) -> UnlockBackend {
 pub fn write_unlock_marker(mode: &StorageMode, backend: UnlockBackend) -> Result<()> {
     mode.ensure_dir()
         .with_context(|| format!("无法创建 {}", mode.dir().display()))?;
-    std::fs::write(mode.unlock_marker_path(), backend.as_str())
+    write_new_synced(&mode.unlock_marker_path(), backend.as_str().as_bytes())
         .with_context(|| format!("写入 {}", mode.unlock_marker_path().display()))?;
     Ok(())
 }
@@ -498,7 +504,7 @@ impl Vault {
                 .exec(&mut *db as &mut dyn toasty::Executor)
                 .await
                 .context("读取凭据库失败")?;
-            let stored = stored_host_keys(&mut db).await?;
+            let stored = stored_host_keys_lossy(&mut db).await?;
             Ok(rows
                 .iter()
                 .map(|row| {
@@ -906,7 +912,9 @@ async fn raw_setting(db: &mut toasty::Db, name: &str) -> Result<Option<String>> 
 ///
 /// 表损坏时记日志并按空表处理：私钥解不出来应表现为"这台主机没有内嵌私钥"，
 /// 而不是让整个主机列表/删除操作一起失败。
-async fn stored_host_keys(db: &mut toasty::Db) -> Result<BTreeMap<i64, String>> {
+/// 读取内嵌私钥表（宽松版）：仅供列出主机用——损坏时按空表降级，
+/// 主机列表还能用，只是「内嵌私钥」标记全部缺席。
+async fn stored_host_keys_lossy(db: &mut toasty::Db) -> Result<BTreeMap<i64, String>> {
     let Some(raw) = raw_setting(db, HOST_KEYS_SETTING).await? else {
         return Ok(BTreeMap::new());
     };
@@ -920,6 +928,24 @@ async fn stored_host_keys(db: &mut toasty::Db) -> Result<BTreeMap<i64, String>> 
             Ok(BTreeMap::new())
         }
     }
+}
+
+/// 读取内嵌私钥表（严格版）：任何要回写这张表的路径（增删内嵌私钥、导出）
+/// 必须用它。损坏时按空表继续，随后的 read-modify-write 会把其余主机的
+/// 内嵌私钥整表抹掉——fail-closed 才保得住数据。
+async fn stored_host_keys(db: &mut toasty::Db) -> Result<BTreeMap<i64, String>> {
+    let Some(raw) = raw_setting(db, HOST_KEYS_SETTING).await? else {
+        return Ok(BTreeMap::new());
+    };
+    if raw.trim().is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    serde_json::from_str(&raw).with_context(|| {
+        format!(
+            "内嵌私钥表损坏（{}），拒绝变更以免丢失其余条目",
+            HOST_KEYS_SETTING
+        )
+    })
 }
 
 async fn put_host_keys(db: &mut toasty::Db, keys: &BTreeMap<i64, String>) -> Result<()> {
@@ -1104,22 +1130,37 @@ pub async fn migrate_legacy(
     // settings.json：theme / status_bar / terminal / session → Setting
     let settings_path = mode.legacy_path(crate::paths::LEGACY_SETTINGS_FILE);
     if settings_path.exists() {
-        if let Ok(text) = std::fs::read_to_string(&settings_path)
-            && let Ok(settings) = serde_json::from_str::<crate::sessions::Settings>(&text)
-        {
-            vault.set_setting("theme", &settings.theme).await?;
-            for (key, value) in [
-                ("status_bar", &settings.status_bar),
-                ("terminal", &settings.terminal),
-                ("session", &settings.session),
-                ("local_shells", &settings.local_shells),
-            ] {
-                if !value.is_empty() {
-                    vault.set_setting(key, value).await?;
+        // 读失败 / 解析失败时保留原文件（不改名归档）：改了名下次启动就
+        // 再也不会尝试迁移，用户的主题与偏好会静默丢掉。
+        let imported = match std::fs::read_to_string(&settings_path) {
+            Ok(text) => match serde_json::from_str::<crate::sessions::Settings>(&text) {
+                Ok(settings) => {
+                    vault.set_setting("theme", &settings.theme).await?;
+                    for (key, value) in [
+                        ("status_bar", &settings.status_bar),
+                        ("terminal", &settings.terminal),
+                        ("session", &settings.session),
+                        ("local_shells", &settings.local_shells),
+                    ] {
+                        if !value.is_empty() {
+                            vault.set_setting(key, value).await?;
+                        }
+                    }
+                    true
                 }
+                Err(error) => {
+                    log::error!("旧 settings.json 解析失败，保留原文件待下次重试: {error}");
+                    false
+                }
+            },
+            Err(error) => {
+                log::error!("读取旧 settings.json 失败，保留原文件待下次重试: {error}");
+                false
             }
+        };
+        if imported {
+            rename_preserving(&settings_path);
         }
-        rename_preserving(&settings_path);
     }
 
     // known_hosts 文件 → 表
@@ -1247,20 +1288,89 @@ pub(crate) fn remove_db_bundle(base: &Path) {
     }
 }
 
-/// 启动时修复上次中断的换主密码事务。
-///
-/// 换密钥按“先把旧库改名成备份，再把新库就位，最后才写盐与解锁标记”的顺序进行，
-/// 因此任一时刻至少有一份可用库。启动时只看主库在不在：
-/// - 主库在：残留的 `ruterm.db.new` 是上一轮草稿，整套删掉；
-/// - 主库不在、有备份：把备份搬回原处（旧盐仍对应旧库），再删草稿；
-/// - 主库与备份都不在却仍有草稿：无法判断草稿对应哪份口令，拒绝自动处理并保留现场。
-pub fn recover_rekey(mode: &StorageMode) -> Result<()> {
-    let db = mode.db_path();
-    let staging = db.with_file_name("ruterm.db.new");
-    if db.exists() {
-        remove_db_bundle(&staging);
-        return Ok(());
+/// 换主密码的事务日志路径（公开数据，明文：两把盐本就明文落盘）。
+fn rekey_journal_path(mode: &StorageMode) -> std::path::PathBuf {
+    mode.db_path().with_file_name("ruterm.db.rekey-pending")
+}
+
+/// 换主密码的事务日志：动库之前落盘，崩溃后 `recover_rekey` 据此判断
+/// 主库当前是新是旧，并把盐 / 解锁标记配平。
+#[derive(Clone, Debug)]
+struct RekeyJournal {
+    new_salt: Option<Vec<u8>>,
+    old_salt: Option<Vec<u8>>,
+    backend: UnlockBackend,
+}
+
+/// 在动库之前写入事务日志（原子写）。
+pub(crate) fn write_rekey_journal(
+    mode: &StorageMode,
+    new_salt: Option<&[u8; 16]>,
+    old_salt: Option<&[u8]>,
+    backend: UnlockBackend,
+) -> Result<()> {
+    // [0] 新盐有无；[1..17) 新盐；[17] 旧盐有无；[18..34) 旧盐；[34] 后端。
+    let mut bytes = Vec::with_capacity(35);
+    match new_salt {
+        Some(salt) => {
+            bytes.push(1);
+            bytes.extend_from_slice(salt);
+        }
+        None => {
+            bytes.push(0);
+            bytes.extend_from_slice(&[0u8; 16]);
+        }
     }
+    match old_salt {
+        Some(salt) => {
+            bytes.push(1);
+            bytes.extend_from_slice(salt);
+        }
+        None => {
+            bytes.push(0);
+            bytes.extend_from_slice(&[0u8; 16]);
+        }
+    }
+    bytes.push(backend.as_str().as_bytes()[0]);
+    write_new_synced(&rekey_journal_path(mode), &bytes).context("写入换密钥事务日志失败")
+}
+
+/// 事务干净结束（成功或已回滚）后清掉日志。
+pub(crate) fn clear_rekey_journal(mode: &StorageMode) {
+    let _ = std::fs::remove_file(rekey_journal_path(mode));
+}
+
+fn read_rekey_journal(mode: &StorageMode) -> Result<Option<RekeyJournal>> {
+    let path = rekey_journal_path(mode);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("读取 {} 失败", path.display()));
+        }
+    };
+    // 日志读不出就拒绝自动处理：配平错盐比停机等人工更糟。
+    if bytes.len() != 35 {
+        anyhow::bail!(
+            "换密钥事务日志 {} 长度异常（{} 字节），已拒绝自动恢复（请保留现场手工处理）",
+            path.display(),
+            bytes.len()
+        );
+    }
+    let backend = match bytes[34] {
+        b'k' => UnlockBackend::Keyring,
+        b'p' => UnlockBackend::Passphrase,
+        _ => anyhow::bail!("换密钥事务日志 {} 内容异常，已拒绝自动恢复", path.display()),
+    };
+    Ok(Some(RekeyJournal {
+        new_salt: (bytes[0] == 1).then(|| bytes[1..17].to_vec()),
+        old_salt: (bytes[17] == 1).then(|| bytes[18..34].to_vec()),
+        backend,
+    }))
+}
+
+/// 收集旧库备份候选：`keyring-bak` 最优先，其余带时间戳的按修改时间取最新。
+fn collect_backups(db: &Path) -> Vec<std::path::PathBuf> {
     let mut backups = Vec::new();
     let primary = db.with_file_name("ruterm.db.keyring-bak");
     if primary.exists() {
@@ -1269,17 +1379,52 @@ pub fn recover_rekey(mode: &StorageMode) -> Result<()> {
     if let Some(dir) = db.parent()
         && let Ok(entries) = std::fs::read_dir(dir)
     {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            if name.to_string_lossy().starts_with("ruterm.db.bak-") {
-                backups.push(entry.path());
-            }
-        }
+        let mut stamped: Vec<(std::path::PathBuf, std::time::SystemTime)> = entries
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("ruterm.db.bak-")
+            })
+            .filter_map(|entry| {
+                let modified = entry.metadata().and_then(|m| m.modified()).ok()?;
+                Some((entry.path(), modified))
+            })
+            .collect();
+        // read_dir 顺序取决于文件系统：按修改时间降序，回滚才总是取到最新的旧库。
+        stamped.sort_by_key(|entry| std::cmp::Reverse(entry.1));
+        backups.extend(stamped.into_iter().map(|(path, _)| path));
     }
+    backups
+}
+
+/// 启动时修复上次中断的换主密码事务。
+///
+/// 换密钥按“落事务日志 → 旧库改名成备份 → 新库就位 → 换盐 → 换标记 → 清日志”的
+/// 顺序进行。启动时结合事务日志判断：
+/// - 主库不在、有备份：换名完成前崩溃，把备份搬回原处，删草稿与日志；
+/// - 主库在、日志在：换名之后崩溃。当前盐已等于日志里的新盐（或本轮不换盐）
+///   则补写解锁标记、把事务补完；否则新库退位，旧库备份回原处、旧盐还原；
+/// - 主库在、日志不在：没有未完成的事务，残留的 `ruterm.db.new` 是上一轮草稿，删掉；
+/// - 主库与备份都不在却仍有草稿：无法判断草稿对应哪份口令，拒绝自动处理并保留现场。
+pub fn recover_rekey(mode: &StorageMode) -> Result<()> {
+    let db = mode.db_path();
+    let staging = db.with_file_name("ruterm.db.new");
+    let journal = read_rekey_journal(mode)?;
+    if db.exists() {
+        if let Some(journal) = journal {
+            return recover_rekey_in_place(mode, &staging, journal);
+        }
+        remove_db_bundle(&staging);
+        return Ok(());
+    }
+    let backups = collect_backups(&db);
     if let Some(backup) = backups.into_iter().next() {
         rename_bundle_sync(&backup, &db)
             .with_context(|| format!("恢复旧库 {} 失败", backup.display()))?;
         remove_db_bundle(&staging);
+        clear_rekey_journal(mode);
         log::warn!(
             "检测到中断的主密码更换，已将旧库备份 {} 恢复为 {}",
             backup.display(),
@@ -1293,6 +1438,61 @@ pub fn recover_rekey(mode: &StorageMode) -> Result<()> {
             db.display()
         );
     }
+    Ok(())
+}
+
+/// 主库已就位但事务日志仍在：崩溃点在换名之后、清理之前。
+fn recover_rekey_in_place(mode: &StorageMode, staging: &Path, journal: RekeyJournal) -> Result<()> {
+    let db = mode.db_path();
+    let salt_path = mode.salt_path();
+    let current_salt = std::fs::read(&salt_path).ok();
+    let salt_is_new = match &journal.new_salt {
+        // 本轮换了盐：只有当前盐文件确实等于新盐，才认定事务已推进过换盐这一步。
+        Some(new_salt) => current_salt.as_deref() == Some(new_salt.as_slice()),
+        // 本轮不换盐（换回 keyring）：盐本就不该动，视为已配平。
+        None => true,
+    };
+    if salt_is_new {
+        // 新库 + 新盐已成对，只差解锁标记：补写标记即事务补完。旧库备份保守
+        // 起见保留在原地（数据完整性在上轮运行里没能最终确认），可手工清理。
+        write_new_synced(
+            &mode.unlock_marker_path(),
+            journal.backend.as_str().as_bytes(),
+        )
+        .with_context(|| format!("补写 {}", mode.unlock_marker_path().display()))?;
+        remove_db_bundle(staging);
+        clear_rekey_journal(mode);
+        log::warn!(
+            "检测到中断的主密码更换：新库与新盐已配平，已补写解锁标记为 {}，旧库备份保留待人工清理",
+            journal.backend.as_str()
+        );
+        return Ok(());
+    }
+    // 盐还是旧的：换盐没发生或没生效，新库退位、旧库备份回原处、旧盐还原。
+    // 解锁标记此刻必然还是旧值（换标记排在换盐之后），无需处理。
+    let backups = collect_backups(&db);
+    let Some(backup) = backups.into_iter().next() else {
+        anyhow::bail!(
+            "检测到中断的主密码更换：主库与旧盐不匹配但找不到旧库备份，已拒绝自动处理（请保留现有文件并手工恢复）"
+        );
+    };
+    rename_bundle_sync(&backup, &db)
+        .with_context(|| format!("恢复旧库 {} 失败", backup.display()))?;
+    match journal.old_salt {
+        Some(old_salt) => {
+            write_new_synced(&salt_path, &old_salt).with_context(|| "还原旧派生盐失败")?;
+        }
+        None => {
+            let _ = std::fs::remove_file(&salt_path);
+        }
+    }
+    remove_db_bundle(staging);
+    clear_rekey_journal(mode);
+    log::warn!(
+        "检测到中断的主密码更换，已回滚旧库（备份 {} 恢复为 {}）",
+        backup.display(),
+        db.display()
+    );
     Ok(())
 }
 

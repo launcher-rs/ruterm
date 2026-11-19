@@ -2,7 +2,8 @@
 //!
 //! 握手支持 3.3 / 3.7 / 3.8，安全类型只收 `None` 与 `VNC Authentication`
 //! （VeNCrypt / RA2 之类直接报「服务器要求的加密方式不支持」，不静默降级）。
-//! 编码只通告 `Raw` / `CopyRect` / `Hextile` 与 `DesktopSize` 伪编码：
+//! 编码只通告 `Hextile` / `CopyRect` / `Raw` 与 `DesktopSize` 伪编码（按偏好排序，
+//! 服务器取第一个支持的，压缩编码先行）：
 //! 这三样是 TigerVNC、x11vnc、macOS 屏幕共享共同支持的最大公约数，
 //! Tight / ZRLE 需要 zlib 流式解码，等真有服务器只肯给它们再加。
 //!
@@ -31,7 +32,10 @@ pub const READ_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 pub const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// 我们通告给服务器的编码（客户端 → 服务器的优先级顺序）。
-pub const ENCODINGS: [i32; 4] = [0, 1, 5, -223];
+/// RFB 规定顺序即偏好：服务器会用列表里第一个自己支持的编码。Hextile 压缩后
+/// 只有原始像素的几十分之一，WAN 下 Raw 先行等于强制全量未压缩传输，因此把
+/// Raw 放在末位兜底；`DesktopSize` 是伪编码，顺序不影响。
+pub const ENCODINGS: [i32; 4] = [5, 1, 0, -223];
 
 /// RFB 的 `Rect`：以帧缓冲左上角为原点的像素矩形。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -469,7 +473,10 @@ where
             Ok(Message::Update { resized })
         }
         1 => {
-            let _first = reader.read_u8().await?;
+            // SetColourMapEntries：type(1) padding(1) first-colour(2) count(2) [6B]*n。
+            // 真彩色像素格式下服务器不该发这条，读对字段只是保证不把流读歪。
+            let _padding = reader.read_u8().await?;
+            let _first = reader.read_u16().await?;
             let count = reader.read_u16().await?;
             for _ in 0..count {
                 let mut entry = [0u8; 6];
@@ -487,7 +494,13 @@ where
             }
             let mut bytes = vec![0u8; length];
             reader.read_exact(&mut bytes).await?;
-            let text = bytes.iter().map(|&byte| char::from(byte)).collect();
+            // RFB 3.3 的 CutText 按规范是 Latin-1，但 Linux 上的服务器
+            // （TigerVNC / x11vnc）转发的选择内容常是 UTF-8 编码的 UTF8_STRING：
+            // 先按 UTF-8 解，解不通再退回 Latin-1，中文不再变成乱码。
+            let text = match std::str::from_utf8(&bytes) {
+                Ok(text) => text.to_string(),
+                Err(_) => bytes.iter().map(|&byte| char::from(byte)).collect(),
+            };
             Ok(Message::Clipboard(text))
         }
         other => bail!("未知的服务器消息类型 {other}"),

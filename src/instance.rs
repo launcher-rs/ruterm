@@ -1,18 +1,32 @@
-//! 单实例守卫：让一台机器上只跑一个 RuTerm 进程。
+//! 单实例守卫：让一个用户会话里只跑一个 RuTerm 进程。
 //!
 //! 关窗口默认是隐藏到托盘（会话要在后台保活），于是很容易再双击一次 exe，
 //! 结果两个进程读写同一个加密库、各自挂一个托盘图标，隐藏的那个再也找不回来。
 //! 这里用「绑定 127.0.0.1 的一个回环端口」当进程间锁：抢到的人做主实例并监听
 //! 敲门；抢不到的人递一个令牌、请主实例把窗口带到前台，然后自己退出。
 //! 令牌要双向核对，端口被无关程序占着时宁可放弃守卫，也不让软件启动不了。
+//!
+//! 端口与令牌都按当前用户名派生：回环端口是机器全局资源，不派生的话
+//! Windows 快速用户切换 / RDP 多会话场景下，另一名用户的启动会撞到
+//! 我们的端口并被"唤醒"到别人的窗口，永远起不了自己的实例。
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::time::Duration;
 
-/// 回环锁端口：挑在常见服务区间之外，降低撞车概率。
-/// 可用环境变量 `RUTERM_INSTANCE_PORT` 覆盖（端口被占用时便于切换）。
+/// 回环锁端口基数：挑在常见服务区间之外，降低撞车概率。
 const DEFAULT_PORT: u16 = 47_122;
+/// 按用户名哈希散开的端口数：不同用户大概率各用各的锁端口。
+const PORT_SPREAD: u16 = 512;
+
+/// 当前用户名（Windows 用 USERNAME，Unix 用 USER）。
+fn session_user() -> String {
+    std::env::var("USERNAME")
+        .or_else(|_| std::env::var("USER"))
+        .unwrap_or_default()
+}
 
 /// 锁端口，可被 `RUTERM_INSTANCE_PORT` 覆盖；非法值回退默认并告警。
 fn port() -> u16 {
@@ -20,16 +34,31 @@ fn port() -> u16 {
         Some(raw) => match raw.to_str().and_then(|s| s.parse::<u16>().ok()) {
             Some(port) => port,
             None => {
-                log::warn!("RUTERM_INSTANCE_PORT 非法（{raw:?}），回退默认端口 {DEFAULT_PORT}");
-                DEFAULT_PORT
+                log::warn!("RUTERM_INSTANCE_PORT 非法（{raw:?}），回退按用户派生的默认端口");
+                default_port()
             }
         },
-        None => DEFAULT_PORT,
+        None => default_port(),
     }
 }
-/// 握手口令：两边都核对，确认对面确实是另一个 RuTerm。
-/// 固定长度帧，不做行解析，避免本机进程用超长行撑爆内存。
-const TOKEN: &[u8] = b"ruterm-instance-v1";
+
+/// 无覆盖时的端口：基数 + 用户名哈希偏移。
+fn default_port() -> u16 {
+    let mut hasher = DefaultHasher::new();
+    session_user().hash(&mut hasher);
+    let offset = (hasher.finish() % u64::from(PORT_SPREAD)) as u16;
+    DEFAULT_PORT + offset
+}
+
+/// 握手令牌：两边都核对，确认对面确实是同一用户会话里的另一个 RuTerm。
+/// 用户名拼进令牌，跨用户的敲门（端口恰好撞上时）核对不上会干净失败。
+fn token() -> Vec<u8> {
+    let mut bytes = b"ruterm-instance-v1".to_vec();
+    bytes.push(0);
+    bytes.extend_from_slice(session_user().as_bytes());
+    bytes
+}
+
 /// 单次握手的等待上限：主实例卡死时不该把第二次启动也拖住。
 const HANDSHAKE: Duration = Duration::from_millis(600);
 
@@ -79,15 +108,16 @@ fn knock() -> bool {
     };
     let _ = stream.set_write_timeout(Some(HANDSHAKE));
     let _ = stream.set_read_timeout(Some(HANDSHAKE));
-    if stream.write_all(TOKEN).is_err() {
+    let token = token();
+    if stream.write_all(&token).is_err() {
         return false;
     }
     let _ = stream.flush();
-    let mut reply = [0u8; TOKEN.len()];
+    let mut reply = vec![0u8; token.len()];
     if stream.read_exact(&mut reply).is_err() {
         return false;
     }
-    reply == TOKEN
+    reply == token
 }
 
 /// 主实例侧：把 std 监听换成 tokio 监听，交给应用执行器跑唤醒循环。
@@ -98,19 +128,26 @@ pub async fn serve<F: FnMut()>(listener: TcpListener, mut wake: F) {
         return;
     };
     loop {
-        let Ok((mut stream, _)) = listener.accept().await else {
-            continue;
+        // accept 持续报错时不能变成忙等（错误立即返回会让这个循环吃满一个核）。
+        let (mut stream, _) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(error) => {
+                log::warn!("单实例监听 accept 失败: {error}");
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                continue;
+            }
         };
         // 每个连接都必须在一个总时限内完成固定长度握手：读半截、慢速灌数据、
         // 连上不说话都不能把唤醒循环卡住。
+        let token = token();
         let authenticated = tokio::time::timeout(HANDSHAKE, async {
             use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-            let mut token = [0u8; TOKEN.len()];
-            stream.read_exact(&mut token).await.ok()?;
-            if token != TOKEN {
+            let mut received = vec![0u8; token.len()];
+            stream.read_exact(&mut received).await.ok()?;
+            if received != token {
                 return None;
             }
-            stream.write_all(TOKEN).await.ok()?;
+            stream.write_all(&token).await.ok()?;
             stream.flush().await.ok()?;
             Some(())
         })
@@ -119,5 +156,24 @@ pub async fn serve<F: FnMut()>(listener: TcpListener, mut wake: F) {
         if authenticated {
             wake();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DEFAULT_PORT, PORT_SPREAD, default_port, token};
+
+    #[test]
+    fn port_offsets_by_user_and_stays_in_range() {
+        let port = default_port();
+        assert!(port >= DEFAULT_PORT && port < DEFAULT_PORT + PORT_SPREAD);
+    }
+
+    #[test]
+    fn token_is_user_scoped() {
+        let token = token();
+        assert!(token.starts_with(b"ruterm-instance-v1\x00"));
+        // 含用户名主体（用户名可能为空，但分隔符必须在）。
+        assert!(token.len() >= 19);
     }
 }

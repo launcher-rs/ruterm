@@ -89,14 +89,37 @@ impl SshTarget {
             ),
         };
 
-        let (host, port) = match rest.rsplit_once(':') {
-            Some((host, port_str)) => {
-                let port = port_str
+        // IPv6：`[::1]:22`（剥方括号取端口）或裸 `::1`（整体即地址）。
+        // 直接 rsplit_once(':') 会把地址切在最后一个冒号上，得出 host=":" 之类的废料。
+        let (host, port) = if let Some(stripped) = rest.strip_prefix('[') {
+            let (host, tail) = stripped
+                .split_once(']')
+                .ok_or_else(|| anyhow::anyhow!("IPv6 地址缺少右方括号: {rest}"))?;
+            let port = match tail.strip_prefix(':') {
+                Some(port_str) => port_str
                     .parse::<u16>()
-                    .map_err(|_| anyhow::anyhow!("端口无法解析: {port_str}"))?;
-                (host.to_string(), port)
+                    .map_err(|_| anyhow::anyhow!("端口无法解析: {port_str}"))?,
+                None => 22,
+            };
+            (host.to_string(), port)
+        } else if rest.matches(':').count() > 1 {
+            // 多个冒号又不是 [v6]:port 形式：按裸 IPv6 解析，解析失败才报错。
+            (
+                rest.parse::<std::net::Ipv6Addr>()
+                    .map_err(|_| anyhow::anyhow!("连接目标无法解析: {rest}"))?
+                    .to_string(),
+                22,
+            )
+        } else {
+            match rest.rsplit_once(':') {
+                Some((host, port_str)) => {
+                    let port = port_str
+                        .parse::<u16>()
+                        .map_err(|_| anyhow::anyhow!("端口无法解析: {port_str}"))?;
+                    (host.to_string(), port)
+                }
+                None => (rest, 22),
             }
-            None => (rest, 22),
         };
 
         Ok(Some(Self {

@@ -52,6 +52,56 @@ pub(super) fn safe_local_name(name: &str) -> Option<String> {
     }
 }
 
+/// 落点已存在时给出不冲突的路径（`name (1).ext`、`name (2).ext` …）：
+/// 没有"保存对话框"兜底的直接落盘路径必须自带防覆盖。
+pub(super) fn unique_local_path(path: PathBuf) -> PathBuf {
+    if !path.exists() {
+        return path;
+    }
+    let stem = path
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let extension = path
+        .extension()
+        .map(|ext| ext.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let parent = path.parent().map(Path::to_path_buf).unwrap_or_default();
+    for index in 1..1000u32 {
+        let candidate = if extension.is_empty() {
+            parent.join(format!("{stem} ({index})"))
+        } else {
+            parent.join(format!("{stem} ({index}).{extension}"))
+        };
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    // 999 个重名都不够用的情况（基本不可能）：宁可沿用原路径走覆盖，
+    // 也不把一个看起来疯掉的文件名塞给用户。
+    path
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unique_local_path;
+
+    #[test]
+    fn unique_path_suffixes_existing_files() {
+        let dir = std::env::temp_dir().join(format!("ruterm-unique-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = dir.join("a.txt");
+        std::fs::write(&base, b"x").unwrap();
+        let unique = unique_local_path(base.clone());
+        assert_eq!(unique, dir.join("a (1).txt"));
+        std::fs::write(&unique, b"x").unwrap();
+        assert_eq!(unique_local_path(base), dir.join("a (2).txt"));
+        // 不存在的路径原样返回。
+        assert_eq!(unique_local_path(dir.join("b.txt")), dir.join("b.txt"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
 /// 用系统默认程序打开本地文件（文件面板里的“打开”）。
 pub(super) fn open_path_with_default(path: &Path) {
     #[cfg(windows)]
@@ -186,6 +236,9 @@ pub(super) const FILE_COL_PERM_W: f32 = 66.0;
 /// 可拖拽列宽的上下限（名称列占剩余空间，不在这里）。
 pub(super) const FILE_COL_MIN_W: f32 = 34.0;
 pub(super) const FILE_COL_MAX_W: f32 = 180.0;
+/// 进度回传给 UI 线程的最小间隔：传输任务可能每块一条进度消息，
+/// 大文件 × 小分块时是成千上万条，主线程不该为每条跑一遍实体更新。
+const PROGRESS_UI_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 /// 行首图标 + 间距占位：让表头「名称」与行内文件名左对齐。
 pub(super) const FILE_ROW_LEAD_W: f32 = 20.0;
 /// 面板实测宽度低于此值算「窄栏」：隐掉修改时间与权限两列（见 [`RuTermApp::pane_narrow`]）。
@@ -1224,6 +1277,7 @@ impl RuTermApp {
         cx.notify();
 
         cx.spawn(async move |this, cx| {
+            let mut last_push: Option<std::time::Instant> = None;
             let outcome = loop {
                 tokio::select! {
                     result = &mut reply_rx => {
@@ -1234,6 +1288,13 @@ impl RuTermApp {
                         };
                     }
                     Some(progress) = progress_rx.recv() => {
+                        // 大文件 × 小分块时进度消息成千上万条：不到 100ms
+                        // 就不上 UI 线程，主线程不该为每条消息跑一遍 update。
+                        let now = std::time::Instant::now();
+                        if last_push.is_some_and(|last| now.duration_since(last) < PROGRESS_UI_INTERVAL) {
+                            continue;
+                        }
+                        last_push = Some(now);
                         let _ = this.update(cx, |this, cx| {
                             if let Some(tab) = this.tabs.iter_mut().find(|tab| tab.id == tab_id)
                                 && !tab.ended
@@ -1394,6 +1455,7 @@ impl RuTermApp {
                         cx.notify();
                     }
                 });
+                let mut last_push: Option<std::time::Instant> = None;
                 let outcome = loop {
                     tokio::select! {
                         result = &mut reply_rx => {
@@ -1404,6 +1466,12 @@ impl RuTermApp {
                             };
                         }
                         Some(progress) = progress_rx.recv() => {
+                            // 进度消息节流到 100ms 一条（理由同单文件上传）。
+                            let now = std::time::Instant::now();
+                            if last_push.is_some_and(|last| now.duration_since(last) < PROGRESS_UI_INTERVAL) {
+                                continue;
+                            }
+                            last_push = Some(now);
                             let _ = this.update(cx, |this, cx| {
                                 if let Some(tab) = this.tabs.iter_mut().find(|tab| tab.id == tab_id)
                                     && tab.files.busy.is_some()
@@ -1553,7 +1621,10 @@ impl RuTermApp {
             return;
         };
         let remote = crate::remote_fs::child(&remote_dir, &name);
-        self.start_download(tab_id, local_dir.join(safe), remote, true, cx);
+        // 落点已有同名文件时自动加序号，而不是无声覆盖——这条路没有保存对话框，
+        // 用户看不到"将要覆盖"这件事。
+        let target = unique_local_path(local_dir.join(&safe));
+        self.start_download(tab_id, target, remote, true, cx);
     }
 
     /// 单个文件下载：进度写在面板底栏，完成后提示结果。
@@ -1615,6 +1686,7 @@ impl RuTermApp {
                 });
                 return;
             }
+            let mut last_push: Option<std::time::Instant> = None;
             let outcome = loop {
                 tokio::select! {
                     result = &mut reply_rx => {
@@ -1625,6 +1697,12 @@ impl RuTermApp {
                         };
                     }
                     Some(progress) = progress_rx.recv() => {
+                        // 进度消息节流到 100ms 一条（理由同上传路径）。
+                        let now = std::time::Instant::now();
+                        if last_push.is_some_and(|last| now.duration_since(last) < PROGRESS_UI_INTERVAL) {
+                            continue;
+                        }
+                        last_push = Some(now);
                         let _ = this.update(cx, |this, cx| {
                             if let Some(tab) = this.tabs.iter_mut().find(|tab| tab.id == tab_id)
                                 && tab.files.busy.is_some()
@@ -1769,6 +1847,7 @@ impl RuTermApp {
                         cx.notify();
                     }
                 });
+                let mut last_push: Option<std::time::Instant> = None;
                 let outcome = loop {
                     tokio::select! {
                         result = &mut reply_rx => {
@@ -1779,6 +1858,12 @@ impl RuTermApp {
                             };
                         }
                         Some(progress) = progress_rx.recv() => {
+                            // 进度消息节流到 100ms 一条（理由同上传路径）。
+                            let now = std::time::Instant::now();
+                            if last_push.is_some_and(|last| now.duration_since(last) < PROGRESS_UI_INTERVAL) {
+                                continue;
+                            }
+                            last_push = Some(now);
                             let _ = this.update(cx, |this, cx| {
                                 if let Some(tab) = this.tabs.iter_mut().find(|tab| tab.id == tab_id)
                                     && tab.zmodem.is_some()
@@ -3289,7 +3374,7 @@ impl RuTermApp {
 }
 
 #[cfg(test)]
-mod tests {
+mod browser_tests {
     use super::{
         FileBrowser, FileSortKey, FileStamp, OpenedRemote, file_stamp, format_remote_time_short,
         poll_opened_files, safe_local_name,

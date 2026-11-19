@@ -322,17 +322,16 @@ impl IacFilter {
         };
         let [cols_hi, cols_lo] = cols.to_be_bytes();
         let [rows_hi, rows_lo] = rows.to_be_bytes();
-        self.replies.extend([
-            IAC,
-            SB,
-            TELOPT_NAWS,
-            cols_hi,
-            cols_lo,
-            rows_hi,
-            rows_lo,
-            IAC,
-            SE,
-        ]);
+        self.replies.extend([IAC, SB, TELOPT_NAWS]);
+        // 子协商内的 0xFF 必须按 RFC 854 转义成 IAC IAC，否则宽/高字节恰好
+        // 是 255（255 列宽的终端很常见）会被服务器当成 IAC 起始，协商失步。
+        for byte in [cols_hi, cols_lo, rows_hi, rows_lo] {
+            if byte == IAC {
+                self.replies.push(IAC);
+            }
+            self.replies.push(byte);
+        }
+        self.replies.extend([IAC, SE]);
     }
 
     fn take_replies(&mut self) -> Vec<u8> {
@@ -454,6 +453,31 @@ mod tests {
         assert_eq!(
             escape_uplink(&[0x01, 0xFF, 0x02]),
             vec![0x01, 0xFF, 0xFF, 0x02]
+        );
+    }
+
+    #[test]
+    fn naws_escapes_255_in_dimensions() {
+        let mut filter = IacFilter::default();
+        filter.process(&[IAC, DO, TELOPT_NAWS]);
+        filter.take_replies();
+        filter.set_size(255, 511);
+        // 255 列 / 511 行的高字节或低字节出现 0xFF 时都要写成 IAC IAC。
+        assert_eq!(
+            filter.take_replies(),
+            vec![
+                IAC,
+                SB,
+                TELOPT_NAWS,
+                0x00,
+                0xFF,
+                0xFF,
+                0x01,
+                0xFF,
+                0xFF,
+                IAC,
+                SE
+            ]
         );
     }
 }

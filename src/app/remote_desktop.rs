@@ -2843,10 +2843,12 @@ fn remote_point_clamped(
 }
 
 /// 认证失败判定：RDP 看凭据类报错，VNC 看协议层「认证失败」文案。
+/// 「服务器要求 VNC 密码」（空密码连强制认证的服务器）也归认证失败：
+/// 要退回密码表单，而不是停在失败卡片上无限重试同样的空密码。
 fn desktop_auth_failure(protocol: Protocol, message: &str) -> bool {
     match protocol {
         Protocol::Rdp => looks_like_auth_failure(message),
-        Protocol::Vnc => message.contains("认证失败"),
+        Protocol::Vnc => message.contains("认证失败") || message.contains("要求 VNC 密码"),
     }
 }
 

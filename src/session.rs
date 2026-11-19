@@ -407,7 +407,16 @@ async fn run(
         let nodes: Vec<&SshTarget> = chain.iter().chain(std::iter::once(&target)).collect();
         for (index, node) in nodes.iter().enumerate() {
             let is_target = index + 1 == nodes.len();
-            let config = Arc::new(SshConfig::default());
+            // keepalive：NAT / 断网这类"静默断连"不会触发 TCP EOF，is_closed() 永远
+            // 不会翻转，会话僵死、自动重连也永不触发。20s 一次 keepalive，3 次无响应
+            // 由 russh 主动关闭连接，健康检查就能上报并走重连。
+            // nodelay：终端逐键上行的场景下 Nagle 会把下一次按键拖到上一个包被确认
+            // 之后（最多一个 RTT），telnet 侧早已 set_nodelay(true)，SSH 侧对齐。
+            let config = Arc::new(SshConfig {
+                keepalive_interval: Some(std::time::Duration::from_secs(20)),
+                nodelay: true,
+                ..SshConfig::default()
+            });
             let node_side = if is_target {
                 side.clone()
             } else {
@@ -661,10 +670,21 @@ async fn run(
                     } => {
                         // 下行接管与 `rz` 命令必须在同一个任务里成对安装 / 摘除，
                         // 否则 shell 提示符会被 ZMODEM 状态机吃掉。
-                        let (down_tx, mut down_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-                        *zmodem_sink
+                        // 接管点只有一个：并发第二条上传会覆盖第一条的 sink，
+                        // 第一条结束时又把第二条摘掉、往新传输里注入 Ctrl+C，
+                        // 两条一起报废——这里直接拒绝并发请求。
+                        let mut sink_slot = zmodem_sink
                             .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(down_tx);
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        if sink_slot.is_some() {
+                            let _ = reply.send(Err(anyhow::anyhow!(
+                                "已有一条 ZMODEM 传输在进行，请等它结束"
+                            )));
+                            continue;
+                        }
+                        let (down_tx, mut down_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+                        *sink_slot = Some(down_tx.clone());
+                        drop(sink_slot);
                         let sink = zmodem_sink.clone();
                         let raw = raw_tx.clone();
                         let feed = feed.clone();
@@ -678,13 +698,23 @@ async fn run(
                                 .await
                             }
                             .await;
-                            // 先恢复终端输出，再回执：UI 收到结果即可继续输入。
-                            *sink
+                            // 只有接管点仍是本任务安装的通道时才摘除：若已被新的
+                            // 上传替换，不能动它，更不能往新传输里发 Ctrl+C。
+                            let owns_sink = sink
                                 .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-                            if result.is_err() {
-                                // 远端可能停在 rz 的交互里：发 Ctrl+C 回到 shell。
-                                let _ = raw.send(vec![0x03]);
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .as_ref()
+                                .map(|tx| tx.same_channel(&down_tx))
+                                .unwrap_or(false);
+                            if owns_sink {
+                                // 先恢复终端输出，再回执：UI 收到结果即可继续输入。
+                                *sink
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                                if result.is_err() {
+                                    // 远端可能停在 rz 的交互里：发 Ctrl+C 回到 shell。
+                                    let _ = raw.send(vec![0x03]);
+                                }
                             }
                             // 协议结束后 shell 的提示符可能已经排进接管通道：
                             // 恢复终端后补投，避免用户以为会话卡住。

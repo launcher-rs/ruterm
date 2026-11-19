@@ -101,13 +101,10 @@ pub async fn list(sftp: &SftpSession, path: Option<&str>) -> Result<Listing> {
             }
         })
         .collect();
-    entries.sort_by(|left, right| {
-        right
-            .is_dir
-            .cmp(&left.is_dir)
-            .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
-            .then_with(|| left.name.cmp(&right.name))
-    });
+    // cached_key：小写形式每条只算一次。sort_by 现场比较的话，O(n log n) 次
+    // 比较 × 2 次堆分配——万条目录一次列表就是二十多万次分配。
+    entries
+        .sort_by_cached_key(|entry| (!entry.is_dir, entry.name.to_lowercase(), entry.name.clone()));
 
     Ok(Listing {
         parent: parent_of(&path),

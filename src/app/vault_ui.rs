@@ -450,6 +450,14 @@ impl RuTermApp {
                 drop(fresh);
                 drop(vault);
                 let db_path = mode.db_path();
+                // 动库之前先落事务日志：此后任何一步崩溃，启动时的 recover_rekey
+                // 都能凭日志判断主库新旧并把盐 / 解锁标记配平。
+                crate::vault::write_rekey_journal(
+                    &mode,
+                    new_salt.as_ref(),
+                    previous_salt.as_deref(),
+                    backend,
+                )?;
                 let mut backup: Option<std::path::PathBuf> = None;
                 if db_path.exists() {
                     let candidate = db_path.with_file_name("ruterm.db.keyring-bak");
@@ -491,6 +499,8 @@ impl RuTermApp {
                             100,
                         )
                         .await;
+                        // 旧库已整体回位：事务作废，清掉日志，免得下次启动多跑一次恢复。
+                        crate::vault::clear_rekey_journal(&mode);
                         return Err(anyhow::anyhow!("新库就位失败（旧库已放回原处）: {error}"));
                     }
                     backup = Some(candidate);
@@ -499,18 +509,47 @@ impl RuTermApp {
                         .await
                         .map_err(anyhow::Error::msg)?;
                 }
-                // 新库已就位：此时才可以换盐、换标记。
-                if let Some(salt) = new_salt
-                    && let Err(error) = crate::vault::write_salt(&salt_path, &salt)
-                {
+                // 新库已就位：此时才可以换盐、换标记。这两步任何一步失败都必须
+                // 把旧库放回原处并还原旧盐——只还原盐是不够的：留在原地的是用
+                // 新盐派生的密钥加密的新库，旧口令派生不出密钥，等于把用户锁死。
+                let swapped = (|| {
+                    if let Some(salt) = new_salt {
+                        crate::vault::write_salt(&salt_path, &salt)
+                            .map_err(|error| anyhow::anyhow!("写入新派生盐失败: {error}"))?;
+                    }
+                    crate::vault::write_unlock_marker(&mode, backend)
+                        .map_err(|error| anyhow::anyhow!("写入解锁标记失败: {error}"))?;
+                    Ok::<(), anyhow::Error>(())
+                })();
+                if let Err(error) = swapped {
+                    match backup.take() {
+                        // 有旧库：整套放回原处（与上方"新库就位失败"的回滚对称）。
+                        Some(candidate) => {
+                            if let Err(rollback) = crate::vault::rename_db_bundle(
+                                &runtime,
+                                candidate,
+                                db_path.clone(),
+                                100,
+                            )
+                            .await
+                            {
+                                log::error!("rekey 回滚旧库失败，请手工检查备份: {rollback}");
+                            }
+                        }
+                        // 换库前本来就没有旧库：把新库整套撤下，回到"无库"原状。
+                        None => crate::vault::remove_db_bundle(&db_path),
+                    }
                     if let Some(previous) = previous_salt.as_deref() {
                         let _ = std::fs::write(&salt_path, previous);
                     }
-                    return Err(anyhow::anyhow!("写入新派生盐失败（已还原旧盐）: {error}"));
+                    // 事务已干净回滚：清掉日志，免得下次启动又触发一次恢复。
+                    crate::vault::clear_rekey_journal(&mode);
+                    return Err(anyhow::anyhow!("{error}（已回滚：旧库与旧口令恢复原状）"));
                 }
-                crate::vault::write_unlock_marker(&mode, backend)?;
                 let reopened = Vault::open(&mode, hexkey.clone(), runtime.clone()).await?;
                 let hosts = reopened.load_hosts().await?;
+                // 事务全部走完：清掉启动恢复用的日志。
+                crate::vault::clear_rekey_journal(&mode);
                 // 只有确认新库数据完整（主机数不少于导出数）才清理旧库备份，
                 // 否则保留备份留待人工处置。
                 if hosts.len() >= expected_hosts {

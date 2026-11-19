@@ -88,7 +88,9 @@ fn sanitize(command: &str) -> Option<String> {
     if command.is_empty() || command.len() > MAX_COMMAND_BYTES {
         return None;
     }
-    if command.chars().any(char::is_control) {
+    // 行内 Tab 是合法 shell 输入（对齐的多列粘贴、`awk\t'{print}'`），
+    // 不该因为它是控制字符就丢掉；回车 / ESC / NUL 这类照旧拒绝。
+    if command.chars().any(|c| c.is_control() && c != '\t') {
         return None;
     }
     if looks_like_password_prompt(command) || looks_like_prompt(command) {

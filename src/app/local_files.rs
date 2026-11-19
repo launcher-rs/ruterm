@@ -27,6 +27,9 @@ pub(super) struct LocalBrowser {
     pub(super) path: Option<PathBuf>,
     /// 上一次列成功的目录：面板首次展示时回到这里，而不是每次从主目录起步。
     pub(super) listed: bool,
+    /// 目录列表请求的代际号：连续快速导航时后台任务可能乱序完成，
+    /// 旧结果晚到会覆盖新目录（连持久化都会存错），完成时比对丢弃。
+    pub(super) load_gen: u64,
     pub(super) entries: Vec<crate::remote_fs::Entry>,
     pub(super) loading: bool,
     pub(super) error: Option<SharedString>,
@@ -44,6 +47,7 @@ impl Default for LocalBrowser {
         Self {
             path: None,
             listed: false,
+            load_gen: 0,
             entries: Vec::new(),
             loading: false,
             error: None,
@@ -174,13 +178,9 @@ fn list_local_dir(
             permissions: mode_of(&metadata),
         });
     }
-    entries.sort_by(|left, right| {
-        right
-            .is_dir
-            .cmp(&left.is_dir)
-            .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
-            .then_with(|| left.name.cmp(&right.name))
-    });
+    // cached_key：小写形式每条只算一次，超大目录不再按比较次数重复分配。
+    entries
+        .sort_by_cached_key(|entry| (!entry.is_dir, entry.name.to_lowercase(), entry.name.clone()));
     Ok((absolute, entries))
 }
 
@@ -205,6 +205,9 @@ impl RuTermApp {
         let show_hidden = self.local.show_hidden;
         self.local.loading = true;
         self.local.error = None;
+        // 代际号跟着这次请求走：完成后只认最新的，乱序完成的旧结果直接丢弃。
+        self.local.load_gen += 1;
+        let generation = self.local.load_gen;
         cx.notify();
 
         cx.spawn(async move |this, cx| {
@@ -212,6 +215,10 @@ impl RuTermApp {
                 .background_spawn(async move { list_local_dir(&target, show_hidden) })
                 .await;
             let _ = this.update(cx, |this, cx| {
+                // 期间又发起了新的列目录请求：这份结果已过时，连 loading 都不归它管。
+                if this.local.load_gen != generation {
+                    return;
+                }
                 this.local.loading = false;
                 match outcome {
                     Ok((resolved, entries)) => {

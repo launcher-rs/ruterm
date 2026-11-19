@@ -474,18 +474,26 @@ impl RuTermApp {
         let start = downloads_dir();
         let entity = cx.entity();
         let rx = cx.prompt_for_new_path(&start, Some("ruterm-macros.json"));
+        let runtime = rgpui::tokio::Tokio::handle(cx);
         cx.spawn(async move |_, cx| {
             let Ok(Ok(Some(path))) = rx.await else {
                 return;
             };
-            let failure = std::fs::write(&path, json).err();
-            let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
+            // 写盘交给阻塞线程池：网络盘 / 杀软实时扫描会让同步 write 卡住
+            // 整个 UI 线程（项目规范：阻塞 IO 必须显式交 tokio）。
+            let outcome = runtime
+                .spawn_blocking(move || std::fs::write(&path, &json).map(|_| path))
+                .await
+                .unwrap_or_else(|error| Err(std::io::Error::other(error.to_string())));
+            let name = outcome
+                .as_ref()
+                .ok()
+                .and_then(|path| path.file_name().map(|n| n.to_string_lossy().into_owned()))
+                .unwrap_or_default();
+            let failure = outcome.err();
             entity.update(cx, move |this, cx| {
                 this.status = match failure {
-                    None => {
-                        let path = name.unwrap_or_default();
-                        crate::i18n::translate(cx, "已导出键宏到 {path}", &[("path", &path)])
-                    }
+                    None => crate::i18n::translate(cx, "已导出键宏到 {path}", &[("path", &name)]),
                     Some(error) => {
                         let error = error.to_string();
                         crate::i18n::translate(cx, "导出失败：{error}", &[("error", &error)])

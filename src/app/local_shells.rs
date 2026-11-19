@@ -374,26 +374,37 @@ impl RuTermApp {
             // rgpui 的 `cx.spawn` 跑在自己的执行器上，`tokio::task::spawn_blocking`
             // 会因"没有 reactor"直接 panic；阻塞任务必须显式交给 tokio 运行时句柄。
             let found = runtime.spawn_blocking(crate::local_shell::scan).await;
-            let found = found.unwrap_or_default();
             let _ = this.update(cx, |this, cx| {
                 this.scanning_shells = false;
-                let count = found.len();
-                this.local_shells = found;
-                this.refresh_shell_icons();
-                if !quiet {
-                    // 主机列表跟着边栏走，文案里的方位也要跟着变。
-                    let side = match this.sidebar.side {
-                        SidebarSide::Left => "左侧",
-                        SidebarSide::Right => "右侧",
-                    };
-                    this.status = if count == 0 {
-                        "扫描完成：没找到可用的本机 shell".into()
-                    } else {
-                        format!(
-                            "扫描完成：找到 {count} 个本机 shell，在{side}「本地终端」里点一下即可打开"
-                        )
-                        .into()
-                    };
+                // 扫描任务失败（如子进程处理里 panic）不能折成空列表把用户
+                // 原有的 shell 配置抹掉：保留原列表，只报状态。
+                match found {
+                    Ok(found) => {
+                        let count = found.len();
+                        this.local_shells = found;
+                        this.refresh_shell_icons();
+                        if !quiet {
+                            // 主机列表跟着边栏走，文案里的方位也要跟着变。
+                            let side = match this.sidebar.side {
+                                SidebarSide::Left => "左侧",
+                                SidebarSide::Right => "右侧",
+                            };
+                            this.status = if count == 0 {
+                                "扫描完成：没找到可用的本机 shell".into()
+                            } else {
+                                format!(
+                                    "扫描完成：找到 {count} 个本机 shell，在{side}「本地终端」里点一下即可打开"
+                                )
+                                .into()
+                            };
+                        }
+                    }
+                    Err(error) => {
+                        log::error!("本机 shell 扫描失败: {error}");
+                        if !quiet {
+                            this.status = "本机 shell 扫描失败，已保留原有列表".into();
+                        }
+                    }
                 }
                 cx.notify();
             });
