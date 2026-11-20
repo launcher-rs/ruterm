@@ -365,7 +365,8 @@ impl RuTermApp {
         self.accept_completion(cx);
     }
 
-    /// 浮层：贴在光标下一行；下方放不下就翻到光标上方。
+    /// 浮层：隔一个空行贴在光标下方；下方放不下就同样隔一行翻到光标上方。
+    /// 直接贴行会让浮层压着光标下一行的视线，边看候选边输入很挡眼。
     pub(super) fn render_completion_popup(
         &self,
         tab_id: usize,
@@ -395,11 +396,13 @@ impl RuTermApp {
             let content_h = state.items.len() as f32 * ROW_HEIGHT + FOOTER_HEIGHT + 12.0;
             let x = cursor.column.0 as f32 * cell_w;
             let left = x.min((pane_w - POPUP_WIDTH - 8.0).max(0.0));
-            let below = (cursor.line.0 + 1) as f32 * line_h + 2.0;
+            // 光标行的下缘在 (line+1) 行处，浮层顶边放到 (line+2) 行：
+            // 中间空一整行，候选浮层不再压住光标正下方那行的视线。
+            let below = (cursor.line.0 + 2) as f32 * line_h;
             let top = if below + content_h <= pane_h {
                 below
             } else {
-                (cursor.line.0 as f32 * line_h - content_h - 2.0).max(0.0)
+                (cursor.line.0 as f32 * line_h - content_h - line_h).max(0.0)
             };
             (px(left), px(top))
         };

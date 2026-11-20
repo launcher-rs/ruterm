@@ -106,13 +106,32 @@ enum TokenSlot {
     Argument,
 }
 
+/// 不改命令语义的包装词：`sudo ` 之后用户要的仍然是「哪条命令」，不是
+/// 「喂给 sudo 的参数」。这类词单独占段首时，正在输入的词按命令位对待——
+/// 否则 `sudo dock` 只能匹配库里以 sudo 开头的片段，提示会完全落空。
+const COMMAND_WRAPPERS: &[&str] = &["sudo", "doas", "nohup", "time", "nice"];
+
+/// 从段首剥掉连续的包装词，剩下的词才决定「这条命令段有没有前文」。
+fn without_wrappers<'a>(words: &'a [&'a str]) -> &'a [&'a str] {
+    let mut kept = words;
+    while let [head, rest @ ..] = kept
+        && COMMAND_WRAPPERS
+            .iter()
+            .any(|wrapper| head.eq_ignore_ascii_case(wrapper))
+    {
+        kept = rest;
+    }
+    kept
+}
+
 /// 正在输入的词落在命令位还是参数位。
 ///
 /// `before_token` 是光标前、不含正在输入那个词的文本：按 `; | & ( )` 切成命令段，
 /// 词落在段首就是命令位。`cd find` 里的 `find` 在 `cd` 之后，是参数位，
 /// 不该再因为片段库里有 `sudo find / -name …` 就把它当命令提示出来。
+/// 包装词（`sudo` 等）不算前文：`sudo dock` 里的 `dock` 仍是命令位。
 fn token_slot(before_token: &str) -> TokenSlot {
-    if segment_words(before_token).is_empty() {
+    if without_wrappers(&segment_words(before_token)).is_empty() {
         TokenSlot::Command
     } else {
         TokenSlot::Argument
@@ -427,6 +446,25 @@ mod tests {
         assert_eq!(token_slot("ls -la | "), TokenSlot::Command);
         assert_eq!(token_slot("cd /tmp && cd "), TokenSlot::Argument);
         assert_eq!(token_slot("echo hi;"), TokenSlot::Command);
+    }
+
+    #[test]
+    fn wrappers_do_not_make_the_next_word_an_argument() {
+        // 段首只剩包装词时，正在输入的词仍是命令位：`sudo dock` 要能捞回
+        // 库里的 docker 命令，而不是只匹配以 sudo 开头的写法。
+        assert_eq!(token_slot("sudo "), TokenSlot::Command);
+        assert_eq!(token_slot("sudo nohup "), TokenSlot::Command);
+        // 包装词之后还有实义词，回到参数位（`sudo apt ` 接续写不受影响）。
+        assert_eq!(token_slot("sudo apt "), TokenSlot::Argument);
+        // `cd sudo` 里的 sudo 是 cd 的参数，不是包装词：剥词只从段首起。
+        assert_eq!(token_slot("cd sudo "), TokenSlot::Argument);
+
+        let items = sample();
+        assert!(names(&complete(&items, "dock", "sudo ")).contains(&"Docker 容器".to_string()));
+        // 命令位候选若本身就带 sudo，接受补全时前缀重叠会被 merged_command 合并，
+        // 不会补成 `sudo sudo ss -tlnp`。
+        let merged = merged_command("sudo ", "sudo ss -tlnp");
+        assert_eq!(merged, "ss -tlnp");
     }
 
     #[test]
