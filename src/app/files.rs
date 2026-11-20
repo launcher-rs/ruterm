@@ -1834,17 +1834,17 @@ impl RuTermApp {
             return;
         };
         if tab.zmodem.is_some() {
-            self.status = "已有 lrzsz 上传进行中，请稍候".into();
+            self.status = tr!(cx, "已有 lrzsz 上传进行中，请稍候");
             cx.notify();
             return;
         }
         if tab.ended {
-            self.status = "会话已断开，无法上传文件".into();
+            self.status = tr!(cx, "会话已断开，无法上传文件");
             cx.notify();
             return;
         }
         let Some(sender) = tab.commands.clone() else {
-            self.status = "本地终端不支持 lrzsz 上传，请使用 SSH 会话".into();
+            self.status = tr!(cx, "本地终端不支持 lrzsz 上传，请使用 SSH 会话");
             cx.notify();
             return;
         };
@@ -1858,7 +1858,8 @@ impl RuTermApp {
             }
         }
         if files.is_empty() {
-            self.status = format!("没有可上传的文件：{}", skipped.join("；")).into();
+            let skipped = skipped.join("；");
+            self.status = tr!(cx, "没有可上传的文件：{skipped}", skipped = skipped);
             cx.notify();
             return;
         }
@@ -1871,18 +1872,19 @@ impl RuTermApp {
         // 批次级取消标记：UI 的「取消」置位它，剩余文件不再发起；
         // 单个传输的取消经 SessionCommand::ZmodemCancel 下发到会话。
         let batch_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let notice = tr!(
+            cx,
+            "正在通过 lrzsz 上传 {total} 个文件…{note}",
+            total = total,
+            note = note
+        );
         if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) {
-            tab.zmodem = Some(format!("正在通过 lrzsz 上传 {total} 个文件…").into());
+            tab.zmodem = Some(notice.clone());
             tab.zmodem_progress = Some((0, 0));
             tab.zmodem_cancel = Some(batch_cancel.clone());
         }
-        self.status = format!("正在通过 lrzsz 上传 {total} 个文件…{note}").into();
-        self.flash_transfer(
-            format!("正在通过 lrzsz 上传 {total} 个文件…{note}"),
-            IconName::ArrowUp,
-            false,
-            cx,
-        );
+        self.status = notice.clone();
+        self.flash_transfer(notice, IconName::ArrowUp, false, cx);
         cx.notify();
 
         cx.spawn(async move |this, cx| {
@@ -1917,7 +1919,7 @@ impl RuTermApp {
                 }
                 let _ = this.update(cx, |this, cx| {
                     if let Some(tab) = this.tabs.iter_mut().find(|tab| tab.id == tab_id) {
-                        tab.zmodem = Some(format!("正在通过 lrzsz 上传 {name}…").into());
+                        tab.zmodem = Some(tr!(cx, "正在通过 lrzsz 上传 {name}…", name = name));
                         cx.notify();
                     }
                 });
@@ -1956,27 +1958,37 @@ impl RuTermApp {
                 }
             }
             let canceled = batch_cancel.load(std::sync::atomic::Ordering::Relaxed);
-            let message = if canceled {
-                format!("lrzsz 上传已取消（成功 {done_count} / {total} 个文件）")
-            } else if failed.is_empty() {
-                format!("lrzsz 上传完成 · {total} 个文件")
-            } else {
-                format!(
-                    "lrzsz 上传结束 · {} 失败：{}",
-                    failed.len(),
-                    failed.join("；")
-                )
-            };
+            let failed_count = failed.len();
+            let failed_list = failed.join("；");
+            let done = done_count.to_string();
+            let total_count = total.to_string();
             let _ = this.update(cx, |this, cx| {
                 if let Some(tab) = this.tabs.iter_mut().find(|tab| tab.id == tab_id) {
                     tab.zmodem = None;
                     tab.zmodem_progress = None;
                     tab.zmodem_cancel = None;
                 }
-                this.status = message.clone().into();
+                let message = if canceled {
+                    tr!(
+                        cx,
+                        "lrzsz 上传已取消（成功 {done} / {total} 个文件）",
+                        done = done,
+                        total = total_count
+                    )
+                } else if failed_count == 0 {
+                    tr!(cx, "lrzsz 上传完成 · {total} 个文件", total = total_count)
+                } else {
+                    tr!(
+                        cx,
+                        "lrzsz 上传结束 · {failed} 失败：{list}",
+                        failed = failed_count,
+                        list = failed_list
+                    )
+                };
+                this.status = message.clone();
                 this.flash_transfer(
                     message,
-                    if failed.is_empty() && !canceled {
+                    if failed_count == 0 && !canceled {
                         IconName::CircleCheck
                     } else {
                         IconName::TriangleAlert
@@ -2007,8 +2019,8 @@ impl RuTermApp {
             let (reply, _rx) = tokio::sync::oneshot::channel();
             let _ = sender.send(crate::session::SessionCommand::ZmodemCancel { reply });
         }
-        tab.zmodem = Some("正在取消 lrzsz 上传…".into());
-        self.status = "正在取消 lrzsz 上传…".into();
+        tab.zmodem = Some(tr!(cx, "正在取消 lrzsz 上传…"));
+        self.status = tr!(cx, "正在取消 lrzsz 上传…");
         cx.notify();
     }
 

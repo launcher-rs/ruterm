@@ -866,10 +866,10 @@ impl RuTermApp {
         if enabled {
             cx.set_tray_icon(Some(crate::TRAY_ICON));
             self.sync_tray(cx);
-            self.status = "已启用系统托盘：关闭窗口将隐藏到托盘".into();
+            self.status = tr!(cx, "已启用系统托盘：关闭窗口将隐藏到托盘");
         } else {
             cx.set_tray_icon(None);
-            self.status = "已关闭系统托盘：之后关窗直接退出，图标在下次启动时完全移除".into();
+            self.status = tr!(cx, "已关闭系统托盘：之后关窗直接退出，图标在下次启动时完全移除");
         }
         cx.notify();
     }

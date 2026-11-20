@@ -716,7 +716,7 @@ impl RuTermApp {
             self.protocols.forget(removed.id);
             self.persist_protocols(cx);
         }
-        self.status = SharedString::from(format!("已删除主机 {label}"));
+        self.status = tr!(cx, "已删除主机 {label}", label = label);
         cx.notify();
     }
 
@@ -736,9 +736,9 @@ impl RuTermApp {
     ) {
         let initial = renaming.clone().unwrap_or_else(|| "".into());
         let placeholder = if renaming.is_some() {
-            "分组名称"
+            tr!(cx, "分组名称")
         } else {
-            "如：生产环境 / 家"
+            tr!(cx, "如：生产环境 / 家")
         };
         let name = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder));
         if !initial.is_empty() {
@@ -769,7 +769,7 @@ impl RuTermApp {
         };
         let name = prompt.name.read(cx).value().trim().to_string();
         if name.is_empty() {
-            self.status = "分组名称不能为空".into();
+            self.status = tr!(cx, "分组名称不能为空");
             cx.notify();
             return;
         }
@@ -779,17 +779,17 @@ impl RuTermApp {
         };
         if !ok {
             self.status = if prompt.renaming.is_some() {
-                "重命名失败：名称为空或已存在同名分组".into()
+                tr!(cx, "重命名失败：名称为空或已存在同名分组")
             } else {
-                "已存在同名分组".into()
+                tr!(cx, "已存在同名分组")
             };
             cx.notify();
             return;
         }
         if let Some(from) = prompt.renaming.as_deref() {
-            self.status = SharedString::from(format!("分组 {from} 已改名为 {name}"));
+            self.status = tr!(cx, "分组 {from} 已改名为 {name}", from = from, name = name);
         } else {
-            self.status = SharedString::from(format!("已新建分组 {name}"));
+            self.status = tr!(cx, "已新建分组 {name}", name = name);
         }
         self.group_prompt = None;
         cx.notify();
@@ -799,7 +799,7 @@ impl RuTermApp {
     /// 删除分组：只退回归属，主机本身保留。
     pub(super) fn delete_group(&mut self, name: &str, cx: &mut Context<Self>) {
         self.sidebar.remove(name);
-        self.status = SharedString::from(format!("已删除分组 {name}（组内主机退回未分组）"));
+        self.status = tr!(cx, "已删除分组 {name}（组内主机退回未分组）", name = name);
         cx.notify();
         self.persist_sidebar(cx);
     }
@@ -858,10 +858,10 @@ impl RuTermApp {
         };
         let Some(anchor) = anchor else {
             let boundary = match action {
-                ReorderAction::Down => "已在组内最后",
-                _ => "已在组内最前",
+                ReorderAction::Down => tr!(cx, "已在组内最后"),
+                _ => tr!(cx, "已在组内最前"),
             };
-            self.status = SharedString::from(boundary);
+            self.status = boundary;
             cx.notify();
             return;
         };
@@ -1007,7 +1007,7 @@ impl RuTermApp {
                     .child(count.to_string()),
             )
         })
-        .context_menu(move |menu, _, _| {
+        .context_menu(move |menu, _, cx| {
             Self::context_menu(
                 MenuTarget::Group(menu_name.clone()),
                 groups.clone(),
@@ -1015,6 +1015,7 @@ impl RuTermApp {
                 sort,
                 entity.clone(),
                 menu,
+                cx,
             )
         })
         .into_any_element()
@@ -1093,7 +1094,7 @@ impl RuTermApp {
                 )
                 .on_click(cx.listener(move |this, _, _, cx| this.toggle_favorite(id, cx))),
         )
-        .context_menu(move |menu, _, _| {
+        .context_menu(move |menu, _, cx| {
             Self::context_menu(
                 MenuTarget::HostId(id),
                 groups.clone(),
@@ -1101,6 +1102,7 @@ impl RuTermApp {
                 sort,
                 entity.clone(),
                 menu,
+                cx,
             )
         })
         .into_any_element()
@@ -1185,7 +1187,7 @@ impl RuTermApp {
                 .w_full()
                 .min_h(px(80.0))
                 .flex_1()
-                .context_menu(move |menu, _, _| {
+                .context_menu(move |menu, _, cx| {
                     Self::context_menu(
                         MenuTarget::Blank,
                         groups.clone(),
@@ -1193,6 +1195,7 @@ impl RuTermApp {
                         sort,
                         entity.clone(),
                         menu,
+                        cx,
                     )
                 })
         };
@@ -1227,7 +1230,7 @@ impl RuTermApp {
                     .py_1()
                     .text_sm()
                     .text_color(pal.muted)
-                    .child("无匹配主机"),
+                    .child(tr!(cx, "无匹配主机")),
             );
         }
         list.child(blank).into_any_element()
@@ -1242,8 +1245,8 @@ impl RuTermApp {
         };
         let renaming = prompt.renaming.clone();
         let title = match &renaming {
-            Some(old) => format!("重命名分组：{old}"),
-            None => "新建分组".to_string(),
+            Some(old) => tr!(cx, "重命名分组：{old}", old = old),
+            None => tr!(cx, "新建分组"),
         };
         v_flex()
             .id("group-backdrop")
@@ -1293,14 +1296,14 @@ impl RuTermApp {
                     .child(
                         v_flex()
                             .gap_1()
-                            .child(div().text_sm().child("分组名称"))
+                            .child(div().text_sm().child(tr!(cx, "分组名称")))
                             .child(styled_input(Input::new(&prompt.name), &pal)),
                     )
                     .child(
                         div()
                             .text_xs()
                             .text_color(pal.muted)
-                            .child("分组只影响列表的组织方式，不改动主机本身。"),
+                            .child(tr!(cx, "分组只影响列表的组织方式，不改动主机本身。")),
                     )
                     .child(
                         h_flex()
@@ -1309,16 +1312,16 @@ impl RuTermApp {
                             .child(
                                 Button::new("commit-group")
                                     .label(if renaming.is_some() {
-                                        "重命名"
+                                        tr!(cx, "重命名")
                                     } else {
-                                        "创建"
+                                        tr!(cx, "创建")
                                     })
                                     .primary()
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.commit_group_prompt(cx);
                                     })),
                             )
-                            .child(Button::new("cancel-group").label("取消").ghost().on_click(
+                            .child(Button::new("cancel-group").label(tr!(cx, "取消")).ghost().on_click(
                                 cx.listener(|this, _, _, cx| {
                                     this.cancel_group_prompt(cx);
                                 }),

@@ -39,13 +39,13 @@ pub(super) fn stepper(
 
 /// 带标题的输入框行。
 pub(super) fn labeled_field(
-    label: &'static str,
+    label: impl Into<SharedString>,
     input: &Entity<InputState>,
     pal: &Palette,
 ) -> impl IntoElement {
     v_flex()
         .gap_1()
-        .child(div().text_sm().child(label))
+        .child(div().text_sm().child(label.into()))
         .child(styled_input(Input::new(input), pal))
 }
 
@@ -72,6 +72,7 @@ impl RuTermApp {
         sort: SidebarSort,
         entity: Entity<RuTermApp>,
         menu: PopupMenu,
+        cx: &App,
     ) -> PopupMenu {
         let menu = menu.min_w(px(168.0));
         // 主机行右键「远程桌面…」：用该行地址预填；空白 / 分组处则打开空表单。
@@ -91,7 +92,7 @@ impl RuTermApp {
                 let id = *id;
                 menu.item(Self::menu_item(
                     entity.clone(),
-                    "编辑",
+                    tr!(cx, "编辑"),
                     None,
                     false,
                     false,
@@ -104,7 +105,7 @@ impl RuTermApp {
                 .item(
                     Self::menu_item(
                         entity.clone(),
-                        "上移一位",
+                        tr!(cx, "上移一位"),
                         None,
                         false,
                         false,
@@ -115,7 +116,7 @@ impl RuTermApp {
                 .item(
                     Self::menu_item(
                         entity.clone(),
-                        "下移一位",
+                        tr!(cx, "下移一位"),
                         None,
                         false,
                         false,
@@ -126,7 +127,7 @@ impl RuTermApp {
                 .item(
                     Self::menu_item(
                         entity.clone(),
-                        "移到组内最前",
+                        tr!(cx, "移到组内最前"),
                         None,
                         false,
                         false,
@@ -155,7 +156,7 @@ impl RuTermApp {
                 ))
                 .item(Self::menu_item(
                     entity.clone(),
-                    "路由追踪",
+                    tr!(cx, "路由追踪"),
                     None,
                     false,
                     false,
@@ -178,7 +179,7 @@ impl RuTermApp {
         let menu = menu
             .item(Self::menu_item(
                 entity.clone(),
-                "新建主机…",
+                tr!(cx, "新建主机…"),
                 None,
                 false,
                 false,
@@ -188,7 +189,7 @@ impl RuTermApp {
             ))
             .item(Self::menu_item(
                 entity.clone(),
-                "远程桌面…",
+                tr!(cx, "远程桌面…"),
                 Some(IconName::Frame),
                 false,
                 false,
@@ -215,7 +216,7 @@ impl RuTermApp {
             ))
             .item(Self::menu_item(
                 entity.clone(),
-                "本地终端…",
+                tr!(cx, "本地终端…"),
                 Some(IconName::SquareTerminal),
                 false,
                 false,
@@ -225,7 +226,7 @@ impl RuTermApp {
             ))
             .item(Self::menu_item(
                 entity.clone(),
-                "新建分组…",
+                tr!(cx, "新建分组…"),
                 Some(IconName::Folder),
                 false,
                 false,
@@ -240,7 +241,7 @@ impl RuTermApp {
                 menu.separator()
                     .item(Self::menu_item(
                         entity.clone(),
-                        "重命名分组…",
+                        tr!(cx, "重命名分组…"),
                         None,
                         false,
                         false,
@@ -250,7 +251,7 @@ impl RuTermApp {
                     ))
                     .item(Self::menu_item(
                         entity.clone(),
-                        "删除分组",
+                        tr!(cx, "删除分组"),
                         None,
                         true,
                         false,
@@ -265,7 +266,10 @@ impl RuTermApp {
             MenuTarget::HostId(id) => {
                 let id = *id;
                 let current = current_group.clone();
-                let mut menu = menu.separator().label("移动到分组").item(Self::menu_item(
+                let mut menu = menu
+                    .separator()
+                    .label(tr!(cx, "移动到分组"))
+                    .item(Self::menu_item(
                     entity.clone(),
                     UNGROUPED,
                     None,
@@ -300,17 +304,17 @@ impl RuTermApp {
                 .separator()
                 .item(Self::menu_item(
                     entity.clone(),
-                    "导入 ~/.ssh/config…",
+                    tr!(cx, "导入 ~/.ssh/config…"),
                     None,
                     false,
                     false,
                     |this, _, cx| this.import_ssh_config(cx),
                 ))
                 .separator()
-                .label("排序方式")
+                .label(tr!(cx, "排序方式"))
                 .item(Self::menu_item(
                     entity.clone(),
-                    "手动排序",
+                    tr!(cx, "手动排序"),
                     None,
                     false,
                     sort == SidebarSort::Manual,
@@ -318,7 +322,7 @@ impl RuTermApp {
                 ))
                 .item(Self::menu_item(
                     entity.clone(),
-                    "按名称排序",
+                    tr!(cx, "按名称排序"),
                     None,
                     false,
                     sort == SidebarSort::Name,
@@ -326,7 +330,7 @@ impl RuTermApp {
                 ))
                 .item(Self::menu_item(
                     entity.clone(),
-                    "按最近连接排序",
+                    tr!(cx, "按最近连接排序"),
                     None,
                     false,
                     sort == SidebarSort::Recent,
@@ -337,7 +341,7 @@ impl RuTermApp {
         match target {
             MenuTarget::HostId(id) => menu.separator().item(Self::menu_item(
                 entity,
-                "删除",
+                tr!(cx, "删除"),
                 Some(IconName::Delete),
                 true,
                 false,
