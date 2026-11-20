@@ -869,7 +869,10 @@ impl RuTermApp {
             self.status = tr!(cx, "已启用系统托盘：关闭窗口将隐藏到托盘");
         } else {
             cx.set_tray_icon(None);
-            self.status = tr!(cx, "已关闭系统托盘：之后关窗直接退出，图标在下次启动时完全移除");
+            self.status = tr!(
+                cx,
+                "已关闭系统托盘：之后关窗直接退出，图标在下次启动时完全移除"
+            );
         }
         cx.notify();
     }

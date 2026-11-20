@@ -8,8 +8,8 @@
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
@@ -235,9 +235,7 @@ pub enum SessionCommand {
     },
     /// 取消进行中的 lrzsz 上传：置位取消标记、摘掉下行接管点并往远端发
     /// Ctrl+C。没有进行中的传输时也安全（no-op）。
-    ZmodemCancel {
-        reply: oneshot::Sender<()>,
-    },
+    ZmodemCancel { reply: oneshot::Sender<()> },
     /// 开始一条转发（本机监听，或请求服务器监听）。
     ///
     /// 回传生效规则：远程转发请求端口 0 时服务器会分配实际端口。
@@ -1352,7 +1350,9 @@ async fn cached_sftp(
     cache: &Mutex<Option<Arc<SftpSession>>>,
 ) -> Result<Arc<SftpSession>> {
     {
-        let guard = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let guard = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(sftp) = guard.as_ref() {
             return Ok(sftp.clone());
         }
@@ -1360,7 +1360,9 @@ async fn cached_sftp(
     // 打开期间不持锁（内含 await）；并发第二条命令会各自开通道，谁先放进
     // 缓存谁赢，输家用完随任务回收（多余的通道由 Drop 关闭）。
     let sftp = Arc::new(open_sftp(handle, side).await?);
-    let mut guard = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut guard = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if guard.is_none() {
         *guard = Some(sftp.clone());
     }
@@ -1371,7 +1373,9 @@ async fn cached_sftp(
 /// 丢弃文件面板的 SFTP 缓存：通道出错后下次点击重开子系统，
 /// 避免抱着坏通道反复报错。循环内与 spawn 出去的任务都会用到。
 fn drop_cached_sftp(cache: &Mutex<Option<Arc<SftpSession>>>) {
-    *cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    *cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
 }
 
 /// 另开一条 exec 通道采集远程主机基本信息，连接期间周期回传状态栏需要刷新的指标。

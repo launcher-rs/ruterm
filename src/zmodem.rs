@@ -207,7 +207,15 @@ mod tests {
         let local = path.clone();
         let sender = tokio::spawn(async move {
             let cancel = &cancel;
-            send_file(&local, "payload.bin", &mut down_rx, &up_tx, &progress_tx, cancel).await
+            send_file(
+                &local,
+                "payload.bin",
+                &mut down_rx,
+                &up_tx,
+                &progress_tx,
+                cancel,
+            )
+            .await
         });
 
         // 同一进程里跑一个接收端，验证发送端的握手、读文件、进度与收尾。
@@ -298,9 +306,16 @@ mod tests {
         let (progress_tx, _progress_rx) = mpsc::unbounded_channel::<(u64, u64)>();
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let local = path.clone();
-        let result = send_file(&local, "payload.bin", &mut down_rx, &up_tx, &progress_tx, &cancel)
-            .await
-            .expect_err("预置取消应直接报错");
+        let result = send_file(
+            &local,
+            "payload.bin",
+            &mut down_rx,
+            &up_tx,
+            &progress_tx,
+            &cancel,
+        )
+        .await
+        .expect_err("预置取消应直接报错");
         tokio::fs::remove_file(&path).await.ok();
         assert!(result.to_string().contains("已取消"));
     }

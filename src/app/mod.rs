@@ -643,7 +643,10 @@ impl RuTermApp {
     /// 没有守卫，再双击一次 exe 会同时跑两个进程读写同一个加密库、挂两个托盘，
     /// 必须让用户知道这次启动不保证单实例。
     pub fn warn_unprotected(&mut self, cx: &mut Context<Self>) {
-        self.status = tr!(cx, "单实例守卫不可用（锁端口被占用），本次启动可能与其它实例并存，请勿再双击图标");
+        self.status = tr!(
+            cx,
+            "单实例守卫不可用（锁端口被占用），本次启动可能与其它实例并存，请勿再双击图标"
+        );
         cx.notify();
     }
 
@@ -668,12 +671,10 @@ impl RuTermApp {
         // 分支，报错与真实原因对不上，不如直接把连接与开库一起禁掉。
         match crate::vault::read_unlock_marker_checked(&mode) {
             Ok(backend) => {
-                self.passphrase_backend =
-                    backend == crate::vault::UnlockBackend::Passphrase;
+                self.passphrase_backend = backend == crate::vault::UnlockBackend::Passphrase;
             }
             Err(error) => {
-                self.status =
-                    format!("读取解锁标记失败，已禁止打开凭据库：{error}").into();
+                self.status = format!("读取解锁标记失败，已禁止打开凭据库：{error}").into();
                 cx.notify();
                 return;
             }
@@ -1172,11 +1173,14 @@ impl RuTermApp {
                             h_flex()
                                 .gap_2()
                                 .justify_end()
-                                .child(Button::new("cancel-delete").label(tr!(cx, "取消")).ghost().on_click(
-                                    cx.listener(|this, _, _, cx| {
-                                        this.cancel_delete(cx);
-                                    }),
-                                ))
+                                .child(
+                                    Button::new("cancel-delete")
+                                        .label(tr!(cx, "取消"))
+                                        .ghost()
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.cancel_delete(cx);
+                                        })),
+                                )
                                 .child(
                                     Button::new("confirm-delete")
                                         .label(tr!(cx, "删除"))

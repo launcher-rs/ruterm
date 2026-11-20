@@ -98,7 +98,8 @@ pub(super) struct DesktopTab {
     pub(super) focus: FocusHandle,
     /// 当前帧（BGRA）。换帧时旧图进 `drop_queue`，在下一次 render 里交给窗口释放。
     pub(super) image: Option<Arc<RenderImage>>,
-    pub(super) drop_queue: Vec<Arc<RenderImage>>,    /// 画面实际绘制区域（窗口坐标），由画布 prepaint 回填，指针坐标据此反算远端像素。
+    pub(super) drop_queue: Vec<Arc<RenderImage>>,
+    /// 画面实际绘制区域（窗口坐标），由画布 prepaint 回填，指针坐标据此反算远端像素。
     pub(super) draw_rect: Rc<Cell<Option<Bounds<Pixels>>>>,
     /// 画面可用区域（整块画布，窗口坐标），「匹配窗口」据此算目标分辨率。
     pub(super) screen_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,

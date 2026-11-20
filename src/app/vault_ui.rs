@@ -578,39 +578,41 @@ impl RuTermApp {
                 // 换钥流程刚写过（或已回滚）unlock.txt：无论成败都从盘上刷新缓存。
                 this.refresh_unlock_backend();
                 match result {
-                Ok((vault, hosts, hexkey, kept_backup)) => {
-                    this.vault_maintenance = false;
-                    this.vault = Some(Arc::new(vault));
-                    this.hosts = hosts;
-                    this.unlocked_key = Some(hexkey);
-                    if let Some(state) = this.settings.as_mut() {
-                        state.busy = false;
-                        state.error = None;
-                        // 输入框销毁：明文口令随之从界面缓冲消失，需再改时重新开启表单。
-                        state.current = None;
-                        state.password = None;
-                        state.confirm = None;
-                        state.info = Some(match kept_backup {
-                            None => SharedString::from(format!("{done}；旧库备份已清理，数据完整")),
-                            Some(path) => SharedString::from(format!(
-                                "{done}，但新库数据不完整，旧库备份保留在 {}",
-                                path.display()
-                            )),
-                        });
+                    Ok((vault, hosts, hexkey, kept_backup)) => {
+                        this.vault_maintenance = false;
+                        this.vault = Some(Arc::new(vault));
+                        this.hosts = hosts;
+                        this.unlocked_key = Some(hexkey);
+                        if let Some(state) = this.settings.as_mut() {
+                            state.busy = false;
+                            state.error = None;
+                            // 输入框销毁：明文口令随之从界面缓冲消失，需再改时重新开启表单。
+                            state.current = None;
+                            state.password = None;
+                            state.confirm = None;
+                            state.info = Some(match kept_backup {
+                                None => {
+                                    SharedString::from(format!("{done}；旧库备份已清理，数据完整"))
+                                }
+                                Some(path) => SharedString::from(format!(
+                                    "{done}，但新库数据不完整，旧库备份保留在 {}",
+                                    path.display()
+                                )),
+                            });
+                        }
+                        this.status = done.into();
+                        cx.notify();
                     }
-                    this.status = done.into();
-                    cx.notify();
-                }
-                Err(error) => {
-                    this.vault_maintenance = false;
-                    log::warn!("更改主密码失败: {error}");
-                    if let Some(state) = this.settings.as_mut() {
-                        state.busy = false;
-                        state.error = Some(format!("更改失败：{error}").into());
+                    Err(error) => {
+                        this.vault_maintenance = false;
+                        log::warn!("更改主密码失败: {error}");
+                        if let Some(state) = this.settings.as_mut() {
+                            state.busy = false;
+                            state.error = Some(format!("更改失败：{error}").into());
+                        }
+                        this.restore_vault(cx);
+                        cx.notify();
                     }
-                    this.restore_vault(cx);
-                    cx.notify();
-                }
                 }
             });
         })

@@ -35,7 +35,9 @@ impl SshTarget {
     ///
     /// 必须在 main 最前（任何线程/运行时建立之前）调用。
     pub fn take_password_from_env() -> Option<String> {
-        let password = std::env::var("RUTERM_PASSWORD").ok().filter(|s| !s.is_empty());
+        let password = std::env::var("RUTERM_PASSWORD")
+            .ok()
+            .filter(|s| !s.is_empty());
         // SAFETY: 唯一调用点在 main 开头、rgpui 与 tokio 初始化之前，
         // 进程内尚无并发线程，独占访问环境变量是安全的。
         unsafe { std::env::remove_var("RUTERM_PASSWORD") };

@@ -215,7 +215,10 @@ pub struct ImportSummary {
 
 /// 合并导入的键宏：触发键重复的跳过（运行时同名组合只有第一条生效，
 /// 收下两条只会造成「保存成功却永远不触发」的困惑）；总数超上限的丢弃。
-pub fn merge_imported(existing: Vec<KeyMacro>, imported: Vec<KeyMacro>) -> (Vec<KeyMacro>, ImportSummary) {
+pub fn merge_imported(
+    existing: Vec<KeyMacro>,
+    imported: Vec<KeyMacro>,
+) -> (Vec<KeyMacro>, ImportSummary) {
     let mut duplicates = 0usize;
     let mut accepted = Vec::new();
     let mut seen: std::collections::HashSet<String> = existing

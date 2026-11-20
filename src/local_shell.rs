@@ -469,7 +469,10 @@ fn wsl_distro_names() -> Option<Vec<String>> {
     // 命中提示语关键字按「确实没装」返回空表，其余才当调用失败——
     // 否则会冒出一条连不上的「WSL（默认发行版）」条目。
     let text = decode_wsl_text(&output.stdout);
-    if text.lines().any(|line| !line.trim().is_empty() && is_wsl_hint(line)) {
+    if text
+        .lines()
+        .any(|line| !line.trim().is_empty() && is_wsl_hint(line))
+    {
         return Some(Vec::new());
     }
     None

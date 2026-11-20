@@ -258,7 +258,10 @@ impl RuTermApp {
         };
         if host.protocol == ProtocolKind::Ssh && host.key_inline {
             if self.vault.is_none() {
-                self.status = tr!(cx, "内嵌私钥需要加密凭据库（当前不可用），请改用本地私钥文件");
+                self.status = tr!(
+                    cx,
+                    "内嵌私钥需要加密凭据库（当前不可用），请改用本地私钥文件"
+                );
                 cx.notify();
                 return;
             }
@@ -266,7 +269,10 @@ impl RuTermApp {
                 .and_then(|id| self.hosts.iter().find(|host| host.id == id))
                 .is_some_and(|current| current.key_inline);
             if key_data.is_none() && !existing {
-                self.status = tr!(cx, "请先导入私钥文件（选择「内嵌到加密库」后点「导入私钥…」）");
+                self.status = tr!(
+                    cx,
+                    "请先导入私钥文件（选择「内嵌到加密库」后点「导入私钥…」）"
+                );
                 cx.notify();
                 return;
             }
@@ -487,10 +493,9 @@ impl RuTermApp {
             // 先按文件大小预检再整读：误选 ISO / 视频等大文件时，不至于把
             // 几 GB 先同步读进内存再做 64 KB 上限判定。
             let read = match std::fs::metadata(&path) {
-                Ok(metadata) if metadata.len() > MAX_INLINE_KEY_BYTES as u64 => Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "文件过大",
-                )),
+                Ok(metadata) if metadata.len() > MAX_INLINE_KEY_BYTES as u64 => Err(
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, "文件过大"),
+                ),
                 _ => std::fs::read_to_string(&path),
             };
             let _ = cx.with_window(entity_id, move |_, cx| {
@@ -518,7 +523,12 @@ impl RuTermApp {
             Ok(text) => text,
             Err(error) => {
                 log::warn!("读取私钥 {label} 失败: {error}");
-                self.status = tr!(cx, "读取私钥文件 {label} 失败：{error}", label = label, error = error);
+                self.status = tr!(
+                    cx,
+                    "读取私钥文件 {label} 失败：{error}",
+                    label = label,
+                    error = error
+                );
                 cx.notify();
                 return;
             }
@@ -665,66 +675,76 @@ impl RuTermApp {
                                 v_flex()
                                     .gap_1()
                                     .child(div().text_sm().child(tr!(cx, "协议")))
-                                    .child(
-                                    h_flex().gap_2().children(options.into_iter().map(|option| {
-                                        let is_selected = form.protocol == option;
-                                        div()
-                                            .id(SharedString::from(format!(
-                                                "protocol-{}",
-                                                option.label()
-                                            )))
-                                            .px_3()
-                                            .py_1()
-                                            .rounded(px(5.0))
-                                            .text_sm()
-                                            .cursor_pointer()
-                                            .bg(if is_selected {
-                                                pal.accent
-                                            } else {
-                                                pal.segment_bg
-                                            })
-                                            .text_color(if is_selected {
-                                                cx.theme().primary_foreground
-                                            } else {
-                                                pal.text
-                                            })
-                                            .when(is_selected, |this| {
-                                                this.font_weight(FontWeight::BOLD)
-                                            })
-                                            .child(option.label())
-                                            .on_click(cx.listener(move |this, _, window, cx| {
-                                                let Some(form) = this.new_host.as_mut() else {
-                                                    return;
-                                                };
-                                                if form.protocol == option {
-                                                    return;
-                                                }
-                                                let previous =
-                                                    form.protocol.default_port().to_string();
-                                                let next = option.default_port().to_string();
-                                                let port_now =
-                                                    form.port.read(cx).value().trim().to_string();
-                                                form.protocol = option;
-                                                if port_now == previous {
-                                                    form.port.update(cx, |state, cx| {
-                                                        state.set_value(next, window, cx);
-                                                    });
-                                                }
-                                                cx.notify();
-                                            }))
-                                    })),
-                                )
+                                    .child(h_flex().gap_2().children(options.into_iter().map(
+                                        |option| {
+                                            let is_selected = form.protocol == option;
+                                            div()
+                                                .id(SharedString::from(format!(
+                                                    "protocol-{}",
+                                                    option.label()
+                                                )))
+                                                .px_3()
+                                                .py_1()
+                                                .rounded(px(5.0))
+                                                .text_sm()
+                                                .cursor_pointer()
+                                                .bg(if is_selected {
+                                                    pal.accent
+                                                } else {
+                                                    pal.segment_bg
+                                                })
+                                                .text_color(if is_selected {
+                                                    cx.theme().primary_foreground
+                                                } else {
+                                                    pal.text
+                                                })
+                                                .when(is_selected, |this| {
+                                                    this.font_weight(FontWeight::BOLD)
+                                                })
+                                                .child(option.label())
+                                                .on_click(cx.listener(
+                                                    move |this, _, window, cx| {
+                                                        let Some(form) = this.new_host.as_mut()
+                                                        else {
+                                                            return;
+                                                        };
+                                                        if form.protocol == option {
+                                                            return;
+                                                        }
+                                                        let previous = form
+                                                            .protocol
+                                                            .default_port()
+                                                            .to_string();
+                                                        let next =
+                                                            option.default_port().to_string();
+                                                        let port_now = form
+                                                            .port
+                                                            .read(cx)
+                                                            .value()
+                                                            .trim()
+                                                            .to_string();
+                                                        form.protocol = option;
+                                                        if port_now == previous {
+                                                            form.port.update(cx, |state, cx| {
+                                                                state.set_value(next, window, cx);
+                                                            });
+                                                        }
+                                                        cx.notify();
+                                                    },
+                                                ))
+                                        },
+                                    )))
                             })
                             .child(labeled_field(tr!(cx, "展示名"), &form.name, &pal))
                             .child(labeled_field(tr!(cx, "主机地址"), &form.host, &pal))
                             .child(
                                 h_flex()
                                     .gap_3()
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .child(labeled_field(tr!(cx, "端口"), &form.port, &pal)),
-                                    )
+                                    .child(div().flex_1().child(labeled_field(
+                                        tr!(cx, "端口"),
+                                        &form.port,
+                                        &pal,
+                                    )))
                                     // Telnet / VNC 的登录名在会话内交互输入，表单里没有对应字段。
                                     .when(
                                         matches!(protocol, ProtocolKind::Ssh | ProtocolKind::Rdp),

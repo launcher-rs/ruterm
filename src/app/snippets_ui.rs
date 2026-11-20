@@ -136,9 +136,7 @@ impl RuTermApp {
             let failure = runtime
                 .spawn_blocking(move || std::fs::write(&path, json).err())
                 .await
-                .unwrap_or_else(|error| {
-                    Some(std::io::Error::other(error.to_string()))
-                });
+                .unwrap_or_else(|error| Some(std::io::Error::other(error.to_string())));
             entity.update(cx, move |this, cx| {
                 this.status = match failure {
                     None => {

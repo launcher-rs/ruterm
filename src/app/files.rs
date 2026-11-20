@@ -155,7 +155,8 @@ pub(super) fn cleanup_stale_open_copies() {
 }
 
 /// 每份新副本独占随机目录；create（非 create_dir_all）不接受预先存在的目录。
-fn create_open_copy(name: &str) -> std::io::Result<PathBuf> {    let safe = safe_local_name(name)
+fn create_open_copy(name: &str) -> std::io::Result<PathBuf> {
+    let safe = safe_local_name(name)
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "文件名不合法"))?;
     for _ in 0..16 {
         let mut random = [0u8; 16];

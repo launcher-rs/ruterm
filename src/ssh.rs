@@ -106,19 +106,27 @@ enum TerminalChannelState {
 impl TerminalChannel {
     /// 登记终端通道 id（shell 通道打开后立即调用）。
     pub fn set(&self, channel: ChannelId) {
-        *self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
             TerminalChannelState::Registered(channel);
     }
 
     /// 标记本连接没有终端通道（跳板机用）：所有非旁路字节都不进终端。
     pub fn disable(&self) {
-        *self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
-            TerminalChannelState::Disabled;
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = TerminalChannelState::Disabled;
     }
 
     fn registered(&self) -> bool {
         !matches!(
-            *self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
+            *self
+                .0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
             TerminalChannelState::Unregistered
         )
     }

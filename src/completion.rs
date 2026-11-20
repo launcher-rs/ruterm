@@ -204,12 +204,14 @@ fn flag_options(items: &[CompletionItem], token: &str, segment: &[&str]) -> Vec<
             }
         }
     }
-    found.sort_by(|(a_flag, a_lower, a_count, _), (b_flag, b_lower, b_count, _)| {
-        b_count
-            .cmp(a_count)
-            .then_with(|| a_lower.cmp(b_lower))
-            .then_with(|| a_flag.cmp(b_flag))
-    });
+    found.sort_by(
+        |(a_flag, a_lower, a_count, _), (b_flag, b_lower, b_count, _)| {
+            b_count
+                .cmp(a_count)
+                .then_with(|| a_lower.cmp(b_lower))
+                .then_with(|| a_flag.cmp(b_flag))
+        },
+    );
     found
         .into_iter()
         .take(MAX_MATCHES)

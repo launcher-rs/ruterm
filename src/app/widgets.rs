@@ -270,15 +270,15 @@ impl RuTermApp {
                     .separator()
                     .label(tr!(cx, "移动到分组"))
                     .item(Self::menu_item(
-                    entity.clone(),
-                    UNGROUPED,
-                    None,
-                    false,
-                    current.is_none(),
-                    move |this, _, cx| {
-                        this.move_host(id, None, cx);
-                    },
-                ));
+                        entity.clone(),
+                        UNGROUPED,
+                        None,
+                        false,
+                        current.is_none(),
+                        move |this, _, cx| {
+                            this.move_host(id, None, cx);
+                        },
+                    ));
                 for name in groups {
                     let group = name.clone();
                     let checked = current.as_ref() == Some(&name);

@@ -274,7 +274,12 @@ mod tests {
         let restored = CommandHistory::from_json(&history.to_json_scrubbed());
         assert_eq!(
             restored.entries(),
-            ["ls -la", "mysql -h db -P 3306", "grep password /etc/app.conf", "ssh -p 2222 root@host"]
+            [
+                "ls -la",
+                "mysql -h db -P 3306",
+                "grep password /etc/app.conf",
+                "ssh -p 2222 root@host"
+            ]
         );
         // 不清洗的完整序列化保持全部条目（加密库路径用）。
         assert_eq!(CommandHistory::from_json(&history.to_json()), history);

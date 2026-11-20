@@ -37,29 +37,26 @@ pub(super) struct TabDrag {
 impl rgpui::Render for TabDrag {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        div()
-            .pl(self.position.x)
-            .pt(self.position.y)
-            .child(
-                div()
-                    .px(px(12.0))
-                    .py(px(6.0))
-                    .bg(theme.tokens.popover.opacity(0.95))
-                    .border_1()
-                    .border_color(theme.tokens.primary)
-                    .rounded(theme.radius)
-                    .shadow(vec![rgpui::BoxShadow {
-                        color: rgpui::hsla(0.0, 0.0, 0.0, 0.25),
-                        offset: rgpui::point(px(0.0), px(4.0)),
-                        blur_radius: px(12.0),
-                        spread_radius: px(0.0),
-                        inset: false,
-                    }])
-                    .text_size(px(13.0))
-                    .text_color(theme.tokens.foreground)
-                    .font_family(theme.font_family.clone())
-                    .child(self.title.clone()),
-            )
+        div().pl(self.position.x).pt(self.position.y).child(
+            div()
+                .px(px(12.0))
+                .py(px(6.0))
+                .bg(theme.tokens.popover.opacity(0.95))
+                .border_1()
+                .border_color(theme.tokens.primary)
+                .rounded(theme.radius)
+                .shadow(vec![rgpui::BoxShadow {
+                    color: rgpui::hsla(0.0, 0.0, 0.0, 0.25),
+                    offset: rgpui::point(px(0.0), px(4.0)),
+                    blur_radius: px(12.0),
+                    spread_radius: px(0.0),
+                    inset: false,
+                }])
+                .text_size(px(13.0))
+                .text_color(theme.tokens.foreground)
+                .font_family(theme.font_family.clone())
+                .child(self.title.clone()),
+        )
     }
 }
 

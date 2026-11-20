@@ -1046,66 +1046,62 @@ impl RuTermApp {
         // 没填展示名时标题直接用地址，避免整行只剩一行灰字。
         let title = Self::host_title(host);
         let sort = self.sidebar.sort;
-        Self::row_base(
-            SharedString::from(format!("host-row-{id}")),
-            pal,
-            px(22.0),
-        )
-        // 双击才连接：手快点两下不会误开两条会话。
-        .on_double_click(cx.listener(move |this, _, window, cx| {
-            this.click_host(id, window, cx);
-        }))
-        .child(
-            Icon::new(Self::host_icon(host))
-                .small()
-                .text_color(if host.favorite { pal.accent } else { pal.muted }),
-        )
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .overflow_hidden()
-                .child(
-                    div()
-                        .text_ellipsis()
-                        .font_weight(rgpui::FontWeight(500.0))
-                        .child(title),
-                )
-                .child(
-                    div()
-                        .text_ellipsis()
-                        .text_xs()
-                        .text_color(pal.muted)
-                        .child(Self::host_subtitle(host)),
-                ),
-        )
-        .child(
-            div()
-                .id(SharedString::from(format!("host-fav-{id}")))
-                .flex_shrink_0()
-                .text_sm()
-                .px_1()
-                .text_color(if host.favorite { pal.accent } else { pal.muted })
-                .child(fav_glyph)
-                .cursor_pointer()
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|_, _, _, cx| cx.stop_propagation()),
-                )
-                .on_click(cx.listener(move |this, _, _, cx| this.toggle_favorite(id, cx))),
-        )
-        .context_menu(move |menu, _, cx| {
-            Self::context_menu(
-                MenuTarget::HostId(id),
-                groups.clone(),
-                current.clone(),
-                sort,
-                entity.clone(),
-                menu,
-                cx,
+        Self::row_base(SharedString::from(format!("host-row-{id}")), pal, px(22.0))
+            // 双击才连接：手快点两下不会误开两条会话。
+            .on_double_click(cx.listener(move |this, _, window, cx| {
+                this.click_host(id, window, cx);
+            }))
+            .child(
+                Icon::new(Self::host_icon(host))
+                    .small()
+                    .text_color(if host.favorite { pal.accent } else { pal.muted }),
             )
-        })
-        .into_any_element()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .text_ellipsis()
+                            .font_weight(rgpui::FontWeight(500.0))
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .text_ellipsis()
+                            .text_xs()
+                            .text_color(pal.muted)
+                            .child(Self::host_subtitle(host)),
+                    ),
+            )
+            .child(
+                div()
+                    .id(SharedString::from(format!("host-fav-{id}")))
+                    .flex_shrink_0()
+                    .text_sm()
+                    .px_1()
+                    .text_color(if host.favorite { pal.accent } else { pal.muted })
+                    .child(fav_glyph)
+                    .cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_favorite(id, cx))),
+            )
+            .context_menu(move |menu, _, cx| {
+                Self::context_menu(
+                    MenuTarget::HostId(id),
+                    groups.clone(),
+                    current.clone(),
+                    sort,
+                    entity.clone(),
+                    menu,
+                    cx,
+                )
+            })
+            .into_any_element()
     }
 
     /// 主机分组树：内置「本地终端」→ 各自定义分组 → 未分组 → 空白区。
@@ -1321,11 +1317,14 @@ impl RuTermApp {
                                         this.commit_group_prompt(cx);
                                     })),
                             )
-                            .child(Button::new("cancel-group").label(tr!(cx, "取消")).ghost().on_click(
-                                cx.listener(|this, _, _, cx| {
-                                    this.cancel_group_prompt(cx);
-                                }),
-                            )),
+                            .child(
+                                Button::new("cancel-group")
+                                    .label(tr!(cx, "取消"))
+                                    .ghost()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.cancel_group_prompt(cx);
+                                    })),
+                            ),
                     ),
             )
             .into_any_element()

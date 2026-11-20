@@ -250,8 +250,9 @@ where
     let writer_task = tokio::spawn(async move {
         let mut input = VncInput::default();
         while let Some(command) = writer_rx.recv().await {
-            let (width, height) =
-                *writer_size.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (width, height) = *writer_size
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let bytes = match command {
                 Command::Pointer { x, y, buttons } => {
                     input.pointer(x, y, buttons);
@@ -339,12 +340,10 @@ where
                     // 8MB 整帧拷贝放锁外完成：界面取快照只拿一下锁，不被搬运
                     // 挡住（与 rdp.rs 的 publish_frame 同一模式）。
                     let publish = {
-                        let slot_free = reader_latest
-                            .lock()
-                            .map_or_else(
-                                |poisoned| poisoned.into_inner().is_none(),
-                                |slot| slot.is_none(),
-                            );
+                        let slot_free = reader_latest.lock().map_or_else(
+                            |poisoned| poisoned.into_inner().is_none(),
+                            |slot| slot.is_none(),
+                        );
                         if slot_free {
                             let bgra = state.fb.bgra.clone();
                             let mut slot = reader_latest

@@ -206,8 +206,7 @@ mod tests {
                 from = marker_end;
                 // 前置边界：标记必须独立成词，不能是 `include_str!(` 这种子串。
                 let boundary_ok = start == 0
-                    || !bytes[start - 1].is_ascii_alphanumeric()
-                    && bytes[start - 1] != b'_';
+                    || !bytes[start - 1].is_ascii_alphanumeric() && bytes[start - 1] != b'_';
                 if !boundary_ok {
                     continue;
                 }
