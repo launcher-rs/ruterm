@@ -202,6 +202,52 @@ pub fn from_json(text: &str) -> Vec<KeyMacro> {
     serde_json::from_str(text).unwrap_or_default()
 }
 
+/// 键宏总数上限：与片段库同思路，防一份异常备份把列表撑爆。
+pub const MAX_MACROS: usize = 100;
+
+/// 导入合并的统计：收下、触发键重复跳过、超出总数上限丢弃。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ImportSummary {
+    pub accepted: usize,
+    pub duplicates: usize,
+    pub over_limit: usize,
+}
+
+/// 合并导入的键宏：触发键重复的跳过（运行时同名组合只有第一条生效，
+/// 收下两条只会造成「保存成功却永远不触发」的困惑）；总数超上限的丢弃。
+pub fn merge_imported(existing: Vec<KeyMacro>, imported: Vec<KeyMacro>) -> (Vec<KeyMacro>, ImportSummary) {
+    let mut duplicates = 0usize;
+    let mut accepted = Vec::new();
+    let mut seen: std::collections::HashSet<String> = existing
+        .iter()
+        .filter_map(|macro_| macro_.trigger.clone())
+        .collect();
+    for macro_ in imported {
+        let Some(trigger) = macro_.trigger.clone() else {
+            accepted.push(macro_);
+            continue;
+        };
+        if !seen.insert(trigger) {
+            duplicates += 1;
+            continue;
+        }
+        accepted.push(macro_);
+    }
+    let free = MAX_MACROS.saturating_sub(existing.len());
+    let over_limit = accepted.len().saturating_sub(free);
+    let accepted_count = accepted.len().min(free);
+    let mut merged = existing;
+    merged.extend(accepted.into_iter().take(free));
+    (
+        merged,
+        ImportSummary {
+            accepted: accepted_count,
+            duplicates,
+            over_limit,
+        },
+    )
+}
+
 /// 步骤文本 → 字节：`\n` = CR、`\t` = Tab、`\e` = ESC、`\\` = 反斜杠，
 /// 未知转义原样保留（反斜杠 + 字符）。
 pub fn unescape_step(text: &str) -> Vec<u8> {
@@ -306,6 +352,50 @@ mod tests {
         assert!(legacy[0].enabled);
         assert_eq!(legacy[0].trigger, None);
         assert!(legacy[0].steps.is_empty());
+    }
+
+    /// 触发键重复跳过、超上限丢弃、未绑键的照收。
+    #[test]
+    fn merge_imported_dedupes_by_trigger_and_caps_total() {
+        let macro_ = |trigger: Option<&str>| KeyMacro {
+            name: "m".into(),
+            trigger: trigger.map(str::to_string),
+            enabled: true,
+            uses: 0,
+            steps: Vec::new(),
+        };
+        let existing = vec![macro_(Some("ctrl-alt-1"))];
+        let imported = vec![
+            macro_(Some("ctrl-alt-1")), // 与现有重复：跳过。
+            macro_(None),               // 未绑键：不参与判重，照收。
+            macro_(Some("ctrl-alt-2")),
+            macro_(Some("ctrl-alt-3")),
+        ];
+        let (merged, summary) = merge_imported(existing, imported);
+        assert_eq!(summary.duplicates, 1);
+        assert_eq!(summary.accepted, 3);
+        assert_eq!(summary.over_limit, 0);
+        let triggers: Vec<Option<String>> =
+            merged.iter().map(|macro_| macro_.trigger.clone()).collect();
+        assert_eq!(
+            triggers,
+            [
+                Some("ctrl-alt-1".to_string()),
+                None,
+                Some("ctrl-alt-2".to_string()),
+                Some("ctrl-alt-3".to_string()),
+            ]
+        );
+
+        // 上限：现有 99 条、新来 2 条 → 收 1 丢 1。
+        let existing: Vec<KeyMacro> = (0..MAX_MACROS - 1)
+            .map(|index| macro_(Some(&format!("ctrl-alt-{index}"))))
+            .collect();
+        let (merged, summary) =
+            merge_imported(existing, vec![macro_(None), macro_(Some("ctrl-alt-99"))]);
+        assert_eq!(summary.accepted, 1);
+        assert_eq!(summary.over_limit, 1);
+        assert_eq!(merged.len(), MAX_MACROS);
     }
 
     #[test]

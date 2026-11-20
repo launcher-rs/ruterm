@@ -381,14 +381,25 @@ fn write_new_synced(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 /// 读取数据目录中的解锁后端标记；文件缺失按 keyring 档处理。
-pub fn read_unlock_marker(mode: &StorageMode) -> UnlockBackend {
+///
+/// 权限 / IO 类错误不吞掉：启动路径（boot_vault）据此 fail-closed，
+/// 无声落回 keyring 档会让 passphrase 用户走错解密分支，最后报出的
+/// 加密错误与真实原因对不上。
+pub fn read_unlock_marker_checked(mode: &StorageMode) -> std::io::Result<UnlockBackend> {
     match std::fs::read_to_string(mode.unlock_marker_path()) {
-        Ok(text) if text.trim() == "passphrase" => UnlockBackend::Passphrase,
-        Ok(_) => UnlockBackend::Keyring,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => UnlockBackend::Keyring,
+        Ok(text) if text.trim() == "passphrase" => Ok(UnlockBackend::Passphrase),
+        Ok(_) => Ok(UnlockBackend::Keyring),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(UnlockBackend::Keyring),
+        Err(error) => Err(error),
+    }
+}
+
+/// [`read_unlock_marker_checked`] 的宽松版：读标记失败时记日志并按 keyring 档处理。
+/// 只用于开库成功之后的低频刷新，启动路径必须用 checked 版。
+pub fn read_unlock_marker(mode: &StorageMode) -> UnlockBackend {
+    match read_unlock_marker_checked(mode) {
+        Ok(backend) => backend,
         Err(error) => {
-            // 权限 / IO 类错误不该无声地落回 keyring：passphrase 用户的解锁
-            // 流程会走错分支，最后报出的加密错误与真实原因对不上。
             log::warn!("读取解锁标记失败（{error}），按 keyring 档处理");
             UnlockBackend::Keyring
         }
@@ -585,7 +596,9 @@ impl Vault {
         self.job(move |cell| async move {
             let mut db = cell.lock().await;
             let Some((host, _)) = fetch_host(&mut db, id, &field_key).await? else {
-                return Ok(());
+                // 主机不存在时明确报错：调用方以为保存成功、实际什么都没发生
+                // 只会掩盖上游 bug。
+                anyhow::bail!("凭据库中不存在 id={id} 的主机，密码未写入");
             };
             put_host(&mut db, &host, password.as_deref(), &field_key).await
         })

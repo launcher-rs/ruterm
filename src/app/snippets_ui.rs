@@ -125,12 +125,20 @@ impl RuTermApp {
         let start = downloads_dir();
         let entity = cx.entity();
         let rx = cx.prompt_for_new_path(&start, Some("ruterm-snippets.json"));
+        let runtime = rgpui::tokio::Tokio::handle(cx);
         cx.spawn(async move |_, cx| {
             let Ok(Ok(Some(path))) = rx.await else {
                 return;
             };
-            let failure = std::fs::write(&path, json).err();
             let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
+            // 写盘交给阻塞线程池：网络盘 / 杀软实时扫描会让同步 write 卡住
+            // 整个 UI 线程（项目规范：阻塞 IO 必须显式交 tokio）。
+            let failure = runtime
+                .spawn_blocking(move || std::fs::write(&path, json).err())
+                .await
+                .unwrap_or_else(|error| {
+                    Some(std::io::Error::other(error.to_string()))
+                });
             entity.update(cx, move |this, cx| {
                 this.status = match failure {
                     None => {
@@ -157,6 +165,7 @@ impl RuTermApp {
             multiple: false,
             prompt: Some(tr!(cx, "选择命令片段 JSON 文件")),
         });
+        let runtime = rgpui::tokio::Tokio::handle(cx);
         cx.spawn(async move |_, cx| {
             let Ok(Ok(Some(paths))) = rx.await else {
                 return;
@@ -164,7 +173,13 @@ impl RuTermApp {
             let Some(path) = paths.into_iter().next() else {
                 return;
             };
-            let text = std::fs::read_to_string(&path).map_err(|error| error.to_string());
+            // 读盘交给阻塞线程池（理由同导出）。
+            let text = runtime
+                .spawn_blocking(move || {
+                    std::fs::read_to_string(&path).map_err(|error| error.to_string())
+                })
+                .await
+                .unwrap_or_else(|error| Err(error.to_string()));
             entity.update(cx, move |this, cx| {
                 let text = match text {
                     Ok(text) => text,

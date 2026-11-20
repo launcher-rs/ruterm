@@ -1725,9 +1725,6 @@ impl CwdKeystrokes {
                     }
                 }
             }
-            if done.is_some() {
-                break;
-            }
         }
         done
     }

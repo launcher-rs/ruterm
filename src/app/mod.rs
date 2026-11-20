@@ -110,6 +110,9 @@ pub(crate) struct RuTermApp {
     terminal_menu: Option<TerminalMenu>,
     /// 同步输入开关：活动终端的按键同时写进其它会话（仅本次运行有效）。
     sync_input: bool,
+    /// 状态栏当前显示的是「同步输入：开…」这条提示：会话减少时 prune 才能
+    /// 无歧义地覆盖它（此前靠状态栏文案前缀匹配，改字即静默失效）。
+    sync_input_notice: bool,
     /// 终端输入镜像通道（中间件 → UI 分发循环）。
     mirror_tx: tokio::sync::mpsc::UnboundedSender<(usize, InputOrigin, Vec<u8>)>,
     /// 命令广播弹窗（一次性把命令发到所有会话）。
@@ -456,6 +459,7 @@ impl RuTermApp {
             },
             terminal_menu: None,
             sync_input: false,
+            sync_input_notice: false,
             mirror_tx,
             broadcast: None,
             tabs: Vec::new(),
@@ -624,7 +628,7 @@ impl RuTermApp {
         };
         self.hosts.push(host.clone());
         self.persist_host(&host, cx);
-        self.status = SharedString::from(format!("已把 {} 加入主机列表", host.addr()));
+        self.status = tr!(cx, "已把 {addr} 加入主机列表", addr = host.addr());
         cx.notify();
     }
 
@@ -633,6 +637,14 @@ impl RuTermApp {
     fn refresh_unlock_backend(&mut self) {
         self.passphrase_backend =
             crate::vault::read_unlock_marker(&self.mode) == crate::vault::UnlockBackend::Passphrase;
+    }
+
+    /// 单实例守卫没能建立（回环锁端口被无关程序占用 / 绑定失败）时的提示。
+    /// 没有守卫，再双击一次 exe 会同时跑两个进程读写同一个加密库、挂两个托盘，
+    /// 必须让用户知道这次启动不保证单实例。
+    pub fn warn_unprotected(&mut self, cx: &mut Context<Self>) {
+        self.status = tr!(cx, "单实例守卫不可用（锁端口被占用），本次启动可能与其它实例并存，请勿再双击图标");
+        cx.notify();
     }
 
     /// 异步打开加密凭据库：成功则接管主机列表（含一次性迁移旧库/JSON 并改名保留），
@@ -651,8 +663,21 @@ impl RuTermApp {
             return;
         }
         // recover_rekey 可能在崩溃恢复里补写 unlock.txt：这里读到的就是恢复后
-        // 的真值，顺手刷新进内存缓存（每帧渲染不再读盘）。
-        self.refresh_unlock_backend();
+        // 的真值，顺手刷新进内存缓存（每帧渲染不再读盘）。标记读不出来
+        // （权限 / IO 错误）时 fail-closed：落回 keyring 档会静默走错解密
+        // 分支，报错与真实原因对不上，不如直接把连接与开库一起禁掉。
+        match crate::vault::read_unlock_marker_checked(&mode) {
+            Ok(backend) => {
+                self.passphrase_backend =
+                    backend == crate::vault::UnlockBackend::Passphrase;
+            }
+            Err(error) => {
+                self.status =
+                    format!("读取解锁标记失败，已禁止打开凭据库：{error}").into();
+                cx.notify();
+                return;
+            }
+        }
         let generation = self.auth_gate.generation();
         let json_hosts = self.hosts.clone();
         // 凭据库（toasty/turso）必须跑在 tokio 运行时上，句柄在此处取出后交给任务。
@@ -1105,7 +1130,7 @@ impl RuTermApp {
                         host.name.clone()
                     }
                 })
-                .unwrap_or_else(|| "该主机".to_string());
+                .unwrap_or_else(|| tr!(cx, "该主机").to_string());
             return v_flex()
                 .id("delete-backdrop")
                 .absolute()
@@ -1135,26 +1160,26 @@ impl RuTermApp {
                             div()
                                 .text_base()
                                 .font_weight(rgpui::FontWeight(600.0))
-                                .child(format!("删除主机 {label}？")),
+                                .child(tr!(cx, "删除主机 {label}？", label = label)),
                         )
                         .child(
                             div()
                                 .text_xs()
                                 .text_color(pal.muted)
-                                .child("若该主机已保存密码/口令，将一并从加密库中清除。"),
+                                .child(tr!(cx, "若该主机已保存密码/口令，将一并从加密库中清除。")),
                         )
                         .child(
                             h_flex()
                                 .gap_2()
                                 .justify_end()
-                                .child(Button::new("cancel-delete").label("取消").ghost().on_click(
+                                .child(Button::new("cancel-delete").label(tr!(cx, "取消")).ghost().on_click(
                                     cx.listener(|this, _, _, cx| {
                                         this.cancel_delete(cx);
                                     }),
                                 ))
                                 .child(
                                     Button::new("confirm-delete")
-                                        .label("删除")
+                                        .label(tr!(cx, "删除"))
                                         .danger()
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.confirm_delete_now(cx);

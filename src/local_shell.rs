@@ -219,13 +219,45 @@ pub fn env_text(env: &std::collections::HashMap<String, String>) -> String {
         .join("\n")
 }
 
-/// 含空白或为空时加双引号（Windows 命令行分词规则）。
+/// 按 Windows `CreateProcessW` 的命令行规则给参数加引号。
+///
+/// 只处理空白远远不够：手编 settings.json 可以携带任意参数——参数内含
+/// `"` 要转义成 `\"`（且其前反斜杠翻倍），收尾的反斜杠要翻倍（否则
+/// `"C:\foo\"` 里的 `\"` 会被当成转义引号吃掉），拼接必须能 round-trip。
 fn quote_arg(arg: &str) -> String {
-    if arg.is_empty() || arg.contains([' ', '\t']) {
-        format!("\"{arg}\"")
-    } else {
-        arg.to_string()
+    if !arg.is_empty() && !arg.contains([' ', '\t', '"']) && !arg.ends_with('\\') {
+        return arg.to_string();
     }
+    let mut quoted = String::with_capacity(arg.len() + 2);
+    quoted.push('"');
+    let mut backslashes = 0usize;
+    for ch in arg.chars() {
+        match ch {
+            '\\' => backslashes += 1,
+            '"' => {
+                // 引号前的反斜杠翻倍（2n），再转义引号本身（\"，自带第 2n+1 条）。
+                for _ in 0..backslashes * 2 {
+                    quoted.push('\\');
+                }
+                backslashes = 0;
+                quoted.push_str("\\\"");
+            }
+            other => {
+                for _ in 0..backslashes {
+                    quoted.push('\\');
+                }
+                backslashes = 0;
+                quoted.push(other);
+            }
+        }
+    }
+    // 收尾反斜杠翻倍（2n）：紧贴闭引号时 `\"` 会被当成转义引号。
+    // 没有收尾反斜杠时什么都不加。
+    for _ in 0..backslashes * 2 {
+        quoted.push('\\');
+    }
+    quoted.push('"');
+    quoted
 }
 
 /// 在 `PATH` 里查找可执行文件（自动补 `.exe`）。
@@ -430,10 +462,17 @@ fn wsl_distro_names() -> Option<Vec<String>> {
         .creation_flags(NO_WINDOW)
         .output()
         .ok()?;
-    output
-        .status
-        .success()
-        .then(|| decode_wsl_list(&output.stdout))
+    if output.status.success() {
+        return Some(decode_wsl_list(&output.stdout));
+    }
+    // 部分版本在没有任何发行版时以非零码退出，stdout 是一句提示语：
+    // 命中提示语关键字按「确实没装」返回空表，其余才当调用失败——
+    // 否则会冒出一条连不上的「WSL（默认发行版）」条目。
+    let text = decode_wsl_text(&output.stdout);
+    if text.lines().any(|line| !line.trim().is_empty() && is_wsl_hint(line)) {
+        return Some(Vec::new());
+    }
+    None
 }
 
 #[cfg(not(windows))]
@@ -445,7 +484,18 @@ fn wsl_distros() -> Vec<ShellProfile> {
 /// 没装发行版时它输出的是一句提示语，按关键字滤掉。
 #[cfg(windows)]
 fn decode_wsl_list(bytes: &[u8]) -> Vec<String> {
-    let text = if looks_utf16(bytes) {
+    decode_wsl_text(bytes)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !is_wsl_hint(line))
+        .map(str::to_string)
+        .collect()
+}
+
+/// 只做编码归一（UTF-16LE / UTF-8 → String），不滤提示语。
+#[cfg(windows)]
+fn decode_wsl_text(bytes: &[u8]) -> String {
+    if looks_utf16(bytes) {
         let units: Vec<u16> = bytes
             .chunks(2)
             .filter_map(|pair| Some(u16::from_le_bytes([pair[0], *pair.get(1)?])))
@@ -453,12 +503,7 @@ fn decode_wsl_list(bytes: &[u8]) -> Vec<String> {
         String::from_utf16_lossy(&units)
     } else {
         String::from_utf8_lossy(bytes).into_owned()
-    };
-    text.lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !is_wsl_hint(line))
-        .map(str::to_string)
-        .collect()
+    }
 }
 
 /// ASCII 文本的 UTF-16LE 形态：奇数位几乎全是 0。
@@ -647,6 +692,19 @@ fn is_executable(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 手编 settings.json 可以携带任意参数：引号 / 收尾反斜杠必须能
+    /// 按 CreateProcessW 的分词规则 round-trip。
+    #[test]
+    fn quote_arg_survives_windows_splitting() {
+        assert_eq!(quote_arg(""), "\"\"");
+        assert_eq!(quote_arg("plain"), "plain");
+        assert_eq!(quote_arg("a b"), "\"a b\"");
+        assert_eq!(quote_arg("C:\\foo"), "C:\\foo");
+        assert_eq!(quote_arg("C:\\foo\\"), "\"C:\\foo\\\\\"");
+        assert_eq!(quote_arg("say \"hi\""), "\"say \\\"hi\\\"\"");
+        assert_eq!(quote_arg("a\"b\\"), "\"a\\\"b\\\\\"");
+    }
 
     #[test]
     fn detect_only_lists_existing_executables() {

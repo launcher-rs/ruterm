@@ -54,7 +54,19 @@ impl DiscoveredHost {
 ///
 /// 没有可用私有网段（例如只有公网地址）时返回空列表而非报错。
 pub async fn scan_lan() -> Result<Vec<DiscoveredHost>> {
-    let mut prefixes = interface_prefixes().await;
+    // `arp -a` 只跑一次：接口行喂 interface_prefixes、邻居行喂 targets，
+    // 同一份数据没必要起两个子进程各采一遍、白多等一次。
+    let arp = tokio::task::spawn_blocking(|| {
+        std::process::Command::new("arp")
+            .arg("-a")
+            .output()
+            .ok()
+            .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+            .unwrap_or_default()
+    })
+    .await
+    .unwrap_or_default();
+    let mut prefixes = interface_prefixes(&arp).await;
     if prefixes.is_empty() {
         bail!("没有可扫描的私有网段");
     }
@@ -68,10 +80,7 @@ pub async fn scan_lan() -> Result<Vec<DiscoveredHost>> {
     }
     // 邻居表里已经出现过的地址也补进来：它们可能在其它网段（如 VMware NAT），
     // 而且多半正开着。
-    let neighbors = tokio::task::spawn_blocking(neighbor_addresses)
-        .await
-        .unwrap_or_default();
-    targets.extend(neighbors);
+    targets.extend(neighbor_addresses(&arp));
 
     let permits = Arc::new(Semaphore::new(HOST_CONCURRENCY));
     let mut tasks = Vec::with_capacity(targets.len());
@@ -126,7 +135,8 @@ async fn port_open(ip: Ipv4Addr, port: u16) -> bool {
 
 /// 本机各私有网段的前三段（/24）。默认路由所在网段排最前，
 /// 再用 `arp -a` 的 Interface 行补齐多网卡（虚拟网卡多时也不会把真正的局域网挤掉）。
-async fn interface_prefixes() -> Vec<(u8, u8, u8)> {
+/// `arp_text` 由调用方采集（`scan_lan` 里单次 `arp -a` 的输出）。
+async fn interface_prefixes(arp_text: &str) -> Vec<(u8, u8, u8)> {
     let mut found: Vec<(u8, u8, u8)> = Vec::new();
     let mut push = |ip: Ipv4Addr| {
         if is_private(ip) {
@@ -140,17 +150,8 @@ async fn interface_prefixes() -> Vec<(u8, u8, u8)> {
     if let Some(ip) = default_local_ip().await {
         push(ip);
     }
-    let arp = tokio::task::spawn_blocking(|| {
-        let output = std::process::Command::new("arp").arg("-a").output().ok()?;
-        Some(String::from_utf8_lossy(&output.stdout).into_owned())
-    })
-    .await
-    .ok()
-    .flatten();
-    if let Some(text) = arp {
-        for ip in interface_addresses(&text) {
-            push(ip);
-        }
+    for ip in interface_addresses(arp_text) {
+        push(ip);
     }
     found
 }
@@ -174,15 +175,10 @@ fn interface_addresses(text: &str) -> Vec<Ipv4Addr> {
 }
 
 /// 解析邻居表里出现的 IPv4（各平台格式都按空白分隔，取第一个能解析的字段）。
-fn neighbor_addresses() -> Vec<Ipv4Addr> {
-    let text = std::process::Command::new("arp")
-        .arg("-a")
-        .output()
-        .ok()
-        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
-        .unwrap_or_default();
+/// `arp_text` 由调用方采集（`scan_lan` 里单次 `arp -a` 的输出）。
+fn neighbor_addresses(arp_text: &str) -> Vec<Ipv4Addr> {
     let mut addresses = Vec::new();
-    for line in text.lines() {
+    for line in arp_text.lines() {
         if line.contains("---") {
             continue;
         }

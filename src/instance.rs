@@ -28,12 +28,13 @@ fn session_user() -> String {
         .unwrap_or_default()
 }
 
-/// 锁端口，可被 `RUTERM_INSTANCE_PORT` 覆盖；非法值回退默认并告警。
+/// 锁端口，可被 `RUTERM_INSTANCE_PORT` 覆盖；非法值（含 0——绑定随机端口
+/// 会让每次启动拿不同的锁端口，守卫静默失效）回退默认并告警。
 fn port() -> u16 {
     match std::env::var_os("RUTERM_INSTANCE_PORT") {
         Some(raw) => match raw.to_str().and_then(|s| s.parse::<u16>().ok()) {
-            Some(port) => port,
-            None => {
+            Some(port) if port != 0 => port,
+            _ => {
                 log::warn!("RUTERM_INSTANCE_PORT 非法（{raw:?}），回退按用户派生的默认端口");
                 default_port()
             }

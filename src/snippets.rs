@@ -68,6 +68,9 @@ pub fn from_json(text: &str) -> Vec<CommandSnippet> {
             snippet.has_name()
                 && !snippet.command.trim().is_empty()
                 && !snippet.command.contains(['\r', '\n', '\0'])
+                // ESC 等其余控制字符一并拒收：虽然无法执行第二条命令（\r 已滤），
+                // 但能伪造终端显示内容（假提示符、假输出）。行内 Tab 照旧放行。
+                && !snippet.command.chars().any(|c| c.is_control() && c != '\t')
                 && snippet.command.len() <= MAX_COMMAND_BYTES
         })
         .take(MAX_SNIPPETS)

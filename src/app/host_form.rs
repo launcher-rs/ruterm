@@ -112,10 +112,10 @@ impl RuTermApp {
                 .map(|name| SharedString::from(name.to_string())),
             None => group,
         };
-        let placeholder_name = if editing {
-            ""
+        let placeholder_name: SharedString = if editing {
+            "".into()
         } else {
-            "展示名（留空用主机地址）"
+            tr!(cx, "展示名（留空用主机地址）")
         };
         let form = NewHostForm {
             protocol,
@@ -141,10 +141,9 @@ impl RuTermApp {
                     .as_ref()
                     .map(|(_, _, port)| port.to_string())
                     .unwrap_or_else(|| protocol.default_port().to_string());
-                let input = InputState::new(window, cx).default_value(default_port);
                 match &existing {
                     Some(host) => InputState::new(window, cx).default_value(host.port.to_string()),
-                    None => input,
+                    None => InputState::new(window, cx).default_value(default_port),
                 }
             }),
             user: cx.new(|cx| {
@@ -182,9 +181,9 @@ impl RuTermApp {
             form.host.update(cx, |state, cx| state.focus(window, cx));
         }
         self.status = if editing {
-            "编辑主机".into()
+            tr!(cx, "编辑主机")
         } else {
-            "填写主机信息".into()
+            tr!(cx, "填写主机信息")
         };
         cx.notify();
     }
@@ -192,7 +191,7 @@ impl RuTermApp {
     /// 关闭新建表单（不保存）。
     pub(super) fn cancel_form(&mut self, cx: &mut Context<Self>) {
         self.new_host = None;
-        self.status = "就绪".into();
+        self.status = tr!(cx, "就绪");
         cx.notify();
     }
 
@@ -234,8 +233,11 @@ impl RuTermApp {
             match port_raw.parse::<u16>() {
                 Ok(port) if port != 0 => port,
                 _ => {
-                    self.status =
-                        SharedString::from(format!("保存失败：端口「{port_raw}」无效（应为 1-65535 的数字）"));
+                    self.status = tr!(
+                        cx,
+                        "保存失败：端口「{port_raw}」无效（应为 1-65535 的数字）",
+                        port_raw = port_raw
+                    );
                     cx.notify();
                     return;
                 }
@@ -256,7 +258,7 @@ impl RuTermApp {
         };
         if host.protocol == ProtocolKind::Ssh && host.key_inline {
             if self.vault.is_none() {
-                self.status = "内嵌私钥需要加密凭据库（当前不可用），请改用本地私钥文件".into();
+                self.status = tr!(cx, "内嵌私钥需要加密凭据库（当前不可用），请改用本地私钥文件");
                 cx.notify();
                 return;
             }
@@ -264,14 +266,14 @@ impl RuTermApp {
                 .and_then(|id| self.hosts.iter().find(|host| host.id == id))
                 .is_some_and(|current| current.key_inline);
             if key_data.is_none() && !existing {
-                self.status = "请先导入私钥文件（选择「内嵌到加密库」后点「导入私钥…」）".into();
+                self.status = tr!(cx, "请先导入私钥文件（选择「内嵌到加密库」后点「导入私钥…」）");
                 cx.notify();
                 return;
             }
         }
         if let Some(error) = host.validate() {
             log::warn!("保存主机失败: {error}");
-            self.status = SharedString::from(format!("保存失败：{error}"));
+            self.status = tr!(cx, "保存失败：{error}", error = error);
             cx.notify();
             return;
         }
@@ -282,17 +284,17 @@ impl RuTermApp {
                 .map(|host| host.id);
             match self.hosts.iter().find(|item| item.id == jump_id) {
                 None => {
-                    self.status = "所选跳板机已不存在，请重新选择".into();
+                    self.status = tr!(cx, "所选跳板机已不存在，请重新选择");
                     cx.notify();
                     return;
                 }
                 Some(jump) if Some(jump.id) == self_id => {
-                    self.status = "不能把主机自己设为跳板机".into();
+                    self.status = tr!(cx, "不能把主机自己设为跳板机");
                     cx.notify();
                     return;
                 }
                 Some(jump) if jump.proxy_jump.is_some() => {
-                    self.status = "跳板机不能再挂跳板机，请先解除它的跳板机设置".into();
+                    self.status = tr!(cx, "跳板机不能再挂跳板机，请先解除它的跳板机设置");
                     cx.notify();
                     return;
                 }
@@ -306,7 +308,7 @@ impl RuTermApp {
         };
         let group_note = group
             .as_deref()
-            .map(|name| format!("（分组：{name}）"))
+            .map(|name| tr!(cx, "（分组：{name}）", name = name).to_string())
             .unwrap_or_default();
         if let Some(edit_id) = editing {
             // 原位替换：id 与收藏标记沿用原主机；已保存的密码/口令不受影响。
@@ -324,13 +326,19 @@ impl RuTermApp {
                 let key_note = self.store_form_key(&host, key_data, was_inline, cx);
                 self.apply_form_group(&host, group, cx);
                 self.new_host = None;
-                self.status = SharedString::from(format!(
-                    "已更新主机 {label}{}{group_note}",
-                    join_notes(note, key_note)
-                ));
+                self.status = tr!(
+                    cx,
+                    "已更新主机 {label}{notes}{group_note}",
+                    label = label,
+                    notes = join_notes(note, key_note),
+                    group_note = group_note,
+                );
                 cx.notify();
                 return;
             }
+            // 编辑态找不到原主机（打开期间被并发替换 / 删除）：明确告知，
+            // 别让「我以为在编辑」悄悄变成「多出一台新主机」。
+            self.status = tr!(cx, "原主机已不存在，本次保存按新主机写入");
         }
         // 新建：加密库可用时同步分配主键（max+1，与库内 INSERT 显式 id 对齐）；
         // 降级模式沿用旧 JSON（id=0，boot_vault 成功回填时会补发）。
@@ -345,10 +353,13 @@ impl RuTermApp {
         let key_note = self.store_form_key(&host, key_data, false, cx);
         self.apply_form_group(&host, group, cx);
         self.new_host = None;
-        self.status = SharedString::from(format!(
-            "已保存主机 {label}{}{group_note}",
-            join_notes(note, key_note)
-        ));
+        self.status = tr!(
+            cx,
+            "已保存主机 {label}{notes}{group_note}",
+            label = label,
+            notes = join_notes(note, key_note),
+            group_note = group_note,
+        );
         cx.notify();
     }
 
@@ -390,14 +401,14 @@ impl RuTermApp {
                     }
                 })
                 .detach();
-                return Some("（口令已加密入库）".to_string());
+                return Some(tr!(cx, "（口令已加密入库）").to_string());
             }
             // 加密库不可用：绝不降级为明文保存，退回本次内存持有。
             self.password_cache.insert(host.addr(), passphrase);
-            return Some("（加密库不可用，口令仅本次内存持有）".to_string());
+            return Some(tr!(cx, "（加密库不可用，口令仅本次内存持有）").to_string());
         }
         self.password_cache.insert(host.addr(), passphrase);
-        Some("（口令仅本次内存持有）".to_string())
+        Some(tr!(cx, "（口令仅本次内存持有）").to_string())
     }
 
     /// 内嵌私钥的落点：新导入的写入加密库，取消内嵌则清除库内旧条目。
@@ -423,7 +434,7 @@ impl RuTermApp {
                 })
                 .detach();
             }
-            return Some("（私钥已加密入库）".to_string());
+            return Some(tr!(cx, "（私钥已加密入库）").to_string());
         }
         if was_inline {
             let id = host.id;
@@ -436,7 +447,7 @@ impl RuTermApp {
                 })
                 .detach();
             }
-            return Some("（已移除内嵌私钥）".to_string());
+            return Some(tr!(cx, "（已移除内嵌私钥）").to_string());
         }
         None
     }
@@ -447,7 +458,7 @@ impl RuTermApp {
     /// 存进库、等到连接时才失败。
     pub(super) fn import_inline_key(&mut self, cx: &mut Context<Self>) {
         if self.vault.is_none() {
-            self.status = "内嵌私钥需要加密凭据库（当前不可用）".into();
+            self.status = tr!(cx, "内嵌私钥需要加密凭据库（当前不可用）");
             cx.notify();
             return;
         }
@@ -460,7 +471,7 @@ impl RuTermApp {
             files: true,
             directories: false,
             multiple: false,
-            prompt: Some("选择私钥文件".into()),
+            prompt: Some(tr!(cx, "选择私钥文件")),
         });
         cx.spawn(async move |_, cx| {
             let Ok(Ok(Some(paths))) = rx.await else {
@@ -500,14 +511,14 @@ impl RuTermApp {
     ) {
         let text = match read {
             Ok(text) if text.len() > MAX_INLINE_KEY_BYTES => {
-                self.status = "私钥文件过大（超过 64 KB），已拒绝导入".into();
+                self.status = tr!(cx, "私钥文件过大（超过 64 KB），已拒绝导入");
                 cx.notify();
                 return;
             }
             Ok(text) => text,
             Err(error) => {
                 log::warn!("读取私钥 {label} 失败: {error}");
-                self.status = format!("读取私钥文件 {label} 失败：{error}").into();
+                self.status = tr!(cx, "读取私钥文件 {label} 失败：{error}", label = label, error = error);
                 cx.notify();
                 return;
             }
@@ -517,7 +528,7 @@ impl RuTermApp {
             && !matches!(error, russh::keys::Error::KeyIsEncrypted)
         {
             log::warn!("导入私钥失败（{label}）: {error}");
-            self.status = format!("无法识别私钥文件 {label}").into();
+            self.status = tr!(cx, "无法识别私钥文件 {label}", label = label);
             cx.notify();
             return;
         }
@@ -527,7 +538,7 @@ impl RuTermApp {
         form.key_data = Some(text);
         form.key_label = Some(label);
         form.key_inline = true;
-        self.status = "私钥已读入，保存主机时写入加密凭据库".into();
+        self.status = tr!(cx, "私钥已读入，保存主机时写入加密凭据库");
         cx.notify();
     }
 
@@ -543,7 +554,7 @@ impl RuTermApp {
             files: true,
             directories: false,
             multiple: false,
-            prompt: Some("选择私钥文件".into()),
+            prompt: Some(tr!(cx, "选择私钥文件")),
         });
         cx.spawn(async move |_, cx| {
             if let Ok(Ok(Some(paths))) = rx.await
@@ -624,9 +635,9 @@ impl RuTermApp {
                                     .text_base()
                                     .font_weight(rgpui::FontWeight(600.0))
                                     .child(if editing {
-                                        "编辑主机"
+                                        tr!(cx, "编辑主机")
                                     } else {
-                                        "新建主机"
+                                        tr!(cx, "新建主机")
                                     }),
                             )
                             .child(
@@ -651,7 +662,10 @@ impl RuTermApp {
                                     ProtocolKind::Rdp,
                                     ProtocolKind::Vnc,
                                 ];
-                                v_flex().gap_1().child(div().text_sm().child("协议")).child(
+                                v_flex()
+                                    .gap_1()
+                                    .child(div().text_sm().child(tr!(cx, "协议")))
+                                    .child(
                                     h_flex().gap_2().children(options.into_iter().map(|option| {
                                         let is_selected = form.protocol == option;
                                         div()
@@ -701,22 +715,22 @@ impl RuTermApp {
                                     })),
                                 )
                             })
-                            .child(labeled_field("展示名", &form.name, &pal))
-                            .child(labeled_field("主机地址", &form.host, &pal))
+                            .child(labeled_field(tr!(cx, "展示名"), &form.name, &pal))
+                            .child(labeled_field(tr!(cx, "主机地址"), &form.host, &pal))
                             .child(
                                 h_flex()
                                     .gap_3()
                                     .child(
                                         div()
                                             .flex_1()
-                                            .child(labeled_field("端口", &form.port, &pal)),
+                                            .child(labeled_field(tr!(cx, "端口"), &form.port, &pal)),
                                     )
                                     // Telnet / VNC 的登录名在会话内交互输入，表单里没有对应字段。
                                     .when(
                                         matches!(protocol, ProtocolKind::Ssh | ProtocolKind::Rdp),
                                         |this| {
                                             this.child(div().flex_1().child(labeled_field(
-                                                "用户名",
+                                                tr!(cx, "用户名"),
                                                 &form.user,
                                                 &pal,
                                             )))
@@ -750,7 +764,7 @@ impl RuTermApp {
                                         div().flex_1().child(
                                             v_flex()
                                                 .gap_1()
-                                                .child(div().text_sm().child("分组"))
+                                                .child(div().text_sm().child(tr!(cx, "分组")))
                                                 .child(
                                                     Select::new(options)
                                                         .id("host-group")
@@ -789,7 +803,7 @@ impl RuTermApp {
                                                 })
                                                 .map(|host| host.id);
                                             let mut options: Vec<SharedString> =
-                                                vec![SharedString::from("直连（无跳板机）")];
+                                                vec![tr!(cx, "直连（无跳板机）")];
                                             let mut ids: Vec<Option<i64>> = vec![None];
                                             if self.vault.is_some() {
                                                 for host in &self.hosts {
@@ -804,10 +818,12 @@ impl RuTermApp {
                                                         host.name.clone()
                                                     };
                                                     ids.push(Some(host.id));
-                                                    options.push(SharedString::from(format!(
-                                                        "{label}（{}）",
-                                                        host.addr()
-                                                    )));
+                                                    options.push(tr!(
+                                                        cx,
+                                                        "{name}（{addr}）",
+                                                        name = label,
+                                                        addr = host.addr()
+                                                    ));
                                                 }
                                             }
                                             let selected = form
@@ -821,7 +837,7 @@ impl RuTermApp {
                                             div().flex_1().child(
                                                 v_flex()
                                                     .gap_1()
-                                                    .child(div().text_sm().child("跳板机"))
+                                                    .child(div().text_sm().child(tr!(cx, "跳板机")))
                                                     .child(
                                                         Select::new(options)
                                                             .id("host-jump")
@@ -937,11 +953,11 @@ impl RuTermApp {
                                         .when(is_selected, |this| {
                                             this.font_weight(FontWeight::BOLD)
                                         })
-                                        .child(label)
+                                        .child(crate::i18n::translate(cx, label, &[]))
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             if inline && this.vault.is_none() {
                                                 this.status =
-                                                    "内嵌私钥需要加密凭据库（当前不可用）".into();
+                                                    tr!(cx, "内嵌私钥需要加密凭据库（当前不可用）");
                                                 cx.notify();
                                                 return;
                                             }
@@ -953,7 +969,7 @@ impl RuTermApp {
                                 };
                                 v_flex()
                                     .gap_1()
-                                    .child(div().text_sm().child("私钥来源"))
+                                    .child(div().text_sm().child(tr!(cx, "私钥来源")))
                                     .child(
                                         h_flex()
                                             .gap_2()
@@ -967,13 +983,13 @@ impl RuTermApp {
                                         .gap_2()
                                         .items_end()
                                         .child(div().flex_1().child(labeled_field(
-                                            "私钥路径",
+                                            tr!(cx, "私钥路径"),
                                             &form.key_path,
                                             &pal,
                                         )))
                                         .child(
                                             Button::new("browse-key")
-                                                .label("浏览…")
+                                                .label(tr!(cx, "浏览…"))
                                                 .ghost()
                                                 .flex_shrink_0()
                                                 .on_click(cx.listener(|this, _, _, cx| {
@@ -985,13 +1001,16 @@ impl RuTermApp {
                             .when(form.key_inline, |this| {
                                 // 已导入的私钥只显示文件名与字节数，界面里绝不出现内容。
                                 let note = match (&form.key_label, &form.key_data) {
-                                    (Some(name), Some(pem)) => {
-                                        format!("待保存：{name}（{} 字节）", pem.len())
-                                    }
+                                    (Some(name), Some(pem)) => tr!(
+                                        cx,
+                                        "待保存：{name}（{bytes} 字节）",
+                                        name = name,
+                                        bytes = pem.len()
+                                    ),
                                     _ if form.editing.is_some() => {
-                                        "已内嵌在加密库（重新导入可替换）".to_string()
+                                        tr!(cx, "已内嵌在加密库（重新导入可替换）")
                                     }
-                                    _ => "尚未导入私钥".to_string(),
+                                    _ => tr!(cx, "尚未导入私钥"),
                                 };
                                 this.child(
                                     h_flex()
@@ -1007,7 +1026,7 @@ impl RuTermApp {
                                         )
                                         .child(
                                             Button::new("import-key")
-                                                .label("导入私钥…")
+                                                .label(tr!(cx, "导入私钥…"))
                                                 .ghost()
                                                 .flex_shrink_0()
                                                 .on_click(cx.listener(|this, _, _, cx| {
@@ -1026,7 +1045,7 @@ impl RuTermApp {
                                             .w_full()
                                             .items_center()
                                             .justify_between()
-                                            .child(div().text_sm().child("私钥口令"))
+                                            .child(div().text_sm().child(tr!(cx, "私钥口令")))
                                             .child(
                                                 h_flex()
                                                     .id("save-passphrase")
@@ -1056,12 +1075,12 @@ impl RuTermApp {
                                                     ).child(
                                                         if self.vault.is_some() {
                                                             if save_checked {
-                                                                "☑ 保存口令到加密库"
+                                                                tr!(cx, "☑ 保存口令到加密库")
                                                             } else {
-                                                                "☐ 保存口令到加密库"
+                                                                tr!(cx, "☐ 保存口令到加密库")
                                                             }
                                                         } else {
-                                                            "口令仅本次内存持有"
+                                                            tr!(cx, "口令仅本次内存持有")
                                                         },
                                                     )),
                                             ),
@@ -1085,13 +1104,17 @@ impl RuTermApp {
                             .justify_end()
                             .child(
                                 Button::new("save-host")
-                                    .label(if editing { "保存修改" } else { "保存" })
+                                    .label(if editing {
+                                        tr!(cx, "保存修改")
+                                    } else {
+                                        tr!(cx, "保存")
+                                    })
                                     .primary()
                                     .on_click(cx.listener(|this, _, _, cx| this.save_form(cx))),
                             )
                             .child(
                                 Button::new("cancel-host")
-                                    .label("取消")
+                                    .label(tr!(cx, "取消"))
                                     .ghost()
                                     .on_click(cx.listener(|this, _, _, cx| this.cancel_form(cx))),
                             ),

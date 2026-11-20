@@ -213,14 +213,17 @@ impl RuTermApp {
         tab.forwards.clear();
         let (title, failed, active) = (tab.title.clone(), tab.failed, self.active_tab == Some(id));
         if active && !failed {
-            self.status =
-                SharedString::from(format!("会话已断开 {title}，按回车或点击「重新连接」恢复"));
+            self.status = tr!(
+                cx,
+                "会话已断开 {title}，按回车或点击「重新连接」恢复",
+                title = title
+            );
         }
         if had_forwards
             && let Some(dialog) = self.forward.as_mut().filter(|dialog| dialog.tab_id == id)
         {
             dialog.info = None;
-            dialog.error = Some("会话已断开，端口转发已全部停止".into());
+            dialog.error = Some(tr!(cx, "会话已断开，端口转发已全部停止"));
         }
         self.prune_multi_session_state();
         cx.notify();
@@ -232,7 +235,10 @@ impl RuTermApp {
         let live = self.live_tab_count();
         if self.sync_input && live < 2 {
             self.sync_input = false;
-            if self.status.as_ref().starts_with("同步输入") {
+            // 状态栏此刻显示的是同步输入提示（由 set_sync_input 记下的显式标记，
+            // 不靠文案前缀识别——译文前缀不同会漏覆盖）才覆盖，其它消息不动。
+            if self.sync_input_notice {
+                self.sync_input_notice = false;
                 self.status = "同步输入已关闭（可用会话不足两个）".into();
             }
         }
@@ -293,14 +299,17 @@ impl RuTermApp {
             && let Some(dialog) = self.forward.as_mut().filter(|dialog| dialog.tab_id == id)
         {
             dialog.info = None;
-            dialog.error = Some("连接已断开，端口转发已全部停止".into());
+            dialog.error = Some(tr!(cx, "连接已断开，端口转发已全部停止"));
         }
         if let Some((attempt, delay, view)) = schedule {
             if self.active_tab == Some(id) {
-                self.status = SharedString::from(format!(
-                    "连接中断，{} 秒后自动重连（第 {attempt} 次，共 {AUTO_RECONNECT_MAX} 次）",
-                    delay.as_secs()
-                ));
+                self.status = tr!(
+                    cx,
+                    "连接中断，{secs} 秒后自动重连（第 {attempt} 次，共 {max} 次）",
+                    secs = delay.as_secs(),
+                    attempt = attempt,
+                    max = AUTO_RECONNECT_MAX
+                );
             }
             self.schedule_auto_reconnect(id, view, attempt, delay, cx);
         }
@@ -350,7 +359,7 @@ impl RuTermApp {
             tab.auto_retry_attempt = AUTO_RECONNECT_MAX;
             cx.notify();
         }
-        self.status = "已取消自动重连，按回车或点击「重新连接」手动恢复".into();
+        self.status = tr!(cx, "已取消自动重连，按回车或点击「重新连接」手动恢复");
     }
 
     /// 手动重连一个已断开的标签（重置自动重连计数）。
@@ -397,7 +406,7 @@ impl RuTermApp {
                             .flatten();
                         let Ok(mut target) = self.host_target(host, password) else {
                             self.status =
-                                "内嵌私钥不可用（加密库未解锁或数据损坏），无法重连".into();
+                                tr!(cx, "内嵌私钥不可用（加密库未解锁或数据损坏），无法重连");
                             cx.notify();
                             return;
                         };
@@ -633,7 +642,7 @@ impl RuTermApp {
             self.forward = None;
         }
         if let Some(title) = title {
-            self.status = SharedString::from(format!("已断开 {title}"));
+            self.status = tr!(cx, "已断开 {title}", title = title);
         }
         if self.active_tab == Some(id) {
             // 优先激活关闭位置上的右邻（浏览器 / Windows Terminal 惯例），
@@ -676,7 +685,7 @@ impl RuTermApp {
             && view.second != id
         {
             self.view_split = None;
-            self.status = "已退出分屏".into();
+            self.status = tr!(cx, "已退出分屏");
         }
         self.active_tab = Some(id);
         // 边栏停留在文件页时切到尚未浏览过的新会话，顺手列出登录主目录。
@@ -752,7 +761,7 @@ impl RuTermApp {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.close_split("已取消分屏", cx);
+        self.close_split(&tr!(cx, "已取消分屏"), cx);
     }
 
     pub(super) fn close_split(&mut self, status: &str, cx: &mut Context<Self>) {
@@ -771,17 +780,17 @@ impl RuTermApp {
     ) {
         if let Some(view) = self.view_split.as_mut() {
             if view.direction == direction {
-                self.close_split("已取消分屏", cx);
+                self.close_split(&tr!(cx, "已取消分屏"), cx);
                 return;
             }
             view.direction = direction;
             let pane = view.pane.clone();
             pane.update(cx, |state, cx| state.set_direction(direction, cx));
-            self.status = SharedString::from(if direction == SplitDirection::Horizontal {
-                "已切换为左右分屏"
+            self.status = if direction == SplitDirection::Horizontal {
+                tr!(cx, "已切换为左右分屏")
             } else {
-                "已切换为上下分屏"
-            });
+                tr!(cx, "已切换为上下分屏")
+            };
             cx.notify();
             return;
         }
@@ -790,7 +799,7 @@ impl RuTermApp {
             .filter(|id| self.tabs.iter().any(|tab| tab.id == *id))
             .or_else(|| self.tabs.last().map(|tab| tab.id))
         else {
-            self.status = "没有可分屏的会话".into();
+            self.status = tr!(cx, "没有可分屏的会话");
             cx.notify();
             return;
         };
@@ -804,7 +813,7 @@ impl RuTermApp {
                 next.or_else(|| ix.checked_sub(1).map(|prev| self.tabs[prev].id))
             })
         else {
-            self.status = "分屏需要两个标签：先再开一个会话".into();
+            self.status = tr!(cx, "分屏需要两个标签：先再开一个会话");
             cx.notify();
             return;
         };
@@ -839,11 +848,11 @@ impl RuTermApp {
             pane,
         });
         self.activate_tab(active, window, cx);
-        self.status = SharedString::from(if direction == SplitDirection::Horizontal {
-            "已左右分屏（拖中间分隔条调宽度）"
+        self.status = if direction == SplitDirection::Horizontal {
+            tr!(cx, "已左右分屏（拖中间分隔条调宽度）")
         } else {
-            "已上下分屏（拖中间分隔条调高度）"
-        });
+            tr!(cx, "已上下分屏（拖中间分隔条调高度）")
+        };
         cx.notify();
     }
 
@@ -1108,9 +1117,9 @@ impl RuTermApp {
         };
         let status = view.read(cx).search_status(cx);
         let (hint, hint_color) = match status {
-            SearchStatus::Invalid => ("正则无效", pal.danger),
-            SearchStatus::NotFound => ("未找到", pal.muted),
-            _ => ("", pal.muted),
+            SearchStatus::Invalid => (tr!(cx, "正则无效"), pal.danger),
+            SearchStatus::NotFound => (tr!(cx, "未找到"), pal.muted),
+            _ => (SharedString::from(""), pal.muted),
         };
         let steppable = status == SearchStatus::Matched;
         let regex = self.find.regex;
@@ -1140,7 +1149,7 @@ impl RuTermApp {
                     .compact()
                     .ghost()
                     .tab_index(-1)
-                    .tooltip("上一个匹配（Shift+回车）")
+                    .tooltip(tr!(cx, "上一个匹配（Shift+回车）"))
                     .disabled(!steppable)
                     .on_click(cx.listener(|this, _, _, cx| this.step_find(true, cx))),
             )
@@ -1150,7 +1159,7 @@ impl RuTermApp {
                     .compact()
                     .ghost()
                     .tab_index(-1)
-                    .tooltip("下一个匹配（回车）")
+                    .tooltip(tr!(cx, "下一个匹配（回车）"))
                     .disabled(!steppable)
                     .on_click(cx.listener(|this, _, _, cx| this.step_find(false, cx))),
             )
@@ -1162,9 +1171,9 @@ impl RuTermApp {
                     .tab_index(-1)
                     .selected(regex)
                     .tooltip(if regex {
-                        "正则匹配（点击改为按字面量）"
+                        tr!(cx, "正则匹配（点击改为按字面量）")
                     } else {
-                        "按字面量匹配（点击启用正则）"
+                        tr!(cx, "按字面量匹配（点击启用正则）")
                     })
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.find.regex = !this.find.regex;
@@ -1178,7 +1187,7 @@ impl RuTermApp {
                     .compact()
                     .ghost()
                     .tab_index(-1)
-                    .tooltip("关闭查找（Esc）")
+                    .tooltip(tr!(cx, "关闭查找（Esc）"))
                     .on_click(cx.listener(|this, _, window, cx| this.do_close_find(window, cx))),
             )
             .into_any_element()

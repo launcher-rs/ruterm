@@ -505,7 +505,8 @@ impl RuTermApp {
         .detach();
     }
 
-    /// 导入：选一个 JSON 文件，整体追加进现有列表（同名不覆盖）。
+    /// 导入：选一个 JSON 文件，读盘交阻塞线程池；触发键重复跳过、总数超
+    /// 上限丢弃，读失败单独报错（不再与「没有可导入」混为一谈）。
     pub(super) fn import_macros(&mut self, cx: &mut Context<Self>) {
         let entity = cx.entity();
         let rx = cx.prompt_for_paths(rgpui::PathPromptOptions {
@@ -514,6 +515,7 @@ impl RuTermApp {
             multiple: false,
             prompt: Some(tr!(cx, "选择键宏 JSON 文件")),
         });
+        let runtime = rgpui::tokio::Tokio::handle(cx);
         cx.spawn(async move |_, cx| {
             let Ok(Ok(Some(paths))) = rx.await else {
                 return;
@@ -521,22 +523,49 @@ impl RuTermApp {
             let Some(path) = paths.into_iter().next() else {
                 return;
             };
-            let imported = std::fs::read_to_string(&path)
-                .map(|text| crate::macros::from_json(&text))
-                .unwrap_or_default();
-            let count = imported.len();
+            // 读盘交给阻塞线程池：网络盘 / 杀软实时扫描会让同步 read 卡住
+            // 整个 UI 线程（项目规范：阻塞 IO 必须显式交 tokio）。
+            let read = runtime
+                .spawn_blocking(move || {
+                    std::fs::read_to_string(&path).map_err(|error| error.to_string())
+                })
+                .await
+                .unwrap_or_else(|error| Err(error.to_string()));
             entity.update(cx, move |this, cx| {
+                let text = match read {
+                    Ok(text) => text,
+                    Err(error) => {
+                        this.status = crate::i18n::translate(
+                            cx,
+                            "读取键宏文件失败：{error}",
+                            &[("error", &error)],
+                        );
+                        cx.notify();
+                        return;
+                    }
+                };
+                let imported = crate::macros::from_json(&text);
                 if imported.is_empty() {
                     this.status = tr!(cx, "文件里没有可导入的键宏");
-                } else {
-                    this.macros.extend(imported);
-                    this.persist_macros(cx);
-                    this.status = crate::i18n::translate(
-                        cx,
-                        "已导入 {count} 条键宏",
-                        &[("count", &count.to_string())],
-                    );
+                    cx.notify();
+                    return;
                 }
+                let (merged, summary) =
+                    crate::macros::merge_imported(std::mem::take(&mut this.macros), imported);
+                this.macros = merged;
+                this.persist_macros(cx);
+                let accepted = summary.accepted.to_string();
+                let duplicates = summary.duplicates.to_string();
+                let over_limit = summary.over_limit.to_string();
+                this.status = crate::i18n::translate(
+                    cx,
+                    "已导入 {accepted} 条键宏（跳过重复 {duplicates}，超出上限 {over_limit}）",
+                    &[
+                        ("accepted", &accepted),
+                        ("duplicates", &duplicates),
+                        ("over_limit", &over_limit),
+                    ],
+                );
                 cx.notify();
             });
         })

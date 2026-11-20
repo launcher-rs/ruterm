@@ -178,34 +178,42 @@ fn is_flag(word: &str) -> bool {
 /// 写回终端的仍是片段里的原大小写。
 fn flag_options(items: &[CompletionItem], token: &str, segment: &[&str]) -> Vec<CompletionItem> {
     let needle = token.to_lowercase();
-    let mut found: Vec<(String, u32, String)> = Vec::new();
+    // (原文, 小写, 次数, 命令)。小写只算一次存下来：这里每个按键都跑一遍，
+    // 逐对比较各 to_lowercase() 是 O(n²) 次堆分配（CompletionItem 已为此
+    // 预计算过小写字段，同一原则）。
+    let mut found: Vec<(String, String, u32, String)> = Vec::new();
     for item in items {
         let words: Vec<&str> = item.command.split_whitespace().collect();
         let Some(aligned) = aligned_word_count(&item.command, segment) else {
             continue;
         };
         for word in &words[aligned..] {
-            if !is_flag(word) || !word.to_lowercase().starts_with(&needle) {
+            if !is_flag(word) {
+                continue;
+            }
+            let lower = word.to_lowercase();
+            if !lower.starts_with(&needle) {
                 continue;
             }
             match found
                 .iter_mut()
-                .find(|(flag, _, _)| flag.to_lowercase() == word.to_lowercase())
+                .find(|(flag, _, _, _)| flag.eq_ignore_ascii_case(word))
             {
-                Some((_, count, _)) => *count += 1,
-                None => found.push((word.to_string(), 1, item.command.clone())),
+                Some((_, _, count, _)) => *count += 1,
+                None => found.push((word.to_string(), lower, 1, item.command.clone())),
             }
         }
     }
-    found.sort_by(|(a_flag, a_count, _), (b_flag, b_count, _)| {
+    found.sort_by(|(a_flag, a_lower, a_count, _), (b_flag, b_lower, b_count, _)| {
         b_count
             .cmp(a_count)
-            .then_with(|| a_flag.to_lowercase().cmp(&b_flag.to_lowercase()))
+            .then_with(|| a_lower.cmp(b_lower))
+            .then_with(|| a_flag.cmp(b_flag))
     });
     found
         .into_iter()
         .take(MAX_MATCHES)
-        .map(|(flag, _, origin)| {
+        .map(|(flag, _, _, origin)| {
             CompletionItem::new(flag.clone(), flag, origin, CompletionKind::Flag)
         })
         .collect()

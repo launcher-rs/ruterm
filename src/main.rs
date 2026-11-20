@@ -138,6 +138,9 @@ fn main() {
         println!("RuTerm 已在运行（可能藏在系统托盘里），已把它的窗口带到前台。");
         return;
     }
+    // 守卫没建起来（锁端口被无关程序占着 / 绑定失败）：照常启动，
+    // 但要在地面应用的状态栏里说清楚这次不保证单实例。
+    let unprotected = matches!(claim, instance::Claim::Unprotected);
 
     let app = rgpui_platform::application();
     app.run(move |cx| {
@@ -250,6 +253,9 @@ fn main() {
             |window, cx| {
                 let quick = quick.clone();
                 let app = cx.new(|cx| RuTermApp::new(quick, window, cx));
+                if unprotected {
+                    app.update(cx, |app, cx| app.warn_unprotected(cx));
+                }
                 // 启用托盘时关闭按钮改为隐藏：窗口不销毁，会话后台保活；
                 // 返回 false 中断关闭，真正退出走托盘"退出"（cx.quit 直接投 WM_QUIT，不经此回调）。
                 // 未启用托盘则按普通窗口关闭，直接退出进程。

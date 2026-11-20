@@ -556,20 +556,24 @@ impl RuTermApp {
     pub(super) fn set_sync_input(&mut self, on: bool, cx: &mut Context<Self>) {
         let live = self.live_tab_count();
         if on && live < 2 {
-            self.status = "同步输入至少需要两个可用会话".into();
+            self.status = tr!(cx, "同步输入至少需要两个可用会话");
             cx.notify();
             return;
         }
         self.sync_input = on;
+        // 状态栏当前显示的是同步输入提示：会话数减少时 tabs.rs 的 prune
+        // 据此无歧义地覆盖本条消息（译文前缀不再可靠，不能靠前缀识别）。
+        self.sync_input_notice = on;
         self.status = if on {
             // 开启即警示：镜像在输入路径上，回显与否无关，sudo/口令提示符下
             // 敲的密码同样会被转发并回显到其它会话的屏幕上（可被历史收录）。
-            // 前缀须保持「同步输入」，tabs.rs 的 prune 靠它识别并覆盖本条消息。
-            SharedString::from(format!(
-                "同步输入：开（{live} 个会话）——所有按键都会原样转发到其它会话，密码输入也不例外，敲敏感信息前请先关闭"
-            ))
+            tr!(
+                cx,
+                "同步输入：开（{live} 个会话）——所有按键都会原样转发到其它会话，密码输入也不例外，敲敏感信息前请先关闭",
+                live = live
+            )
         } else {
-            "同步输入：关".into()
+            tr!(cx, "同步输入：关")
         };
         cx.notify();
     }

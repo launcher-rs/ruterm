@@ -450,10 +450,15 @@ pub fn key_message(keysym: u32, down: bool) -> Vec<u8> {
     bytes
 }
 
-/// ClientCutText：RFB 只传 Latin-1，非 Latin-1 字符以 `?` 占位。
+/// 出站剪贴板字符数上限：超大文本整块编码会占住 writer 单条写（最长 30 秒），
+/// 期间按键全部排队。入站有 MAX_CLIPBOARD_BYTES(4MB) 上限，出站收紧到 1M 字符。
+const CLIPBOARD_OUT_MAX_CHARS: usize = 1024 * 1024;
+
+/// ClientCutText：RFB 只传 Latin-1，非 Latin-1 字符以 `?` 占位；超长截断。
 pub fn clipboard_message(text: &str) -> Vec<u8> {
     let latin1: Vec<u8> = text
         .chars()
+        .take(CLIPBOARD_OUT_MAX_CHARS)
         .map(|ch| u8::try_from(ch).unwrap_or(b'?'))
         .collect();
     let mut bytes = Vec::with_capacity(8 + latin1.len());
