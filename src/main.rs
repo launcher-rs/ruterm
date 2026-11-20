@@ -132,15 +132,29 @@ fn main() {
     };
 
     // 单实例：关窗口只是隐藏到托盘，再双击 exe 会又起一个进程读写同一个加密库。
-    // 抢不到锁的这次启动负责把主实例的窗口带回前台，然后自己退出。
-    let claim = instance::claim();
+    // 守卫按「用户 + 数据目录」划界：便携模式不同文件夹各用各的数据、各起各的；
+    // 同一数据目录的重复启动（含藏进托盘后再双击）由抢不到锁的这次启动把主实例
+    // 的窗口带回前台，然后自己退出。
+    let mode = StorageMode::detect();
+    let claim = instance::claim(mode.dir());
     if let instance::Claim::Activated = claim {
         println!("RuTerm 已在运行（可能藏在系统托盘里），已把它的窗口带到前台。");
         return;
     }
-    // 守卫没建起来（锁端口被无关程序占着 / 绑定失败）：照常启动，
+    // 守卫没建起来（候选端口都被无关程序占着）：照常启动，
     // 但要在地面应用的状态栏里说清楚这次不保证单实例。
     let unprotected = matches!(claim, instance::Claim::Unprotected);
+    // 主实例侧的等敲门监听线程：抢完锁就起（建窗之前），快速连着的第二次
+    // 启动才不会敲不到人；线程只把事件投进通道，激活窗口回到应用主线程做。
+    let knock_rx = if let instance::Claim::Primary(listener) = claim {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        instance::spawn_knock_listener(listener, mode.dir(), move || {
+            let _ = tx.send(());
+        });
+        Some(rx)
+    } else {
+        None
+    };
 
     let app = rgpui_platform::application();
     app.run(move |cx| {
@@ -150,7 +164,7 @@ fn main() {
         rgpui::theme::init(cx);
         // theme::init 默认切到亮色；库内主题要等解锁后才能读到，这里先按
         // 非敏感 theme.txt 镜像起窗，避免解锁前后切换主题。
-        let store = SessionStore::new(&StorageMode::detect());
+        let store = SessionStore::new(&mode);
         let settings = store.load_settings();
         let dark = store.load_theme();
         // 托盘必须在建窗前决定：关闭时窗口直接退出，不留下后台进程。
@@ -279,17 +293,9 @@ fn main() {
         };
         cx.activate(true);
 
-        // 单实例锁的持有侧：后来的进程敲门 → 把主窗口带回前台。
-        // 收敲门必须跑在 tokio 线程池上（rgpui 的前台执行器没有 IO reactor），
-        // 因此用通道把事件递回主线程，再在应用上下文里激活窗口。
-        if let instance::Claim::Primary(listener) = claim {
-            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-            let knock_loop = rgpui::tokio::Tokio::spawn(
-                cx,
-                instance::serve(listener, move || {
-                    let _ = tx.send(());
-                }),
-            );
+        // 单实例锁的持有侧：后来的进程敲门核对成功 → 把主窗口带回前台。
+        // 监听线程早在抢锁后就起来了，这里只负责把通道事件落到窗口上。
+        if let Some(mut rx) = knock_rx {
             let handle = window_handle;
             cx.spawn(async move |cx| {
                 while rx.recv().await.is_some() {
@@ -297,8 +303,6 @@ fn main() {
                         .update(cx, |_, window, _| window.activate_window())
                         .ok();
                 }
-                // 守活 knock_loop：Task 被丢弃会连带取消 tokio 侧的监听。
-                drop(knock_loop.await);
             })
             .detach();
         }
