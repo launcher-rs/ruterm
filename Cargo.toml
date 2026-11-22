@@ -8,13 +8,9 @@ readme = "README.md"
 description = "Rust 远程连接工具，集成 SSH、本地终端、SFTP 与远程桌面"
 
 [dependencies]
-# 「拖选到视口边缘自动滚动」的修复只在 rgpui 源码里（rgpui-term 1.7.0 发布版没有），
-# 上游的日常改动都走 feat/diff，这里就跟着该分支取。rgpui 内部对 rgpui-platform /
-# rgpui-windows 等是 path 依赖，只换 rgpui-term 会出现两份 rgpui 类型，
-# 所以三个 crate 一起指到同一分支；上游发新版后再整体换回版本号。
-rgpui = { git = "https://github.com/launcher-rs/rgpui.git", branch = "feat/diff", features = ["tokio"] }
-rgpui-platform = { git = "https://github.com/launcher-rs/rgpui.git", branch = "feat/diff" }
-rgpui-term = { git = "https://github.com/launcher-rs/rgpui.git", branch = "feat/diff" }
+rgpui = { version = "1.8.1", features = ["tokio"] }
+rgpui-platform = "1.8.1"
+rgpui-term = "1.8.1"
 russh = { version = "0.64.1", default-features = false, features = ["flate2", "ring", "rsa"] }
 russh-sftp = "3.0.1"
 zmodem2 = "0.7.3"
