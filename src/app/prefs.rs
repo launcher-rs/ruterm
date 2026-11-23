@@ -325,10 +325,13 @@ pub struct TerminalPrefs {
     /// 向远端 shell 注入 OSC 7 目录上报（文件面板「跟随 / 定位」的来源）。
     #[serde(default = "shell_integration_default")]
     pub shell_integration: bool,
+    /// 标记用户已明确选择 shell 集成开关；旧配置里的默认开启值需要迁移为关闭。
+    #[serde(default)]
+    pub(super) shell_integration_configured: bool,
 }
 
 pub(super) fn shell_integration_default() -> bool {
-    true
+    false
 }
 
 pub(super) fn inline_completion_default() -> bool {
@@ -355,7 +358,8 @@ impl Default for TerminalPrefs {
             theme: TERMINAL_THEME_DEFAULT.to_string(),
             custom: TerminalColors::default(),
             inline_completion: true,
-            shell_integration: true,
+            shell_integration: false,
+            shell_integration_configured: true,
         }
     }
 }
@@ -396,6 +400,12 @@ impl TerminalPrefs {
             return Self::default();
         }
         let mut prefs: Self = serde_json::from_str(text).unwrap_or_default();
+        // 旧版默认开启会在连接后向交互 shell 注入并执行一条命令。旧配置没有
+        // 「用户明确选择」标记，因此一律迁移为关闭，避免升级后继续自动注入。
+        if !prefs.shell_integration_configured {
+            prefs.shell_integration = false;
+            prefs.shell_integration_configured = true;
+        }
         prefs.clamp();
         prefs
     }
@@ -1487,12 +1497,23 @@ mod tests {
         assert_eq!(restored.custom, prefs.custom);
         assert!(!restored.inline_completion);
         assert!(!restored.shell_integration);
-        // 旧版 JSON 没有 custom / inline_completion / shell_integration：补默认值
-        // （One Dark、自动补全与目录上报都开启）。
+        // 老配置的 shell_integration=true 是旧版默认值，不代表用户明确选择，
+        // 迁移时必须关掉；新版默认也关闭，只有用户在设置里明确勾选才启用。
         let legacy = TerminalPrefs::from_json(r#"{"font_size":16.0}"#);
         assert_eq!(legacy.custom, TerminalColors::default());
         assert!(legacy.inline_completion);
-        assert!(legacy.shell_integration);
+        assert!(!legacy.shell_integration);
+        assert!(legacy.shell_integration_configured);
+
+        // 旧版序列化会保存默认 true，迁移也必须关闭它。
+        let old_default = TerminalPrefs::from_json(r#"{"shell_integration":true}"#);
+        assert!(!old_default.shell_integration);
+
+        // 新版明确选择会保留。
+        let mut opted_in = TerminalPrefs::default();
+        opted_in.shell_integration = true;
+        opted_in.shell_integration_configured = true;
+        assert!(TerminalPrefs::from_json(&opted_in.to_json()).shell_integration);
     }
 
     #[test]

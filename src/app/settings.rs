@@ -636,7 +636,7 @@ impl RuTermApp {
                 div()
                     .text_xs()
                     .text_color(pal.muted)
-                    .child(tr!(cx, "连上 bash / zsh 会话时追加一条提示符钩子，用 OSC 7 上报 $PWD；文件面板的「定位 / 跟随」据此跳到终端所在目录。关掉或换成别的 shell 时，仍按命令行里的 cd 猜测目录。改动只对之后建立的会话生效。")),
+                    .child(tr!(cx, "默认关闭。启用后，连接 bash / zsh 时会向远端 shell 输入一条提示符钩子命令，用 OSC 7 上报 $PWD；文件面板的「定位 / 跟随」据此跳到终端所在目录。关掉或换成别的 shell 时，仍按命令行里的 cd 猜测目录。改动只对之后建立的会话生效。")),
             )
             .child(self.render_local_shell_row(pal, cx))
             .child(

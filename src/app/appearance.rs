@@ -176,6 +176,7 @@ impl RuTermApp {
     pub(super) fn set_shell_integration(&mut self, enabled: bool, cx: &mut Context<Self>) {
         let mut prefs = self.terminal.clone();
         prefs.shell_integration = enabled;
+        prefs.shell_integration_configured = true;
         self.set_terminal_prefs(prefs, cx);
     }
 
