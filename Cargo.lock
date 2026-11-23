@@ -1459,7 +1459,7 @@ checksum = "af491d569909a7e4dee0ad7db7f5341fef5c614d5b8ec8cf765732aba3cff681"
 dependencies = [
  "serde",
  "termcolor",
- "unicode-width 0.2.2",
+ "unicode-width 0.1.14",
 ]
 
 [[package]]
@@ -2926,8 +2926,8 @@ dependencies = [
  "libc",
  "log",
  "rustversion",
- "windows-link 0.2.1",
- "windows-result 0.4.1",
+ "windows-link 0.1.3",
+ "windows-result 0.3.4",
 ]
 
 [[package]]
@@ -6923,8 +6923,6 @@ dependencies = [
 [[package]]
 name = "rgpui-term"
 version = "1.8.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d64cc0ff732e45817f9f1c10a5cbfcb0f0822a2b4514ceb3b37f4c96039eafef"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -9369,7 +9367,7 @@ version = "2.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "86a801b3cea342a06d468c8710662aa29e5e05e4f5c0d62f00bbb7f2ad7941c2"
 dependencies = [
- "rand 0.10.4",
+ "rand 0.9.5",
 ]
 
 [[package]]

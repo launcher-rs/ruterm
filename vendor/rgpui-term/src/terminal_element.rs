@@ -1,0 +1,2467 @@
+//! 终端元素，用于在 rgpui 中渲染终端内容。
+//!
+//! 本模块提供 `TerminalElement` 结构体，实现 rgpui 的 `Element` trait
+//! 以渲染终端内容。处理以下功能：
+//! - 批量处理相邻相同样式的单元格以提高渲染效率
+//! - 颜色转换：从 Alacritty 的颜色格式转换为 rgpui 的 Hsla
+//! - 单元格标志处理（粗体、斜体、下划线、删除线、暗淡）
+//! - 光标渲染，支持块状、条状和下划线形状
+//!
+//! # 架构
+//!
+//! 渲染管道包含三个阶段：
+//! 1. `request_layout` - 返回布局 ID 和请求的尺寸
+//! 2. `prepaint` - 计算布局状态：批量文本运行、背景矩形、光标
+//! 3. `paint` - 渲染背景、文本运行和光标
+//!
+//! # 示例
+//!
+//! ```ignore
+//! let element = TerminalElement::new(terminal_entity, focus_handle, true, true, TextStyle::default());
+//! ```
+
+use std::mem;
+
+use alacritty_terminal::{
+    index::Point as AlacPoint,
+    selection::SelectionRange,
+    term::{TermMode, cell::Flags},
+    vte::ansi::{Color as AnsiColor, CursorShape as AlacCursorShape, NamedColor},
+};
+use itertools::Itertools;
+use rgpui::{
+    AbsoluteLength, App, Bounds, ContentMask, DispatchPhase, Element, ElementId, Entity,
+    FocusHandle, Font, FontStyle, FontWeight, GlobalElementId, Hitbox, Hsla, InputHandler,
+    IntoElement, LayoutId, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Point, Rgba,
+    ShapedLine, StrikethroughStyle, TextRun, UTF16Selection, UnderlineStyle, Window, fill, point,
+    px, size,
+};
+
+use crate::{
+    IndexedCell, Terminal, TerminalBounds, TerminalConfig, TerminalContent, TerminalTheme,
+};
+
+const SCROLLBAR_WIDTH: f32 = 8.0;
+const SCROLLBAR_THUMB_MIN_HEIGHT: f32 = 20.0;
+
+/// Layout state computed during prepaint, used for painting.
+pub struct LayoutState {
+    _hitbox: Hitbox,
+    batched_text_runs: Vec<BatchedTextRun>,
+    background_rects: Vec<LayoutRect>,
+    block_fragments: Vec<BlockFragment>,
+    polygon_fragments: Vec<PolygonFragment>,
+    selection_rects: Vec<LayoutRect>,
+    /// 搜索匹配高亮矩形（画在 selection 之下）
+    search_rects: Vec<LayoutRect>,
+    cursor: Option<CursorLayout>,
+    /// IME 组合预览：已排版好的文本 + 相对元素原点的位置（画在光标处）
+    composition: Option<(ShapedLine, Point<Pixels>)>,
+    background_color: Hsla,
+    foreground_color: Hsla,
+    dimensions: TerminalBounds,
+    _mode: TermMode,
+    history_size: usize,
+    display_offset: usize,
+    /// 拖动滚动条时不足一行的平滑偏移；paint 时把网格整体下移该值。
+    subline_offset: Pixels,
+}
+
+/// Helper for converting Alacritty cursor points to display coordinates.
+struct DisplayCursor {
+    line: i32,
+    col: usize,
+}
+
+impl DisplayCursor {
+    fn from(cursor_point: AlacPoint, display_offset: usize) -> Self {
+        Self {
+            line: cursor_point.line.0 + display_offset as i32,
+            col: cursor_point.column.0,
+        }
+    }
+
+    fn line(&self) -> i32 {
+        self.line
+    }
+
+    fn col(&self) -> usize {
+        self.col
+    }
+}
+
+/// 批处理的文本运行，合并具有相同样式的相邻单元格。
+///
+/// 通过将共享相同字体、颜色和装饰属性的多个字符合并为单个文本形状，
+/// 减少绘制调用次数。
+#[derive(Debug)]
+pub struct BatchedTextRun {
+    /// 起始位置
+    pub start_point: AlacPoint<i32, i32>,
+    /// 文本内容
+    pub text: String,
+    /// 单元格数量
+    pub cell_count: usize,
+    /// 文本样式
+    pub style: TextRun,
+    /// 字体大小
+    pub font_size: AbsoluteLength,
+}
+
+impl BatchedTextRun {
+    fn new_from_char(
+        start_point: AlacPoint<i32, i32>,
+        c: char,
+        style: TextRun,
+        font_size: AbsoluteLength,
+    ) -> Self {
+        // Pre-allocate capacity for typical terminal line runs
+        let mut text = String::with_capacity(128);
+        text.push(c);
+        BatchedTextRun {
+            start_point,
+            text,
+            cell_count: 1,
+            style,
+            font_size,
+        }
+    }
+
+    fn can_append(&self, other_style: &TextRun) -> bool {
+        self.style.font == other_style.font
+            && self.style.color == other_style.color
+            && self.style.background_color == other_style.background_color
+            && self.style.underline == other_style.underline
+            && self.style.strikethrough == other_style.strikethrough
+    }
+
+    fn append_char(&mut self, c: char) {
+        self.append_char_internal(c, true);
+    }
+
+    fn append_zero_width_chars(&mut self, chars: &[char]) {
+        for &c in chars {
+            self.append_char_internal(c, false);
+        }
+    }
+
+    fn append_char_internal(&mut self, c: char, counts_cell: bool) {
+        self.text.push(c);
+        if counts_cell {
+            self.cell_count += 1;
+        }
+        self.style.len += c.len_utf8();
+    }
+
+    fn paint(
+        &self,
+        origin: Point<Pixels>,
+        dimensions: &TerminalBounds,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        // Pixel-snap text position to avoid subpixel rendering blur on Windows
+        let pos = Point::new(
+            (origin.x + self.start_point.column as f32 * dimensions.cell_width).round(),
+            (origin.y + self.start_point.line as f32 * dimensions.line_height).round(),
+        );
+
+        let _ = window
+            .text_system()
+            .shape_line(
+                self.text.clone().into(),
+                self.font_size.to_pixels(window.rem_size()),
+                std::slice::from_ref(&self.style),
+                Some(dimensions.cell_width),
+            )
+            .paint(
+                pos,
+                dimensions.line_height,
+                rgpui::TextAlign::Left,
+                None,
+                window,
+                cx,
+            );
+    }
+}
+
+/// 具有非默认背景颜色的单元格的背景矩形。
+#[derive(Clone, Debug, Default)]
+pub struct LayoutRect {
+    point: AlacPoint<i32, i32>,
+    num_of_cells: usize,
+    color: Hsla,
+}
+
+impl LayoutRect {
+    fn new(point: AlacPoint<i32, i32>, num_of_cells: usize, color: Hsla) -> LayoutRect {
+        LayoutRect {
+            point,
+            num_of_cells,
+            color,
+        }
+    }
+
+    fn paint(&self, origin: Point<Pixels>, dimensions: &TerminalBounds, window: &mut Window) {
+        let position = {
+            let alac_point = self.point;
+            point(
+                (origin.x + alac_point.column as f32 * dimensions.cell_width).floor(),
+                (origin.y + alac_point.line as f32 * dimensions.line_height).floor(),
+            )
+        };
+        let rect_size = point(
+            (dimensions.cell_width * self.num_of_cells as f32).ceil(),
+            dimensions.line_height,
+        )
+        .into();
+
+        window.paint_quad(fill(Bounds::new(position, rect_size), self.color));
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BlockRect {
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BlockFragment {
+    point: AlacPoint<i32, i32>,
+    rect: BlockRect,
+    color: Hsla,
+}
+
+impl BlockFragment {
+    fn paint(&self, origin: Point<Pixels>, dimensions: &TerminalBounds, window: &mut Window) {
+        let cell_origin = point(
+            (origin.x + self.point.column as f32 * dimensions.cell_width).floor(),
+            (origin.y + self.point.line as f32 * dimensions.line_height).floor(),
+        );
+        let position = point(
+            (cell_origin.x + self.rect.x * dimensions.cell_width).round(),
+            (cell_origin.y + self.rect.y * dimensions.line_height).round(),
+        );
+        let rect_size = size(
+            (dimensions.cell_width * self.rect.width).ceil(),
+            (dimensions.line_height * self.rect.height).ceil(),
+        );
+        window.paint_quad(fill(Bounds::new(position, rect_size), self.color));
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BlockPoint {
+    x: f32,
+    y: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PolygonFragment {
+    point: AlacPoint<i32, i32>,
+    points: [BlockPoint; 3],
+    color: Hsla,
+}
+
+impl PolygonFragment {
+    fn paint(&self, origin: Point<Pixels>, dimensions: &TerminalBounds, window: &mut Window) {
+        let cell_origin = point(
+            (origin.x + self.point.column as f32 * dimensions.cell_width).floor(),
+            (origin.y + self.point.line as f32 * dimensions.line_height).floor(),
+        );
+        let to_point = |p: BlockPoint| {
+            point(
+                (cell_origin.x + p.x * dimensions.cell_width).round(),
+                (cell_origin.y + p.y * dimensions.line_height).round(),
+            )
+        };
+
+        let mut builder = PathBuilder::fill();
+        builder.move_to(to_point(self.points[0]));
+        builder.line_to(to_point(self.points[1]));
+        builder.line_to(to_point(self.points[2]));
+        builder.close();
+
+        if let Ok(path) = builder.build() {
+            window.paint_path(path, self.color);
+        }
+    }
+}
+
+/// 光标渲染信息。
+pub struct CursorLayout {
+    origin: Point<Pixels>,
+    block_width: Pixels,
+    line_height: Pixels,
+    color: Hsla,
+    shape: CursorShape,
+    text: Option<ShapedLine>,
+}
+
+/// 支持的光标形状。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorShape {
+    /// 块状光标
+    Block,
+    /// 空心光标
+    Hollow,
+    /// 条状光标
+    Bar,
+    /// 下划线光标
+    Underline,
+}
+
+impl CursorLayout {
+    fn new(
+        origin: Point<Pixels>,
+        block_width: Pixels,
+        line_height: Pixels,
+        color: Hsla,
+        shape: CursorShape,
+        text: Option<ShapedLine>,
+    ) -> Self {
+        CursorLayout {
+            origin,
+            block_width,
+            line_height,
+            color,
+            shape,
+            text,
+        }
+    }
+
+    fn bounds(&self, origin: Point<Pixels>) -> Bounds<Pixels> {
+        Bounds::new(
+            origin + self.origin,
+            size(self.block_width, self.line_height),
+        )
+    }
+
+    fn paint(&self, origin: Point<Pixels>, window: &mut Window, cx: &mut App) {
+        let bounds = self.bounds(origin);
+
+        match self.shape {
+            CursorShape::Block => {
+                window.paint_quad(fill(bounds, self.color));
+                if let Some(text) = &self.text {
+                    let _ = text.paint(
+                        bounds.origin,
+                        self.line_height,
+                        rgpui::TextAlign::Left,
+                        None,
+                        window,
+                        cx,
+                    );
+                }
+            }
+            CursorShape::Hollow => {
+                window.paint_quad(rgpui::outline(
+                    bounds,
+                    self.color,
+                    rgpui::BorderStyle::Solid,
+                ));
+            }
+            CursorShape::Bar => {
+                let bar_bounds = Bounds::new(bounds.origin, size(px(2.0), bounds.size.height));
+                window.paint_quad(fill(bar_bounds, self.color));
+            }
+            CursorShape::Underline => {
+                let underline_bounds = Bounds::new(
+                    point(
+                        bounds.origin.x,
+                        bounds.origin.y + bounds.size.height - px(2.0),
+                    ),
+                    size(bounds.size.width, px(2.0)),
+                );
+                window.paint_quad(fill(underline_bounds, self.color));
+            }
+        }
+    }
+}
+
+/// 用于背景合并优化的矩形区域。
+#[derive(Debug, Clone)]
+struct BackgroundRegion {
+    start_line: i32,
+    start_col: i32,
+    end_line: i32,
+    end_col: i32,
+    color: Hsla,
+}
+
+impl BackgroundRegion {
+    fn new(line: i32, col: i32, color: Hsla) -> Self {
+        BackgroundRegion {
+            start_line: line,
+            start_col: col,
+            end_line: line,
+            end_col: col,
+            color,
+        }
+    }
+}
+
+/// 合并相邻行的同色背景矩形。
+///
+/// 输入由 `layout_grid` 按行生成、行内已是最大同色横向区间，因此只需把
+/// 「上一行同列跨度、同颜色」的矩形向下延伸即可，一趟线性扫描完成。
+/// 旧实现对所有矩形两两比较并反复扫描到不动点：相邻单元格背景色交错
+/// （如逐格高亮的 TUI）时是 O(n²)，实测 200×60 全屏需 242 ms，会直接掉帧。
+fn merge_background_regions(regions: Vec<BackgroundRegion>) -> Vec<BackgroundRegion> {
+    // 颜色分量按位取键：与 `Hsla` 的字段相等语义一致，且可哈希。
+    let color_key = |color: Hsla| {
+        (
+            color.h.to_bits(),
+            color.s.to_bits(),
+            color.l.to_bits(),
+            color.a.to_bits(),
+        )
+    };
+
+    let mut merged: Vec<BackgroundRegion> = Vec::with_capacity(regions.len());
+    type SpanKey = (i32, i32, (u32, u32, u32, u32));
+    // 上一行的「列跨度 + 颜色」→ 合并结果下标；每换一行滚动一次。
+    let mut previous: std::collections::HashMap<SpanKey, usize> = std::collections::HashMap::new();
+    let mut current: std::collections::HashMap<SpanKey, usize> = std::collections::HashMap::new();
+    let mut current_line = i32::MIN;
+
+    for region in regions {
+        if region.start_line != current_line {
+            previous = std::mem::take(&mut current);
+            current_line = region.start_line;
+        }
+
+        let key = (region.start_col, region.end_col, color_key(region.color));
+        if let Some(&index) = previous.get(&key)
+            && merged[index].end_line + 1 == region.start_line
+        {
+            merged[index].end_line = region.start_line;
+            current.insert(key, index);
+            continue;
+        }
+
+        current.insert(key, merged.len());
+        merged.push(region);
+    }
+
+    merged
+}
+
+/// 用于渲染终端内容的 rgpui 元素。
+///
+/// 实现三阶段渲染管道：
+/// 1. `request_layout` - 向布局系统请求空间
+/// 2. `prepaint` - 计算批量文本运行、背景矩形和光标
+/// 3. `paint` - 渲染所有计算出的元素
+pub struct TerminalElement {
+    terminal: Entity<Terminal>,
+    focus: FocusHandle,
+    focused: bool,
+    cursor_visible: bool,
+    show_scrollbar: bool,
+    cached_font_family: Option<rgpui::SharedString>,
+    text_style: TextStyle,
+}
+
+impl TerminalElement {
+    /// 创建新的终端元素。
+    ///
+    /// # 参数
+    ///
+    /// * `terminal` - 要渲染的终端实体
+    /// * `focus` - 键盘输入的焦点句柄
+    /// * `focused` - 终端当前是否获得焦点
+    /// * `cursor_visible` - 光标是否可见（用于闪烁）
+    pub fn new(
+        terminal: Entity<Terminal>,
+        focus: FocusHandle,
+        focused: bool,
+        cursor_visible: bool,
+        text_style: TextStyle,
+        show_scrollbar: bool,
+    ) -> Self {
+        TerminalElement {
+            terminal,
+            focus,
+            focused,
+            cursor_visible,
+            show_scrollbar,
+            cached_font_family: None,
+            text_style,
+        }
+    }
+
+    /// 布局单元格网格，生成批量文本运行和背景矩形。
+    ///
+    /// 传入的 `grid` 来自 `renderable_content().display_iter`，本身就已经按视口
+    /// 裁剪（只有可见的 `rows × cols` 个单元格），因此这里不需要再做二次裁剪；
+    /// 早先预留的 `viewport_lines` 参数若真启用反而会把行号算错，已删除。
+    ///
+    /// 迭代器借用单元格而不复制：整屏网格每帧都会被布局，逐格克隆
+    /// `Cell`（含可选 `Arc` 扩展数据）是纯浪费。
+    ///
+    /// `display_offset` 用于把 alacritty 的回滚坐标归零：`point.line` 以回滚
+    /// 缓冲为基准，回滚时首行是 `-display_offset`，直接当绘制行号会让整屏上移、
+    /// 底部留空。
+    fn layout_grid<'a>(
+        grid: impl Iterator<Item = &'a IndexedCell>,
+        text_style: &TextStyle,
+        display_offset: usize,
+    ) -> (
+        Vec<LayoutRect>,
+        Vec<BlockFragment>,
+        Vec<PolygonFragment>,
+        Vec<BatchedTextRun>,
+    ) {
+        let estimated_cells = grid.size_hint().0;
+        // Improved capacity estimates based on typical terminal usage
+        // Most runs are 3-5 characters, so cells/4 is a good estimate
+        let estimated_runs = (estimated_cells / 4).max(50);
+        // Background regions are less common, typically 5-10% of cells
+        let estimated_regions = (estimated_cells / 15).max(20);
+
+        let mut batched_runs = Vec::with_capacity(estimated_runs);
+        let mut background_regions: Vec<BackgroundRegion> = Vec::with_capacity(estimated_regions);
+        let mut block_fragments: Vec<BlockFragment> = Vec::with_capacity(estimated_regions);
+        let mut polygon_fragments: Vec<PolygonFragment> = Vec::with_capacity(estimated_regions);
+        let mut current_batch: Option<BatchedTextRun> = None;
+
+        let linegroups = grid.chunk_by(|cell| cell.point.line.0 + display_offset as i32);
+        for (alac_line, line) in linegroups.into_iter() {
+            if let Some(batch) = current_batch.take() {
+                batched_runs.push(batch);
+            }
+
+            let mut previous_cell_had_extras = false;
+
+            for cell in line {
+                let mut fg = cell.fg;
+                let mut bg = cell.bg;
+                if cell.flags.contains(Flags::INVERSE) {
+                    mem::swap(&mut fg, &mut bg);
+                }
+
+                // 常见情况：默认底色、无装饰的空格。它不产生背景矩形、不可能是
+                // 制表/方块字符，也不会进入文本运行 —— 省掉颜色解析与三次形状匹配。
+                // 典型 shell 输出（约六分之五为空格）实测整屏布局快 17%。
+                if cell.c == ' '
+                    && cell.bg == AnsiColor::Named(NamedColor::Background)
+                    && !cell
+                        .flags
+                        .intersects(Flags::INVERSE | Flags::ALL_UNDERLINES | Flags::STRIKEOUT)
+                    && cell.zerowidth().is_none_or(|chars| chars.is_empty())
+                {
+                    previous_cell_had_extras = false;
+                    continue;
+                }
+
+                let fg_color = cell_fg_color(cell, fg, &text_style.theme);
+                let bg_color = text_style.theme.resolve_color(&bg);
+                if !matches!(bg, AnsiColor::Named(NamedColor::Background))
+                    && !(is_block_element_char(cell.c) && bg_color == fg_color)
+                {
+                    let color = bg_color;
+                    let col = cell.point.column.0 as i32;
+
+                    if let Some(last_region) = background_regions.last_mut() {
+                        if last_region.color == color
+                            && last_region.start_line == alac_line
+                            && last_region.end_line == alac_line
+                            && last_region.end_col + 1 == col
+                        {
+                            last_region.end_col = col;
+                        } else {
+                            background_regions.push(BackgroundRegion::new(alac_line, col, color));
+                        }
+                    } else {
+                        background_regions.push(BackgroundRegion::new(alac_line, col, color));
+                    }
+                }
+
+                if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                    continue;
+                }
+
+                if cell.c == ' ' && previous_cell_had_extras {
+                    previous_cell_had_extras = false;
+                    continue;
+                }
+                previous_cell_had_extras =
+                    matches!(cell.zerowidth(), Some(chars) if !chars.is_empty());
+
+                let cell_point = AlacPoint::new(alac_line, cell.point.column.0 as i32);
+                if push_powerline_fragments(
+                    &mut block_fragments,
+                    &mut polygon_fragments,
+                    cell_point,
+                    fg_color,
+                    cell.c,
+                ) {
+                    continue;
+                }
+
+                if push_box_fragments(&mut block_fragments, cell_point, fg_color, cell.c) {
+                    continue;
+                }
+
+                if push_block_fragments(&mut block_fragments, cell_point, fg_color, cell.c) {
+                    continue;
+                }
+
+                if !is_blank(cell) {
+                    let cell_style = Self::cell_style(cell, fg, text_style);
+                    let zero_width_chars = cell.zerowidth();
+
+                    if let Some(ref mut batch) = current_batch {
+                        if batch.can_append(&cell_style)
+                            && batch.start_point.line == cell_point.line
+                            && batch.start_point.column + batch.cell_count as i32
+                                == cell_point.column
+                        {
+                            batch.append_char(cell.c);
+                            if let Some(chars) = zero_width_chars {
+                                batch.append_zero_width_chars(chars);
+                            }
+                        } else {
+                            // 外层 `if let Some(ref mut batch)` 已证明此处必然是 Some，
+                            // take() 只是把它从 current_batch 里摘出来落盘。
+                            if let Some(old_batch) = current_batch.take() {
+                                batched_runs.push(old_batch);
+                            }
+                            let mut new_batch = BatchedTextRun::new_from_char(
+                                cell_point,
+                                cell.c,
+                                cell_style,
+                                text_style.font_size,
+                            );
+                            if let Some(chars) = zero_width_chars {
+                                new_batch.append_zero_width_chars(chars);
+                            }
+                            current_batch = Some(new_batch);
+                        }
+                    } else {
+                        let mut new_batch = BatchedTextRun::new_from_char(
+                            cell_point,
+                            cell.c,
+                            cell_style,
+                            text_style.font_size,
+                        );
+                        if let Some(chars) = zero_width_chars {
+                            new_batch.append_zero_width_chars(chars);
+                        }
+                        current_batch = Some(new_batch);
+                    }
+                }
+            }
+        }
+
+        if let Some(batch) = current_batch {
+            batched_runs.push(batch);
+        }
+
+        let merged_regions = merge_background_regions(background_regions);
+        let mut rects = Vec::with_capacity(merged_regions.len() * 2);
+
+        for region in merged_regions {
+            for line in region.start_line..=region.end_line {
+                rects.push(LayoutRect::new(
+                    AlacPoint::new(line, region.start_col),
+                    (region.end_col - region.start_col + 1) as usize,
+                    region.color,
+                ));
+            }
+        }
+
+        (rects, block_fragments, polygon_fragments, batched_runs)
+    }
+
+    /// 计算光标位置和尺寸。
+    fn shape_cursor(
+        cursor_point: DisplayCursor,
+        size: TerminalBounds,
+        text_fragment: &ShapedLine,
+    ) -> Option<(Point<Pixels>, Pixels)> {
+        if cursor_point.line() < size.num_lines() as i32 {
+            let cursor_width = if text_fragment.width == Pixels::ZERO {
+                size.cell_width
+            } else {
+                text_fragment.width
+            };
+
+            Some((
+                point(
+                    (cursor_point.col() as f32 * size.cell_width).floor(),
+                    (cursor_point.line() as f32 * size.line_height).floor(),
+                ),
+                cursor_width.ceil(),
+            ))
+        } else {
+            None
+        }
+    }
+
+    /// 将 Alacritty 单元格样式转换为 rgpui TextRun。
+    fn cell_style(indexed: &IndexedCell, fg: AnsiColor, text_style: &TextStyle) -> TextRun {
+        let flags = indexed.cell.flags;
+        let mut fg_color = text_style.theme.resolve_color(&fg);
+
+        if flags.intersects(Flags::DIM) {
+            fg_color.a *= 0.7;
+        }
+
+        // OSC 8 超链接：文字用主题蓝、强制下划线，色调优先于 DIM/BOLD 视觉。
+        let hyperlink_uri = indexed.cell.hyperlink();
+        let link_color = text_style.theme.ansi[4];
+
+        let underline = if hyperlink_uri.is_some() {
+            Some(UnderlineStyle {
+                color: Some(link_color),
+                thickness: Pixels::from(1.0),
+                wavy: false,
+            })
+        } else {
+            flags
+                .intersects(Flags::ALL_UNDERLINES)
+                .then(|| UnderlineStyle {
+                    color: Some(fg_color),
+                    thickness: Pixels::from(1.0),
+                    wavy: flags.contains(Flags::UNDERCURL),
+                })
+        };
+
+        let strikethrough = flags
+            .intersects(Flags::STRIKEOUT)
+            .then(|| StrikethroughStyle {
+                color: Some(fg_color),
+                thickness: Pixels::from(1.0),
+            });
+
+        let weight = if flags.intersects(Flags::BOLD) {
+            FontWeight::BOLD
+        } else {
+            text_style.font_weight
+        };
+
+        let style = if flags.intersects(Flags::ITALIC) {
+            FontStyle::Italic
+        } else {
+            FontStyle::Normal
+        };
+
+        TextRun {
+            len: indexed.c.len_utf8(),
+            color: if hyperlink_uri.is_some() {
+                link_color
+            } else {
+                fg_color
+            },
+            background_color: None,
+            font: Font {
+                weight,
+                style,
+                ..text_style.font.clone()
+            },
+            underline,
+            strikethrough,
+        }
+    }
+}
+
+/// 终端渲染的文本样式配置。
+#[derive(Clone)]
+pub struct TextStyle {
+    /// 字体
+    pub font: Font,
+    /// 字体大小
+    pub font_size: AbsoluteLength,
+    /// 字体粗细
+    pub font_weight: FontWeight,
+    /// 前景色
+    pub foreground: Hsla,
+    /// 背景色
+    pub background: Hsla,
+    /// 行高倍数
+    pub line_height_multiplier: f32,
+    /// 字母间距
+    pub letter_spacing: f32,
+    /// 终端主题
+    pub theme: TerminalTheme,
+}
+
+impl Default for TextStyle {
+    fn default() -> Self {
+        let theme = TerminalTheme::default();
+        TextStyle {
+            font: Font {
+                family: "FiraCode Nerd Font".into(),
+                features: rgpui::FontFeatures::default(),
+                fallbacks: None, // Allow platform font fallback for missing glyphs.
+                weight: FontWeight::NORMAL,
+                style: FontStyle::Normal,
+            },
+            font_size: AbsoluteLength::Pixels(px(14.0)),
+            font_weight: FontWeight::NORMAL,
+            foreground: theme.foreground,
+            // Semi-transparent background so the parent can decide the window fill.
+            background: theme.background,
+            line_height_multiplier: 1.2, // Optimized for better readability
+            letter_spacing: 0.0,
+            theme,
+        }
+    }
+}
+
+impl TextStyle {
+    pub fn from_config(config: &TerminalConfig) -> Self {
+        let theme = config.theme.to_theme();
+        let font_size = config.font_size.max(1.0);
+        let line_height = config.line_height.max(0.5);
+        TextStyle {
+            font: Font {
+                family: config.font_family.clone().into(),
+                features: rgpui::FontFeatures::default(),
+                fallbacks: None,
+                weight: FontWeight::NORMAL,
+                style: FontStyle::Normal,
+            },
+            font_size: AbsoluteLength::Pixels(px(font_size)),
+            font_weight: FontWeight::NORMAL,
+            foreground: theme.foreground,
+            background: theme.background,
+            line_height_multiplier: line_height,
+            letter_spacing: config.letter_spacing,
+            theme,
+        }
+    }
+}
+
+const MONO_FONT_FAMILIES: &[&str] = &[
+    "FiraCode Nerd Font",
+    "FiraCode Nerd Font Mono",
+    "Fira Code",
+    "JetBrains Mono",
+    "SF Mono",
+    "Menlo",
+    "Monaco",
+    "Cascadia Mono",
+    "Noto Sans Mono",
+    "DejaVu Sans Mono",
+];
+
+fn selection_color(theme: &TerminalTheme) -> Hsla {
+    theme.selection
+}
+
+/// 搜索高亮色：从 selection 色派生（同一色相、更低透明度），避免为每个
+/// 预设主题单独补字段。
+fn search_match_color(theme: &TerminalTheme) -> Hsla {
+    Hsla {
+        a: 0.30,
+        ..theme.selection
+    }
+}
+
+fn is_block_element_char(ch: char) -> bool {
+    ('\u{2580}'..='\u{259F}').contains(&ch)
+}
+
+fn is_monospace_font(
+    text_system: &rgpui::WindowTextSystem,
+    font: &Font,
+    font_size: Pixels,
+) -> bool {
+    let font_id = text_system.resolve_font(font);
+    let mut widths = Vec::new();
+
+    for ch in ['i', 'm', 'W', '0', ' '] {
+        if let Ok(advance) = text_system.advance(font_id, font_size, ch) {
+            widths.push(f32::from(advance.width));
+        }
+    }
+
+    if widths.is_empty() {
+        return false;
+    }
+
+    let mut min_width = widths[0];
+    let mut max_width = widths[0];
+
+    for width in widths.iter().skip(1) {
+        min_width = min_width.min(*width);
+        max_width = max_width.max(*width);
+    }
+
+    (max_width - min_width) <= 0.5
+}
+
+fn select_font_family(
+    text_system: &rgpui::WindowTextSystem,
+    base_font: &Font,
+    font_size: Pixels,
+) -> rgpui::SharedString {
+    let available = text_system.all_font_names();
+    let mut candidates: Vec<String> = Vec::new();
+    let base_family = base_font.family.as_ref();
+
+    if available.iter().any(|name| name == base_family) {
+        candidates.push(base_family.to_string());
+    }
+
+    for &family in MONO_FONT_FAMILIES {
+        if family == base_family {
+            continue;
+        }
+        if available.iter().any(|name| name == family)
+            && !candidates.iter().any(|candidate| candidate == family)
+        {
+            candidates.push(family.to_string());
+        }
+    }
+
+    if candidates.is_empty() {
+        for name in &available {
+            let lower = name.to_ascii_lowercase();
+            if lower.contains("mono") || lower.contains("code") || lower.contains("console") {
+                candidates.push(name.to_string());
+            }
+        }
+    }
+
+    for family in candidates {
+        let mut font = base_font.clone();
+        font.family = family.into();
+        if is_monospace_font(text_system, &font, font_size) {
+            return font.family;
+        }
+    }
+
+    base_font.family.clone()
+}
+
+fn measure_cell_width(
+    text_system: &rgpui::WindowTextSystem,
+    font_id: rgpui::FontId,
+    font_size: Pixels,
+) -> Pixels {
+    let mut widths = Vec::new();
+
+    for ch in ['0', 'm', 'M', 'W', 'i', ' '] {
+        if let Ok(advance) = text_system.advance(font_id, font_size, ch) {
+            widths.push(f32::from(advance.width));
+        }
+    }
+
+    if widths.is_empty() {
+        // 兜底路径：逐个字符测不到时退回 em / ch 宽度。两者都失败说明字体系统本身
+        // 出问题，此时按终端等宽字常见宽高比给一个估值并记警告——格子尺寸略偏远好于
+        // 整个终端面板崩掉。
+        return text_system
+            .em_advance(font_id, font_size)
+            .or_else(|_| text_system.ch_advance(font_id, font_size))
+            .unwrap_or_else(|err| {
+                log::warn!("测量终端单元格宽度失败（{err}），按字号 0.6 倍估值");
+                px((f32::from(font_size) * 0.6).ceil())
+            });
+    }
+
+    let mut min_width = widths[0];
+    let mut max_width = widths[0];
+
+    for width in widths.iter().skip(1) {
+        min_width = min_width.min(*width);
+        max_width = max_width.max(*width);
+    }
+
+    // For terminal rendering, always use max width to ensure no character clipping
+    // Add a small padding (1px) to prevent edge cases where characters touch
+    let width = max_width + 0.5;
+
+    px(width.ceil())
+}
+
+fn cell_fg_color(indexed: &IndexedCell, fg: AnsiColor, theme: &TerminalTheme) -> Hsla {
+    let mut fg_color = theme.resolve_color(&fg);
+    if indexed.cell.flags.intersects(Flags::DIM) {
+        fg_color.a *= 0.7;
+    }
+    fg_color
+}
+
+#[derive(Clone, Copy, Debug)]
+enum BoxWeight {
+    Light,
+    Heavy,
+    Double,
+}
+
+fn line_thickness(weight: BoxWeight) -> f32 {
+    match weight {
+        BoxWeight::Light => 1.0 / 8.0,
+        BoxWeight::Heavy => 2.0 / 8.0,
+        BoxWeight::Double => 1.0 / 10.0,
+    }
+}
+
+fn push_rect_fragment(
+    out: &mut Vec<BlockFragment>,
+    point: AlacPoint<i32, i32>,
+    color: Hsla,
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+) {
+    out.push(BlockFragment {
+        point,
+        rect: BlockRect {
+            x,
+            y,
+            width,
+            height,
+        },
+        color,
+    });
+}
+
+fn push_horizontal_line(
+    out: &mut Vec<BlockFragment>,
+    point: AlacPoint<i32, i32>,
+    color: Hsla,
+    weight: BoxWeight,
+    left: bool,
+    right: bool,
+) {
+    if !left && !right {
+        return;
+    }
+
+    let thickness = line_thickness(weight);
+    let (x_start, x_end) = match (left, right) {
+        (true, true) => (0.0, 1.0),
+        (true, false) => (0.0, 0.5),
+        (false, true) => (0.5, 1.0),
+        _ => return,
+    };
+
+    let centers: [f32; 2] = if matches!(weight, BoxWeight::Double) {
+        let offset = thickness * 1.5;
+        [0.5 - offset, 0.5 + offset]
+    } else {
+        [0.5, 0.5]
+    };
+
+    for center in centers {
+        let y = (center - thickness / 2.0).max(0.0);
+        let height = (center + thickness / 2.0).min(1.0) - y;
+        push_rect_fragment(out, point, color, x_start, y, x_end - x_start, height);
+        if !matches!(weight, BoxWeight::Double) {
+            break;
+        }
+    }
+}
+
+fn push_vertical_line(
+    out: &mut Vec<BlockFragment>,
+    point: AlacPoint<i32, i32>,
+    color: Hsla,
+    weight: BoxWeight,
+    up: bool,
+    down: bool,
+) {
+    if !up && !down {
+        return;
+    }
+
+    let thickness = line_thickness(weight);
+    let (y_start, y_end) = match (up, down) {
+        (true, true) => (0.0, 1.0),
+        (true, false) => (0.0, 0.5),
+        (false, true) => (0.5, 1.0),
+        _ => return,
+    };
+
+    let centers: [f32; 2] = if matches!(weight, BoxWeight::Double) {
+        let offset = thickness * 1.5;
+        [0.5 - offset, 0.5 + offset]
+    } else {
+        [0.5, 0.5]
+    };
+
+    for center in centers {
+        let x = (center - thickness / 2.0).max(0.0);
+        let width = (center + thickness / 2.0).min(1.0) - x;
+        push_rect_fragment(out, point, color, x, y_start, width, y_end - y_start);
+        if !matches!(weight, BoxWeight::Double) {
+            break;
+        }
+    }
+}
+
+fn push_box_fragments(
+    out: &mut Vec<BlockFragment>,
+    point: AlacPoint<i32, i32>,
+    color: Hsla,
+    ch: char,
+) -> bool {
+    let (weight, left, right, up, down) = match ch {
+        '\u{2500}' => (BoxWeight::Light, true, true, false, false),
+        '\u{2502}' => (BoxWeight::Light, false, false, true, true),
+        '\u{250C}' => (BoxWeight::Light, false, true, false, true),
+        '\u{2510}' => (BoxWeight::Light, true, false, false, true),
+        '\u{2514}' => (BoxWeight::Light, false, true, true, false),
+        '\u{2518}' => (BoxWeight::Light, true, false, true, false),
+        '\u{251C}' => (BoxWeight::Light, false, true, true, true),
+        '\u{2524}' => (BoxWeight::Light, true, false, true, true),
+        '\u{252C}' => (BoxWeight::Light, true, true, false, true),
+        '\u{2534}' => (BoxWeight::Light, true, true, true, false),
+        '\u{253C}' => (BoxWeight::Light, true, true, true, true),
+        '\u{2574}' => (BoxWeight::Light, true, false, false, false),
+        '\u{2575}' => (BoxWeight::Light, false, false, true, false),
+        '\u{2576}' => (BoxWeight::Light, false, true, false, false),
+        '\u{2577}' => (BoxWeight::Light, false, false, false, true),
+        '\u{256D}' => (BoxWeight::Light, false, true, false, true),
+        '\u{256E}' => (BoxWeight::Light, true, false, false, true),
+        '\u{256F}' => (BoxWeight::Light, true, false, true, false),
+        '\u{2570}' => (BoxWeight::Light, false, true, true, false),
+        '\u{2501}' => (BoxWeight::Heavy, true, true, false, false),
+        '\u{2503}' => (BoxWeight::Heavy, false, false, true, true),
+        '\u{250F}' => (BoxWeight::Heavy, false, true, false, true),
+        '\u{2513}' => (BoxWeight::Heavy, true, false, false, true),
+        '\u{2517}' => (BoxWeight::Heavy, false, true, true, false),
+        '\u{251B}' => (BoxWeight::Heavy, true, false, true, false),
+        '\u{2523}' => (BoxWeight::Heavy, false, true, true, true),
+        '\u{252B}' => (BoxWeight::Heavy, true, false, true, true),
+        '\u{2533}' => (BoxWeight::Heavy, true, true, false, true),
+        '\u{253B}' => (BoxWeight::Heavy, true, true, true, false),
+        '\u{254B}' => (BoxWeight::Heavy, true, true, true, true),
+        '\u{2550}' => (BoxWeight::Double, true, true, false, false),
+        '\u{2551}' => (BoxWeight::Double, false, false, true, true),
+        '\u{2554}' => (BoxWeight::Double, false, true, false, true),
+        '\u{2557}' => (BoxWeight::Double, true, false, false, true),
+        '\u{255A}' => (BoxWeight::Double, false, true, true, false),
+        '\u{255D}' => (BoxWeight::Double, true, false, true, false),
+        '\u{2560}' => (BoxWeight::Double, false, true, true, true),
+        '\u{2563}' => (BoxWeight::Double, true, false, true, true),
+        '\u{2566}' => (BoxWeight::Double, true, true, false, true),
+        '\u{2569}' => (BoxWeight::Double, true, true, true, false),
+        '\u{256C}' => (BoxWeight::Double, true, true, true, true),
+        _ => return false,
+    };
+
+    push_horizontal_line(out, point, color, weight, left, right);
+    push_vertical_line(out, point, color, weight, up, down);
+    true
+}
+
+fn push_powerline_fragments(
+    rects: &mut Vec<BlockFragment>,
+    polys: &mut Vec<PolygonFragment>,
+    point: AlacPoint<i32, i32>,
+    color: Hsla,
+    ch: char,
+) -> bool {
+    match ch {
+        '\u{E0B0}' => {
+            polys.push(PolygonFragment {
+                point,
+                points: [
+                    BlockPoint { x: 0.0, y: 0.0 },
+                    BlockPoint { x: 1.0, y: 0.5 },
+                    BlockPoint { x: 0.0, y: 1.0 },
+                ],
+                color,
+            });
+            true
+        }
+        '\u{E0B2}' => {
+            polys.push(PolygonFragment {
+                point,
+                points: [
+                    BlockPoint { x: 1.0, y: 0.0 },
+                    BlockPoint { x: 0.0, y: 0.5 },
+                    BlockPoint { x: 1.0, y: 1.0 },
+                ],
+                color,
+            });
+            true
+        }
+        '\u{E0B1}' | '\u{E0B3}' | '\u{E0B5}' | '\u{E0B7}' => {
+            let thickness = line_thickness(BoxWeight::Light);
+            push_rect_fragment(
+                rects,
+                point,
+                color,
+                0.5 - thickness / 2.0,
+                0.0,
+                thickness,
+                1.0,
+            );
+            true
+        }
+        '\u{E0B4}' => {
+            polys.push(PolygonFragment {
+                point,
+                points: [
+                    BlockPoint { x: 0.0, y: 0.0 },
+                    BlockPoint { x: 1.0, y: 0.5 },
+                    BlockPoint { x: 0.0, y: 1.0 },
+                ],
+                color,
+            });
+            true
+        }
+        '\u{E0B6}' => {
+            polys.push(PolygonFragment {
+                point,
+                points: [
+                    BlockPoint { x: 1.0, y: 0.0 },
+                    BlockPoint { x: 0.0, y: 0.5 },
+                    BlockPoint { x: 1.0, y: 1.0 },
+                ],
+                color,
+            });
+            true
+        }
+        _ => false,
+    }
+}
+
+fn push_block_fragments(
+    out: &mut Vec<BlockFragment>,
+    point: AlacPoint<i32, i32>,
+    color: Hsla,
+    ch: char,
+) -> bool {
+    let rect = |x: f32, y: f32, width: f32, height: f32| BlockRect {
+        x,
+        y,
+        width,
+        height,
+    };
+
+    let mut push = |x: f32, y: f32, width: f32, height: f32| {
+        out.push(BlockFragment {
+            point,
+            rect: rect(x, y, width, height),
+            color,
+        });
+    };
+
+    match ch {
+        '\u{2591}' => {
+            let mut shade = color;
+            shade.a *= 0.25;
+            push(0.0, 0.0, 1.0, 1.0);
+            if let Some(fragment) = out.last_mut() {
+                fragment.color = shade;
+            }
+            true
+        }
+        '\u{2592}' => {
+            let mut shade = color;
+            shade.a *= 0.5;
+            push(0.0, 0.0, 1.0, 1.0);
+            if let Some(fragment) = out.last_mut() {
+                fragment.color = shade;
+            }
+            true
+        }
+        '\u{2593}' => {
+            let mut shade = color;
+            shade.a *= 0.75;
+            push(0.0, 0.0, 1.0, 1.0);
+            if let Some(fragment) = out.last_mut() {
+                fragment.color = shade;
+            }
+            true
+        }
+        '\u{2588}' => {
+            push(0.0, 0.0, 1.0, 1.0);
+            true
+        }
+        '\u{2580}' => {
+            push(0.0, 0.0, 1.0, 0.5);
+            true
+        }
+        '\u{2584}' => {
+            push(0.0, 0.5, 1.0, 0.5);
+            true
+        }
+        '\u{2581}'..='\u{2587}' => {
+            let steps = ch as u32 - 0x2580;
+            let height = steps as f32 / 8.0;
+            push(0.0, 1.0 - height, 1.0, height);
+            true
+        }
+        '\u{2589}'..='\u{258F}' => {
+            let steps = 0x2590 - ch as u32;
+            let width = steps as f32 / 8.0;
+            push(0.0, 0.0, width, 1.0);
+            true
+        }
+        '\u{2590}' => {
+            push(0.5, 0.0, 0.5, 1.0);
+            true
+        }
+        '\u{2594}' => {
+            push(0.0, 0.0, 1.0, 1.0 / 8.0);
+            true
+        }
+        '\u{2595}' => {
+            push(7.0 / 8.0, 0.0, 1.0 / 8.0, 1.0);
+            true
+        }
+        '\u{2596}' | '\u{2597}' | '\u{2598}' | '\u{2599}' | '\u{259A}' | '\u{259B}'
+        | '\u{259C}' | '\u{259D}' | '\u{259E}' | '\u{259F}' => {
+            let mask = match ch {
+                '\u{2596}' => 0b0010, // lower left
+                '\u{2597}' => 0b0001, // lower right
+                '\u{2598}' => 0b1000, // upper left
+                '\u{2599}' => 0b1011, // upper left + lower left + lower right
+                '\u{259A}' => 0b1001, // upper left + lower right
+                '\u{259B}' => 0b1110, // upper left + upper right + lower left
+                '\u{259C}' => 0b1101, // upper left + upper right + lower right
+                '\u{259D}' => 0b0100, // upper right
+                '\u{259E}' => 0b0110, // upper right + lower left
+                '\u{259F}' => 0b0111, // upper right + lower left + lower right
+                _ => 0,
+            };
+
+            if mask & 0b1000 != 0 {
+                push(0.0, 0.0, 0.5, 0.5);
+            }
+            if mask & 0b0100 != 0 {
+                push(0.5, 0.0, 0.5, 0.5);
+            }
+            if mask & 0b0010 != 0 {
+                push(0.0, 0.5, 0.5, 0.5);
+            }
+            if mask & 0b0001 != 0 {
+                push(0.5, 0.5, 0.5, 0.5);
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+fn range_rects(
+    selection: &SelectionRange,
+    display_offset: usize,
+    dimensions: &TerminalBounds,
+    color: Hsla,
+) -> Vec<LayoutRect> {
+    let num_lines = dimensions.num_lines() as i32;
+    let num_columns = dimensions.num_columns();
+
+    if num_lines <= 0 || num_columns == 0 {
+        return Vec::new();
+    }
+
+    let max_line = num_lines - 1;
+    let max_col = num_columns.saturating_sub(1) as i32;
+
+    let mut start_line = selection.start.line.0 + display_offset as i32;
+    let mut end_line = selection.end.line.0 + display_offset as i32;
+
+    if start_line > end_line {
+        mem::swap(&mut start_line, &mut end_line);
+    }
+
+    if end_line < 0 || start_line > max_line {
+        return Vec::new();
+    }
+
+    start_line = start_line.max(0);
+    end_line = end_line.min(max_line);
+
+    let start_col = selection.start.column.0 as i32;
+    let end_col = selection.end.column.0 as i32;
+
+    let mut rects = Vec::new();
+    if selection.is_block {
+        let left = start_col.min(end_col).clamp(0, max_col);
+        let right = start_col.max(end_col).clamp(0, max_col);
+        for line in start_line..=end_line {
+            rects.push(LayoutRect::new(
+                AlacPoint::new(line, left),
+                (right - left + 1) as usize,
+                color,
+            ));
+        }
+    } else {
+        for line in start_line..=end_line {
+            let (mut col_start, mut col_end) = if line == start_line && line == end_line {
+                (start_col, end_col)
+            } else if line == start_line {
+                (start_col, max_col)
+            } else if line == end_line {
+                (0, end_col)
+            } else {
+                (0, max_col)
+            };
+
+            col_start = col_start.clamp(0, max_col);
+            col_end = col_end.clamp(0, max_col);
+
+            if col_end >= col_start {
+                rects.push(LayoutRect::new(
+                    AlacPoint::new(line, col_start),
+                    (col_end - col_start + 1) as usize,
+                    color,
+                ));
+            }
+        }
+    }
+
+    rects
+}
+
+impl Element for TerminalElement {
+    type RequestLayoutState = ();
+    type PrepaintState = LayoutState;
+
+    fn id(&self) -> Option<ElementId> {
+        Some("terminal-element".into())
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _global_id: Option<&GlobalElementId>,
+        _inspector_id: Option<&rgpui::InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let mut style = rgpui::Style::default();
+        style.size.width = rgpui::Length::Definite(rgpui::DefiniteLength::Fraction(1.0));
+        style.size.height = rgpui::Length::Definite(rgpui::DefiniteLength::Fraction(1.0));
+        style.flex_grow = 1.0;
+
+        let layout_id = window.request_layout(style, None, cx);
+        (layout_id, ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _global_id: Option<&GlobalElementId>,
+        _inspector_id: Option<&rgpui::InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self::PrepaintState {
+        let hitbox = window.insert_hitbox(bounds, rgpui::HitboxBehavior::Normal);
+
+        let mut text_style = self.text_style.clone();
+        let background_color = text_style.background;
+        let foreground_color = text_style.foreground;
+
+        let font_pixels = text_style.font_size.to_pixels(window.rem_size());
+        let text_system = window.text_system();
+
+        if let Some(family) = self.cached_font_family.clone() {
+            text_style.font.family = family;
+        } else {
+            let family = select_font_family(text_system, &text_style.font, font_pixels);
+            text_style.font.family = family.clone();
+            self.cached_font_family = Some(family);
+        }
+
+        let font_id = window.text_system().resolve_font(&text_style.font);
+        let mut cell_width = measure_cell_width(text_system, font_id, font_pixels);
+        cell_width = (cell_width + px(text_style.letter_spacing)).max(px(1.0));
+        // Round line_height to whole pixels for crisp text rendering on Windows
+        let line_height = px((f32::from(font_pixels) * text_style.line_height_multiplier).round());
+
+        let dimensions = TerminalBounds::new(line_height, cell_width, bounds);
+
+        self.terminal.update(cx, |terminal, cx| {
+            terminal.set_size(dimensions);
+            terminal.sync(window, cx);
+        });
+
+        let TerminalContent {
+            cells,
+            mode,
+            display_offset,
+            cursor_char,
+            cursor,
+            selection,
+            search_match,
+            history_size,
+            subline_offset,
+            ..
+        } = &self.terminal.read(cx).last_content;
+        let mode = *mode;
+        let display_offset = *display_offset;
+        let history_size = *history_size;
+        let subline_offset = *subline_offset;
+
+        let (rects, block_fragments, polygon_fragments, batched_text_runs) =
+            Self::layout_grid(cells.iter(), &text_style, display_offset);
+
+        let selection_rects = selection
+            .as_ref()
+            .map(|selection| {
+                range_rects(
+                    selection,
+                    display_offset,
+                    &dimensions,
+                    selection_color(&text_style.theme),
+                )
+            })
+            .unwrap_or_default();
+
+        let search_rects = search_match
+            .map(|search_match| {
+                range_rects(
+                    &search_match,
+                    display_offset,
+                    &dimensions,
+                    search_match_color(&text_style.theme),
+                )
+            })
+            .unwrap_or_default();
+
+        let cursor_layout = if let AlacCursorShape::Hidden = cursor.shape {
+            None
+        } else {
+            let cursor_point = DisplayCursor::from(cursor.point, display_offset);
+            let cursor_text = {
+                let str_text = cursor_char.to_string();
+                let len = str_text.len();
+                window.text_system().shape_line(
+                    str_text.into(),
+                    font_pixels,
+                    &[TextRun {
+                        len,
+                        font: text_style.font.clone(),
+                        color: text_style.background,
+                        ..Default::default()
+                    }],
+                    None,
+                )
+            };
+
+            let focused = self.focused;
+            Self::shape_cursor(cursor_point, dimensions, &cursor_text).map(
+                move |(cursor_position, block_width)| {
+                    let (shape, text) = match cursor.shape {
+                        AlacCursorShape::Block if !focused => (CursorShape::Hollow, None),
+                        AlacCursorShape::Block => (CursorShape::Block, Some(cursor_text)),
+                        AlacCursorShape::Underline => (CursorShape::Underline, None),
+                        AlacCursorShape::Beam => (CursorShape::Bar, None),
+                        AlacCursorShape::HollowBlock => (CursorShape::Hollow, None),
+                        AlacCursorShape::Hidden => {
+                            unreachable!("Hidden 光标已在上面短路返回，不会走到成形这一步")
+                        }
+                    };
+
+                    CursorLayout::new(
+                        cursor_position,
+                        block_width,
+                        dimensions.line_height,
+                        text_style.theme.cursor,
+                        shape,
+                        text,
+                    )
+                },
+            )
+        };
+
+        // IME 组合预览：贴在光标格上，下划线表示「还没上屏」
+        let composition = cursor_layout.as_ref().and_then(|cursor_layout| {
+            let composition = self.terminal.read(cx).ime_composition()?.to_owned();
+            if composition.is_empty() {
+                return None;
+            }
+
+            let len = composition.len();
+            let line = window.text_system().shape_line(
+                composition.into(),
+                font_pixels,
+                &[TextRun {
+                    len,
+                    font: text_style.font.clone(),
+                    color: text_style.foreground,
+                    underline: Some(UnderlineStyle {
+                        thickness: px(1.0),
+                        color: Some(text_style.foreground),
+                        wavy: false,
+                    }),
+                    ..Default::default()
+                }],
+                None,
+            );
+            Some((line, cursor_layout.origin))
+        });
+
+        LayoutState {
+            _hitbox: hitbox,
+            batched_text_runs,
+            background_rects: rects,
+            block_fragments,
+            polygon_fragments,
+            selection_rects,
+            search_rects,
+            cursor: cursor_layout,
+            composition,
+            background_color,
+            foreground_color,
+            dimensions,
+            _mode: mode,
+            history_size,
+            display_offset,
+            subline_offset,
+        }
+    }
+
+    fn paint(
+        &mut self,
+        _global_id: Option<&GlobalElementId>,
+        _inspector_id: Option<&rgpui::InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        layout: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        // Register input handler for text input
+        let input_handler = TerminalInputHandler {
+            terminal: self.terminal.clone(),
+            cursor_bounds: layout.cursor.as_ref().map(|c| c.bounds(bounds.origin)),
+        };
+        window.handle_input(&self.focus, input_handler, cx);
+
+        // 兜底：拖滚动条时若在终端**外**松手（状态栏、相邻面板），视图上的
+        // on_mouse_up 收不到事件，拖动状态就会一直挂着。这里在窗口层再挂一个
+        // 监听，任何一次松手都把状态清掉，避免解析线程长期按「UI 忙」的小切片跑。
+        {
+            let terminal = self.terminal.clone();
+            window.on_mouse_event(move |_: &MouseUpEvent, phase, window, cx| {
+                if phase != DispatchPhase::Bubble {
+                    return;
+                }
+                let was_dragging = terminal.read(cx).has_scrollbar_drag();
+                if was_dragging {
+                    let _ = terminal.update(cx, |terminal, _| terminal.end_scrollbar_drag());
+                    window.refresh();
+                }
+            });
+        }
+
+        // 滚动条拖动界外兜底：滚动条贴在终端最右缘，元素级 on_mouse_move
+        // 只在指针 hover hitbox 时派发，稍偏右越界就断流→画面停住。
+        // 这里在窗口层补一段：拖动期间指针在终端 bounds 外时继续驱动滚动，
+        // 几何由 Terminal 在抓取时锁定（见 begin_scrollbar_drag）。
+        {
+            let terminal = self.terminal.clone();
+            window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
+                if phase != DispatchPhase::Bubble || !event.dragging() {
+                    return;
+                }
+                if !terminal.read(cx).has_scrollbar_drag() {
+                    return;
+                }
+                let bounds = terminal.read(cx).last_content().terminal_bounds.bounds;
+                if bounds.contains(&event.position) {
+                    return; // 视口内交给元素级监听。
+                }
+                let moved = terminal.update(cx, |terminal, _| {
+                    terminal.drag_scrollbar_to(event.position.y)
+                });
+                if moved {
+                    window.refresh();
+                }
+            });
+        }
+
+        // 拖选中把鼠标事件收一份到窗口层：元素上的鼠标监听只在 hitbox 被 hover 时
+        // 派发，指针一旦拖出终端（状态栏、相邻面板）选区就停在原地，边缘自动滚动
+        // 也就永远触发不了。视口内仍由元素自己的监听处理，这里只补界外那段，
+        // 松开鼠标的落点同样不看位置——在界外松开也要能结束拖选。
+        if self.terminal.read(cx).selection_started() {
+            let terminal = self.terminal.clone();
+            window.on_mouse_event(move |event: &MouseMoveEvent, phase, _window, cx| {
+                if phase != DispatchPhase::Bubble || !event.dragging() {
+                    return;
+                }
+                let bounds = terminal.read(cx).last_content().terminal_bounds.bounds;
+                if bounds.contains(&event.position) {
+                    return;
+                }
+                let _ = terminal.update(cx, |terminal, cx| {
+                    terminal.drag_select(event.position, bounds, cx);
+                });
+            });
+
+            let terminal = self.terminal.clone();
+            window.on_mouse_event(move |event: &MouseUpEvent, phase, _window, cx| {
+                if phase != DispatchPhase::Bubble {
+                    return;
+                }
+                let bounds = terminal.read(cx).last_content().terminal_bounds.bounds;
+                if bounds.contains(&event.position) {
+                    return;
+                }
+                let _ = terminal.update(cx, |terminal, cx| terminal.mouse_up(event, cx));
+            });
+        }
+
+        window.with_content_mask(Some(ContentMask { bounds }), |window| {
+            window.paint_quad(fill(bounds, layout.background_color));
+            // 拖动滚动条时把网格整体下移不足一行的部分：视口上方有一行
+            // 缓冲（alacritty display_iter 从 -offset-1 起），下移后正好
+            // 补进顶部，底部署出的部分由 mask 裁掉、背景已铺满。
+            // 这样鼠标每移动 1px 画面就移动 1px，而不是按整行跳十几行。
+            let origin = Point::new(bounds.origin.x, bounds.origin.y + layout.subline_offset);
+
+            for rect in &layout.background_rects {
+                rect.paint(origin, &layout.dimensions, window);
+            }
+
+            for fragment in &layout.block_fragments {
+                fragment.paint(origin, &layout.dimensions, window);
+            }
+
+            for fragment in &layout.polygon_fragments {
+                fragment.paint(origin, &layout.dimensions, window);
+            }
+
+            // 搜索高亮画在文本与 selection 之下
+            for rect in &layout.search_rects {
+                rect.paint(origin, &layout.dimensions, window);
+            }
+
+            for rect in &layout.selection_rects {
+                rect.paint(origin, &layout.dimensions, window);
+            }
+
+            for batch in &layout.batched_text_runs {
+                batch.paint(origin, &layout.dimensions, window, cx);
+            }
+
+            if self.cursor_visible
+                && let Some(cursor) = &layout.cursor
+            {
+                cursor.paint(origin, window, cx);
+            }
+
+            // IME 组合预览画在光标之上，保证块状光标下也看得见
+            if let Some((line, position)) = &layout.composition {
+                let _ = line.paint(
+                    origin + *position,
+                    layout.dimensions.line_height,
+                    rgpui::TextAlign::Left,
+                    None,
+                    window,
+                    cx,
+                );
+            }
+
+            // Paint scrollbar on top of terminal content
+            let history_size = layout.history_size;
+            if history_size > 0 && self.show_scrollbar {
+                let track_height = f32::from(bounds.size.height);
+                let visible_lines = layout.dimensions.num_lines();
+                let total_lines = history_size + visible_lines;
+
+                let thumb_height = (visible_lines as f32 / total_lines as f32 * track_height)
+                    .max(SCROLLBAR_THUMB_MIN_HEIGHT);
+                let scrollable_track = track_height - thumb_height;
+
+                let display_offset = layout.display_offset;
+                let thumb_top = if history_size > 0 {
+                    (1.0 - display_offset as f32 / history_size as f32) * scrollable_track
+                } else {
+                    0.0
+                };
+
+                let track_x = bounds.origin.x + bounds.size.width - px(SCROLLBAR_WIDTH);
+                let track_bounds = Bounds::new(
+                    point(track_x, bounds.origin.y),
+                    size(px(SCROLLBAR_WIDTH), bounds.size.height),
+                );
+                let track_color = Hsla {
+                    a: 0.08,
+                    ..layout.foreground_color
+                };
+                window.paint_quad(fill(track_bounds, track_color));
+
+                let thumb_bounds = Bounds::new(
+                    point(track_x, bounds.origin.y + px(thumb_top)),
+                    size(px(SCROLLBAR_WIDTH), px(thumb_height)),
+                );
+                let thumb_color = Hsla {
+                    a: 0.45,
+                    ..layout.foreground_color
+                };
+                window.paint_quad(rgpui::quad(
+                    thumb_bounds,
+                    px(SCROLLBAR_WIDTH / 2.0),
+                    thumb_color,
+                    rgpui::Edges::default(),
+                    Hsla::transparent_black(),
+                    rgpui::BorderStyle::Solid,
+                ));
+            }
+        });
+    }
+}
+
+impl IntoElement for TerminalElement {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+/// 检查单元格是否为空白，渲染时可以跳过。
+fn is_blank(cell: &IndexedCell) -> bool {
+    if cell.c != ' ' {
+        return false;
+    }
+
+    if cell.bg != AnsiColor::Named(NamedColor::Background) {
+        return false;
+    }
+
+    if cell
+        .flags
+        .intersects(Flags::ALL_UNDERLINES | Flags::INVERSE | Flags::STRIKEOUT)
+    {
+        return false;
+    }
+
+    true
+}
+
+/// 将 Alacritty ANSI 颜色转换为 rgpui 的 Hsla 格式。
+///
+/// 支持：
+/// - 命名颜色（16 种标准 ANSI 颜色）
+/// - 真彩色（24 位 RGB）
+/// - 索引颜色（256 色调色板）
+pub fn convert_color(color: &AnsiColor) -> Hsla {
+    match color {
+        AnsiColor::Named(named) => named_color_to_hsla(*named),
+        AnsiColor::Spec(rgb) => {
+            let rgba = Rgba {
+                r: rgb.r as f32 / 255.0,
+                g: rgb.g as f32 / 255.0,
+                b: rgb.b as f32 / 255.0,
+                a: 1.0,
+            };
+            rgba.into()
+        }
+        AnsiColor::Indexed(idx) => indexed_color_to_hsla(*idx),
+    }
+}
+
+/// 将命名 ANSI 颜色转换为 Hsla，提高颜色准确性。
+fn named_color_to_hsla(named: NamedColor) -> Hsla {
+    match named {
+        // Base colors - improved for better contrast and readability
+        NamedColor::Black => hsla_from_rgb(0x1E, 0x1E, 0x1E),
+        NamedColor::Red => hsla_from_rgb(0xE0, 0x6C, 0x75),
+        NamedColor::Green => hsla_from_rgb(0x98, 0xC3, 0x79),
+        NamedColor::Yellow => hsla_from_rgb(0xE5, 0xC0, 0x7B),
+        NamedColor::Blue => hsla_from_rgb(0x61, 0xAF, 0xEF),
+        NamedColor::Magenta => hsla_from_rgb(0xC6, 0x78, 0xDD),
+        NamedColor::Cyan => hsla_from_rgb(0x56, 0xB6, 0xC2),
+        NamedColor::White => hsla_from_rgb(0xAB, 0xB2, 0xBF),
+
+        // Bright colors - enhanced vibrancy
+        NamedColor::BrightBlack => hsla_from_rgb(0x5C, 0x63, 0x70),
+        NamedColor::BrightRed => hsla_from_rgb(0xE0, 0x6C, 0x75),
+        NamedColor::BrightGreen => hsla_from_rgb(0x98, 0xC3, 0x79),
+        NamedColor::BrightYellow => hsla_from_rgb(0xE5, 0xC0, 0x7B),
+        NamedColor::BrightBlue => hsla_from_rgb(0x61, 0xAF, 0xEF),
+        NamedColor::BrightMagenta => hsla_from_rgb(0xC6, 0x78, 0xDD),
+        NamedColor::BrightCyan => hsla_from_rgb(0x56, 0xB6, 0xC2),
+        NamedColor::BrightWhite => hsla_from_rgb(0xDF, 0xDF, 0xDF),
+
+        // Foreground/Background
+        NamedColor::Foreground => hsla_from_rgb(0xD4, 0xD4, 0xD4),
+        NamedColor::Background => hsla_from_rgb(0x1E, 0x1E, 0x1E),
+        NamedColor::Cursor => hsla_from_rgb(0xAE, 0xAF, 0xAD),
+
+        // Dim colors - better visibility
+        NamedColor::DimBlack => hsla_from_rgb(0x1E, 0x1E, 0x1E),
+        NamedColor::DimRed => hsla_from_rgb(0xBE, 0x5B, 0x65),
+        NamedColor::DimGreen => hsla_from_rgb(0x7A, 0x9F, 0x60),
+        NamedColor::DimYellow => hsla_from_rgb(0xD1, 0x9A, 0x66),
+        NamedColor::DimBlue => hsla_from_rgb(0x4E, 0x88, 0xB8),
+        NamedColor::DimMagenta => hsla_from_rgb(0xA0, 0x61, 0xB0),
+        NamedColor::DimCyan => hsla_from_rgb(0x44, 0x91, 0x9B),
+        NamedColor::DimWhite => hsla_from_rgb(0x8A, 0x8F, 0x98),
+        NamedColor::BrightForeground => hsla_from_rgb(0xDF, 0xDF, 0xDF),
+        NamedColor::DimForeground => hsla_from_rgb(0x8A, 0x8F, 0x98),
+    }
+}
+
+/// 将 256 色调色板索引转换为 Hsla。
+fn indexed_color_to_hsla(idx: u8) -> Hsla {
+    match idx {
+        0..=15 => {
+            let named = match idx {
+                0 => NamedColor::Black,
+                1 => NamedColor::Red,
+                2 => NamedColor::Green,
+                3 => NamedColor::Yellow,
+                4 => NamedColor::Blue,
+                5 => NamedColor::Magenta,
+                6 => NamedColor::Cyan,
+                7 => NamedColor::White,
+                8 => NamedColor::BrightBlack,
+                9 => NamedColor::BrightRed,
+                10 => NamedColor::BrightGreen,
+                11 => NamedColor::BrightYellow,
+                12 => NamedColor::BrightBlue,
+                13 => NamedColor::BrightMagenta,
+                14 => NamedColor::BrightCyan,
+                15 => NamedColor::BrightWhite,
+                // 外层 match 已把 idx 限定在 0..=15，具名色在此穷举完毕
+                _ => unreachable!("0..=15 的具名色已穷举"),
+            };
+            named_color_to_hsla(named)
+        }
+        16..=231 => {
+            let idx = idx - 16;
+            let r = (idx / 36) % 6;
+            let g = (idx / 6) % 6;
+            let b = idx % 6;
+
+            let r = if r > 0 { r * 40 + 55 } else { 0 };
+            let g = if g > 0 { g * 40 + 55 } else { 0 };
+            let b = if b > 0 { b * 40 + 55 } else { 0 };
+
+            hsla_from_rgb(r, g, b)
+        }
+        232..=255 => {
+            let gray = (idx - 232) * 10 + 8;
+            hsla_from_rgb(gray, gray, gray)
+        }
+    }
+}
+
+/// 从 RGB 值（0-255）创建 Hsla 的辅助函数。
+fn hsla_from_rgb(r: u8, g: u8, b: u8) -> Hsla {
+    let rgba = Rgba {
+        r: r as f32 / 255.0,
+        g: g as f32 / 255.0,
+        b: b as f32 / 255.0,
+        a: 1.0,
+    };
+    rgba.into()
+}
+
+/// 终端的输入处理器，处理文本输入。
+///
+/// 处理常规字符输入（打字）、IME 组合
+/// 以及其他与文本相关的输入事件，通过 rgpui 的 InputHandler trait。
+struct TerminalInputHandler {
+    terminal: Entity<Terminal>,
+    cursor_bounds: Option<Bounds<Pixels>>,
+}
+
+impl InputHandler for TerminalInputHandler {
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut Window,
+        cx: &mut App,
+    ) -> Option<UTF16Selection> {
+        // Return empty selection when not in ALT_SCREEN mode
+        // This allows text input to work
+        if self
+            .terminal
+            .read(cx)
+            .last_content
+            .mode
+            .contains(TermMode::ALT_SCREEN)
+        {
+            None
+        } else {
+            Some(UTF16Selection {
+                range: 0..0,
+                reversed: false,
+            })
+        }
+    }
+
+    fn marked_text_range(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut App,
+    ) -> Option<std::ops::Range<usize>> {
+        // 终端没有可编辑缓冲区，组合文本永远是一段前缀
+        self.terminal
+            .read(cx)
+            .ime_composition()
+            .filter(|text| !text.is_empty())
+            .map(|text| 0..text.encode_utf16().count())
+    }
+
+    fn text_for_range(
+        &mut self,
+        range: std::ops::Range<usize>,
+        actual_range: &mut Option<std::ops::Range<usize>>,
+        _window: &mut Window,
+        cx: &mut App,
+    ) -> Option<String> {
+        let composition = self.terminal.read(cx).ime_composition()?.to_owned();
+        let (actual, text) = utf16_slice(&composition, range);
+        *actual_range = Some(actual);
+        Some(text)
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        _replacement_range: Option<std::ops::Range<usize>>,
+        text: &str,
+        _window: &mut Window,
+        cx: &mut App,
+    ) {
+        // 上屏：清掉组合预览，把文本送进 PTY
+        self.terminal.update(cx, |terminal, cx| {
+            terminal.set_ime_composition(None);
+            terminal.input_text(text);
+            cx.notify();
+        });
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        _range_utf16: Option<std::ops::Range<usize>>,
+        new_text: &str,
+        new_marked_range: Option<std::ops::Range<usize>>,
+        _window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.terminal.update(cx, |terminal, cx| {
+            if new_marked_range.is_some() {
+                // 组合中：只更新预览，等 unmark / replace_text 再上屏
+                terminal.set_ime_composition(Some(new_text.to_owned()));
+            } else {
+                terminal.set_ime_composition(None);
+                terminal.input_text(new_text);
+            }
+            cx.notify();
+        });
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, cx: &mut App) {
+        // 组合结束但没有提交（例如按 Esc 取消）：丢掉预览
+        self.terminal.update(cx, |terminal, cx| {
+            terminal.set_ime_composition(None);
+            cx.notify();
+        });
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        _range_utf16: std::ops::Range<usize>,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Option<Bounds<Pixels>> {
+        // Return cursor bounds for IME positioning
+        self.cursor_bounds
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _point: Point<Pixels>,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Option<usize> {
+        None
+    }
+}
+
+/// 按 UTF-16 下标截取字符串，返回（实际生效的区间, 截出的文本）。
+///
+/// IME 回调给的是 UTF-16 下标，组合文本里可能含 BMP 之外的字符（一个字符占两个
+/// 码元）；越界区间要夹回范围内，否则截断代理对会得到替换字符。
+fn utf16_slice(text: &str, range: std::ops::Range<usize>) -> (std::ops::Range<usize>, String) {
+    let utf16: Vec<u16> = text.encode_utf16().collect();
+    let start = range.start.min(utf16.len());
+    let end = range.end.clamp(start, utf16.len());
+    (start..end, String::from_utf16_lossy(&utf16[start..end]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn utf16_slice_handles_ascii_and_bmp() {
+        assert_eq!(utf16_slice("abc", 0..2), (0..2, "ab".to_string()));
+        // 中文在 BMP 内，每个字占一个 UTF-16 码元
+        assert_eq!(utf16_slice("中文输入", 1..3), (1..3, "文输".to_string()));
+    }
+
+    #[test]
+    fn utf16_slice_keeps_surrogate_pairs() {
+        // “🦀” 占两个 UTF-16 码元，整段请求应原样返回
+        assert_eq!(utf16_slice("a🦀b", 1..3), (1..3, "🦀".to_string()));
+        // 只截半个代理对时退化成替换字符，不能 panic
+        assert_eq!(utf16_slice("a🦀b", 1..2), (1..2, "\u{fffd}".to_string()));
+    }
+
+    #[test]
+    fn utf16_slice_clamps_out_of_range() {
+        assert_eq!(utf16_slice("ab", 1..99), (1..2, "b".to_string()));
+        assert_eq!(utf16_slice("ab", 99..120), (2..2, String::new()));
+        // 反向区间按空区间处理
+        let (start, end) = (2, 1);
+        assert_eq!(utf16_slice("ab", start..end), (2..2, String::new()));
+    }
+
+    #[test]
+    fn test_convert_named_colors_returns_valid_hsla() {
+        let colors = [
+            NamedColor::Black,
+            NamedColor::Red,
+            NamedColor::Green,
+            NamedColor::Yellow,
+            NamedColor::Blue,
+            NamedColor::Magenta,
+            NamedColor::Cyan,
+            NamedColor::White,
+        ];
+
+        for color in colors {
+            let hsla = named_color_to_hsla(color);
+            assert!(
+                hsla.a >= 0.0 && hsla.a <= 1.0,
+                "Alpha should be in valid range for {:?}",
+                color
+            );
+            assert!(
+                hsla.s >= 0.0 && hsla.s <= 1.0,
+                "Saturation should be in valid range for {:?}",
+                color
+            );
+            assert!(
+                hsla.l >= 0.0 && hsla.l <= 1.0,
+                "Lightness should be in valid range for {:?}",
+                color
+            );
+        }
+    }
+
+    #[test]
+    fn test_indexed_color_standard_colors_map_to_named() {
+        let black = indexed_color_to_hsla(0);
+        let named_black = named_color_to_hsla(NamedColor::Black);
+        assert_eq!(black, named_black, "Index 0 should map to black");
+
+        let bright_white = indexed_color_to_hsla(15);
+        let named_bright_white = named_color_to_hsla(NamedColor::BrightWhite);
+        assert_eq!(
+            bright_white, named_bright_white,
+            "Index 15 should map to bright white"
+        );
+    }
+
+    #[test]
+    fn test_indexed_color_cube_colors_produce_valid_hsla() {
+        for idx in 16..=231u8 {
+            let hsla = indexed_color_to_hsla(idx);
+            assert!(
+                hsla.a == 1.0,
+                "Indexed color {} should have full alpha",
+                idx
+            );
+        }
+    }
+
+    #[test]
+    fn test_indexed_color_grayscale_produces_valid_hsla() {
+        for idx in 232..=255u8 {
+            let hsla = indexed_color_to_hsla(idx);
+            assert!(
+                hsla.a == 1.0,
+                "Grayscale color {} should have full alpha",
+                idx
+            );
+            assert!(
+                hsla.s < 0.01,
+                "Grayscale color {} should have near-zero saturation",
+                idx
+            );
+        }
+    }
+
+    #[test]
+    fn test_convert_spec_color_rgb_values() {
+        let rgb = alacritty_terminal::vte::ansi::Rgb {
+            r: 255,
+            g: 128,
+            b: 64,
+        };
+        let color = AnsiColor::Spec(rgb);
+        let hsla = convert_color(&color);
+
+        assert!(hsla.a == 1.0, "Spec color should have full alpha");
+    }
+
+    #[test]
+    fn test_batched_text_run_can_append_same_style() {
+        let style1 = TextRun {
+            len: 1,
+            font: Font::default(),
+            color: Hsla::red(),
+            ..Default::default()
+        };
+
+        let style2 = TextRun {
+            len: 1,
+            font: Font::default(),
+            color: Hsla::red(),
+            ..Default::default()
+        };
+
+        let font_size = AbsoluteLength::Pixels(px(12.0));
+        let batch = BatchedTextRun::new_from_char(AlacPoint::new(0, 0), 'a', style1, font_size);
+
+        assert!(
+            batch.can_append(&style2),
+            "Should be able to append same style"
+        );
+    }
+
+    #[test]
+    fn test_batched_text_run_cannot_append_different_color() {
+        let style1 = TextRun {
+            len: 1,
+            font: Font::default(),
+            color: Hsla::red(),
+            ..Default::default()
+        };
+
+        let style2 = TextRun {
+            len: 1,
+            font: Font::default(),
+            color: Hsla::blue(),
+            ..Default::default()
+        };
+
+        let font_size = AbsoluteLength::Pixels(px(12.0));
+        let batch = BatchedTextRun::new_from_char(AlacPoint::new(0, 0), 'a', style1, font_size);
+
+        assert!(
+            !batch.can_append(&style2),
+            "Should not be able to append different color"
+        );
+    }
+
+    #[test]
+    fn test_batched_text_run_append_increments_cell_count() {
+        let style = TextRun {
+            len: 1,
+            font: Font::default(),
+            color: Hsla::red(),
+            ..Default::default()
+        };
+
+        let font_size = AbsoluteLength::Pixels(px(12.0));
+        let mut batch = BatchedTextRun::new_from_char(AlacPoint::new(0, 0), 'a', style, font_size);
+
+        assert_eq!(batch.cell_count, 1, "Initial cell count should be 1");
+        assert_eq!(batch.text, "a", "Initial text should be 'a'");
+
+        batch.append_char('b');
+
+        assert_eq!(
+            batch.cell_count, 2,
+            "Cell count should increment after append"
+        );
+        assert_eq!(batch.text, "ab", "Text should be 'ab' after append");
+    }
+
+    #[test]
+    fn test_background_region_merges_vertical_same_span() {
+        let color = Hsla::red();
+        let mut first = BackgroundRegion::new(0, 0, color);
+        first.end_col = 2;
+        let mut second = BackgroundRegion::new(1, 0, color);
+        second.end_col = 2;
+
+        let merged = merge_background_regions(vec![first, second]);
+
+        assert_eq!(merged.len(), 1, "同色同跨度的相邻行应合并成一个矩形");
+        assert_eq!(merged[0].start_line, 0);
+        assert_eq!(merged[0].end_line, 1);
+    }
+
+    #[test]
+    fn test_background_region_keeps_different_colors_separate() {
+        let mut first = BackgroundRegion::new(0, 0, Hsla::red());
+        first.end_col = 1;
+        let mut second = BackgroundRegion::new(1, 0, Hsla::blue());
+        second.end_col = 1;
+
+        let merged = merge_background_regions(vec![first, second]);
+
+        assert_eq!(merged.len(), 2, "不同颜色的相邻行应保持为两个矩形");
+    }
+
+    #[test]
+    fn test_background_region_merge_preserves_cell_coverage() {
+        // 逐格交错的背景是合并算法最容易出错（重复覆盖／漏覆盖）的输入。
+        let theme = TextStyle::default().theme;
+        let palette = [NamedColor::Red, NamedColor::Blue, NamedColor::Green];
+        let (lines, cols) = (6i32, 8i32);
+
+        let mut expected = vec![None; (lines * cols) as usize];
+        let mut regions = Vec::new();
+        for line in 0..lines {
+            let color_at = |col: i32| ((line * 5 + col * 3) % 7) as usize % palette.len();
+            let mut col = 0;
+            while col < cols {
+                let index = color_at(col);
+                let mut end = col;
+                while end + 1 < cols && color_at(end + 1) == index {
+                    end += 1;
+                }
+                for col in col..=end {
+                    expected[(line * cols + col) as usize] = Some(palette[index]);
+                }
+                let color = theme.resolve_color(&AnsiColor::Named(palette[index]));
+                let mut region = BackgroundRegion::new(line, col, color);
+                region.end_col = end;
+                regions.push(region);
+                col = end + 1;
+            }
+        }
+
+        let mut actual = vec![None; (lines * cols) as usize];
+        for region in merge_background_regions(regions) {
+            for line in region.start_line..=region.end_line {
+                for col in region.start_col..=region.end_col {
+                    let slot = &mut actual[(line * cols + col) as usize];
+                    assert!(slot.is_none(), "合并后的矩形不应重复覆盖格子");
+                    *slot = palette.iter().copied().find(|named| {
+                        theme.resolve_color(&AnsiColor::Named(*named)) == region.color
+                    });
+                    assert!(slot.is_some(), "合并矩形颜色应来自输入调色板");
+                }
+            }
+        }
+
+        assert_eq!(actual, expected, "合并后每个格子的底色应与输入一致");
+    }
+
+    #[test]
+    fn test_layout_grid_batches_text_and_merges_background() {
+        use alacritty_terminal::{
+            index::{Column, Line},
+            term::cell::Cell,
+        };
+
+        let mut cells = Vec::new();
+        for (line, text) in [(0i32, "ab  "), (1i32, "cd\u{2500}")] {
+            for (col, ch) in text.chars().enumerate() {
+                let mut cell = Cell::default();
+                cell.c = ch;
+                if line == 0 && col >= 2 {
+                    cell.bg = AnsiColor::Named(NamedColor::Blue);
+                }
+                cells.push(IndexedCell {
+                    point: AlacPoint::new(Line(line), Column(col)),
+                    cell,
+                });
+            }
+        }
+
+        let (rects, blocks, polygons, runs) =
+            TerminalElement::layout_grid(cells.iter(), &TextStyle::default(), 0);
+
+        assert_eq!(rects.len(), 1, "两个相邻蓝底空格应合并为一个矩形");
+        assert_eq!((rects[0].point.line, rects[0].point.column), (0, 2));
+        assert_eq!(rects[0].num_of_cells, 2);
+
+        let texts: Vec<&str> = runs.iter().map(|run| run.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            ["ab  ", "cd"],
+            "非默认底色的空格仍进文本运行；换行必须切断批量运行"
+        );
+        assert!(!blocks.is_empty(), "制表框字符应生成块片段而不是文本运行");
+        assert!(polygons.is_empty());
+    }
+
+    #[test]
+    fn test_layout_grid_normalizes_scrollback_line_numbers() {
+        use alacritty_terminal::{
+            index::{Column, Line},
+            term::cell::Cell,
+        };
+
+        // 回滚后 alacritty 的首行是 -display_offset，绘制坐标必须从 0 开始。
+        let display_offset = 7;
+        let mut cells = Vec::new();
+        for (point_line, text) in [(-7i32, "hi"), (-6i32, "==")] {
+            for (col, ch) in text.chars().enumerate() {
+                let mut cell = Cell::default();
+                cell.c = ch;
+                if point_line == -6 {
+                    cell.bg = AnsiColor::Named(NamedColor::Blue);
+                }
+                cells.push(IndexedCell {
+                    point: AlacPoint::new(Line(point_line), Column(col)),
+                    cell,
+                });
+            }
+        }
+
+        let (rects, _, _, runs) =
+            TerminalElement::layout_grid(cells.iter(), &TextStyle::default(), display_offset);
+
+        assert_eq!(rects.len(), 1);
+        assert_eq!(
+            rects[0].point.line, 1,
+            "背景矩形应换算成 0 基显示行号，而不是保留负的回滚坐标"
+        );
+        assert_eq!(rects[0].num_of_cells, 2);
+        assert_eq!(
+            runs.iter()
+                .map(|run| run.start_point.line)
+                .collect::<Vec<_>>(),
+            vec![0, 1],
+            "文本运行同样应按显示行号定位"
+        );
+    }
+
+    #[test]
+    fn test_display_cursor_calculates_offset_correctly() {
+        let cursor_point = AlacPoint::new(
+            alacritty_terminal::index::Line(5),
+            alacritty_terminal::index::Column(10),
+        );
+        let display_offset = 3usize;
+
+        let display_cursor = DisplayCursor::from(cursor_point, display_offset);
+
+        assert_eq!(
+            display_cursor.line(),
+            8,
+            "Line should be cursor line + display offset"
+        );
+        assert_eq!(
+            display_cursor.col(),
+            10,
+            "Column should match cursor column"
+        );
+    }
+}

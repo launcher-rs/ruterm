@@ -64,6 +64,11 @@ sspi = { path = "vendor/sspi" }
 # 本地副本移植上游 0.9 的 Windows 文件剪贴板实现（CF_HDROP / 文件流），
 # 只保留 Windows 后端，Linux 继续走 stub。
 ironrdp-cliprdr-native = { path = "vendor/cliprdr-native" }
+# 临时：拖滚动条出界松手后解析线程卡死、Ctrl+C 看似失效的修复还没发版。
+# vendor/rgpui-term 是 registry 1.8.2 源码 + 上游修复分支的三个源文件，
+# 依赖已展开为 registry 版本，避免把整个本地 rgpui workspace 牵进来。
+# 等上游发版后删掉这段、把依赖版本提到修复版即可。
+rgpui-term = { path = "vendor/rgpui-term" }
 
 [target.'cfg(windows)'.dependencies]
 # 提取 shell 可执行文件的系统图标：Win32 取 HICON，png 编成 rgpui 能直接吃的字节。
