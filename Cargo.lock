@@ -1459,7 +1459,7 @@ checksum = "af491d569909a7e4dee0ad7db7f5341fef5c614d5b8ec8cf765732aba3cff681"
 dependencies = [
  "serde",
  "termcolor",
- "unicode-width 0.1.14",
+ "unicode-width 0.2.2",
 ]
 
 [[package]]
@@ -2409,7 +2409,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6645,9 +6645,9 @@ dependencies = [
 
 [[package]]
 name = "rgpui"
-version = "1.8.1"
+version = "1.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bd68b2e9f5820e75730f53c1f91208ac75a29eb99ea0b7f222b660a3c882e2b2"
+checksum = "ba4cfcf989345c81f508a4d93cf021dbbe309808b9ebb8d2752a990a7872f5d6"
 dependencies = [
  "accesskit",
  "anyhow",
@@ -6763,9 +6763,9 @@ dependencies = [
 
 [[package]]
 name = "rgpui-dom"
-version = "1.8.1"
+version = "1.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ccaf41805841b53c57198af5149aab8d2f05ec72057a1e54d6146f94bf0bbfa6"
+checksum = "c709b8bb0bae32aa2f7cb0b8ad7b940a5214cf1ee4e56fa2edaac0e912d2f53e"
 dependencies = [
  "js-sys",
  "rgpui",
@@ -6801,9 +6801,9 @@ dependencies = [
 
 [[package]]
 name = "rgpui-linux"
-version = "1.8.1"
+version = "1.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5141ceaa0dbe7fc81837a4b4ef514dafe23767781569dae82971171f5b105466"
+checksum = "0b99167579200cf330f556a35445de58c2d06248af9cb440bf82adf52dda1db2"
 dependencies = [
  "accesskit",
  "accesskit_unix",
@@ -6850,9 +6850,9 @@ dependencies = [
 
 [[package]]
 name = "rgpui-macos"
-version = "1.8.1"
+version = "1.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b106d0b9dba9d2d823da639d4534eaa1766056c3907c1ada2c710ddce60b6811"
+checksum = "592834dbab6aaf6938179199df34915a0b0639bb1dcab89df214f0c1bee9bdcd"
 dependencies = [
  "accesskit",
  "accesskit_macos",
@@ -6896,9 +6896,9 @@ dependencies = [
 
 [[package]]
 name = "rgpui-macros"
-version = "1.8.1"
+version = "1.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b80c0988743c1c009b86b0c4910ac5d03005ac8d06d6f23f896be52c4b89660f"
+checksum = "2c3407f51b1a92be9ba01e64df46ccf50ed6e5ad6a7e1648d851df094585752c"
 dependencies = [
  "heck 0.5.0",
  "proc-macro2",
@@ -6908,9 +6908,9 @@ dependencies = [
 
 [[package]]
 name = "rgpui-platform"
-version = "1.8.1"
+version = "1.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6f160cf19ec1ca98ca994651101156b7cfec38a7dbd5a0d2eb8fa5501af6b76c"
+checksum = "0c18335c5a350aeda0837b546b5e26f5c0ebcb2732136d0841632bb285661b9f"
 dependencies = [
  "console_error_panic_hook",
  "rgpui",
@@ -6922,9 +6922,9 @@ dependencies = [
 
 [[package]]
 name = "rgpui-term"
-version = "1.8.1"
+version = "1.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "38ad1042d63fab6829b7a845279bdff78b2b494030b106bab625bd1ad728c6d8"
+checksum = "d64cc0ff732e45817f9f1c10a5cbfcb0f0822a2b4514ceb3b37f4c96039eafef"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -6940,9 +6940,9 @@ dependencies = [
 
 [[package]]
 name = "rgpui-web"
-version = "1.8.1"
+version = "1.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6ef85abd002304ae52c327fcc3059fca06a0384e231a51199658ad6382098947"
+checksum = "077aeae7084b7092d5a5241a72967936058d7eb4b45de927ae7839df131b88dc"
 dependencies = [
  "anyhow",
  "futures",
@@ -6963,9 +6963,9 @@ dependencies = [
 
 [[package]]
 name = "rgpui-wgpu"
-version = "1.8.1"
+version = "1.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9f7147941a0d40610dcc46812d400759a733ba3b93e96cd3e08bfdfa2fe42933"
+checksum = "297625e9fa09e326e9f32290a1e0bb90bd640683c60e02c1f62665c02517e741"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -6995,9 +6995,9 @@ dependencies = [
 
 [[package]]
 name = "rgpui-windows"
-version = "1.8.1"
+version = "1.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b62abcc2ce9cfdfc70a80429e9e238371a2fbe36b7b9038d5a3ac522f27246f4"
+checksum = "815cb53621ea8b26d1ca745a3ede1effbe529714c3a519f7c9a9758e23ed8550"
 dependencies = [
  "accesskit",
  "accesskit_windows",
@@ -7348,7 +7348,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -7361,7 +7361,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -8552,7 +8552,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.5",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -10054,7 +10054,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
