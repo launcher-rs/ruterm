@@ -262,6 +262,10 @@ fn main() {
                 // 客户区装饰：窗口样式改为 WS_THICKFRAME 无边框（DWM 仍画圆角与可拖边框），
                 // 拖拽与窗口控制由标题栏里显式登记的 WindowControlArea 命中区交给系统。
                 app_owns_titlebar_drag: true,
+                // Wayland 下用 app_id 标识窗口：合成器据此分组任务栏图标、匹配
+                // 窗口规则，xdg-activation 请求也会带上它（托盘恢复窗口时提示
+                // 「有应用想抢焦点」）。反向域名避免与其他应用的标识冲突。
+                app_id: Some("com.launcher-rs.ruterm".into()),
                 ..Default::default()
             },
             |window, cx| {
