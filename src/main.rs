@@ -21,9 +21,7 @@ mod vault;
 pub(crate) use files::{remote_fs, transfer, zmodem};
 pub(crate) use hosts::{config, discovery, remote, sessions, ssh_config};
 pub(crate) use support::{i18n, instance, paths, platform};
-pub(crate) use terminal::{
-    completion, history, local_shell, macros, snippet_presets, snippets,
-};
+pub(crate) use terminal::{completion, history, local_shell, macros, snippet_presets, snippets};
 
 use rgpui::prelude::*;
 use rgpui::{

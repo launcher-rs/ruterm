@@ -9,7 +9,7 @@ use anyhow::{Context as _, Result};
 
 use crate::paths::StorageMode;
 
-use super::{write_new_synced, UnlockBackend};
+use super::{UnlockBackend, write_new_synced};
 
 /// 文件换名（带重试，每 100ms 一次）：turso/toasty 的连接由 tokio 运行时异步回收，
 /// Windows 上句柄可能滞留片刻，立刻改名会撞上"文件被占用"；休眠必须在运行时内进行。

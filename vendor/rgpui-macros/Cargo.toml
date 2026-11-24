@@ -12,7 +12,7 @@
 [package]
 edition = "2024"
 name = "rgpui-macros"
-version = "1.8.2"
+version = "1.8.3"
 build = false
 publish = true
 autolib = false

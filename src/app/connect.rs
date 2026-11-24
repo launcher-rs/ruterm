@@ -495,8 +495,7 @@ impl RuTermApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some((terminal, terminal_view, handles)) =
-            self.open_external_terminal(id, window, cx)
+        let Some((terminal, terminal_view, handles)) = self.open_external_terminal(id, window, cx)
         else {
             return;
         };
@@ -790,8 +789,7 @@ impl RuTermApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some((terminal, terminal_view, handles)) =
-            self.open_external_terminal(id, window, cx)
+        let Some((terminal, terminal_view, handles)) = self.open_external_terminal(id, window, cx)
         else {
             return;
         };

@@ -1228,7 +1228,6 @@ fn archive_legacy(vault: &Vault, path: &Path) {
     });
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

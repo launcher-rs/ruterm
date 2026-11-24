@@ -1,6 +1,6 @@
 [package]
 name = "ruterm"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/launcher-rs/ruterm"
@@ -8,9 +8,9 @@ readme = "README.md"
 description = "Rust 远程连接工具，集成 SSH、本地终端、SFTP 与远程桌面"
 
 [dependencies]
-rgpui = { version = "1.8.2", features = ["tokio"] }
-rgpui-platform = "1.8.2"
-rgpui-term = "1.8.2"
+rgpui = { version = "1.8.3", features = ["tokio"] }
+rgpui-platform = "1.8.3"
+rgpui-term = "1.8.3"
 russh = { version = "0.64.1", default-features = false, features = ["flate2", "ring", "rsa"] }
 russh-sftp = "3.0.1"
 zmodem2 = "0.7.3"
@@ -64,11 +64,6 @@ sspi = { path = "vendor/sspi" }
 # 本地副本移植上游 0.9 的 Windows 文件剪贴板实现（CF_HDROP / 文件流），
 # 只保留 Windows 后端，Linux 继续走 stub。
 ironrdp-cliprdr-native = { path = "vendor/cliprdr-native" }
-# 临时：拖滚动条出界松手后解析线程卡死、Ctrl+C 看似失效的修复还没发版。
-# vendor/rgpui-term 是 registry 1.8.2 源码 + 上游修复分支的三个源文件，
-# 依赖已展开为 registry 版本，避免把整个本地 rgpui workspace 牵进来。
-# 等上游发版后删掉这段、把依赖版本提到修复版即可。
-rgpui-term = { path = "vendor/rgpui-term" }
 # 临时：rgpui 的预设阴影（shadow_md/lg 等）在终端 canvas 的浮层上会被
 # 合成为斜纹/三角形灰块，命令补全面板和右键菜单都中招。本地宏副本把预设
 # 阴影统一置空，显式 shadow(vec![...]) 仍可用；上游修好后删掉这段即可。

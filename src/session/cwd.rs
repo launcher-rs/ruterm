@@ -202,7 +202,6 @@ pub(crate) fn path_from_osc7(payload: &str) -> Option<String> {
     Some(percent_decode(path))
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

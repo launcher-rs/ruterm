@@ -30,15 +30,15 @@ use tokio::sync::oneshot;
 use tokio::task::JoinSet;
 
 use crate::config::SshTarget;
-use crate::remote::{PROBE_CMD, RemoteInfo};
 use crate::protocols::ssh::{ForwardedTcpip, SideChannels, SshTerminalHandler};
+use crate::remote::{PROBE_CMD, RemoteInfo};
 use crate::transfer;
 
 mod cwd;
 
 // 纯解析函数迁到 cwd 子模块，re-export 保持 crate::session::path_from_osc7 路径不变。
 pub(crate) use cwd::path_from_osc7;
-use cwd::{lex_join, CwdKeystrokes};
+use cwd::{CwdKeystrokes, lex_join};
 
 /// 信号：私钥有口令但连接未携带口令。
 ///
@@ -1669,7 +1669,6 @@ async fn forward_uplink(
     }
 }
 
-
 /// 校验任务：按序处理 cd / OSC 7 线索，解析出绝对路径后用 SFTP 确认是目录，
 /// 成功才回传 UI。顺序处理避免快速连 cd 时校验乱序导致面板跳错。
 async fn follow_cwd(
@@ -1898,7 +1897,7 @@ async fn authenticate_key(
 
 #[cfg(test)]
 mod tests {
-    use super::{path_from_osc7, ForwardKind, ForwardRule};
+    use super::{ForwardKind, ForwardRule, path_from_osc7};
     use anyhow::Result;
     use tokio::net::{TcpListener, TcpStream};
 
@@ -2030,7 +2029,6 @@ mod tests {
         let empty: &[u8] = b"";
         assert_eq!(shell_path_from_output(empty), None);
     }
-
 
     /// 真实 SSH 下的目录上报联调（默认跳过）：`cargo test -- --ignored cwd_report`。
     ///
