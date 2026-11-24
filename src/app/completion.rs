@@ -484,9 +484,10 @@ impl RuTermApp {
             .p_1()
             .rounded(px(6.0))
             .bg(pal.card_bg)
+            // 不用 shadow：浮层压在高频重绘的终端 canvas 上，阴影的半透明像素
+            // 会与画布内容混合出斜向条纹。用边框区分层次即可。
             .border_1()
             .border_color(pal.border)
-            .shadow_md()
             .child(rows)
             .child(
                 div()
