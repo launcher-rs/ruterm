@@ -10,7 +10,9 @@ use rgpui::{
     IntoElement, KeyDownEvent, ParentElement, SharedString, StatefulInteractiveElement, Styled,
     Window, div, h_flex, px, v_flex,
 };
-use rgpui_term::{Event as TerminalEvent, TerminalBuilder, TerminalView};
+use rgpui_term::{
+    Event as TerminalEvent, ExternalHandles, Terminal, TerminalBuilder, TerminalView,
+};
 
 use crate::config::SshTarget;
 use crate::sessions::{AuthMethod, HostConfig, ProtocolKind};
@@ -401,6 +403,80 @@ impl RuTermApp {
         );
     }
 
+    /// 创建外接终端并挂上输入中间件，返回终端实体、视图与待交给协议层的句柄。
+    /// SSH / Telnet 的终端创建过程完全一致，差异只在拿到句柄之后如何建连。
+    fn open_external_terminal(
+        &self,
+        id: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<(Entity<Terminal>, Entity<TerminalView>, ExternalHandles)> {
+        let Ok(mut builder) = TerminalBuilder::new_external(None) else {
+            log::error!("无法创建外接终端后端");
+            return None;
+        };
+        let Some(handles) = builder.take_external_handles() else {
+            log::error!("new_external 之后缺失外接句柄");
+            return None;
+        };
+        let terminal = cx.new(|cx| builder.subscribe(cx));
+        // 同步输入的观察点：终端所有输入都会经过中间件，程序化写回的会被标记为
+        // Programmatic 从而不再反弹。
+        let mirror_tx = self.mirror_tx.clone();
+        terminal.update(cx, |terminal, _| {
+            terminal.add_middleware(Arc::new(NormalizePastedLineEndings));
+            terminal.add_middleware(Arc::new(MirrorInput {
+                tab_id: id,
+                tx: mirror_tx,
+            }));
+        });
+        let style = self.terminal_text_style(cx);
+        let terminal_view =
+            cx.new(|cx| TerminalView::new_with_style(terminal.clone(), style, window, cx));
+        Some((terminal, terminal_view, handles))
+    }
+
+    /// 订阅终端关闭事件：会话结束保留标签并展示断开横幅。
+    /// 捕获视图弱引用：订阅 detach 后活到终端实体销毁为止，强引用会把旧
+    /// TerminalView（连同整份回滚网格）钉在闭包里永不释放。
+    fn subscribe_session_end(
+        &self,
+        id: usize,
+        terminal: &Entity<Terminal>,
+        terminal_view: &Entity<TerminalView>,
+        cx: &mut Context<Self>,
+    ) {
+        let close_view = terminal_view.downgrade();
+        cx.subscribe(terminal, move |this, _, event: &TerminalEvent, cx| {
+            // 只认当前标签的终端：重连后旧终端若迟来 CloseTerminal，不能把新会话标成已断开。
+            let Some(close_view) = close_view.upgrade() else {
+                return;
+            };
+            if matches!(event, TerminalEvent::CloseTerminal) && this.tab_is_current(id, &close_view)
+            {
+                this.end_session_tab(id, cx);
+            }
+        })
+        .detach();
+    }
+
+    /// 把会话落到标签槽位：重连沿用原序号，新会话补最小空号。
+    fn install_session_tab(
+        &mut self,
+        tab: SessionTab,
+        reconnect: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let id = tab.id;
+        match self.tabs.iter_mut().find(|existing| existing.id == id) {
+            Some(existing) if reconnect => *existing = tab,
+            Some(_) => log::warn!("标签 id {id} 已存在，忽略重复落标签"),
+            None => self.tabs.push(tab),
+        }
+        self.activate_tab(id, window, cx);
+    }
+
     /// 在指定标签槽位启动 SSH 会话：`reconnect` 为真时原位替换该标签的终端，
     /// 否则追加为新标签。`retry_attempt` 为自动重连的连续次数（手动连接为 0）。
     /// 会话结束（远端 exit / 断线）由终端 `CloseTerminal` 事件收尾——标签不摘除，
@@ -419,28 +495,11 @@ impl RuTermApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Ok(mut builder) = TerminalBuilder::new_external(None) else {
-            log::error!("无法创建外接终端后端");
+        let Some((terminal, terminal_view, handles)) =
+            self.open_external_terminal(id, window, cx)
+        else {
             return;
         };
-        let Some(handles) = builder.take_external_handles() else {
-            log::error!("new_external 之后缺失外接句柄");
-            return;
-        };
-        let terminal = cx.new(|cx| builder.subscribe(cx));
-        // 同步输入的观察点：终端所有输入都会经过中间件，程序化写回的会被标记为
-        // Programmatic 从而不再反弹。
-        let mirror_tx = self.mirror_tx.clone();
-        terminal.update(cx, |terminal, _| {
-            terminal.add_middleware(Arc::new(NormalizePastedLineEndings));
-            terminal.add_middleware(Arc::new(MirrorInput {
-                tab_id: id,
-                tx: mirror_tx,
-            }));
-        });
-        let style = self.terminal_text_style(cx);
-        let terminal_view =
-            cx.new(|cx| TerminalView::new_with_style(terminal.clone(), style, window, cx));
         // 状态栏展示用的连接位置与认证方式，须在 target 被 crate::session::start 消费前取出。
         let addr = format!("{}@{}:{}", target.user, target.host, target.port);
         let auth = if target.password.is_some() {
@@ -456,12 +515,15 @@ impl RuTermApp {
             secret_from_vault,
         };
         let crate::session::SshSession {
-            join,
+            handle:
+                crate::protocols::SessionHandle {
+                    join,
+                    started,
+                    ready,
+                    disconnect,
+                },
             mut remote_info,
             mut cwd_events,
-            started,
-            ready,
-            disconnect,
             commands,
         } = crate::session::start(
             target,
@@ -472,20 +534,7 @@ impl RuTermApp {
             cx,
         );
         // 会话结束（远端 exit / 断线 / 连接失败）→ 保留标签并展示断开横幅。
-        // 捕获弱引用：订阅 detach 后活到终端实体销毁为止，强引用会把
-        // 旧 TerminalView（连同整份回滚网格）钉在闭包里永不释放。
-        let close_view = terminal_view.downgrade();
-        cx.subscribe(&terminal, move |this, _, event: &TerminalEvent, cx| {
-            // 只认当前标签的终端：重连后旧终端若迟来 CloseTerminal，不能把新会话标成已断开。
-            let Some(close_view) = close_view.upgrade() else {
-                return;
-            };
-            if matches!(event, TerminalEvent::CloseTerminal) && this.tab_is_current(id, &close_view)
-            {
-                this.end_session_tab(id, cx);
-            }
-        })
-        .detach();
+        self.subscribe_session_end(id, &terminal, &terminal_view, cx);
         // 查找是排队执行的：终端 sync 完才定状态，收到结果后重绘查找条。
         self.watch_terminal(id, &terminal, cx);
         self.status = SharedString::from(format!("正在连接 {addr}…"));
@@ -528,13 +577,8 @@ impl RuTermApp {
             auto_retry_pending: false,
             connected_at: None,
         };
-        match self.tabs.iter_mut().find(|tab| tab.id == id) {
-            Some(existing) if reconnect => *existing = tab,
-            Some(_) => log::warn!("标签 id {id} 已存在，忽略重复落标签"),
-            None => self.tabs.push(tab),
-        }
         // 新标签/重连后把焦点交回终端，键入住处即可继续敲命令。
-        self.activate_tab(id, window, cx);
+        self.install_session_tab(tab, reconnect, window, cx);
         let ready_view = terminal_view.clone();
         let ready_addr = addr.clone();
         let recent_host_id = host.as_ref().map(|host| host.id).filter(|id| *id != 0);
@@ -746,57 +790,31 @@ impl RuTermApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Ok(mut builder) = TerminalBuilder::new_external(None) else {
-            log::error!("无法创建外接终端后端");
+        let Some((terminal, terminal_view, handles)) =
+            self.open_external_terminal(id, window, cx)
+        else {
             return;
         };
-        let Some(handles) = builder.take_external_handles() else {
-            log::error!("new_external 之后缺失外接句柄");
-            return;
-        };
-        let terminal = cx.new(|cx| builder.subscribe(cx));
-        // 同步输入同样覆盖 Telnet 会话。
-        let mirror_tx = self.mirror_tx.clone();
-        terminal.update(cx, |terminal, _| {
-            terminal.add_middleware(Arc::new(NormalizePastedLineEndings));
-            terminal.add_middleware(Arc::new(MirrorInput {
-                tab_id: id,
-                tx: mirror_tx,
-            }));
-        });
-        let style = self.terminal_text_style(cx);
-        let terminal_view =
-            cx.new(|cx| TerminalView::new_with_style(terminal.clone(), style, window, cx));
         let addr = format!("{host}:{port}");
         let resume = Resume::Telnet {
             host: host.clone(),
             port,
             source: source.clone(),
         };
-        let crate::telnet::TelnetSession {
+        let crate::protocols::SessionHandle {
             join,
             started,
             ready,
             disconnect,
-        } = crate::telnet::start(
+        } = crate::protocols::telnet::start(
             host,
             port,
             handles,
             Duration::from_secs(self.session_prefs.connect_timeout),
             cx,
         );
-        // 远端关闭 / 断线 → 保留标签并展示断开横幅。捕获弱引用，理由同 SSH 侧。
-        let close_view = terminal_view.downgrade();
-        cx.subscribe(&terminal, move |this, _, event: &TerminalEvent, cx| {
-            let Some(close_view) = close_view.upgrade() else {
-                return;
-            };
-            if matches!(event, TerminalEvent::CloseTerminal) && this.tab_is_current(id, &close_view)
-            {
-                this.end_session_tab(id, cx);
-            }
-        })
-        .detach();
+        // 远端关闭 / 断线 → 保留标签并展示断开横幅。
+        self.subscribe_session_end(id, &terminal, &terminal_view, cx);
         self.watch_terminal(id, &terminal, cx);
         self.status = SharedString::from(format!("正在连接 Telnet {addr}…"));
         let title_ordinal = if reconnect {
@@ -837,12 +855,7 @@ impl RuTermApp {
             auto_retry_pending: false,
             connected_at: None,
         };
-        match self.tabs.iter_mut().find(|tab| tab.id == id) {
-            Some(existing) if reconnect => *existing = tab,
-            Some(_) => log::warn!("标签 id {id} 已存在，忽略重复落标签"),
-            None => self.tabs.push(tab),
-        }
-        self.activate_tab(id, window, cx);
+        self.install_session_tab(tab, reconnect, window, cx);
         let ready_view = terminal_view.clone();
         let ready_addr = addr.clone();
         let recent_host_id = source.as_ref().map(|host| host.id).filter(|id| *id != 0);

@@ -34,26 +34,16 @@ pub enum ProtocolKind {
 
 impl ProtocolKind {
     pub fn label(self) -> &'static str {
-        match self {
-            Self::Ssh => "SSH",
-            Self::Telnet => "Telnet",
-            Self::Rdp => "RDP",
-            Self::Vnc => "VNC",
-        }
+        crate::protocols::protocol_spec(self).label
     }
 
     pub fn default_port(self) -> u16 {
-        match self {
-            Self::Ssh => 22,
-            Self::Telnet => 23,
-            Self::Rdp => 3389,
-            Self::Vnc => 5900,
-        }
+        crate::protocols::protocol_spec(self).default_port
     }
 
     /// 桌面协议：点开主机行时走桌面标签，而不是终端会话。
     pub fn is_desktop(self) -> bool {
-        matches!(self, Self::Rdp | Self::Vnc)
+        crate::protocols::protocol_spec(self).desktop
     }
 }
 

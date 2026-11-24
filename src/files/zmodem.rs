@@ -1,6 +1,6 @@
 //! ZMODEM 发送端：配合远端 `rz`（lrzsz）把本地文件上传到 shell 当前目录。
 //!
-//! 上行字节走独立的原始通道（不经过终端 IO），下行由 [`crate::ssh::ZmodemSink`]
+//! 上行字节走独立的原始通道（不经过终端 IO），下行由 [`crate::protocols::ssh::ZmodemSink`]
 //! 在握手期间接管；协议状态机由 `zmodem2` 驱动，本模块只负责文件读写、超时与进度。
 
 use std::path::Path;

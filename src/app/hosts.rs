@@ -907,13 +907,13 @@ impl RuTermApp {
     }
 
     /// 列表副标题：Telnet / 远程桌面前缀协议名，避免与 SSH 主机混淆。
+    /// 前缀取自协议元数据表，新增协议不必再回来补分支。
     pub(super) fn host_subtitle(host: &HostConfig) -> String {
-        match host.protocol {
-            ProtocolKind::Ssh => host.addr(),
-            ProtocolKind::Telnet => format!("Telnet · {}", host.addr()),
-            ProtocolKind::Rdp => format!("RDP · {}", host.addr()),
-            ProtocolKind::Vnc => format!("VNC · {}", host.addr()),
-        }
+        format!(
+            "{}{}",
+            crate::protocols::protocol_spec(host.protocol).subtitle_prefix,
+            host.addr()
+        )
     }
 
     /// 列表里显示的主机名：没填展示名时退回 user@host:port。

@@ -24,7 +24,7 @@ pub const BASE_LOCALE: &str = "zh-CN";
 const EN_LOCALE: &str = "en";
 
 /// 英文词条表，编译进二进制：发布包不需要额外带 locales 目录。
-const EN_JSON: &str = include_str!("../assets/locales/en.json");
+const EN_JSON: &str = include_str!("../../assets/locales/en.json");
 
 /// 安装全局 i18n 管理器并设定初始语言。
 ///

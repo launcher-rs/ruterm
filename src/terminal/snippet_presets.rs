@@ -1618,7 +1618,7 @@ mod tests {
     #[test]
     fn preset_texts_and_fallbacks_have_english_entries() {
         let table: std::collections::BTreeMap<String, String> =
-            serde_json::from_str(include_str!("../assets/locales/en.json"))
+            serde_json::from_str(include_str!("../../assets/locales/en.json"))
                 .expect("en.json 必须是扁平字符串表");
         for preset in PRESETS {
             for text in [preset.group, preset.name, preset.note] {

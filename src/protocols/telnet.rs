@@ -15,7 +15,6 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use rgpui::AppContext;
-use rgpui::Task;
 use rgpui_term::{ExternalHandles, FeedHandle, PtyBoundMessage};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
@@ -34,17 +33,11 @@ const TELOPT_ECHO: u8 = 1;
 const TELOPT_SGA: u8 = 3;
 const TELOPT_NAWS: u8 = 31;
 
-/// Telnet 会话句柄（与 SSH 会话同形，UI 侧统一按"可重连会话"处理）。
-pub struct TelnetSession {
-    /// 会话任务，必须被持有（提前 drop 会中断连接）。
-    pub join: Task<Result<()>>,
-    /// 是否成功建立过连接（失败发生在建连阶段时标签按"连接失败"处理）。
-    pub started: Arc<AtomicBool>,
-    /// TCP 建连成功时发送一次：UI 据此记录"连接真正可用"的时刻。
-    pub ready: oneshot::Receiver<()>,
-    /// 主动断开信号：标签被关闭时发送，会话任务随即释放连接。
-    pub disconnect: oneshot::Sender<()>,
-}
+/// Telnet 会话句柄。
+///
+/// 与 SSH 会话共用 [`SessionHandle`]：两者对 UI 的生命周期契约完全一致，
+/// 差异只在传输层内部（Telnet 是明文 TCP + 最小 IAC 协商）。
+pub type TelnetSession = crate::protocols::SessionHandle;
 
 /// 在 rgpui 的 tokio 运行时上启动 Telnet 会话。
 pub fn start<C: AppContext>(
