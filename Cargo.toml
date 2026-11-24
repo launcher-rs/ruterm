@@ -69,6 +69,10 @@ ironrdp-cliprdr-native = { path = "vendor/cliprdr-native" }
 # 依赖已展开为 registry 版本，避免把整个本地 rgpui workspace 牵进来。
 # 等上游发版后删掉这段、把依赖版本提到修复版即可。
 rgpui-term = { path = "vendor/rgpui-term" }
+# 临时：rgpui 的预设阴影（shadow_md/lg 等）在终端 canvas 的浮层上会被
+# 合成为斜纹/三角形灰块，命令补全面板和右键菜单都中招。本地宏副本把预设
+# 阴影统一置空，显式 shadow(vec![...]) 仍可用；上游修好后删掉这段即可。
+rgpui-macros = { path = "vendor/rgpui-macros" }
 
 [target.'cfg(windows)'.dependencies]
 # 提取 shell 可执行文件的系统图标：Win32 取 HICON，png 编成 rgpui 能直接吃的字节。

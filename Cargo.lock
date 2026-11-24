@@ -6897,8 +6897,6 @@ dependencies = [
 [[package]]
 name = "rgpui-macros"
 version = "1.8.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2c3407f51b1a92be9ba01e64df46ccf50ed6e5ad6a7e1648d851df094585752c"
 dependencies = [
  "heck 0.5.0",
  "proc-macro2",
