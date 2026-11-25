@@ -608,18 +608,6 @@ impl RuTermApp {
         // 启动档 shell 只有几个，图标走 shell 缓存、毫秒级，直接在主线程取好再进列表。
         app.refresh_shell_icons();
         app.auto_scan_local_shells(cx);
-        // 桌面标签捕获键盘时，组合键必须先于全局绑定交给远端：否则 Ctrl+W / Ctrl+B
-        // 这类应用快捷键会在捕获期间把标签关掉或收起边栏。拦截器只挡动作分发，
-        // capture_key_down 仍会照常把按键送给会话。
-        let entity = cx.entity().downgrade();
-        cx.intercept_keystrokes(move |_, window, cx| {
-            if let Some(this) = entity.upgrade()
-                && this.read(cx).desktop_capturing(window)
-            {
-                cx.stop_propagation();
-            }
-        })
-        .detach();
         app
     }
 

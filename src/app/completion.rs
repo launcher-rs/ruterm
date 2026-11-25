@@ -1,4 +1,4 @@
-//! 终端内命令补全：边输入边在光标下方浮出候选，Tab / Enter 补全。
+//! 终端内命令补全：边输入边在光标下方浮出候选，Tab 补全、Enter 执行当前输入。
 //!
 //! 按键在 `App::intercept_keystrokes` 阶段处理（早于动作分发），所以有候选时
 //! Tab / Enter / Esc / ↑↓ 不会被终端先吃掉；候选为空时全部原样放行。
@@ -28,7 +28,7 @@ pub(super) struct CompletionState {
     pub(super) token: String,
     /// 当前候选（已经按匹配度排好）。
     pub(super) items: Vec<CompletionItem>,
-    pub(super) selected: usize,
+    pub(super) selected: Option<usize>,
 }
 
 /// 浮层宽度与单行高度（像素）：命令通常比名称长，给宽一点。
@@ -115,11 +115,25 @@ impl RuTermApp {
                     cx.stop_propagation();
                     return;
                 }
-                "tab" | "enter" => {
-                    // 两键都只补全不执行：补全后命令停在行尾，再回车才跑。
-                    self.accept_completion(cx);
+                "tab" => {
+                    // Tab 是明确的补全动作；没有手动选中项时采用排序第一项。
+                    self.accept_completion(true, cx);
                     cx.stop_propagation();
                     return;
+                }
+                "enter" => {
+                    if self
+                        .completion
+                        .as_ref()
+                        .is_some_and(|state| state.selected.is_some())
+                    {
+                        // 只有用户用方向键明确选了候选，Enter 才确认候选。
+                        self.accept_completion(false, cx);
+                        cx.stop_propagation();
+                        return;
+                    }
+                    // 没有明确选择时，关闭提示并让 Enter 执行原样输入的命令。
+                    self.close_completion(cx);
                 }
                 "escape" => {
                     self.close_completion(cx);
@@ -242,14 +256,13 @@ impl RuTermApp {
         let previous = self
             .completion
             .as_ref()
-            .map(|state| state.selected)
-            .unwrap_or(0);
-        let selected = previous.min(hits.len().saturating_sub(1));
+            .and_then(|state| state.selected)
+            .filter(|index| *index < hits.len());
         self.completion = Some(CompletionState {
             tab_id,
             token,
             items: hits,
-            selected,
+            selected: previous,
         });
         cx.notify();
     }
@@ -262,11 +275,12 @@ impl RuTermApp {
         if len == 0 {
             return;
         }
-        state.selected = if down {
-            (state.selected + 1) % len
-        } else {
-            (state.selected + len - 1) % len
-        };
+        state.selected = Some(match state.selected {
+            Some(selected) if down => (selected + 1) % len,
+            Some(selected) => (selected + len - 1) % len,
+            None if down => 0,
+            None => len - 1,
+        });
         cx.notify();
     }
 
@@ -278,11 +292,14 @@ impl RuTermApp {
     }
 
     /// 接受选中项：退掉正在输入的词，换成完整命令，不追加回车。
-    fn accept_completion(&mut self, cx: &mut Context<Self>) {
+    fn accept_completion(&mut self, use_first_if_unselected: bool, cx: &mut Context<Self>) {
         let Some(state) = self.completion.take() else {
             return;
         };
-        let Some(item) = state.items.get(state.selected).cloned() else {
+        let selected = state
+            .selected
+            .or_else(|| use_first_if_unselected.then_some(0));
+        let Some(item) = selected.and_then(|slot| state.items.get(slot)).cloned() else {
             cx.notify();
             return;
         };
@@ -360,9 +377,9 @@ impl RuTermApp {
             if slot >= state.items.len() {
                 return;
             }
-            state.selected = slot;
+            state.selected = Some(slot);
         }
-        self.accept_completion(cx);
+        self.accept_completion(false, cx);
     }
 
     /// 浮层：隔一个空行贴在光标下方；下方放不下就同样隔一行翻到光标上方。
@@ -409,7 +426,7 @@ impl RuTermApp {
 
         let mut rows = v_flex().gap(px(1.0)).py(px(2.0));
         for (slot, item) in state.items.iter().enumerate() {
-            let selected = slot == state.selected;
+            let selected = state.selected == Some(slot);
             // 选项候选补的就是它自己，第二列改放它来自哪条命令，免得两列重复；
             // 历史候选的名称就是整条命令，第二列再放一遍只是占地方。
             let detail = match item.kind {
@@ -484,8 +501,7 @@ impl RuTermApp {
             .p_1()
             .rounded(px(6.0))
             .bg(pal.card_bg)
-            // 不用 shadow：浮层压在高频重绘的终端 canvas 上，阴影的半透明像素
-            // 会与画布内容混合出斜向条纹。用边框区分层次即可。
+            .shadow_md()
             .border_1()
             .border_color(pal.border)
             .child(rows)
@@ -495,7 +511,10 @@ impl RuTermApp {
                     .py(px(2.0))
                     .text_xs()
                     .text_color(pal.muted)
-                    .child(tr!(cx, "↑↓ 选择 · Tab 补全 · Esc 关闭")),
+                    .child(tr!(
+                        cx,
+                        "↑↓ 选择 · Tab 补全 · 回车执行输入或确认所选 · Esc 关闭"
+                    )),
             )
             .into_any_element()
     }

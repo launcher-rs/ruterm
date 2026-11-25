@@ -4271,6 +4271,8 @@ dependencies = [
 [[package]]
 name = "ironrdp-tls"
 version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ea5f0bb732e33159834f06a687f5415dae1a82c71c123c1c3a3689d41ed47645"
 dependencies = [
  "tokio",
  "tokio-native-tls",
@@ -6472,7 +6474,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7160,6 +7162,8 @@ dependencies = [
 [[package]]
 name = "rgpui-macros"
 version = "1.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "665549262d185ea7752c12130e99ce3291031d9710b45f0c79638de7b271d542"
 dependencies = [
  "heck 0.5.0",
  "proc-macro2",
@@ -7691,7 +7695,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7720,7 +7724,7 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
 name = "ruterm"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "aes-gcm 0.11.1",
  "anyhow",
@@ -7732,7 +7736,6 @@ dependencies = [
  "image",
  "ironrdp",
  "ironrdp-cliprdr-native",
- "ironrdp-tls",
  "keyring",
  "log",
  "png",

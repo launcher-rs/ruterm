@@ -631,7 +631,7 @@ impl RuTermApp {
                 div()
                     .text_xs()
                     .text_color(pal.muted)
-                    .child(tr!(cx, "输入命令时自动弹出片段候选：↑↓ 选择、Tab / Enter 补全、Esc 关闭；补全只替换正在输入的那个词，不会执行命令。关闭后按键完全交给 shell。")),
+                    .child(tr!(cx, "输入命令时自动弹出片段候选：↑↓ 选择、Tab 补全；未选候选时回车执行输入内容，选中候选后回车确认；补全只替换正在输入的那个词。关闭后按键完全交给 shell。")),
             )
             .child({
                 let entity = cx.entity();

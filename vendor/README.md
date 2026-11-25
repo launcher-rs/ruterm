@@ -6,10 +6,6 @@
 
 ## 各副本说明
 
-### ironrdp-tls
-上游 IronRDP 的 TLS 辅助库。本地补丁：用系统根证书 + rustls 默认校验器替换
-`danger_accept_invalid_certs(true)`，拒绝未受信自签证书（详见 `src/rustls.rs`）。
-
 ### picky
 上游 picky（PKCS#12 / X.509）。本地补丁：仅把几个 RustCrypto 依赖跟到已发布版本，
 裁掉不需要的 jose / pkcs12 默认特性，以与 russh 已解析的 crypto 版本共存；
@@ -27,11 +23,6 @@
 上游 IronRDP 的 Windows 原生剪贴板后端。本地副本把上游 0.9 的 Windows 文件剪贴板
 实现（CF_HDROP / 文件流）回移到 IronRDP 0.17 钉的 cliprdr 0.7 上（0.7 只有文本），
 只保留 Windows 后端，Linux 继续走 stub；并补充拖放上传的进度登记。
-
-### rgpui-macros
-上游 rgpui 的过程宏库。本地补丁把 `shadow_2xs()` 至 `shadow_2xl()` 等预设阴影统一置空，
-避免阴影的半透明像素在终端 canvas 的浮层上被合成为斜纹/三角形灰块（右键菜单、
-命令补全面板都中招）；显式 `shadow(vec![...])` 仍保留原行为。
 
 ## 许可证
 

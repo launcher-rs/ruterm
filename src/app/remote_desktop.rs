@@ -83,8 +83,6 @@ pub(super) struct DesktopTab {
     pub(super) request_size: (u16, u16),
     /// 共享桌面（VNC shared 标志）。
     pub(super) shared: bool,
-    /// 连接表单里「接受自签名证书」的勾选态（只影响下一次 RDP 连接）。
-    pub(super) accept_invalid_cert: bool,
     pub(super) phase: DesktopPhase,
     /// 标签内连接表单的输入框。
     pub(super) form_host: Entity<InputState>,
@@ -336,7 +334,6 @@ impl RuTermApp {
             domain: prefilled_domain,
             request_size: (1280, 800),
             shared: true,
-            accept_invalid_cert: false,
             phase: DesktopPhase::Form,
             form_host,
             form_port,
@@ -961,7 +958,6 @@ impl RuTermApp {
             username: (!desktop.username.is_empty()).then(|| desktop.username.clone()),
             domain: (!desktop.domain.is_empty()).then(|| desktop.domain.clone()),
             size: desktop.request_size,
-            accept_invalid_cert: desktop.accept_invalid_cert,
         };
         let handle = rgpui::tokio::Tokio::handle(cx);
         cx.spawn(async move |this, cx| {
@@ -1165,7 +1161,9 @@ impl RuTermApp {
             return;
         }
         desktop.phase = DesktopPhase::Live;
-        desktop.capture_keys = true;
+        // 握手完成并不代表远程画面已获得本地焦点；先显示未捕获，避免工具栏
+        // 看似已开启、但 desktop_key_* 因 focus 未命中而静默丢弃输入。
+        desktop.capture_keys = false;
         // 连接成功才缓存密码：内存里供本进程复用；已保存主机再加密写入凭据库，
         // 重启后点同一主机也不用再问。
         let connected_password = desktop.password.clone();
@@ -1196,7 +1194,7 @@ impl RuTermApp {
         if save_secret {
             store_desktop_secret(self.vault.clone(), saved_host, &connected_password, cx);
         }
-        self.status = tr!(cx, "已连接远程桌面");
+        self.status = tr!(cx, "已连接远程桌面，点击画面捕获键盘");
         self.sync_tray(cx);
         cx.notify();
     }
@@ -1316,10 +1314,6 @@ impl RuTermApp {
         // 认证类失败直接回输入处：直连标签回密码框，表单标签回完整表单，
         // 用户改密码就能重试，不必去失败卡片上找「修改参数」。
         let auth_failure = desktop_auth_failure(desktop.protocol, &message);
-        // TLS 证书校验失败（自签名 / 主机名不符）不是认证失败，但同样应回到表单：
-        // 用户要么装可信证书，要么显式勾选"接受自签名证书"再重试。
-        let cert_failure = desktop.protocol == Protocol::Rdp
-            && (message.contains("TLS 验证/握手失败") || message.contains("[TLS upgrade]"));
         let message = SharedString::from(message);
         desktop.command = None;
         desktop.latest = None;
@@ -1348,14 +1342,6 @@ impl RuTermApp {
             });
             tab.ended = false;
             tab.failed = false;
-        } else if cert_failure {
-            desktop.phase = DesktopPhase::Form;
-            desktop.form_error = Some(tr!(
-                cx,
-                "RDP TLS 证书校验失败：请安装系统信任且主机名匹配的证书；确认服务器可信后，也可勾选「接受自签名证书（不安全）」重试"
-            ));
-            tab.ended = false;
-            tab.failed = false;
         } else {
             desktop.phase = DesktopPhase::Failed {
                 message: message.clone(),
@@ -1365,7 +1351,7 @@ impl RuTermApp {
         }
         tab.last_error = Some(message.clone());
         if self.active_tab == Some(id) {
-            self.status = if auth_failure || cert_failure {
+            self.status = if auth_failure {
                 desktop
                     .form_error
                     .clone()
@@ -1628,22 +1614,12 @@ impl RuTermApp {
         cx.notify();
     }
 
-    /// 当前标签是否正在捕获键盘（活动标签是桌面、画面持有焦点且捕获已开启）。
-    ///
-    /// 用于全局按键拦截：捕获期间应用快捷键要让位给远端。
-    pub(super) fn desktop_capturing(&self, window: &Window) -> bool {
-        self.active_tab
-            .and_then(|id| self.tabs.iter().find(|tab| tab.id == id))
-            .and_then(|tab| tab.desktop.as_ref())
-            .is_some_and(|desktop| desktop.capture_keys && desktop.focus.is_focused(window))
-    }
-
     /// 键盘按下：捕获开启时全部转给远端，Esc 先用来释放捕获（不发给远端）。
     pub(super) fn desktop_key_down(
         &mut self,
         id: usize,
         event: &KeyDownEvent,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(desktop) = self
@@ -1654,7 +1630,9 @@ impl RuTermApp {
         else {
             return;
         };
-        if !desktop.capture_keys || !desktop.focus.is_focused(window) {
+        // 该监听器只会沿当前键盘焦点路径派发；这里再核对 FocusHandle 会在
+        // rgpui 的焦点句柄与派发节点不同步时吞掉按键。捕获状态才是转发开关。
+        if !desktop.capture_keys {
             return;
         }
         cx.stop_propagation();
@@ -1691,7 +1669,7 @@ impl RuTermApp {
         &mut self,
         id: usize,
         event: &KeyUpEvent,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(desktop) = self
@@ -1702,7 +1680,7 @@ impl RuTermApp {
         else {
             return;
         };
-        if !desktop.capture_keys || !desktop.focus.is_focused(window) {
+        if !desktop.capture_keys {
             return;
         }
         cx.stop_propagation();
@@ -1717,7 +1695,7 @@ impl RuTermApp {
         &mut self,
         id: usize,
         event: &ModifiersChangedEvent,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(desktop) = self
@@ -1728,7 +1706,7 @@ impl RuTermApp {
         else {
             return;
         };
-        if !desktop.capture_keys || !desktop.focus.is_focused(window) {
+        if !desktop.capture_keys {
             return;
         }
         cx.stop_propagation();
@@ -2436,33 +2414,6 @@ impl RuTermApp {
                                         .child(tr!(cx, "域（可留空）")),
                                 )
                                 .child(styled_input(Input::new(&desktop.form_domain), &pal)),
-                        )
-                        .child({
-                            let entity = cx.entity();
-                            Checkbox::new(SharedString::from(format!(
-                                "rd-accept-cert-{tab_id}"
-                            )))
-                            .checked(desktop.accept_invalid_cert)
-                            .label(tr!(cx, "接受自签名证书（不安全）"))
-                            .on_change(move |value, _window, cx| {
-                                entity.update(cx, |this, cx| {
-                                    if let Some(desktop) = this
-                                        .tabs
-                                        .iter_mut()
-                                        .find(|tab| tab.id == tab_id)
-                                        .and_then(|tab| tab.desktop.as_mut())
-                                    {
-                                        desktop.accept_invalid_cert = value;
-                                        cx.notify();
-                                    }
-                                });
-                            })
-                        })
-                        .child(
-                            div().text_xs().text_color(pal.muted).child(tr!(
-                                cx,
-                                "仅用于自签名 / 主机名不匹配的内网 RDP 服务器；确认服务器可信再勾选，且只影响本次连接。"
-                            )),
                         )
                     })
                     .child({

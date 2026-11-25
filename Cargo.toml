@@ -1,6 +1,6 @@
 [package]
 name = "ruterm"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/launcher-rs/ruterm"
@@ -42,8 +42,6 @@ ironrdp-cliprdr-native = { path = "vendor/cliprdr-native" }
 rgpui-extra = { git = "https://github.com/launcher-rs/rgpui-extra.git", features = ["ui"] }
 # 「检查镜像」用同一套 reqwest 做轻量探测（Release API + 安装包首字节），不重复引入 HTTP 栈。
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "default-tls"] }
-# 直接依赖只为在 RDP 会话线程上切换"接受自签证书"开关（后端特性由 ironrdp 统一启用）。
-ironrdp-tls = { version = "0.2", default-features = false }
 ironrdp = { version = "0.17", default-features = false, features = [
     "client",
     "client-clipboard",
@@ -57,8 +55,6 @@ ironrdp = { version = "0.17", default-features = false, features = [
 sspi = "=0.21.3"
 
 [patch.crates-io]
-# Require system CA + hostname validation in both TLS backends.
-ironrdp-tls = { path = "vendor/ironrdp-tls" }
 # ironrdp-connector 的 CredSSP 唯一用到的是 `picky::key::PrivateKey`。上游
 # 7.0.0-rc.25 把 curve25519-dalek 等钉在预发布版，与 russh 已解析的 5.0.0 /
 # 3.0.0 落在同一兼容区间而无法共存；本地副本只把几个 RustCrypto 依赖跟到
@@ -71,10 +67,6 @@ sspi = { path = "vendor/sspi" }
 # 本地副本移植上游 0.9 的 Windows 文件剪贴板实现（CF_HDROP / 文件流），
 # 只保留 Windows 后端，Linux 继续走 stub。
 ironrdp-cliprdr-native = { path = "vendor/cliprdr-native" }
-# 临时：rgpui 的预设阴影（shadow_md/lg 等）在终端 canvas 的浮层上会被
-# 合成为斜纹/三角形灰块，命令补全面板和右键菜单都中招。本地宏副本把预设
-# 阴影统一置空，显式 shadow(vec![...]) 仍可用；上游修好后删掉这段即可。
-rgpui-macros = { path = "vendor/rgpui-macros" }
 
 [target.'cfg(windows)'.dependencies]
 # 提取 shell 可执行文件的系统图标：Win32 取 HICON，png 编成 rgpui 能直接吃的字节。
