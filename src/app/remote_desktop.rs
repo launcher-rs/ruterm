@@ -780,11 +780,7 @@ impl RuTermApp {
     }
 
     /// 把表单内容落到主机列表 / 凭据库；返回状态栏附注。校验失败返回 None 并已提示。
-    fn persist_desktop_host(
-        &mut self,
-        tab_id: usize,
-        cx: &mut Context<Self>,
-    ) -> Option<String> {
+    fn persist_desktop_host(&mut self, tab_id: usize, cx: &mut Context<Self>) -> Option<String> {
         let desktop = self
             .tabs
             .iter()
@@ -2711,9 +2707,11 @@ impl RuTermApp {
                                 .label(tr!(cx, "保存并连接"))
                                 .secondary()
                                 .outline()
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.save_and_connect_desktop(tab_id, cx);
-                                })),
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        this.save_and_connect_desktop(tab_id, cx);
+                                    },
+                                )),
                             )
                             .child(
                                 Button::new(SharedString::from(format!("rd-connect-{tab_id}")))
@@ -2812,12 +2810,10 @@ impl RuTermApp {
                                 }),
                         )
                     })
-                    .child(
-                        div().text_xs().text_color(pal.muted).child(tr!(
-                            cx,
-                            "留空表示不带密码；勾选「记住密码」后加密存入凭据库，下次不用再输"
-                        )),
-                    )
+                    .child(div().text_xs().text_color(pal.muted).child(tr!(
+                        cx,
+                        "留空表示不带密码；勾选「记住密码」后加密存入凭据库，下次不用再输"
+                    )))
                     .when_some(desktop.form_error.clone(), |this, error| {
                         this.child(
                             div()
