@@ -48,6 +48,8 @@ pub async fn connect(config: Config) -> Result<Session> {
     let spawned = std::thread::Builder::new()
         .name("ruterm-rdp".to_string())
         .spawn(move || {
+            // 证书校验开关是线程局部的，必须在握手发生的这个线程上设置。
+            ironrdp_tls::set_accept_invalid_cert(config.accept_invalid_cert);
             // WinClipboard is built on this thread inside `RdpClient::run`.
             ironrdp_cliprdr_native::prepare_clipboard_session(clipboard_token);
             let result = run_session(client_config, name, command_rx, &event_tx, &thread_latest);

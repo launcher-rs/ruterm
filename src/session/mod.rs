@@ -281,11 +281,20 @@ pub struct SshSession {
 
 /// anyhow 错误链拍平成一行（状态栏与终端展示用，避免只看到顶层语境）。
 pub fn error_summary(error: &anyhow::Error) -> String {
-    error
+    let summary = error
         .chain()
         .map(std::string::ToString::to_string)
         .collect::<Vec<_>>()
-        .join("：")
+        .join("：");
+    // russh 的主机密钥不符只报一句 Unknown server key，用户既不知道原因也不知道
+    // 去哪里改；把可操作的入口直接写进状态栏文案。
+    if summary.contains("Unknown server key") {
+        format!(
+            "{summary}（主机密钥已变更？在主机列表右键选「重设 SSH 凭据」；确认服务器可信后再连接）"
+        )
+    } else {
+        summary
+    }
 }
 
 /// 在 rgpui 的 tokio 运行时上启动 SSH 会话。

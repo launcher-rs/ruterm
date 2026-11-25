@@ -1,5 +1,23 @@
-//! RuTerm patch: require system-trusted certificates and matching server names; no insecure fallback.
+//! RuTerm 补丁：默认要求系统可信证书且主机名匹配；用户在连接表单显式勾选后，
+//! 可仅对当前连接线程放宽校验（自签名 / 主机名不符的内网 RDP服务器）。
 #![doc(html_logo_url = "https://cdnweb.devolutions.net/images/projects/devolutions/logos/devolutions-icon-shadow.svg")]
+
+use std::cell::Cell;
+
+// 每个 RDP 会话跑在自己的线程上，握手也在该线程完成；用线程局部状态避免
+// 多个会话同时连接时，一个会话的"接受自签"影响到另一个会话。
+thread_local! {
+    static ACCEPT_INVALID_CERT: Cell<bool> = const { Cell::new(false) };
+}
+
+/// 仅对当前线程的下一次 TLS 握手生效：true = 接受自签名 / 主机名不符的证书。
+pub fn set_accept_invalid_cert(accept: bool) {
+    ACCEPT_INVALID_CERT.with(|flag| flag.set(accept));
+}
+
+pub(crate) fn accept_invalid_cert() -> bool {
+    ACCEPT_INVALID_CERT.with(Cell::get)
+}
 
 #[cfg(feature = "rustls-no-provider")]
 #[path = "rustls.rs"]

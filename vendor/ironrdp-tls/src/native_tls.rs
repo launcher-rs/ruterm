@@ -9,15 +9,27 @@ where
     S: Unpin + AsyncRead + AsyncWrite,
 {
     let mut tls_stream = {
-        let connector = tokio_native_tls::native_tls::TlsConnector::builder()
-            // RuTerm: retain system CA and hostname verification (including CredSSP TLS).
+        let accept_invalid = crate::accept_invalid_cert();
+        let mut builder = tokio_native_tls::native_tls::TlsConnector::builder();
+        // 默认保留系统 CA 与主机名校验；只有用户在表单显式勾选时才放宽，
+        // 且只影响当前会话线程，不会把后续连接一起降级。
+        if accept_invalid {
+            builder
+                .danger_accept_invalid_certs(true)
+                .danger_accept_invalid_hostnames(true);
+        }
+        let connector = builder
             .use_sni(true)
             .build()
             .map(tokio_native_tls::TlsConnector::from)
             .map_err(io::Error::other)?;
 
         connector.connect(server_name, stream).await.map_err(|error| {
-            io::Error::other(format!("TLS 验证/握手失败：{error}；请安装/使用系统信任且主机名匹配的证书，不接受未受信自签证书"))
+            if accept_invalid {
+                io::Error::other(format!("TLS 握手失败：{error}"))
+            } else {
+                io::Error::other(format!("TLS 验证/握手失败：{error}；请安装系统信任且主机名匹配的证书，或在连接表单勾选「接受自签名证书（不安全）」"))
+            }
         })?
     };
 

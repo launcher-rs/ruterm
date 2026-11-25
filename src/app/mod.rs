@@ -164,6 +164,8 @@ pub(crate) struct RuTermApp {
     /// 删除二次确认（主机 id；浮层遮挡期间 attach_vault 仍可能整表替换列表，
     /// 下标会指向别的行，身份必须用 id）。
     confirm_delete: Option<i64>,
+    /// 重设 SSH 凭据（清主机信任 + 已保存密码）的二次确认，用 id 定位主机。
+    confirm_trust: Option<i64>,
     /// 多行粘贴确认：目标标签 id 与待粘文本。
     confirm_paste: Option<(usize, String)>,
     /// 确认弹窗里「本次运行不再提示」的勾选态（打开弹窗时重置）。
@@ -484,6 +486,7 @@ impl RuTermApp {
             protocols,
             group_prompt: None,
             confirm_delete: None,
+            confirm_trust: None,
             confirm_paste: None,
             paste_confirm_checked: false,
             paste_confirm_disabled: false,
@@ -1076,6 +1079,7 @@ impl RuTermApp {
         self.unlock.is_some()
             || self.settings.is_some()
             || self.confirm_delete.is_some()
+            || self.confirm_trust.is_some()
             || self.confirm_paste.is_some()
             || self.about_open
             || self.new_host.is_some()
@@ -1197,6 +1201,82 @@ impl RuTermApp {
                                 cx.stop_propagation();
                             }),
                         ),
+                )
+                .into_any_element();
+        }
+        // 重设 SSH 凭据：明说会同时清掉主机密钥信任与已保存密码，避免误点后莫名其妙。
+        if let Some(id) = self.confirm_trust {
+            let label = self
+                .hosts
+                .iter()
+                .find(|host| host.id == id)
+                .map(|host| {
+                    if host.name.is_empty() {
+                        host.addr()
+                    } else {
+                        host.name.clone()
+                    }
+                })
+                .unwrap_or_else(|| tr!(cx, "该主机").to_string());
+            return v_flex()
+                .id("trust-backdrop")
+                .absolute()
+                .top(px(0.0))
+                .left(px(0.0))
+                .size_full()
+                .items_center()
+                .justify_center()
+                .bg(rgpui::hsla(0.0, 0.0, 0.0, 0.45))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| this.cancel_reset_trust(cx)),
+                )
+                .child(
+                    v_flex()
+                        .id("trust-dialog")
+                        .w(px(400.0))
+                        .gap_3()
+                        .p_4()
+                        .rounded(px(8.0))
+                        .bg(pal.card_bg)
+                        .border_1()
+                        .border_color(pal.border)
+                        .child(
+                            div()
+                                .text_base()
+                                .font_weight(rgpui::FontWeight(600.0))
+                                .child(tr!(cx, "重设 {label} 的 SSH 凭据？", label = label)),
+                        )
+                        .child(
+                            div().text_xs().text_color(pal.muted).child(tr!(
+                                cx,
+                                "服务器重装系统 / 改密码后使用：清除已记录的主机密钥与保存的密码，下次连接重新确认指纹并输入新密码。"
+                            )),
+                        )
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .justify_end()
+                                .child(
+                                    Button::new("cancel-trust")
+                                        .label(tr!(cx, "取消"))
+                                        .ghost()
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.cancel_reset_trust(cx);
+                                        })),
+                                )
+                                .child(
+                                    Button::new("confirm-trust")
+                                        .label(tr!(cx, "重设凭据"))
+                                        .danger()
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.confirm_reset_trust(cx);
+                                        })),
+                                ),
+                        )
+                        .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, cx| {
+                            cx.stop_propagation();
+                        })),
                 )
                 .into_any_element();
         }

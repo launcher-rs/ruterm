@@ -433,6 +433,71 @@ impl RuTermApp {
         cx.notify();
     }
 
+    /// 主机右键「重设 SSH 凭据…」：先二次确认，用户明确知道会清掉信任与密码。
+    pub(super) fn ask_reset_trust(&mut self, id: i64, cx: &mut Context<Self>) {
+        if self
+            .hosts
+            .iter()
+            .any(|host| host.id == id && host.protocol == ProtocolKind::Ssh)
+        {
+            self.confirm_trust = Some(id);
+            cx.notify();
+        }
+    }
+
+    pub(super) fn cancel_reset_trust(&mut self, cx: &mut Context<Self>) {
+        self.confirm_trust = None;
+        cx.notify();
+    }
+
+    /// 确认重设：清掉 known_hosts 记录（下次连接重新记录新指纹）与已保存密码，
+    /// 内存缓存也一并移除，保证下次必然重新询问密码而不是拿旧的再试一次。
+    pub(super) fn confirm_reset_trust(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.confirm_trust.take() else {
+            return;
+        };
+        let Some(host) = self.hosts.iter().find(|host| host.id == id).cloned() else {
+            self.status = tr!(cx, "原主机已不存在，无需重设凭据");
+            cx.notify();
+            return;
+        };
+        let host_port = format!("[{}]:{}", host.host, host.port);
+        self.password_cache.remove(&host.addr());
+        let label = if host.name.is_empty() {
+            host.addr()
+        } else {
+            host.name.clone()
+        };
+        if let Some(vault) = self.vault.clone() {
+            let host_id = (host.id != 0).then_some(id);
+            cx.spawn(async move |_, _| {
+                if let Err(error) = vault.forget_known_host(&host_port).await {
+                    log::warn!("清除主机密钥信任失败: {error}");
+                }
+                if let Some(id) = host_id
+                    && let Err(error) = vault.set_password(id, None).await
+                {
+                    log::warn!("清除已保存密码失败: {error}");
+                }
+            })
+            .detach();
+        } else {
+            let path = crate::protocols::ssh::legacy_known_hosts_path();
+            cx.spawn(async move |_, _| {
+                if let Err(error) = crate::vault::forget_legacy_known_host(&path, &host_port) {
+                    log::warn!("清除旧 known_hosts 失败: {error}");
+                }
+            })
+            .detach();
+        }
+        self.status = tr!(
+            cx,
+            "已重设 {label} 的凭据：下次连接会重新记录主机指纹并询问密码",
+            label = label
+        );
+        cx.notify();
+    }
+
     /// 发现行按钮：按指定协议打开；打开即关闭弹窗，把位置让给表单 / 标签。
     pub(super) fn open_discovered_as(
         &mut self,
@@ -481,11 +546,13 @@ impl RuTermApp {
         } else {
             tr!(cx, "共 {count} 台主机，点服务按钮直接打开", count = count)
         };
-        let mut rows = v_flex()
-            .id("discovery-list")
-            .gap_1()
-            .max_h(px(340.0))
-            .overflow_y_scrollbar();
+        // 滚动条默认「滚动时才显示」，主机多时补一句提示，免得以为后面的主机不存在。
+        let status = if count > 7 && !self.discovering && self.discovery_error.is_none() {
+            SharedString::from(format!("{status} · {}", tr!(cx, "列表可滚动")))
+        } else {
+            status
+        };
+        let mut rows = v_flex().id("discovery-list").gap_1();
         for (index, host) in self.discovered.iter().enumerate() {
             let ip = host.ip.to_string();
             let services = host.services();
@@ -565,6 +632,14 @@ impl RuTermApp {
                     .child(buttons),
             );
         }
+        // 只有 max_h 时滚动区在自动高度的弹窗里拿不到确定视口：内容照样被裁掉，
+        // 滚动条不出现、鼠标滚轮也到不了后面的主机。超过一屏就给死高度，
+        // 让 Scrollable 的视口高度确定；少于一屏保持内容高度，弹窗不空一大块。
+        let rows: AnyElement = if count > 7 {
+            rows.h(px(340.0)).overflow_y_scrollbar().into_any_element()
+        } else {
+            rows.into_any_element()
+        };
         v_flex()
             .id("discovery-backdrop")
             .absolute()

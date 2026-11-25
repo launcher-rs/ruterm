@@ -87,92 +87,115 @@ impl RuTermApp {
             MenuTarget::HostId(_) => current_group.clone(),
             _ => None,
         };
+        // 服务器重装 / 改密码后，用户需要同时重记主机指纹和改保存的密码。
+        // 只对 SSH 主机显示；私钥与密码主机都适用。
+        let is_ssh = match &target {
+            MenuTarget::HostId(id) => entity
+                .read(cx)
+                .hosts
+                .iter()
+                .any(|host| host.id == *id && host.protocol == ProtocolKind::Ssh),
+            _ => false,
+        };
         let menu = match &target {
             MenuTarget::HostId(id) => {
                 let id = *id;
-                menu.item(Self::menu_item(
-                    entity.clone(),
-                    tr!(cx, "编辑"),
-                    None,
-                    false,
-                    false,
-                    move |this, window, cx| {
-                        this.open_form_at(Some(id), None, window, cx);
-                    },
-                ))
-                .separator()
-                // 非手动排序下这几项不生效，禁用比隐藏更容易让人看懂现在为什么不动。
-                .item(
-                    Self::menu_item(
+                let menu = menu
+                    .item(Self::menu_item(
                         entity.clone(),
-                        tr!(cx, "上移一位"),
+                        tr!(cx, "编辑"),
                         None,
                         false,
                         false,
-                        move |this, _, cx| this.reorder_host(id, ReorderAction::Up, cx),
+                        move |this, window, cx| {
+                            this.open_form_at(Some(id), None, window, cx);
+                        },
+                    ))
+                    .separator()
+                    // 非手动排序下这几项不生效，禁用比隐藏更容易让人看懂现在为什么不动。
+                    .item(
+                        Self::menu_item(
+                            entity.clone(),
+                            tr!(cx, "上移一位"),
+                            None,
+                            false,
+                            false,
+                            move |this, _, cx| this.reorder_host(id, ReorderAction::Up, cx),
+                        )
+                        .disabled(sort != SidebarSort::Manual),
                     )
-                    .disabled(sort != SidebarSort::Manual),
-                )
-                .item(
-                    Self::menu_item(
+                    .item(
+                        Self::menu_item(
+                            entity.clone(),
+                            tr!(cx, "下移一位"),
+                            None,
+                            false,
+                            false,
+                            move |this, _, cx| this.reorder_host(id, ReorderAction::Down, cx),
+                        )
+                        .disabled(sort != SidebarSort::Manual),
+                    )
+                    .item(
+                        Self::menu_item(
+                            entity.clone(),
+                            tr!(cx, "移到组内最前"),
+                            None,
+                            false,
+                            false,
+                            move |this, _, cx| this.reorder_host(id, ReorderAction::Top, cx),
+                        )
+                        .disabled(sort != SidebarSort::Manual),
+                    )
+                    .separator()
+                    .item(Self::menu_item(
                         entity.clone(),
-                        tr!(cx, "下移一位"),
+                        "Ping",
                         None,
                         false,
                         false,
-                        move |this, _, cx| this.reorder_host(id, ReorderAction::Down, cx),
-                    )
-                    .disabled(sort != SidebarSort::Manual),
-                )
-                .item(
-                    Self::menu_item(
+                        move |this, _, cx| {
+                            let Some(host) = this
+                                .hosts
+                                .iter()
+                                .find(|host| host.id == id)
+                                .map(|host| host.host.clone())
+                            else {
+                                return;
+                            };
+                            this.open_network_tool(&host, NetTool::Ping, cx);
+                        },
+                    ))
+                    .item(Self::menu_item(
                         entity.clone(),
-                        tr!(cx, "移到组内最前"),
+                        tr!(cx, "路由追踪"),
                         None,
                         false,
                         false,
-                        move |this, _, cx| this.reorder_host(id, ReorderAction::Top, cx),
-                    )
-                    .disabled(sort != SidebarSort::Manual),
-                )
-                .separator()
-                .item(Self::menu_item(
-                    entity.clone(),
-                    "Ping",
-                    None,
-                    false,
-                    false,
-                    move |this, _, cx| {
-                        let Some(host) = this
-                            .hosts
-                            .iter()
-                            .find(|host| host.id == id)
-                            .map(|host| host.host.clone())
-                        else {
-                            return;
-                        };
-                        this.open_network_tool(&host, NetTool::Ping, cx);
-                    },
-                ))
-                .item(Self::menu_item(
-                    entity.clone(),
-                    tr!(cx, "路由追踪"),
-                    None,
-                    false,
-                    false,
-                    move |this, _, cx| {
-                        let Some(host) = this
-                            .hosts
-                            .iter()
-                            .find(|host| host.id == id)
-                            .map(|host| host.host.clone())
-                        else {
-                            return;
-                        };
-                        this.open_network_tool(&host, NetTool::TraceRoute, cx);
-                    },
-                ))
-                .separator()
+                        move |this, _, cx| {
+                            let Some(host) = this
+                                .hosts
+                                .iter()
+                                .find(|host| host.id == id)
+                                .map(|host| host.host.clone())
+                            else {
+                                return;
+                            };
+                            this.open_network_tool(&host, NetTool::TraceRoute, cx);
+                        },
+                    ))
+                    .separator();
+                if is_ssh {
+                    menu.item(Self::menu_item(
+                        entity.clone(),
+                        tr!(cx, "重设 SSH 凭据（重装 / 改密码后）…"),
+                        None,
+                        false,
+                        false,
+                        move |this, _, cx| this.ask_reset_trust(id, cx),
+                    ))
+                } else {
+                    menu
+                }
             }
             _ => menu,
         };

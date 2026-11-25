@@ -37,6 +37,8 @@ image = { version = "0.25.10", default-features = false }
 # 剪贴板在 Windows 上由 ironrdp-cliprdr-native 直接挂系统剪贴板，文本双向自动同步。
 # 本机副本还提供拖放上传的进度登记（写剪贴板前登记，剪贴板线程回报已发送字节）。
 ironrdp-cliprdr-native = { path = "vendor/cliprdr-native" }
+# 直接依赖只为在 RDP 会话线程上切换"接受自签证书"开关（后端特性由 ironrdp 统一启用）。
+ironrdp-tls = { version = "0.2", default-features = false }
 ironrdp = { version = "0.17", default-features = false, features = [
     "client",
     "client-clipboard",

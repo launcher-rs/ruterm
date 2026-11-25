@@ -698,6 +698,23 @@ impl Vault {
         .await
     }
 
+    /// 清除某主机的信任记录（服务器重装 / 换密钥后由用户显式确认才调用）。
+    /// 下一次连接会重新记录新指纹；不提供自动"遇到不符就覆盖"，避免中间人攻击被静默放行。
+    pub async fn forget_known_host(&self, host_port: &str) -> Result<()> {
+        let host_port = host_port.to_string();
+        self.job(move |cell| async move {
+            let mut db = cell.lock().await;
+            Query::<List<KnownHostRow>>::all()
+                .filter(KnownHostRow::fields().host_port().eq(host_port))
+                .delete()
+                .exec(&mut *db as &mut dyn toasty::Executor)
+                .await
+                .context("清除 known_hosts 记录失败")?;
+            Ok(())
+        })
+        .await
+    }
+
     /// 旧信任记录只能补缺，绝不能覆盖新库中已确认的指纹。
     pub async fn record_known_hosts(&self, entries: Vec<(String, String, String)>) -> Result<()> {
         for (host_port, fingerprint, algorithm) in entries {
@@ -1074,6 +1091,26 @@ pub fn read_legacy_known_hosts(path: &Path) -> Result<Option<String>> {
     }
 }
 
+/// 降级模式（无加密库）下清除某主机的旧信任记录；保留其它主机行。
+pub fn forget_legacy_known_host(path: &Path, host_port: &str) -> Result<()> {
+    let Some(text) = read_legacy_known_hosts(path)? else {
+        return Ok(());
+    };
+    let kept: Vec<&str> = text
+        .lines()
+        .filter(|line| {
+            line.split_whitespace()
+                .next()
+                .is_none_or(|host| host != host_port)
+        })
+        .collect();
+    let mut body = kept.join("\n");
+    if !body.is_empty() && text.ends_with('\n') {
+        body.push('\n');
+    }
+    std::fs::write(path, body).context("写入旧 known_hosts 失败")
+}
+
 pub async fn import_legacy_trust(vault: &Vault, text: &str) -> Result<()> {
     vault
         .record_known_hosts(parse_legacy_known_hosts(text))
@@ -1325,6 +1362,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(trust, Trust::Mismatch);
+        // 用户确认服务器重装后清除旧信任：同一主机变成首次接触，新指纹可记录。
+        vault.forget_known_host("[example.com]:2222").await.unwrap();
+        let trust = vault
+            .check_or_record_known_host("[example.com]:2222", "bbb", "ssh-ed25519")
+            .await
+            .unwrap();
+        assert_eq!(trust, Trust::New);
 
         // 换密钥重开必须失败（页级加密真实生效），同密钥重开数据仍在。
         let wrong = Vault::open(&mode, "1f".repeat(32), rt.clone()).await;
@@ -1815,5 +1859,24 @@ mod tests {
         assert_eq!(entries[0].1, "abc123");
         assert_eq!(entries[0].2, "ssh-ed25519");
         assert_eq!(entries[1].2, "unknown");
+    }
+
+    #[test]
+    fn forget_legacy_known_host_keeps_other_rows() {
+        let dir = temp_dir("ruterm-forget-kh-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("known_hosts");
+        std::fs::write(
+            &path,
+            "[a]:22 aaa ssh-ed25519\n[b]:22 bbb ssh-ed25519\n[c]:22 ccc ssh-ed25519\n",
+        )
+        .unwrap();
+        forget_legacy_known_host(&path, "[b]:22").unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text, "[a]:22 aaa ssh-ed25519\n[c]:22 ccc ssh-ed25519\n");
+        assert_eq!(parse_legacy_known_hosts(&text).len(), 2);
+        // 目标不存在不能破坏文件。
+        forget_legacy_known_host(&path, "[missing]:22").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
     }
 }

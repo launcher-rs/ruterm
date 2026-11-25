@@ -1033,5 +1033,15 @@
  "同步输入：关": "Sync input: off",
  "同步输入至少需要两个可用会话": "Sync input needs at least two live sessions",
  "单实例守卫不可用（锁端口被占用），本次启动可能与其它实例并存，请勿再双击图标": "Single-instance guard unavailable (the lock port is occupied); this launch may coexist with another instance — don't double-click the icon again",
- "原主机已不存在，本次保存按新主机写入": "The original host no longer exists; this save created a new host instead"
+ "原主机已不存在，本次保存按新主机写入": "The original host no longer exists; this save created a new host instead",
+ "列表可滚动": "the list is scrollable",
+ "重设 SSH 凭据（重装 / 改密码后）…": "Reset SSH credentials (after reinstall / password change)…",
+ "重设 {label} 的 SSH 凭据？": "Reset SSH credentials for {label}?",
+ "服务器重装系统 / 改密码后使用：清除已记录的主机密钥与保存的密码，下次连接重新确认指纹并输入新密码。": "Use this after reinstalling the server or changing its password: clears the recorded host key and saved password; the next connection reconfirms the fingerprint and asks for the new password.",
+ "重设凭据": "Reset credentials",
+ "原主机已不存在，无需重设凭据": "The host no longer exists; nothing to reset",
+ "已重设 {label} 的凭据：下次连接会重新记录主机指纹并询问密码": "Credentials reset for {label}: the next connection will record the host fingerprint again and ask for the password",
+ "接受自签名证书（不安全）": "Accept self-signed certificate (insecure)",
+ "仅用于自签名 / 主机名不匹配的内网 RDP 服务器；确认服务器可信再勾选，且只影响本次连接。": "Only for internal RDP servers with a self-signed certificate or a hostname mismatch. Check it only if you trust the server; it applies to this connection only.",
+ "RDP TLS 证书校验失败：请安装系统信任且主机名匹配的证书；确认服务器可信后，也可勾选「接受自签名证书（不安全）」重试": "RDP TLS certificate verification failed: install a system-trusted certificate matching the hostname, or, if you trust the server, check \"Accept self-signed certificate (insecure)\" and retry"
 }

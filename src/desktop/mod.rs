@@ -56,6 +56,8 @@ pub struct Config {
     pub domain: Option<String>,
     /// RDP 请求的桌面尺寸（远端会按这个分辨率建会话）。
     pub size: (u16, u16),
+    /// 用户显式勾选后接受自签名 / 主机名不符的 RDP 证书；仅本次连接生效。
+    pub accept_invalid_cert: bool,
 }
 
 impl Config {

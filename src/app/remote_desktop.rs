@@ -83,6 +83,8 @@ pub(super) struct DesktopTab {
     pub(super) request_size: (u16, u16),
     /// 共享桌面（VNC shared 标志）。
     pub(super) shared: bool,
+    /// 连接表单里「接受自签名证书」的勾选态（只影响下一次 RDP 连接）。
+    pub(super) accept_invalid_cert: bool,
     pub(super) phase: DesktopPhase,
     /// 标签内连接表单的输入框。
     pub(super) form_host: Entity<InputState>,
@@ -334,6 +336,7 @@ impl RuTermApp {
             domain: prefilled_domain,
             request_size: (1280, 800),
             shared: true,
+            accept_invalid_cert: false,
             phase: DesktopPhase::Form,
             form_host,
             form_port,
@@ -958,6 +961,7 @@ impl RuTermApp {
             username: (!desktop.username.is_empty()).then(|| desktop.username.clone()),
             domain: (!desktop.domain.is_empty()).then(|| desktop.domain.clone()),
             size: desktop.request_size,
+            accept_invalid_cert: desktop.accept_invalid_cert,
         };
         let handle = rgpui::tokio::Tokio::handle(cx);
         cx.spawn(async move |this, cx| {
@@ -1312,6 +1316,10 @@ impl RuTermApp {
         // 认证类失败直接回输入处：直连标签回密码框，表单标签回完整表单，
         // 用户改密码就能重试，不必去失败卡片上找「修改参数」。
         let auth_failure = desktop_auth_failure(desktop.protocol, &message);
+        // TLS 证书校验失败（自签名 / 主机名不符）不是认证失败，但同样应回到表单：
+        // 用户要么装可信证书，要么显式勾选"接受自签名证书"再重试。
+        let cert_failure = desktop.protocol == Protocol::Rdp
+            && (message.contains("TLS 验证/握手失败") || message.contains("[TLS upgrade]"));
         let message = SharedString::from(message);
         desktop.command = None;
         desktop.latest = None;
@@ -1340,6 +1348,14 @@ impl RuTermApp {
             });
             tab.ended = false;
             tab.failed = false;
+        } else if cert_failure {
+            desktop.phase = DesktopPhase::Form;
+            desktop.form_error = Some(tr!(
+                cx,
+                "RDP TLS 证书校验失败：请安装系统信任且主机名匹配的证书；确认服务器可信后，也可勾选「接受自签名证书（不安全）」重试"
+            ));
+            tab.ended = false;
+            tab.failed = false;
         } else {
             desktop.phase = DesktopPhase::Failed {
                 message: message.clone(),
@@ -1349,7 +1365,7 @@ impl RuTermApp {
         }
         tab.last_error = Some(message.clone());
         if self.active_tab == Some(id) {
-            self.status = if auth_failure {
+            self.status = if auth_failure || cert_failure {
                 desktop
                     .form_error
                     .clone()
@@ -2420,6 +2436,33 @@ impl RuTermApp {
                                         .child(tr!(cx, "域（可留空）")),
                                 )
                                 .child(styled_input(Input::new(&desktop.form_domain), &pal)),
+                        )
+                        .child({
+                            let entity = cx.entity();
+                            Checkbox::new(SharedString::from(format!(
+                                "rd-accept-cert-{tab_id}"
+                            )))
+                            .checked(desktop.accept_invalid_cert)
+                            .label(tr!(cx, "接受自签名证书（不安全）"))
+                            .on_change(move |value, _window, cx| {
+                                entity.update(cx, |this, cx| {
+                                    if let Some(desktop) = this
+                                        .tabs
+                                        .iter_mut()
+                                        .find(|tab| tab.id == tab_id)
+                                        .and_then(|tab| tab.desktop.as_mut())
+                                    {
+                                        desktop.accept_invalid_cert = value;
+                                        cx.notify();
+                                    }
+                                });
+                            })
+                        })
+                        .child(
+                            div().text_xs().text_color(pal.muted).child(tr!(
+                                cx,
+                                "仅用于自签名 / 主机名不匹配的内网 RDP 服务器；确认服务器可信再勾选，且只影响本次连接。"
+                            )),
                         )
                     })
                     .child({
