@@ -166,6 +166,9 @@ pub struct Settings {
     /// 本机文件页偏好（隐藏文件开关 + 上次停留的目录，序列化成 JSON 字符串）。
     #[serde(default)]
     pub local_files: String,
+    /// 检查更新偏好（镜像开关 + 自定义镜像前缀，序列化成 JSON 字符串）。
+    #[serde(default)]
+    pub update: String,
     /// 是否启用系统托盘；缺省关闭（关窗即退出）。
     #[serde(default)]
     pub tray: bool,
@@ -330,6 +333,12 @@ impl SessionStore {
     pub fn save_local_shells(&self, json: &str) {
         let json = json.to_string();
         self.update_settings(|settings| settings.local_shells = json);
+    }
+
+    /// 降级模式（无加密库）下保存检查更新偏好。
+    pub fn save_update(&self, json: &str) {
+        let json = json.to_string();
+        self.update_settings(|settings| settings.update = json);
     }
 
     /// 降级模式（无加密库）下保存本机文件页偏好。

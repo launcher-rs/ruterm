@@ -20,7 +20,7 @@ mod vault;
 // 避免几十处引用跟着改（也留出后续逐个收敛到新路径的余地）。
 pub(crate) use files::{remote_fs, transfer, zmodem};
 pub(crate) use hosts::{config, discovery, remote, sessions, ssh_config};
-pub(crate) use support::{i18n, instance, paths, platform};
+pub(crate) use support::{i18n, instance, paths, platform, update};
 pub(crate) use terminal::{completion, history, local_shell, macros, snippet_presets, snippets};
 
 use rgpui::prelude::*;

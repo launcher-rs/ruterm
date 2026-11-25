@@ -3,7 +3,8 @@
 use std::time::Duration;
 
 use rgpui::components::status_bar::{StatusBar, StatusBarItem};
-use rgpui::{App, Context, Entity, IconName, SharedString};
+use rgpui::components::{AnimatedProgress, AnimatedProgressSize};
+use rgpui::{AnyElement, App, Context, Entity, IconName, SharedString, div, px};
 use rgpui_term::Terminal;
 
 use crate::remote::Metric;
@@ -72,7 +73,7 @@ impl RuTermApp {
     ///
     /// 可点的开关不放这里——状态栏两侧都被会话读数占着，会话一多按钮就被挤掉，
     /// 输入提示与同步输入的开关在「终端」菜单里。
-    pub(super) fn render_status_bar(&self, cx: &Context<Self>) -> StatusBar {
+    pub(super) fn render_status_bar(&self, cx: &Context<Self>) -> AnyElement {
         let active = self
             .active_tab
             .and_then(|id| self.tabs.iter().find(|tab| tab.id == id));
@@ -134,12 +135,32 @@ impl RuTermApp {
             }
         }
         let mut right = Vec::new();
+        // 检查更新 / 下载进度：文本复用组件模型，细进度条贴在状态栏上方。
+        if let Some(label) = self.update_status.label(
+            &tr!(cx, "正在检查更新…"),
+            &tr!(cx, "正在下载更新"),
+            &tr!(cx, "下载完成"),
+        ) {
+            right.push(StatusBarItem::new(label).id("update-progress").muted(true));
+        }
         right.push(
             StatusBarItem::new(tr!(cx, "会话 {count}", count = self.tabs.len()))
                 .id("sessions")
                 .muted(true),
         );
-        StatusBar::new().left(left).right(right)
+        let mut wrapper = div().w_full().flex_shrink_0().flex().flex_col();
+        if let Some(fraction) = self.update_status.fraction() {
+            wrapper = wrapper.child(
+                div().w_full().h(px(3.0)).child(
+                    AnimatedProgress::new("update-progress-bar")
+                        .value(fraction)
+                        .size(AnimatedProgressSize::Sm),
+                ),
+            );
+        }
+        wrapper
+            .child(StatusBar::new().left(left).right(right).w_full())
+            .into_any_element()
     }
 
     /// 在状态栏打一条醒目的传输提示（图标 + 高亮背景）。

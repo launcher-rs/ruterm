@@ -501,14 +501,19 @@ impl RuTermApp {
                     ))
             };
 
-        // 帮助菜单只有「关于」：版本、仓库与许可证都在对话框里；
+        // 帮助菜单：检查更新（手动触发，启动时不联网）+ 关于。
         // 快捷键已随各菜单项右侧显示，不再单列一份文字清单。
         let app = cx.entity();
         let help_menu = move |menu: PopupMenu, _: &mut Window, cx: &mut Context<PopupMenu>| {
             let about = tr!(cx, "关于 RuTerm…");
-            let app = app.clone();
-            menu.item(PopupMenuItem::new(about).on_click(move |_, _, cx| {
-                app.update(cx, |this, cx| {
+            let check = tr!(cx, "检查更新…");
+            let app_check = app.clone();
+            let app_about = app.clone();
+            menu.item(PopupMenuItem::new(check).on_click(move |_, window, cx| {
+                app_check.update(cx, |this, cx| this.check_for_updates(window, cx));
+            }))
+            .item(PopupMenuItem::new(about).on_click(move |_, _, cx| {
+                app_about.update(cx, |this, cx| {
                     this.about_open = true;
                     cx.notify();
                 });

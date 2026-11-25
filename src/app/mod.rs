@@ -23,6 +23,7 @@ mod status_bar;
 mod tabs;
 mod terminal_ops;
 mod title_bar;
+mod update;
 mod vault_ui;
 mod widgets;
 
@@ -174,6 +175,14 @@ pub(crate) struct RuTermApp {
     paste_confirm_disabled: bool,
     /// 「帮助 → 关于」浮层开关。
     about_open: bool,
+    /// 检查更新 / 下载进度（状态栏复用组件模型）。
+    update_status: rgpui_extra::updater::ui::UpdateStatus,
+    /// 检查更新偏好（镜像开关与前缀），随加密库 / settings.json 持久化。
+    update_prefs: UpdatePrefs,
+    /// 设置弹窗里的镜像前缀输入框（单行，多个前缀用空格分隔）。
+    update_mirror_input: Entity<InputState>,
+    /// 发现新版本时待展示的更新对话框数据。
+    update_dialog: Option<update::UpdateDialogState>,
     /// 主密码解锁弹窗（便携模式 / 已设置主密码时启动弹出）。
     unlock: Option<UnlockState>,
     /// 设置弹窗（主密码管理、主题、锁定）。
@@ -378,6 +387,7 @@ impl RuTermApp {
         let snippets = crate::snippets::from_json(&settings.snippets);
         let history = CommandHistory::from_json(&settings.history);
         let local_files = LocalFilesPrefs::from_json(&settings.local_files);
+        let update_prefs = UpdatePrefs::from_json(&settings.update);
         // 终端配色预设管理器：全局一份，`TerminalView::set_theme` 与自建样式都从这里取。
         if !cx.has_global::<ThemeManager>() {
             cx.set_global(ThemeManager::new(None));
@@ -399,6 +409,15 @@ impl RuTermApp {
                 input
             })
             .collect::<Vec<_>>();
+        // 镜像前缀输入框同样常驻：库内偏好晚到时只在打开设置时回填，不打断用户输入。
+        let update_mirror_input =
+            cx.new(|cx| InputState::new(window, cx).default_value(update_prefs.mirrors_text()));
+        cx.subscribe(&update_mirror_input, |this, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                this.set_update_mirrors_from_input(cx);
+            }
+        })
+        .detach();
         // 侧边栏 ↔ 主区 分隔面板：默认边栏约占 0.32，够放下文件表格的五列。
         let split_state = cx.new(SplitPaneState::new);
         split_state.update(cx, |state, cx| {
@@ -491,6 +510,10 @@ impl RuTermApp {
             paste_confirm_checked: false,
             paste_confirm_disabled: false,
             about_open: false,
+            update_status: rgpui_extra::updater::ui::UpdateStatus::default(),
+            update_prefs,
+            update_mirror_input,
+            update_dialog: None,
             unlock: None,
             settings: None,
             sidebar_page: SidebarPage::Hosts,
@@ -901,6 +924,16 @@ impl RuTermApp {
                     }
                 });
             }
+            // 检查更新偏好同样以库内为准；镜像输入框在打开设置时回填。
+            if let Ok(Some(json)) = vault.setting("update").await {
+                let prefs = UpdatePrefs::from_json(&json);
+                let _ = this.update(cx, |this, cx| {
+                    if this.update_prefs != prefs {
+                        this.update_prefs = prefs;
+                        cx.notify();
+                    }
+                });
+            }
             // 托盘开关：启动时读 settings.json；库内若有更新值（换机器等）在此补齐。
             if let Ok(Some(value)) = vault.setting("tray").await {
                 let enabled = value == "1" || value.eq_ignore_ascii_case("true");
@@ -1082,6 +1115,7 @@ impl RuTermApp {
             || self.confirm_trust.is_some()
             || self.confirm_paste.is_some()
             || self.about_open
+            || self.update_dialog.is_some()
             || self.new_host.is_some()
             || self.group_prompt.is_some()
             || self.shell_prompt.is_some()
@@ -1094,7 +1128,7 @@ impl RuTermApp {
 
     /// 窗口级浮层：删除二次确认、主机表单、分组新建/重命名等居中模态。
     /// （主机右键菜单不在这里——它走框架的独立图层，见 `context_menu`。）
-    pub(super) fn render_overlay(&self, window: &Window, cx: &Context<Self>) -> AnyElement {
+    pub(super) fn render_overlay(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let pal = self.palette(cx);
         // 解锁 / 主密码弹窗优先于一切浮层（库未解锁时其余操作无意义）。
         if self.unlock.is_some() {
@@ -1117,6 +1151,10 @@ impl RuTermApp {
         }
         if self.file_upload_prompt.is_some() {
             return self.render_file_upload_prompt(cx);
+        }
+        // 检查更新：组件自带遮罩与按钮，挂在窗口级覆盖层最前面。
+        if let Some(dialog) = self.render_update_overlay(cx) {
+            return dialog;
         }
         // 「帮助 → 关于」：半透明遮罩 + 居中卡片，点遮罩或「确定」关闭。
         if self.about_open {
@@ -1724,7 +1762,7 @@ impl Render for RuTermApp {
                     .child(self.render_right_rail(cx))
                     .into_any_element()
             })
-            .child(self.render_status_bar(cx).flex_shrink_0().w_full())
+            .child(self.render_status_bar(cx))
             .child(self.render_overlay(window, cx))
             .child(self.render_terminal_menu())
     }

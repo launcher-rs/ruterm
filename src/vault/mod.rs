@@ -1199,6 +1199,7 @@ pub async fn migrate_legacy(
                         ("terminal", &settings.terminal),
                         ("session", &settings.session),
                         ("local_shells", &settings.local_shells),
+                        ("update", &settings.update),
                     ] {
                         if !value.is_empty() {
                             vault.set_setting(key, value).await?;

@@ -49,6 +49,8 @@ pub(super) const SETTINGS_TAB_STATUS: usize = 2;
 pub(super) const SETTINGS_TAB_TERMINAL: usize = 3;
 /// 设置弹窗分页：会话行为（自动重连 / 连接超时）。
 pub(super) const SETTINGS_TAB_SESSION: usize = 4;
+/// 设置弹窗分页：检查更新（镜像开关与自定义前缀）。
+pub(super) const SETTINGS_TAB_UPDATE: usize = 5;
 
 /// 设置弹窗固定宽高：切分页不重排，弹窗不随内容忽大忽小。
 pub(super) const SETTINGS_DIALOG_W: f32 = 640.0;
@@ -73,8 +75,9 @@ impl RuTermApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // 库内终端偏好可能在上次打开之后才到达，先把自定义色回填到输入框。
+        // 库内偏好可能在上次打开之后才到达，先把自定义色与镜像前缀回填到输入框。
         self.sync_custom_color_inputs(window, cx);
+        self.sync_update_mirror_input(window, cx);
         if let Some(state) = self.settings.as_mut() {
             // 已开着：只换分页（搬迁途中锁住分页，避免切走看不到结果）。
             if !state.busy {
@@ -206,6 +209,7 @@ impl RuTermApp {
             SETTINGS_TAB_STATUS => self.render_status_tab(&pal, cx),
             SETTINGS_TAB_TERMINAL => self.render_terminal_tab(&pal, cx),
             SETTINGS_TAB_SESSION => self.render_session_tab(&pal, cx),
+            SETTINGS_TAB_UPDATE => self.render_update_prefs_tab(&pal, cx),
             _ => self.render_vault_tab(&pal, state, passphrase_mode, unlocked, cx),
         };
         let entity = cx.entity();
@@ -315,6 +319,12 @@ impl RuTermApp {
                                         "settings-tab-session",
                                         tr!(cx, "会话"),
                                         SETTINGS_TAB_SESSION,
+                                        entity.clone(),
+                                    ))
+                                    .child(tab_item(
+                                        "settings-tab-update",
+                                        tr!(cx, "更新"),
+                                        SETTINGS_TAB_UPDATE,
                                         entity,
                                     )),
                             )

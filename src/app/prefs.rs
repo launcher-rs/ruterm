@@ -158,6 +158,63 @@ impl StatusBarPrefs {
     }
 }
 
+/// 检查更新偏好：默认只连 GitHub Release；镜像是网络不通时的可选中转。
+///
+/// 镜像前缀按优先级排列，组件会依次尝试自定义 → 内置 → 直连；开关关闭时完全不走镜像。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdatePrefs {
+    /// 是否启用镜像中转。
+    #[serde(default)]
+    pub use_mirrors: bool,
+    /// 自定义镜像前缀（去尾部斜杠后保存）。
+    #[serde(default)]
+    pub custom_mirrors: Vec<String>,
+}
+
+impl Default for UpdatePrefs {
+    fn default() -> Self {
+        Self {
+            // 默认开启：前面几个是实测可用的前缀，最后一个兜底仍是直连。
+            // 不信任第三方中转时可在「设置 → 更新」关掉。
+            use_mirrors: true,
+            custom_mirrors: crate::update::RECOMMENDED_MIRRORS
+                .iter()
+                .map(|mirror| (*mirror).to_string())
+                .collect(),
+        }
+    }
+}
+
+impl UpdatePrefs {
+    /// 界面输入框用空格分隔多个前缀；空串与重复项直接丢掉。
+    pub(super) fn set_mirrors_text(&mut self, text: &str) {
+        let mut mirrors = Vec::new();
+        for part in text.split(|c: char| c.is_whitespace() || c == ',') {
+            let mirror = part.trim().trim_end_matches('/').to_string();
+            if !mirror.is_empty() && !mirrors.contains(&mirror) {
+                mirrors.push(mirror);
+            }
+        }
+        self.custom_mirrors = mirrors;
+    }
+
+    /// 回填输入框：多个前缀用空格分隔。
+    pub(super) fn mirrors_text(&self) -> String {
+        self.custom_mirrors.join(" ")
+    }
+
+    pub(super) fn to_json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
+    }
+
+    pub(super) fn from_json(text: &str) -> Self {
+        if text.is_empty() {
+            return Self::default();
+        }
+        serde_json::from_str(text).unwrap_or_default()
+    }
+}
+
 /// 终端字号范围与步进：下限保证可读，上限避免把窗口撑爆。
 pub(super) const FONT_SIZE_MIN: f32 = 10.0;
 pub(super) const FONT_SIZE_MAX: f32 = 32.0;
@@ -1083,7 +1140,7 @@ mod tests {
         FONT_SIZE_MAX, FONT_SIZE_MIN, ForwardPrefs, JumpPrefs, LINE_HEIGHT_MAX, LINE_HEIGHT_MIN,
         LocalShellPrefs, ProtocolPrefs, SavedForward, SessionPrefs, SidebarPrefs, SidebarSort,
         SortableHost, StatusBarPrefs, TERMINAL_THEME_DEFAULT, TerminalColors, TerminalPrefs,
-        auto_reconnect_delay, hex_to_hsla, normalize_hex,
+        UpdatePrefs, auto_reconnect_delay, hex_to_hsla, normalize_hex,
     };
     use crate::remote::Metric;
     use crate::session::ForwardKind;
@@ -1606,5 +1663,35 @@ mod tests {
             TerminalPrefs::from_json(r#"{"font_size":"大","line_height":[]}"#),
             TerminalPrefs::default()
         );
+    }
+
+    #[test]
+    fn update_prefs_parse_and_roundtrip_mirrors() {
+        let mut prefs = UpdatePrefs::default();
+        assert!(prefs.use_mirrors);
+        assert_eq!(
+            prefs.custom_mirrors,
+            crate::update::RECOMMENDED_MIRRORS
+                .iter()
+                .map(|mirror| (*mirror).to_string())
+                .collect::<Vec<_>>()
+        );
+        prefs.set_mirrors_text(
+            " https://mirror.example/  , https://mirror2.example https://mirror.example ",
+        );
+        assert_eq!(
+            prefs.custom_mirrors,
+            vec!["https://mirror.example", "https://mirror2.example"]
+        );
+        assert_eq!(
+            prefs.mirrors_text(),
+            "https://mirror.example https://mirror2.example"
+        );
+        assert_eq!(UpdatePrefs::from_json(&prefs.to_json()), prefs);
+
+        prefs.set_mirrors_text("  ,  ");
+        assert!(prefs.custom_mirrors.is_empty());
+        assert_eq!(UpdatePrefs::from_json(""), UpdatePrefs::default());
+        assert_eq!(UpdatePrefs::from_json("{ not json"), UpdatePrefs::default());
     }
 }

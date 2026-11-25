@@ -4,3 +4,4 @@ pub(crate) mod i18n;
 pub(crate) mod instance;
 pub(crate) mod paths;
 pub(crate) mod platform;
+pub(crate) mod update;
