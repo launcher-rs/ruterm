@@ -124,16 +124,12 @@ pub enum Command {
     Clipboard(String),
     /// 把本地文件放上系统剪贴板并让远端粘贴（RDP 文件剪贴板；VNC 忽略）。
     PasteFiles(Vec<std::path::PathBuf>),
+    /// 中止当前 RDP 文件剪贴板传输。
+    CancelUpload,
     /// 请求一次增量更新（正常由会话自己排，界面基本不用发）。
     Refresh,
     /// 请求整帧（切回标签、自适应时用）。
     RequestFull,
-    /// 让远端把桌面改成指定像素尺寸（RDP 动态分辨率；VNC 忽略）。
-    Resize {
-        width: u16,
-        height: u16,
-        scale_factor: u32,
-    },
     /// 释放该会话已发送的所有键和鼠标按钮。
     ReleaseAll,
     /// 主动断开。
@@ -279,10 +275,9 @@ where
                 Command::RequestFull => vnc::update_request_message(false, width, height),
                 // 松开所有仍按着的键和鼠标按钮；失焦 / 退出键鼠捕获时由界面下发。
                 Command::ReleaseAll => input.release_all(),
-                // VNC 的动态分辨率要协商 ExtendedDesktopSize，这里不做；忽略即可。
-                Command::Resize { .. } => continue,
                 // RFB 没有文件剪贴板，界面侧已提前拦下并提示。
                 Command::PasteFiles(_) => continue,
+                Command::CancelUpload => continue,
                 Command::Close => break,
             };
             if tokio::time::timeout(vnc::WRITE_TIMEOUT, writer.write_all(&bytes))

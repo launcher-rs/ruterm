@@ -33,6 +33,10 @@ const UPLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
 const UPLOAD_START_TIMEOUT: Duration = Duration::from_secs(120);
 /// 剪贴板线程枚举大目录的宽限；超过还没认出这批文件就当登记失败。
 const UPLOAD_ENUM_TIMEOUT: Duration = Duration::from_secs(60);
+/// 连接后观察首屏的时长：这段时间内若桌面几乎全黑，说明远端只有图标、没有重画壁纸。
+const WALLPAPER_CHECK_DELAY: Duration = Duration::from_millis(900);
+/// 判定「只有图标的黑底」的纯黑像素比例阈值。正常壁纸桌面远低于此值。
+const WALLPAPER_BLACK_THRESHOLD: f64 = 0.80;
 
 /// 连上服务器：建好客户端配置后把会话交给专用线程。
 pub async fn connect(config: Config) -> Result<Session> {
@@ -78,16 +82,25 @@ fn build_client_config(config: &Config) -> Result<ironrdp::client::config::Confi
         .with_username(config.username.clone().unwrap_or_default())
         .with_password(config.password.clone().unwrap_or_default())
         .with_client_name("RuTerm")
-        .with_client_dir("")
-        .with_client_build(0)
+        // 与 mstsc / FreeRDP 的握手值保持一致，避免服务端把客户端识别成老版本。
+        // 这不是壁纸问题的根因（系统 mstsc 同样会复现），只是消除无谓的兼容分支。
+        .with_client_dir("C:\\Windows\\System32\\mstscax.dll")
+        .with_client_build(22631)
         .with_platform(MajorPlatformType::WINDOWS)
         .with_desktop_width(config.size.0.max(200))
         .with_desktop_height(config.size.1.max(200))
         .with_color_depth(32)
+        // 只广告 RemoteFX。本项目没有编译 IronRDP 的 qoi/qoiz feature，所以默认
+        // 也只有 RemoteFX。注意 `client_codecs_capabilities` 对未列出的 codec 用
+        // `unwrap_or(true)`，单靠 `remotefx:on` 无法排除将来编译进来的 qoi/qoiz；
+        // 真正守住这一点的是单测 `client_config_advertises_only_remotefx`。
+        .with_codecs(vec!["remotefx:on".to_owned()])
         .with_credssp(true)
         // Only disable legacy TLS + graphical login; CredSSP still uses validated TLS.
         .with_tls(false)
-        .with_autologon(true)
+        // 与 mstsc / FreeRDP 的默认行为一致。CredSSP 下这个标志会被服务端忽略，
+        // 但保留 false 可以避免以后改用其它认证方式时意外改变会话行为。
+        .with_autologon(false)
         .with_compression(true)
         // Windows 后端直接挂系统剪贴板：文本与文件（CF_HDROP / 文件流）双向同步。
         .with_clipboard(ironrdp::client::config::ClipboardType::Enable);
@@ -126,6 +139,9 @@ fn run_session(
         let mut frame: Option<Frame> = None;
         let mut announced = false;
         let mut frames = 0u32;
+        // 壁纸自愈：首屏若只有图标（几乎全黑），等远端画完首帧后按一次 F5，
+        // 强制资源管理器重画桌面。只做一次，避免干扰用户后续操作。
+        let mut wallpaper_check_at: Option<Instant> = None;
         let mut stats_at = Instant::now();
         let mut close_at: Option<Instant> = None;
         // 上一帧发布时间与下一次允许发布的截止点：密集更新期间只保留最新整帧，
@@ -146,7 +162,15 @@ fn run_session(
                     // 收尾前排空队列：Terminated 往往就在里面等着。
                     while let Ok(event) = output_rx.try_recv() {
                         if matches!(
-                            handle_output(event, event_tx, &mut frame, &mut announced, &name, &mut frames),
+                            handle_output(
+                                event,
+                                event_tx,
+                                &mut frame,
+                                &mut announced,
+                                &name,
+                                &mut frames,
+                                &mut wallpaper_check_at,
+                            ),
                             Output::Ended
                         ) {
                             return;
@@ -168,7 +192,15 @@ fn run_session(
                         });
                         return;
                     };
-                    match handle_output(event, event_tx, &mut frame, &mut announced, &name, &mut frames) {
+                    match handle_output(
+                        event,
+                        event_tx,
+                        &mut frame,
+                        &mut announced,
+                        &name,
+                        &mut frames,
+                        &mut wallpaper_check_at,
+                    ) {
                         Output::Ended => return,
                         Output::Dirty => {
                             if last_publish.elapsed() >= FRAME_INTERVAL {
@@ -216,6 +248,20 @@ fn run_session(
                                 });
                             }
                         }
+                        Command::CancelUpload => {
+                            if let Some(state) = upload.take() {
+                                state.progress.abort();
+                                cancel_upload(&state.progress);
+                                let _ = event_tx.send(Event::Upload {
+                                    done: state.progress.sent(),
+                                    total: state.progress.total(),
+                                    files: state.progress.files(),
+                                    finished: true,
+                                    failed: true,
+                                });
+                            }
+                            upload_tick = None;
+                        }
                         command => {
                             if handle_command(
                                 command,
@@ -238,6 +284,38 @@ fn run_session(
                     }
                 }, if pending_at.is_some() => {
                     pending_at = flush_or_retry(event_tx, latest, &frame, &mut last_publish);
+                }
+                // 首屏只有图标、整块壁纸没画出来：按一次 F5 让远端资源管理器
+                // 重画桌面。服务端偶尔在会话恢复时跳过壁纸绘制，图标却照常显示，
+                // 从帧缓冲看就是「纯黑底 + 少量非黑像素」。只补一次，不反复打扰。
+                _ = async {
+                    if let Some(deadline) = wallpaper_check_at {
+                        tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                }, if wallpaper_check_at.is_some() => {
+                    wallpaper_check_at = None;
+                    let black = frame.as_ref().map_or(0.0, |(buffer, _, _)| {
+                        let black = buffer
+                            .iter()
+                            .filter(|pixel| **pixel & 0x00FF_FFFF == 0)
+                            .count();
+                        black as f64 / buffer.len().max(1) as f64
+                    });
+                    if black > WALLPAPER_BLACK_THRESHOLD {
+                        log::info!(
+                            target: "ruterm::desktop::rdp",
+                            "desktop looks black ({:.0}%), sending F5 to repaint wallpaper",
+                            black * 100.0
+                        );
+                        let f5 = Scancode::from_u16(0x3F);
+                        send_input(
+                            &mut database,
+                            &input,
+                            [Operation::KeyPressed(f5), Operation::KeyReleased(f5)],
+                        );
+                    }
                 }
                 _ = async {
                     if let Some(deadline) = close_at {
@@ -299,7 +377,9 @@ fn run_session(
                         } else {
                             state.last_change.elapsed() >= UPLOAD_IDLE_TIMEOUT
                         };
-                        if stalled && state.paste_at.is_none() {
+                        // If enumeration never attached our file list, `paste_at` is never
+                        // cleared; the enumeration timeout must still finish the operation.
+                        if stalled && (state.started_at.is_none() || state.paste_at.is_none()) {
                             state.progress.abort();
                         }
                     }
@@ -420,6 +500,7 @@ fn handle_output(
     announced: &mut bool,
     name: &str,
     frames: &mut u32,
+    wallpaper_check_at: &mut Option<Instant>,
 ) -> Output {
     match event {
         RdpOutputEvent::Image {
@@ -431,6 +512,9 @@ fn handle_output(
             *frames += 1;
             if !*announced {
                 *announced = true;
+                // 首帧到达后再等一小会儿检查壁纸：期间服务器还会补发增量，
+                // 太早判断会把正常桌面误判成黑底。
+                *wallpaper_check_at = Some(Instant::now() + WALLPAPER_CHECK_DELAY);
                 let _ = event_tx.send(Event::Connected {
                     width,
                     height,
@@ -441,8 +525,11 @@ fn handle_output(
             Output::Dirty
         }
         RdpOutputEvent::ConnectionFailure(error) => {
+            // IronRDP 的 Error Display 只打印 `[context] kind`，真正的底层原因
+            // （如 Connection refused / 主机不可达）挂在 source 链上，必须用
+            // report() 展开，否则用户只看到「custom error」无从排查。
             let _ = event_tx.send(Event::Closed {
-                reason: error.to_string(),
+                reason: error.report().to_string(),
             });
             Output::Ended
         }
@@ -578,24 +665,12 @@ fn handle_command(
             send_input(database, input, operations);
             false
         }
-        Command::Resize {
-            width,
-            height,
-            scale_factor,
-        } => {
-            let _ = input.send(RdpInputEvent::Resize {
-                width,
-                height,
-                scale_factor,
-                physical_size: None,
-            });
-            false
-        }
         // 剪贴板由 WinClipboard 后端直接挂系统剪贴板（文本与文件都自动双向同步）；
         // 界面侧再发一遍会覆盖远端刚复制的内容，这里忽略。
         Command::Clipboard(_) => false,
         // 文件拖放在会话循环里先进剪贴板、再按 Ctrl+V，不走这里。
         Command::PasteFiles(_) => false,
+        Command::CancelUpload => false,
         // RDP 只在画面变化时推帧；界面要整帧时把最后一帧再放回槽位。
         Command::Refresh | Command::RequestFull => {
             if let Some(frame) = frame {
@@ -814,6 +889,33 @@ mod tests {
             bgra: vec![0; 4],
         }));
         assert!(!publish_frame(&latest, &(vec![0x0011_2233], 1, 1)));
+    }
+
+    #[test]
+    fn client_config_advertises_only_remotefx() {
+        // 守住图形路径：只广告服务端真正支持的 RemoteFX，避免将来打开 qoi/qoiz
+        // feature 后悄悄改变协商结果（不同编解码器的首屏行为并不一致）。
+        let config = Config {
+            protocol: crate::desktop::Protocol::Rdp,
+            host: "127.0.0.1".to_owned(),
+            port: 3389,
+            password: None,
+            shared: false,
+            username: Some("tester".to_owned()),
+            domain: None,
+            size: (1280, 800),
+        };
+        let client = build_client_config(&config).expect("配置有效");
+        let codecs = &client
+            .connector()
+            .bitmap
+            .as_ref()
+            .expect("bitmap 配置存在")
+            .codecs
+            .0;
+        assert_eq!(codecs.len(), 1, "只应广告 RemoteFX 一种编解码器");
+        // CODEC_ID_REMOTEFX == 3；QOI(0x0A)/QOIZ(0x0B) 都不应在列。
+        assert_eq!(codecs[0].id, 3);
     }
 
     #[test]

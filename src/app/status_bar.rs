@@ -3,8 +3,7 @@
 use std::time::Duration;
 
 use rgpui::components::status_bar::{StatusBar, StatusBarItem};
-use rgpui::components::{AnimatedProgress, AnimatedProgressSize};
-use rgpui::{AnyElement, App, Context, Entity, IconName, SharedString, div, px};
+use rgpui::{AnyElement, App, Context, Entity, IconName, SharedString, div, px, relative};
 use rgpui_term::Terminal;
 
 use crate::remote::Metric;
@@ -150,12 +149,21 @@ impl RuTermApp {
         );
         let mut wrapper = div().w_full().flex_shrink_0().flex().flex_col();
         if let Some(fraction) = self.update_status.fraction() {
+            let theme = cx.theme();
             wrapper = wrapper.child(
-                div().w_full().h(px(3.0)).child(
-                    AnimatedProgress::new("update-progress-bar")
-                        .value(fraction)
-                        .size(AnimatedProgressSize::Sm),
-                ),
+                div()
+                    .w_full()
+                    .h(px(3.0))
+                    .rounded(theme.radius_lg)
+                    .bg(*theme.tokens.muted)
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .h_full()
+                            .w(relative(fraction))
+                            .rounded(theme.radius_lg)
+                            .bg(*theme.tokens.primary),
+                    ),
             );
         }
         wrapper

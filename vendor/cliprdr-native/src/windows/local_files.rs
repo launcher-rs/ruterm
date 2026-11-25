@@ -272,6 +272,10 @@ impl LocalFiles {
     }
 
     pub(crate) fn file_contents(&self, request: &FileContentsRequest) -> FileContentsResponse<'static> {
+        if self.upload.as_ref().is_some_and(|upload| upload.failed()) {
+            return FileContentsResponse::new_error(request.stream_id);
+        }
+
         // Without a snapshot for its `clipDataId`, `Cliprdr` validated the request against the
         // current list, so it is served from there as well.
         let source = request

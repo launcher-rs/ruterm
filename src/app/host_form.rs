@@ -13,6 +13,7 @@ use crate::NewHost;
 use crate::sessions::{AuthMethod, HostConfig, ProtocolKind};
 use crate::tr;
 
+use super::remote_desktop::{desktop_cache_key, store_desktop_secret_after_save};
 use super::*;
 
 /// 新建/编辑主机表单（各字段为受控输入状态）。
@@ -32,6 +33,8 @@ pub(super) struct NewHostForm {
     pub(super) key_label: Option<String>,
     /// 加密私钥口令（可选）。保存时勾选入库则写加密库，否则仅本次内存缓存；绝不落明文。
     pub(super) passphrase: Entity<InputState>,
+    /// 远程桌面（RDP / VNC）新密码。已保存的密码不会回填显示；留空＝不改动。
+    pub(super) password: Entity<InputState>,
     /// 表单层"保存口令到加密库"开关（默认否＝仅本次内存持有）。
     pub(super) save_secret: bool,
     pub(super) auth: AuthMethod,
@@ -165,6 +168,9 @@ impl RuTermApp {
                 InputState::new(window, cx)
                     .placeholder(tr!(cx, "私钥口令（可选，留空则连接时按需询问）"))
             }),
+            password: cx.new(|cx| {
+                InputState::new(window, cx).placeholder(tr!(cx, "已保存密码不会显示，留空则不改动"))
+            }),
             key_inline: existing.as_ref().is_some_and(|host| host.key_inline),
             key_data: None,
             key_label: None,
@@ -210,6 +216,7 @@ impl RuTermApp {
             AuthMethod::Agent
         };
         let passphrase = form.passphrase.read(cx).value().trim().to_string();
+        let password = form.password.read(cx).value().trim().to_string();
         let save_secret = form.save_secret;
         let group = form.group.clone();
         // 跳板机是 SSH 专属：切到其它协议时连同旧值一起清掉，
@@ -329,6 +336,8 @@ impl RuTermApp {
                 self.note_jump(&host, cx);
                 self.note_protocol(&host, cx);
                 let note = self.store_form_secret(&host, passphrase.clone(), save_secret, cx);
+                let password_note =
+                    self.store_desktop_form_secret(&host, password.clone(), save_secret, cx);
                 let key_note = self.store_form_key(&host, key_data, was_inline, cx);
                 self.apply_form_group(&host, group, cx);
                 self.new_host = None;
@@ -336,7 +345,7 @@ impl RuTermApp {
                     cx,
                     "已更新主机 {label}{notes}{group_note}",
                     label = label,
-                    notes = join_notes(note, key_note),
+                    notes = join_notes(Some(join_notes(note, password_note)), key_note),
                     group_note = group_note,
                 );
                 cx.notify();
@@ -356,6 +365,7 @@ impl RuTermApp {
         self.note_jump(&host, cx);
         self.note_protocol(&host, cx);
         let note = self.store_form_secret(&host, passphrase, save_secret, cx);
+        let password_note = self.store_desktop_form_secret(&host, password, save_secret, cx);
         let key_note = self.store_form_key(&host, key_data, false, cx);
         self.apply_form_group(&host, group, cx);
         self.new_host = None;
@@ -363,7 +373,7 @@ impl RuTermApp {
             cx,
             "已保存主机 {label}{notes}{group_note}",
             label = label,
-            notes = join_notes(note, key_note),
+            notes = join_notes(Some(join_notes(note, password_note)), key_note),
             group_note = group_note,
         );
         cx.notify();
@@ -415,6 +425,36 @@ impl RuTermApp {
         }
         self.password_cache.insert(host.addr(), passphrase);
         Some(tr!(cx, "（口令仅本次内存持有）").to_string())
+    }
+
+    /// 远程桌面主机密码的落点。与 SSH 口令共用「保存口令」开关，但按桌面的
+    /// 缓存键与凭据库写入路径处理；空密码＝不改动已保存的凭据。
+    pub(super) fn store_desktop_form_secret(
+        &mut self,
+        host: &HostConfig,
+        password: String,
+        save: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<String> {
+        if !matches!(host.protocol, ProtocolKind::Rdp | ProtocolKind::Vnc) || password.is_empty() {
+            return None;
+        }
+        // 进程内缓存按桌面口径（账号 + 地址 + 端口）记，连接时才能直接命中。
+        let key = desktop_cache_key(&host.host, host.port, &host.user, "");
+        self.password_cache.insert(key, password.clone());
+        if save {
+            let written =
+                store_desktop_secret_after_save(self.vault.clone(), host.clone(), &password, cx);
+            return Some(
+                if written {
+                    tr!(cx, "（密码已加密入库）")
+                } else {
+                    tr!(cx, "（加密库不可用，密码仅本次内存持有）")
+                }
+                .to_string(),
+            );
+        }
+        Some(tr!(cx, "（密码仅本次内存持有）").to_string())
     }
 
     /// 内嵌私钥的落点：新导入的写入加密库，取消内嵌则清除库内旧条目。
@@ -756,6 +796,69 @@ impl RuTermApp {
                                             )))
                                         },
                                     ),
+                            )
+                            // 桌面协议密码：已保存的密码一律不回填显示（与「修改参数」一致）。
+                            // 这里输入的是「新密码」，留空保存＝沿用已保存的密码。
+                            .when(
+                                matches!(protocol, ProtocolKind::Rdp | ProtocolKind::Vnc),
+                                |this| {
+                                    this.child(
+                                        v_flex()
+                                            .gap_1()
+                                            .child(
+                                                h_flex()
+                                                    .w_full()
+                                                    .items_center()
+                                                    .justify_between()
+                                                    .child(div().text_sm().child(tr!(cx, "密码")))
+                                                    .child(
+                                                        h_flex()
+                                                            .id("save-desktop-password")
+                                                            .gap_2()
+                                                            .items_center()
+                                                            .when(self.vault.is_some(), |this| {
+                                                                this.cursor_pointer().on_click(
+                                                                    cx.listener(|this, _, _, cx| {
+                                                                        if let Some(form) =
+                                                                            this.new_host.as_mut()
+                                                                        {
+                                                                            form.save_secret =
+                                                                                !form.save_secret;
+                                                                            cx.notify();
+                                                                        }
+                                                                    }),
+                                                                )
+                                                            })
+                                                            .child(
+                                                                div().text_xs().text_color(
+                                                                    if self.vault.is_none() {
+                                                                        pal.muted
+                                                                    } else if save_checked {
+                                                                        pal.text
+                                                                    } else {
+                                                                        pal.muted
+                                                                    },
+                                                                )
+                                                                .child(if self.vault.is_some() {
+                                                                    if save_checked {
+                                                                        tr!(cx, "☑ 保存密码到加密库")
+                                                                    } else {
+                                                                        tr!(cx, "☐ 保存密码到加密库")
+                                                                    }
+                                                                } else {
+                                                                    tr!(cx, "密码仅本次内存持有")
+                                                                }),
+                                                            ),
+                                                    ),
+                                            )
+                                            .child(styled_input(
+                                                Input::new(&form.password)
+                                                    .content_type(InputContentType::Password)
+                                                    .mask_toggle(),
+                                                &pal,
+                                            )),
+                                    )
+                                },
                             )
                             // 分组 / 跳板机并排一行：两项都是可选的下拉，各占一半宽度，
                             // 省下的竖向空间留给私钥字段。

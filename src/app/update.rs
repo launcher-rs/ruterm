@@ -608,6 +608,8 @@ async fn confirm_and_install(path: PathBuf, handle: AnyWindowHandle, cx: &mut As
     };
     match updater::spawn_install_helper(&options) {
         Ok(_) => {
+            // 必须应用级退出，而不是只关当前窗口：helper 按 PID 等整个进程退出后替换 exe；
+            // 将来若一个进程创建多个主窗口，这里也会一并结束它们。
             cx.update(|cx| cx.quit());
             true
         }

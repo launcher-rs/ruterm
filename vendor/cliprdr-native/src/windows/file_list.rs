@@ -282,14 +282,32 @@ pub fn read_file_contents(request: &FileContentsRequest, entry: &LocalFileEntry)
         return FileContentsResponse::new_error(request.stream_id);
     }
 
+    // Each RANGE opens the path again. If the source changes during a multi-range paste,
+    // refuse it instead of silently combining bytes from different versions of the file.
+    let source_matches_descriptor = |metadata: &fs::Metadata| {
+        entry
+            .descriptor
+            .file_size
+            .map_or(true, |size| metadata.len() == size)
+            && entry
+                .descriptor
+                .last_write_time
+                .map_or(true, |modified| metadata.last_write_time() == modified)
+    };
+    let metadata = match fs::metadata(&entry.path) {
+        Ok(metadata) if source_matches_descriptor(&metadata) => metadata,
+        Ok(_) => {
+            debug!(path = %entry.path.display(), "Clipboard file changed after it was offered");
+            return FileContentsResponse::new_error(request.stream_id);
+        }
+        Err(error) => {
+            debug!(%error, path = %entry.path.display(), "Failed to inspect clipboard file");
+            return FileContentsResponse::new_error(request.stream_id);
+        }
+    };
+
     if request.flags.contains(FileContentsFlags::SIZE) {
-        return match fs::metadata(&entry.path) {
-            Ok(metadata) => FileContentsResponse::new_size_response(request.stream_id, metadata.len()),
-            Err(error) => {
-                debug!(%error, index = request.index, "Failed to read clipboard file size");
-                FileContentsResponse::new_error(request.stream_id)
-            }
-        };
+        return FileContentsResponse::new_size_response(request.stream_id, metadata.len());
     }
 
     let read_len = request.requested_size.min(MAX_FILE_CONTENTS_CHUNK);
@@ -302,7 +320,19 @@ pub fn read_file_contents(request: &FileContentsRequest, entry: &LocalFileEntry)
     });
 
     match result {
-        Ok(data) => FileContentsResponse::new_data_response(request.stream_id, data),
+        Ok(data) => match fs::metadata(&entry.path) {
+            Ok(metadata) if source_matches_descriptor(&metadata) => {
+                FileContentsResponse::new_data_response(request.stream_id, data)
+            }
+            Ok(_) => {
+                debug!(path = %entry.path.display(), "Clipboard file changed during transfer");
+                FileContentsResponse::new_error(request.stream_id)
+            }
+            Err(error) => {
+                debug!(%error, path = %entry.path.display(), "Failed to recheck clipboard file");
+                FileContentsResponse::new_error(request.stream_id)
+            }
+        },
         Err(error) => {
             debug!(%error, index = request.index, position = request.position, "Failed to read clipboard file");
             FileContentsResponse::new_error(request.stream_id)
