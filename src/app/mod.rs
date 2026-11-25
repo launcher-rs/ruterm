@@ -58,11 +58,12 @@ use std::sync::Arc;
 use rgpui::components::split_pane::{SplitPane, SplitPaneState};
 use rgpui::input_ui::{Input, InputEvent, InputState, TextArea};
 use rgpui::prelude::*;
+use rgpui::title_bar::window_border;
 use rgpui::{
-    AnyElement, App, Button, ButtonVariants, ClickEvent, Context, Entity, FocusHandle, Focusable,
-    Hsla, Icon, IconName, Image, InteractiveElement, IntoElement, MouseButton, ParentElement,
-    Point, Render, ScrollHandle, SharedString, StatefulInteractiveElement, Styled, Tooltip, Window,
-    canvas, div, h_flex, px, relative, v_flex,
+    AnyElement, App, Button, ButtonVariants, ClickEvent, Context, Decorations, Entity, FocusHandle,
+    Focusable, Hsla, Icon, IconName, Image, InteractiveElement, IntoElement, MouseButton,
+    ParentElement, Point, Render, ScrollHandle, SharedString, StatefulInteractiveElement, Styled,
+    Tooltip, Window, canvas, div, h_flex, px, relative, v_flex,
 };
 use rgpui_term::{InputOrigin, ThemeManager};
 
@@ -1656,7 +1657,7 @@ impl Render for RuTermApp {
         // 换下来的远程桌面旧帧在这里释放：精灵图集按图像 id 缓存，不释放会越积越多。
         self.drop_desktop_images(window, cx);
         let pal = self.palette(cx);
-        v_flex()
+        let root = v_flex()
             .id("ruterm-root")
             .track_focus(&self.focus_handle)
             .relative()
@@ -1764,7 +1765,21 @@ impl Render for RuTermApp {
             })
             .child(self.render_status_bar(cx))
             .child(self.render_overlay(window, cx))
-            .child(self.render_terminal_menu())
+            .child(self.render_terminal_menu());
+        // Linux 客户端装饰下系统不画边框：用框架提供的边框组件接管四边/四角的
+        // 缩放命中区与光标。shadow_size 必须为 0——默认的 20px 阴影内边距会
+        // 在内容外留出一圈未被绘制的区域，亮色主题下就是一条白边；这里只借它
+        // 的 resize 命中带，不留阴影/留白。其余平台保持原样。
+        if cfg!(any(target_os = "linux", target_os = "freebsd"))
+            && matches!(window.window_decorations(), Decorations::Client { .. })
+        {
+            window_border()
+                .shadow_size(px(0.0))
+                .child(root)
+                .into_any_element()
+        } else {
+            root.into_any_element()
+        }
     }
 }
 

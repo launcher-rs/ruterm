@@ -20,6 +20,22 @@ use crate::{
 
 use super::*;
 
+/// Linux 客户端装饰下标题栏拖拽的中间状态：按下先记下，等第一次移动再让
+/// 合成器接管窗口移动。否则菜单/按钮上的单击也会被当成拖动。
+#[derive(Default)]
+struct TitleBarDrag {
+    should_move: bool,
+}
+
+/// 窗口控制按钮的动作。Windows 交给 `WindowControlArea` 命中区；Linux
+/// 后端没有实现命中测试回调，必须自己调用平台窗口方法。
+#[derive(Clone, Copy)]
+enum WindowControlAction {
+    Minimize,
+    Maximize,
+    Close,
+}
+
 impl RuTermApp {
     /// 「帮助 → 关于」浮层：版本、源码仓库（点击用浏览器打开）、许可证与数据存放位置。
     /// 版本与许可证取自 `Cargo.toml`，仓库地址取自其 `repository` 字段，免得几处各写一份。
@@ -111,20 +127,24 @@ impl RuTermApp {
             .into_any_element()
     }
 
-    /// 标题栏右侧的窗口控制按钮：登记为 `WindowControlArea`，交给系统
-    /// HTMINBUTTON / HTMAXBUTTON / HTCLOSE（关闭仍会走 `on_window_should_close`，
-    /// 即隐藏到托盘）。
+    /// 标题栏右侧的窗口控制按钮。
+    ///
+    /// - Windows：登记为 `WindowControlArea`，交给系统 HTMINBUTTON / HTMAXBUTTON /
+    ///   HTCLOSE（关闭仍会走 `on_window_should_close`，即隐藏到托盘）。
+    /// - Linux：后端没有实现 `on_hit_test_window_control`，标记形同虚设；改为
+    ///   和框架 `TitleBar` 一样直接调 `minimize_window` / `zoom_window` /
+    ///   `request_window_close`（与托盘关闭路径同源）。
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn window_control(
+    fn window_control(
         id: &'static str,
         icon: IconName,
-        area: WindowControlArea,
+        action: WindowControlAction,
         fg: Hsla,
         hover_bg: Hsla,
         active_bg: Hsla,
         hover_fg: Hsla,
     ) -> AnyElement {
-        div()
+        let elem = div()
             .id(id)
             .flex()
             .w(TITLE_BAR_HEIGHT)
@@ -135,10 +155,29 @@ impl RuTermApp {
             .items_center()
             .text_color(fg)
             .hover(|style| style.bg(hover_bg).text_color(hover_fg))
-            .active(|style| style.bg(active_bg).text_color(hover_fg))
-            .window_control_area(area)
-            .child(Icon::new(icon).small())
-            .into_any_element()
+            .active(|style| style.bg(active_bg).text_color(hover_fg));
+        let elem = if cfg!(any(target_os = "linux", target_os = "freebsd")) {
+            elem.on_mouse_down(MouseButton::Left, |_, window, cx| {
+                window.prevent_default();
+                cx.stop_propagation();
+            })
+            .on_click(move |_, window, cx| {
+                cx.stop_propagation();
+                match action {
+                    WindowControlAction::Minimize => window.minimize_window(),
+                    WindowControlAction::Maximize => window.zoom_window(),
+                    WindowControlAction::Close => crate::request_window_close(window),
+                }
+            })
+        } else {
+            let area = match action {
+                WindowControlAction::Minimize => WindowControlArea::Min,
+                WindowControlAction::Maximize => WindowControlArea::Max,
+                WindowControlAction::Close => WindowControlArea::Close,
+            };
+            elem.window_control_area(area)
+        };
+        elem.child(Icon::new(icon).small()).into_any_element()
     }
 
     /// 自定义标题栏：品牌 + 菜单（会话 / 凭据 / 外观 / 帮助）+ 快捷按钮 + 窗口控制。
@@ -176,6 +215,10 @@ impl RuTermApp {
             tr!(cx, "主密码档 · 已解锁")
         };
         let entity = cx.entity();
+        // Linux 客户端装饰下没有系统标题栏可拖：拖拽与双击最大化由应用接管。
+        // 状态放在窗口级实体里，跨帧保留按下的中间态（与框架 TitleBar 同套路）。
+        let drag = window.use_state(cx, |_, _| TitleBarDrag::default());
+        let is_linux = cfg!(any(target_os = "linux", target_os = "freebsd"));
 
         // 会话菜单：新建主机、本地终端、标签切换、侧栏折叠、设置入口、托盘与退出。
         // 前六项挂 action（而非 on_click）：rgpui 会按键绑定在项右侧自动显示
@@ -549,6 +592,35 @@ impl RuTermApp {
                     .pr_3()
                     .flex_shrink_0()
                     .window_control_area(WindowControlArea::Drag)
+                    // Linux 的 WindowControlArea 是空实现：按下记状态、移动时才
+                    // 交给合成器；双击标题栏切换最大化（框架 TitleBar 同款）。
+                    .when(is_linux, |this| {
+                        this.on_mouse_down(
+                            MouseButton::Left,
+                            window.listener_for(&drag, |state, _, _, _| {
+                                state.should_move = true;
+                            }),
+                        )
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            window.listener_for(&drag, |state, _, _, _| {
+                                state.should_move = false;
+                            }),
+                        )
+                        .on_mouse_up_out(
+                            MouseButton::Left,
+                            window.listener_for(&drag, |state, _, _, _| {
+                                state.should_move = false;
+                            }),
+                        )
+                        .on_mouse_move(window.listener_for(&drag, |state, _, window, _| {
+                            if state.should_move {
+                                state.should_move = false;
+                                window.start_window_move();
+                            }
+                        }))
+                        .on_double_click(|_, window, _| window.zoom_window())
+                    })
                     .child(
                         div()
                             .text_base()
@@ -589,7 +661,34 @@ impl RuTermApp {
                     .flex_1()
                     .min_w_0()
                     .h_full()
-                    .window_control_area(WindowControlArea::Drag),
+                    .window_control_area(WindowControlArea::Drag)
+                    .when(is_linux, |this| {
+                        this.on_mouse_down(
+                            MouseButton::Left,
+                            window.listener_for(&drag, |state, _, _, _| {
+                                state.should_move = true;
+                            }),
+                        )
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            window.listener_for(&drag, |state, _, _, _| {
+                                state.should_move = false;
+                            }),
+                        )
+                        .on_mouse_up_out(
+                            MouseButton::Left,
+                            window.listener_for(&drag, |state, _, _, _| {
+                                state.should_move = false;
+                            }),
+                        )
+                        .on_mouse_move(window.listener_for(&drag, |state, _, window, _| {
+                            if state.should_move {
+                                state.should_move = false;
+                                window.start_window_move();
+                            }
+                        }))
+                        .on_double_click(|_, window, _| window.zoom_window())
+                    }),
             )
             // 右侧：锁定入口 + 细分隔线 + 系统窗口按钮。
             // 文件 / 转发的入口在边栏的竖向导航里，标题栏只留全局操作。
@@ -619,7 +718,7 @@ impl RuTermApp {
             .child(Self::window_control(
                 "win-minimize",
                 IconName::WindowMinimize,
-                WindowControlArea::Min,
+                WindowControlAction::Minimize,
                 fg,
                 plain_hover_bg,
                 plain_active_bg,
@@ -632,7 +731,7 @@ impl RuTermApp {
                 } else {
                     IconName::WindowMaximize
                 },
-                WindowControlArea::Max,
+                WindowControlAction::Maximize,
                 fg,
                 plain_hover_bg,
                 plain_active_bg,
@@ -641,7 +740,7 @@ impl RuTermApp {
             .child(Self::window_control(
                 "win-close",
                 IconName::WindowClose,
-                WindowControlArea::Close,
+                WindowControlAction::Close,
                 fg,
                 close_hover_bg,
                 close_active_bg,

@@ -26,7 +26,7 @@ pub(crate) use terminal::{completion, history, local_shell, macros, snippet_pres
 use rgpui::prelude::*;
 use rgpui::{
     App, Bounds, Icon, IconNamed, IntoElement, KeyBinding, NoAction, SharedString, TrayIconEvent,
-    Window, WindowBounds, WindowOptions, actions, icon_named, px, size,
+    Window, WindowBounds, WindowDecorations, WindowOptions, actions, icon_named, px, size,
 };
 
 use crate::app::RuTermApp;
@@ -46,6 +46,19 @@ pub(crate) const TRAY_ICON: &[u8] = include_bytes!("../assets/icons/tray-32.png"
 /// 当前是否启用托盘（窗口关闭回调与托盘同步都读这里）。
 pub(crate) fn tray_enabled() -> bool {
     TRAY_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// 统一的「关闭窗口」处理：启用托盘时只隐藏、会话后台保活；否则移除窗口。
+///
+/// 自绘标题栏上的关闭按钮（Linux 客户端装饰下系统不接管该按钮）与
+/// 平台发来的关闭事件（`on_window_should_close`）必须走同一条路径，
+/// 否则两者行为会在启用 / 未启用托盘之间出现分歧。
+pub(crate) fn request_window_close(window: &mut Window) {
+    if tray_enabled() {
+        window.hide_window();
+    } else {
+        window.remove_window();
+    }
 }
 
 // 应用自定义图标（来自 lucide，ISC 许可）：rgpui 内置集合里没有合适的
@@ -238,48 +251,53 @@ fn main() {
             KeyBinding::new("ctrl-shift-v", TerminalPaste, Some("Terminal")),
             KeyBinding::new("shift-insert", TerminalPaste, Some("Terminal")),
         ]);
-        let opened = cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
-                    None,
-                    size(px(1100.0), px(720.0)),
-                    cx,
-                ))),
-                titlebar: Some(rgpui::TitlebarOptions {
-                    title: Some("RuTerm".into()),
-                    // 隐藏系统标题栏，改由应用自绘（品牌 + 菜单 + 窗口控制按钮）。
-                    appears_transparent: true,
-                    ..Default::default()
-                }),
-                // 客户区装饰：窗口样式改为 WS_THICKFRAME 无边框（DWM 仍画圆角与可拖边框），
-                // 拖拽与窗口控制由标题栏里显式登记的 WindowControlArea 命中区交给系统。
-                app_owns_titlebar_drag: true,
-                // Wayland 下用 app_id 标识窗口：合成器据此分组任务栏图标、匹配
-                // 窗口规则，xdg-activation 请求也会带上它（托盘恢复窗口时提示
-                // 「有应用想抢焦点」）。反向域名避免与其他应用的标识冲突。
-                app_id: Some("com.launcher-rs.ruterm".into()),
+        let mut options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
+                None,
+                size(px(1100.0), px(720.0)),
+                cx,
+            ))),
+            titlebar: Some(rgpui::TitlebarOptions {
+                title: Some("RuTerm".into()),
+                // 隐藏系统标题栏，改由应用自绘（品牌 + 菜单 + 窗口控制按钮）。
+                appears_transparent: true,
                 ..Default::default()
-            },
-            |window, cx| {
-                let quick = quick.clone();
-                let app = cx.new(|cx| RuTermApp::new(quick, window, cx));
-                if unprotected {
-                    app.update(cx, |app, cx| app.warn_unprotected(cx));
+            }),
+            // Windows 下让标题栏自行处理拖拽与双击（自绘栏注册 WM_NCHITTEST 命中区）；
+            // Linux 下则在自绘标题栏里显式接管 start_window_move（见 title_bar.rs）。
+            app_owns_titlebar_drag: true,
+            // Wayland 下用 app_id 标识窗口：合成器据此分组任务栏图标、匹配
+            // 窗口规则，xdg-activation 请求也会带上它（托盘恢复窗口时提示
+            // 「有应用想抢焦点」）。反向域名避免与其他应用的标识冲突。
+            app_id: Some("com.launcher-rs.ruterm".into()),
+            ..Default::default()
+        };
+        if cfg!(any(target_os = "linux", target_os = "freebsd")) {
+            // 自绘标题栏在 Linux 上是客户端装饰：必须明确告诉合成器别再画一套
+            // 原生边框，否则请求服务端装饰会静默回退成客户端装饰、窗口既没有
+            // 系统拖拽边框也没有我们自己的处理（拖动/缩放/三个按钮全都点不动）。
+            // 与框架 TitleBar::window_options() 一致，拖拽与按钮由标题栏接管。
+            options.window_decorations = Some(WindowDecorations::Client);
+        }
+        let opened = cx.open_window(options, |window, cx| {
+            let quick = quick.clone();
+            let app = cx.new(|cx| RuTermApp::new(quick, window, cx));
+            if unprotected {
+                app.update(cx, |app, cx| app.warn_unprotected(cx));
+            }
+            // 启用托盘时关闭按钮改为隐藏：窗口不销毁，会话后台保活；
+            // 返回 false 中断关闭，真正退出走托盘"退出"（cx.quit 直接投 WM_QUIT，不经此回调）。
+            // 未启用托盘则按普通窗口关闭，直接退出进程。
+            window.on_window_should_close(cx, |window, _cx| {
+                if tray_enabled() {
+                    request_window_close(window);
+                    false
+                } else {
+                    true
                 }
-                // 启用托盘时关闭按钮改为隐藏：窗口不销毁，会话后台保活；
-                // 返回 false 中断关闭，真正退出走托盘"退出"（cx.quit 直接投 WM_QUIT，不经此回调）。
-                // 未启用托盘则按普通窗口关闭，直接退出进程。
-                window.on_window_should_close(cx, |window, _cx| {
-                    if tray_enabled() {
-                        window.hide_window();
-                        false
-                    } else {
-                        true
-                    }
-                });
-                app
-            },
-        );
+            });
+            app
+        });
         let window_handle = match opened {
             Ok(handle) => handle,
             Err(_) => {
