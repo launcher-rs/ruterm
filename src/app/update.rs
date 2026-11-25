@@ -386,7 +386,7 @@ impl RuTermApp {
             .gap_2()
             .child(div().text_sm().text_color(pal.muted).child(tr!(
                 cx,
-                "检查更新默认走实测可用的镜像，并保留直连兜底；关闭镜像后只走直连。"
+                "检查更新优先走官方直连；直连失败且开启镜像时，才按自定义前缀 → 内置镜像回退。"
             )))
             .child(
                 Checkbox::new("update-use-mirrors")
@@ -445,7 +445,7 @@ impl RuTermApp {
                     )
                     .child(div().text_xs().text_color(pal.muted).child(tr!(
                         cx,
-                        "每行一个前缀，回车换行；按书写顺序优先尝试，留空则只用内置镜像。"
+                        "每行一个前缀，回车换行；镜像回退时按书写顺序尝试，留空则只用内置镜像。"
                     )))
                     .when(!self.mirror_probe.results.is_empty(), |this| {
                         this.child(
