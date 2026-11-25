@@ -7736,6 +7736,7 @@ dependencies = [
  "keyring",
  "log",
  "png",
+ "reqwest 0.13.5",
  "rgpui",
  "rgpui-extra",
  "rgpui-platform",

@@ -56,7 +56,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use rgpui::components::split_pane::{SplitPane, SplitPaneState};
-use rgpui::input_ui::{Input, InputEvent, InputState};
+use rgpui::input_ui::{Input, InputEvent, InputState, TextArea};
 use rgpui::prelude::*;
 use rgpui::{
     AnyElement, App, Button, ButtonVariants, ClickEvent, Context, Entity, FocusHandle, Focusable,
@@ -179,8 +179,12 @@ pub(crate) struct RuTermApp {
     update_status: rgpui_extra::updater::ui::UpdateStatus,
     /// 检查更新偏好（镜像开关与前缀），随加密库 / settings.json 持久化。
     update_prefs: UpdatePrefs,
-    /// 设置弹窗里的镜像前缀输入框（单行，多个前缀用空格分隔）。
+    /// 设置弹窗里的镜像前缀输入框（多行，一行一个前缀）。
     update_mirror_input: Entity<InputState>,
+    /// 镜像前缀输入框是否有尚未保存的修改（用于回填保护与状态提示）。
+    update_mirrors_dirty: bool,
+    /// 「设置 → 更新」里镜像探测的进度与结果。
+    mirror_probe: update::MirrorProbeState,
     /// 发现新版本时待展示的更新对话框数据。
     update_dialog: Option<update::UpdateDialogState>,
     /// 主密码解锁弹窗（便携模式 / 已设置主密码时启动弹出）。
@@ -409,12 +413,18 @@ impl RuTermApp {
                 input
             })
             .collect::<Vec<_>>();
-        // 镜像前缀输入框同样常驻：库内偏好晚到时只在打开设置时回填，不打断用户输入。
-        let update_mirror_input =
-            cx.new(|cx| InputState::new(window, cx).default_value(update_prefs.mirrors_text()));
+        // 镜像前缀输入框同样常驻：多行编辑，回车换行；保存由「设置 → 更新」的按钮显式触发。
+        // 库内偏好晚到时只在打开设置时回填，且不会覆盖尚未保存的输入。
+        let update_mirror_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .multi_line(true)
+                .default_value(update_prefs.mirrors_text())
+        });
         cx.subscribe(&update_mirror_input, |this, _, event: &InputEvent, cx| {
+            // 打字后标记未保存并刷新提示；真正的落库交给保存按钮。
             if matches!(event, InputEvent::Change) {
-                this.set_update_mirrors_from_input(cx);
+                this.update_mirrors_dirty = true;
+                cx.notify();
             }
         })
         .detach();
@@ -513,6 +523,8 @@ impl RuTermApp {
             update_status: rgpui_extra::updater::ui::UpdateStatus::default(),
             update_prefs,
             update_mirror_input,
+            update_mirrors_dirty: false,
+            mirror_probe: update::MirrorProbeState::default(),
             update_dialog: None,
             unlock: None,
             settings: None,

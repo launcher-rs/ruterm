@@ -40,6 +40,8 @@ ironrdp-cliprdr-native = { path = "vendor/cliprdr-native" }
 # 检查更新组件：版本比较 / 镜像回退 / 分块下载 / 解压落地都在扩展库里，
 # 项目侧只做菜单、对话框、偏好与状态栏编排（用法参考 launcher-rs/rumark）。
 rgpui-extra = { git = "https://github.com/launcher-rs/rgpui-extra.git", features = ["ui"] }
+# 「检查镜像」用同一套 reqwest 做轻量探测（Release API + 安装包首字节），不重复引入 HTTP 栈。
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "default-tls"] }
 # 直接依赖只为在 RDP 会话线程上切换"接受自签证书"开关（后端特性由 ironrdp 统一启用）。
 ironrdp-tls = { version = "0.2", default-features = false }
 ironrdp = { version = "0.17", default-features = false, features = [

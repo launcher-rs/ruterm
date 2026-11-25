@@ -1067,9 +1067,17 @@
  "正在下载更新": "Downloading update",
  "下载完成": "Download complete",
  "更新": "Update",
- "检查更新默认使用实测可用的镜像前缀，并保留直连兜底；不想经第三方中转可关闭。": "Update checks use tested mirror prefixes by default, with a direct fallback. Turn mirrors off if you prefer not to use third-party relays.",
+ "检查更新默认走实测可用的镜像，并保留直连兜底；关闭镜像后只走直连。": "Update checks use tested mirrors by default with a direct fallback; turn mirrors off for direct access only.",
  "启用下载镜像": "Enable download mirrors",
- "关闭时只走直连；开启后依次尝试自定义前缀 → 内置镜像 → 直连。内置：{mirrors}": "Off: direct connection only. On: custom prefixes, built-in mirrors, then direct. Built-in: {mirrors}",
- "自定义镜像前缀": "Custom mirror prefixes",
- "多个前缀用空格或逗号分隔，按书写顺序优先尝试；留空则用内置镜像。": "Separate multiple prefixes with spaces or commas; they are tried in order. Leave empty to use built-in mirrors."
+ "自定义镜像前缀（每行一个）": "Custom mirror prefixes (one per line)",
+ "每行一个前缀，回车换行；按书写顺序优先尝试，留空则只用内置镜像。": "One prefix per line; press Enter for a new line. They are tried in order. Leave empty to use only built-in mirrors.",
+ "有未保存的更改": "Unsaved changes",
+ "保存镜像前缀": "Save mirror prefixes",
+ "检查镜像…": "Check mirrors…",
+ "正在检查镜像…": "Checking mirrors…",
+ "直连": "Direct",
+ "API 正常": "API OK",
+ "API 失败": "API failed",
+ "下载正常": "Download OK",
+ "下载失败": "Download failed"
 }

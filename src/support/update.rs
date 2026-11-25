@@ -3,7 +3,9 @@
 //! 与 rumark 共用同一套组件，发布资产的命名也已对齐（ruterm-<平台>.zip / .tar.gz），
 //! 换发布平台时只需改这里，UI 与下载流程不用动。
 
-use rgpui_extra::updater::{Config, Provider};
+use std::time::Duration;
+
+use rgpui_extra::updater::{Config, Provider, ReleaseInfo, fetch_latest_release, mirror_url};
 
 /// 当前程序版本（来自 Cargo.toml，release 工作流会校验 tag 与此一致）。
 pub(crate) const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -32,8 +34,8 @@ pub(crate) fn updater_provider() -> Provider {
 }
 
 pub(crate) use rgpui_extra::updater::{
-    DEFAULT_MIRRORS, DownloadProgress, InstallOptions, ReleaseAsset, check, download_and_stage,
-    load_staged_update, open_release_page, run_blocking, spawn_install_helper,
+    DownloadProgress, InstallOptions, ReleaseAsset, check, download_and_stage, load_staged_update,
+    open_release_page, run_blocking, spawn_install_helper,
 };
 
 /// 构造更新配置。默认直连，只有偏好里显式开启镜像才走中转。
@@ -44,6 +46,128 @@ pub(crate) fn updater_config(use_mirrors: bool, custom_mirrors: Vec<String>) -> 
     config.use_mirrors = use_mirrors;
     config.custom_mirrors = custom_mirrors;
     config
+}
+
+/// 单个镜像的探测结果；`mirror` 为空表示直连。
+#[derive(Clone, Debug)]
+pub(crate) struct MirrorProbe {
+    pub(crate) mirror: String,
+    pub(crate) api_ok: bool,
+    pub(crate) download_ok: bool,
+    pub(crate) detail: String,
+}
+
+/// 逐个探测候选镜像：Release API 是否返回合法 JSON、安装包是否支持首字节下载。
+/// 必须在后台线程调用；超时压到 12 秒，避免某个失效站点拖住整个列表。
+pub(crate) fn probe_mirrors(config: &Config) -> Vec<MirrorProbe> {
+    let client = match reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(6))
+        .timeout(Duration::from_secs(12))
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .user_agent(&config.user_agent)
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => {
+            return vec![MirrorProbe {
+                mirror: String::new(),
+                api_ok: false,
+                download_ok: false,
+                detail: error.to_string(),
+            }];
+        }
+    };
+
+    // 先从任一通道拿到安装包地址；拿不到时只测 API，不误报下载失败。
+    let asset_url = fetch_latest_release(config).ok().and_then(|(release, _)| {
+        release
+            .assets
+            .into_iter()
+            .find(|asset| asset.name == config.asset_name())
+            .map(|asset| asset.browser_download_url)
+    });
+
+    // 无论总开关是否打开，都把所有候选列出来给用户看；直连排在最前。
+    let mut probe_config = config.clone();
+    probe_config.use_mirrors = true;
+    let api_url = config.api_url();
+
+    let mut results: Vec<MirrorProbe> = probe_config
+        .candidate_mirrors()
+        .into_iter()
+        .map(|mirror| {
+            let mut errors = Vec::new();
+
+            let api_ok = match client
+                .get(mirror_url(&mirror, &api_url))
+                .header("Accept", "application/vnd.github+json")
+                .send()
+            {
+                Ok(response) => {
+                    let status = response.status();
+                    match response.text() {
+                        Ok(body)
+                            if status.is_success()
+                                && ReleaseInfo::parse_for(&config.provider, &body).is_ok() =>
+                        {
+                            true
+                        }
+                        Ok(_) => {
+                            errors.push(format!("API HTTP {status}"));
+                            false
+                        }
+                        Err(error) => {
+                            errors.push(format!("API {error}"));
+                            false
+                        }
+                    }
+                }
+                Err(error) => {
+                    errors.push(format!("API {error}"));
+                    false
+                }
+            };
+
+            let download_ok = if let Some(asset) = &asset_url {
+                match client
+                    .get(mirror_url(&mirror, asset))
+                    .header("Range", "bytes=0-1023")
+                    .send()
+                {
+                    Ok(response) => {
+                        let status = response.status();
+                        if status.is_success() || status == reqwest::StatusCode::PARTIAL_CONTENT {
+                            match response.bytes() {
+                                Ok(bytes) => !bytes.is_empty(),
+                                Err(error) => {
+                                    errors.push(format!("下载 {error}"));
+                                    false
+                                }
+                            }
+                        } else {
+                            errors.push(format!("下载 HTTP {status}"));
+                            false
+                        }
+                    }
+                    Err(error) => {
+                        errors.push(format!("下载 {error}"));
+                        false
+                    }
+                }
+            } else {
+                false
+            };
+
+            MirrorProbe {
+                mirror,
+                api_ok,
+                download_ok,
+                detail: errors.join("；"),
+            }
+        })
+        .collect();
+    results.sort_by_key(|probe| if probe.mirror.is_empty() { 0 } else { 1 });
+    results
 }
 
 #[cfg(test)]
@@ -92,6 +216,26 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    #[ignore = "需要外网，手动运行以查看镜像实时状态"]
+    fn probe_mirrors_reports_each_candidate() {
+        let config = updater_config(
+            true,
+            RECOMMENDED_MIRRORS
+                .iter()
+                .map(|mirror| (*mirror).to_string())
+                .collect(),
+        );
+        let results = probe_mirrors(&config);
+        assert!(!results.is_empty());
+        for result in &results {
+            println!(
+                "mirror={:?} api={} download={} detail={}",
+                result.mirror, result.api_ok, result.download_ok, result.detail
+            );
+        }
     }
 
     #[test]

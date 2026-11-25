@@ -7,7 +7,10 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, TryRecvError};
 use std::time::Duration;
 
-use rgpui::{AnyView, AnyWindowHandle, App, AsyncApp, Checkbox, Context, PromptLevel, Window};
+use rgpui::{
+    AnyView, AnyWindowHandle, App, AsyncApp, Checkbox, Context, Disableable, PromptLevel,
+    ScrollableElement, Window,
+};
 use rgpui_extra::updater::ui::{
     UpdateChoice, UpdateDialogContent, UpdateDialogStrings, UpdatePhase, UpdateStatus,
     render_update_dialog,
@@ -17,6 +20,13 @@ use crate::paths::StorageMode;
 use crate::update as updater;
 
 use super::*;
+
+/// 「设置 → 更新」里镜像探测的进度与结果。
+#[derive(Default)]
+pub(super) struct MirrorProbeState {
+    pub(super) checking: bool,
+    pub(super) results: Vec<updater::MirrorProbe>,
+}
 
 /// 更新对话框需要的数据（下载时据此选择资产）。
 #[derive(Clone, Debug)]
@@ -39,14 +49,17 @@ impl RuTermApp {
         self.update_status = UpdateStatus::checking();
         cx.notify();
 
-        let config = updater_config(&self.update_prefs);
-        let staged_config = config.clone();
+        let configs = fallback_configs(&self.update_prefs);
+        let staged_config = configs[0].clone();
         let weak = cx.entity().downgrade();
         let window_handle = window.window_handle();
         cx.spawn(async move |_this, cx: &mut AsyncApp| {
-            let result =
-                updater::run_blocking(move || updater::check(&config, updater::CURRENT_VERSION))
-                    .await;
+            let result = updater::run_blocking(move || {
+                try_configs(configs, |config| {
+                    updater::check(config, updater::CURRENT_VERSION)
+                })
+            })
+            .await;
             // 检查结果已拿到：提示框会等待用户点击，先收起状态栏进度，
             // 免得「已是最新版本」弹窗旁边还挂着「正在检查更新…」。
             let _ = weak.update(cx, |this, cx| {
@@ -113,7 +126,7 @@ impl RuTermApp {
         match choice {
             UpdateChoice::Later => {}
             UpdateChoice::OpenRelease => {
-                let config = updater_config(&self.update_prefs);
+                let config = updater::updater_config(false, Vec::new());
                 cx.spawn(async move |_this, _cx: &mut AsyncApp| {
                     let _ =
                         updater::run_blocking(move || updater::open_release_page(&config)).await;
@@ -122,7 +135,7 @@ impl RuTermApp {
             }
             UpdateChoice::Download => {
                 let staged = dialog.staged_version.as_deref().and_then(|version| {
-                    let config = updater_config(&self.update_prefs);
+                    let config = updater::updater_config(false, Vec::new());
                     updater::load_staged_update(&updates_dir(), &config.executable_name, version)
                 });
                 if let Some(staged) = staged {
@@ -141,7 +154,7 @@ impl RuTermApp {
                 }
                 let Some(asset) = dialog.asset else {
                     let title = tr!(cx, "检查更新失败").to_string();
-                    let config = updater_config(&self.update_prefs);
+                    let config = updater::updater_config(false, Vec::new());
                     let detail = tr!(
                         cx,
                         "Release 中没有找到当前平台的安装包：{asset}",
@@ -172,7 +185,7 @@ impl RuTermApp {
         self.update_status = UpdateStatus::downloading();
         cx.notify();
 
-        let config = updater_config(&self.update_prefs);
+        let configs = fallback_configs(&self.update_prefs);
         let (tx, rx) = mpsc::channel::<updater::DownloadProgress>();
 
         let pump = cx.entity().downgrade();
@@ -203,8 +216,16 @@ impl RuTermApp {
         let keepalive = tx.clone();
         cx.spawn(async move |_this, cx: &mut AsyncApp| {
             let result = updater::run_blocking(move || {
-                updater::download_and_stage(&config, &asset, &version, &updates_dir(), |progress| {
-                    let _ = tx.send(progress);
+                try_configs(configs, |config| {
+                    updater::download_and_stage(
+                        config,
+                        &asset,
+                        &version,
+                        &updates_dir(),
+                        |progress| {
+                            let _ = tx.send(progress);
+                        },
+                    )
                 })
             })
             .await;
@@ -275,7 +296,11 @@ impl RuTermApp {
     }
 
     /// 库内镜像偏好晚到时，在打开设置弹窗前回填输入框（程序化回填不触发变更事件）。
+    /// 用户正在编辑且尚未保存时不覆盖，避免丢掉输入内容。
     pub(super) fn sync_update_mirror_input(&self, window: &mut Window, cx: &mut App) {
+        if self.update_mirrors_dirty {
+            return;
+        }
         let text = self.update_prefs.mirrors_text();
         self.update_mirror_input.update(cx, |input, cx| {
             if input.value().as_ref() != text.as_str() {
@@ -284,12 +309,41 @@ impl RuTermApp {
         });
     }
 
-    /// 镜像输入框变化：解析后立即生效并落库（空列表等同于关闭自定义镜像）。
-    pub(super) fn set_update_mirrors_from_input(&mut self, cx: &mut Context<Self>) {
+    /// 保存镜像前缀：一行一个，保存后把输入框规范化回「已保存」状态。
+    pub(super) fn save_update_mirrors(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.update_mirror_input.read(cx).value().to_string();
         let mut prefs = self.update_prefs.clone();
         prefs.set_mirrors_text(&text);
+        let normalized = prefs.mirrors_text();
+        self.update_mirror_input.update(cx, |input, cx| {
+            if input.value().as_ref() != normalized.as_str() {
+                input.set_value(normalized, window, cx);
+            }
+        });
+        self.update_mirrors_dirty = false;
         self.set_update_prefs(prefs, cx);
+    }
+
+    /// 「检查镜像」：后台逐个探测候选镜像的 API 与安装包，结果写回设置页。
+    pub(super) fn check_mirrors(&mut self, cx: &mut Context<Self>) {
+        if self.mirror_probe.checking {
+            return;
+        }
+        self.mirror_probe.checking = true;
+        self.mirror_probe.results.clear();
+        cx.notify();
+
+        let config = updater_config(&self.update_prefs);
+        let weak = cx.entity().downgrade();
+        cx.spawn(async move |_this, cx: &mut AsyncApp| {
+            let results = updater::run_blocking(move || updater::probe_mirrors(&config)).await;
+            let _ = weak.update(cx, |this, cx| {
+                this.mirror_probe.checking = false;
+                this.mirror_probe.results = results;
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// 镜像总开关。
@@ -329,10 +383,10 @@ impl RuTermApp {
         let use_mirrors = self.update_prefs.use_mirrors;
         v_flex()
             .id("settings-tab-update")
-            .gap_3()
+            .gap_2()
             .child(div().text_sm().text_color(pal.muted).child(tr!(
                 cx,
-                "检查更新默认使用实测可用的镜像前缀，并保留直连兜底；不想经第三方中转可关闭。"
+                "检查更新默认走实测可用的镜像，并保留直连兜底；关闭镜像后只走直连。"
             )))
             .child(
                 Checkbox::new("update-use-mirrors")
@@ -342,44 +396,160 @@ impl RuTermApp {
                         app.update(cx, |this, cx| this.set_use_mirrors(value, cx));
                     }),
             )
-            .child(div().text_xs().text_color(pal.muted).child(tr!(
-                cx,
-                "关闭时只走直连；开启后依次尝试自定义前缀 → 内置镜像 → 直连。内置：{mirrors}",
-                mirrors = updater::DEFAULT_MIRRORS.join(" ")
-            )))
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(pal.muted)
+                            .child(tr!(cx, "自定义镜像前缀（每行一个）")),
+                    )
+                    .child(
+                        TextArea::new(&self.update_mirror_input)
+                            .rows(4)
+                            .w_full()
+                            .text_sm()
+                            .bg(pal.input_bg)
+                            .text_color(pal.input_text)
+                            .border_1()
+                            .border_color(pal.input_border),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(if self.update_mirrors_dirty {
+                                        pal.danger
+                                    } else {
+                                        pal.muted
+                                    })
+                                    .child(if self.update_mirrors_dirty {
+                                        tr!(cx, "有未保存的更改")
+                                    } else {
+                                        tr!(cx, "已保存")
+                                    }),
+                            )
+                            .child(
+                                Button::new("update-mirrors-save")
+                                    .label(tr!(cx, "保存镜像前缀"))
+                                    .primary()
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.save_update_mirrors(window, cx);
+                                    })),
+                            ),
+                    )
+                    .child(div().text_xs().text_color(pal.muted).child(tr!(
+                        cx,
+                        "每行一个前缀，回车换行；按书写顺序优先尝试，留空则只用内置镜像。"
+                    )))
+                    .when(!self.mirror_probe.results.is_empty(), |this| {
+                        this.child(
+                            v_flex()
+                                .id("mirror-probe-results")
+                                .h(px(76.0))
+                                .gap_1()
+                                .p_2()
+                                .bg(pal.card_bg)
+                                .border_1()
+                                .border_color(pal.border)
+                                .rounded(px(4.0))
+                                .overflow_y_scrollbar()
+                                .children(self.mirror_probe.results.iter().map(|probe| {
+                                    let name = if probe.mirror.is_empty() {
+                                        tr!(cx, "直连").to_string()
+                                    } else {
+                                        probe.mirror.clone()
+                                    };
+                                    let api = if probe.api_ok {
+                                        tr!(cx, "API 正常")
+                                    } else {
+                                        tr!(cx, "API 失败")
+                                    };
+                                    let download = if probe.download_ok {
+                                        tr!(cx, "下载正常")
+                                    } else {
+                                        tr!(cx, "下载失败")
+                                    };
+                                    let suffix = if probe.detail.is_empty() {
+                                        String::new()
+                                    } else {
+                                        format!("（{}）", probe.detail)
+                                    };
+                                    div()
+                                        .text_xs()
+                                        .text_color(pal.muted)
+                                        .child(format!("{name}：{api} / {download}{suffix}"))
+                                })),
+                        )
+                    }),
+            )
             .child(
                 h_flex()
                     .gap_2()
-                    .items_center()
                     .child(
-                        div()
-                            .w(px(120.0))
-                            .text_sm()
-                            .text_color(pal.muted)
-                            .child(tr!(cx, "自定义镜像前缀")),
+                        Button::new("update-check-mirrors")
+                            .label(if self.mirror_probe.checking {
+                                tr!(cx, "正在检查镜像…")
+                            } else {
+                                tr!(cx, "检查镜像…")
+                            })
+                            .secondary()
+                            .outline()
+                            .disabled(self.mirror_probe.checking)
+                            .on_click(cx.listener(|this, _, _, cx| this.check_mirrors(cx))),
                     )
-                    .child(styled_input(Input::new(&self.update_mirror_input), pal).flex_1()),
-            )
-            .child(div().text_xs().text_color(pal.muted).child(tr!(
-                cx,
-                "多个前缀用空格或逗号分隔，按书写顺序优先尝试；留空则用内置镜像。"
-            )))
-            .child(
-                Button::new("update-check-now")
-                    .label(tr!(cx, "检查更新…"))
-                    .secondary()
-                    .outline()
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.check_for_updates(window, cx);
-                    })),
+                    .child(
+                        Button::new("update-check-now")
+                            .label(tr!(cx, "检查更新…"))
+                            .secondary()
+                            .outline()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                // 检查前先应用尚未保存的镜像，避免「改了却没生效」。
+                                this.save_update_mirrors(window, cx);
+                                this.check_for_updates(window, cx);
+                            })),
+                    ),
             )
             .into_any_element()
     }
 }
 
-/// 组件配置：默认直连，只有偏好里显式开启镜像才走中转。
+/// 镜像探测用的配置：把用户填的前缀都列出来，直连也一并探测。
 fn updater_config(prefs: &UpdatePrefs) -> rgpui_extra::updater::Config {
     updater::updater_config(prefs.use_mirrors, prefs.custom_mirrors.clone())
+}
+
+/// 实际更新走的候选配置：官方直连永远排第一；只有直连失败且用户开启镜像，
+/// 才追加一组走自定义前缀 → 内置镜像 → 直连的配置。
+fn fallback_configs(prefs: &UpdatePrefs) -> Vec<rgpui_extra::updater::Config> {
+    let mut configs = vec![updater::updater_config(false, Vec::new())];
+    if prefs.use_mirrors {
+        configs.push(updater::updater_config(true, prefs.custom_mirrors.clone()));
+    }
+    configs
+}
+
+/// 依次尝试候选配置，返回第一个成功结果；全失败时保留最后一个错误。
+fn try_configs<T, F>(configs: Vec<rgpui_extra::updater::Config>, mut job: F) -> anyhow::Result<T>
+where
+    F: FnMut(&rgpui_extra::updater::Config) -> anyhow::Result<T>,
+{
+    let mut last_error = None;
+    for config in &configs {
+        match job(config) {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                log::warn!("更新通道失败，尝试下一个：{error}");
+                last_error = Some(error);
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("没有可用的更新通道")))
 }
 
 /// 更新暂存目录跟数据目录走，便携模式下也随程序目录一起搬走。

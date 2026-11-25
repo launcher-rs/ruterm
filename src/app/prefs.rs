@@ -186,21 +186,24 @@ impl Default for UpdatePrefs {
 }
 
 impl UpdatePrefs {
-    /// 界面输入框用空格分隔多个前缀；空串与重复项直接丢掉。
+    /// 界面输入框一行写一个前缀；同时兼容旧的空格 / 逗号分隔写法。
+    /// 空串与重复项直接丢掉，尾部斜杠统一去掉。
     pub(super) fn set_mirrors_text(&mut self, text: &str) {
         let mut mirrors = Vec::new();
-        for part in text.split(|c: char| c.is_whitespace() || c == ',') {
-            let mirror = part.trim().trim_end_matches('/').to_string();
-            if !mirror.is_empty() && !mirrors.contains(&mirror) {
-                mirrors.push(mirror);
+        for line in text.lines() {
+            for part in line.split(|c: char| c.is_whitespace() || c == ',') {
+                let mirror = part.trim().trim_end_matches('/').to_string();
+                if !mirror.is_empty() && !mirrors.contains(&mirror) {
+                    mirrors.push(mirror);
+                }
             }
         }
         self.custom_mirrors = mirrors;
     }
 
-    /// 回填输入框：多个前缀用空格分隔。
+    /// 回填输入框：一行一个前缀，方便逐条查看与编辑。
     pub(super) fn mirrors_text(&self) -> String {
-        self.custom_mirrors.join(" ")
+        self.custom_mirrors.join("\n")
     }
 
     pub(super) fn to_json(&self) -> String {
@@ -1677,7 +1680,7 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         prefs.set_mirrors_text(
-            " https://mirror.example/  , https://mirror2.example https://mirror.example ",
+            " https://mirror.example/  \nhttps://mirror2.example\n https://mirror.example ",
         );
         assert_eq!(
             prefs.custom_mirrors,
@@ -1685,7 +1688,13 @@ mod tests {
         );
         assert_eq!(
             prefs.mirrors_text(),
-            "https://mirror.example https://mirror2.example"
+            "https://mirror.example\nhttps://mirror2.example"
+        );
+        // 旧的单行空格 / 逗号写法仍可解析，保存后统一变成一行一个。
+        prefs.set_mirrors_text(" https://mirror.example/ , https://mirror2.example");
+        assert_eq!(
+            prefs.mirrors_text(),
+            "https://mirror.example\nhttps://mirror2.example"
         );
         assert_eq!(UpdatePrefs::from_json(&prefs.to_json()), prefs);
 
