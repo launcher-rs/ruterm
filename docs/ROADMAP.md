@@ -78,6 +78,22 @@
   协议选择存加密库 `settings` 的 `protocols` 键（不动 hosts 列，沿用 proxy_jump 的既有先例），
   断线横幅 / 回车重连 / 自动重连与 SSH 同形（`Resume::Telnet`）；Telnet 主机不参与跳板机与
   SSH 认证字段，标签也不挂 SFTP/转发能力。侧栏以 Globe 图标 + `Telnet · host:port` 副标题区分。
+- [x] **串口 / 裸 TCP / WebSocket 会话（issue #3）** — `M` — 已完成
+  对齐 MobaXterm 会话能力里我们缺的三类连接（MobaXterm 原生只有串口；裸 TCP 与
+  WebSocket 是 PuTTY "Raw" 与 Web 终端网关场景，详见「MobaXterm 功能对照」一节）：
+  - **串口**：`serialport` 同步 API，读在专用线程阻塞轮询（100ms 超时兼做停止标记
+    检查），写走 `try_clone` 出的独立句柄；打开即拉高 DTR / RTS（PuTTY / MobaXterm
+    同款行为）。参数 115200 8-N-1 默认，五项下拉与 MobaXterm 字段一致。
+  - **裸 TCP**：Telnet 去掉 IAC 的直通搬运。
+  - **WebSocket**：`tokio-tungstenite`（native-tls 与 reqwest / IronRDP 同栈），
+    帧内容原样进出、Ping 自动回 Pong，wss 走 schannel。
+  落地：`src/protocols/{tcp,ws,serial}.rs`（各自返回公共 `SessionHandle`，文档注释里
+  预留的"串口 / WebSocket"位置补齐）；建连层把 Telnet 的落标签流程抽成
+  `install_stream_session`，四种无认证协议共用；`Resume::Tcp / Ws / Serial` 快照重连。
+  持久化沿用「不加列、用 settings 键」：串口 / WS 参数存 `HostConfig.extras`
+  （降级模式随 sessions.json 落盘）+ 加密库 `settings.host_extras` 键
+  （`HostExtrasPrefs`，同 protocols / jumps 先例，降级模式 id=0 不回填）。
+  非目标：串口设备扫描下拉、RFC 2217 协商、Mosh（见对照表）。
 - [x] **中英文界面** — `M` — 已完成
   加 `tr!` 宏 + 库内 `language` 设置，先覆盖菜单 / 标题栏 / 设置 / 状态栏 / 文件与转发页，
   终端内与提示文案后续增量替换。
@@ -373,6 +389,32 @@
   非 Windows 的 PTY 后端传不了参数，点了只给状态栏提示。
   单测覆盖 `sanitize_host` 的注入面与 `diagnostic_profile` 的参数拼装；界面点击待复核（同 VNC，
   本次未启动 ruterm 窗口）。
+
+## MobaXterm 功能对照（issue #3 延伸调研）
+
+> 逐项对照 MobaXterm 官方特性页（mobaxterm.mobatek.net/features.html）与本仓现状；
+> 已具备的不展开，缺的给出「跟进 / 观望 / 不做」结论。日期：2026-11。
+
+| MobaXterm 特性 | 我们现状 | 结论 |
+|---|---|---|
+| SSH / Telnet / RDP / VNC / SFTP 会话 | 已有 | — |
+| Serial（串口会话，PuTTY 式参数） | 已完成（issue #3） | — |
+| 裸 TCP / WebSocket（MobaXterm 官方无此项；来自 issue 诉求，PuTTY "Raw" / websockify 场景） | 已完成（issue #3） | — |
+| SSH gateway（跳板机） | 已有（ProxyJump） | — |
+| SSH tunnels（端口转发） | 已有（-L / -R / -D） | — |
+| Passwords management + 主密码 | 已有（加密库 + argon2id） | — |
+| Multi-execution（多会话同发命令） | 已有（同步输入 / 命令广播） | — |
+| Macros（录制终端操作后回放） | 有键宏（触发键 → 多步文本），无**录制** | 观望：录制回放价值有限且误录风险高，键宏已覆盖主要场景 |
+| Text editor（远程文件就地编辑） | 基本覆盖：「打开远端文件」落本机副本、改动后回传确认 | 观望：就地铁辑需要远端进程配合，收益低 |
+| 会话日志（终端输出落文件） | 无 | 候选（`S`）：审计 / 留痕刚需，低成本可做 |
+| Rlogin（明文 513） | 无 | 不做：明文协议已近绝迹，Telnet 场景重合 |
+| FTP（明文 21） | 无（SFTP 覆盖） | 不做：明文传输，与安全定位冲突 |
+| Mosh（UDP 漫游） | 无 | 观望：需 mosh-server + SSP 协议栈，收益集中在弱网漫游，暂无场景 |
+| X11 server / XDMCP | 无 | 不做：在 Windows 上移植 X server 是另一个量级的工程，与「远程连接工具」定位不符（参照「非目标」） |
+| Embedded servers（内置 sshd / sftpd 等守护进程） | 无 | 不做：客户端工具不该反向开服务端口 |
+| MobApt 包管理器 / Cygwin 环境 | N/A（用本机 shell，无内置 Unix 环境） | 不做 |
+| 终端语法高亮（无色终端渲染配色） | 无 | 不做：rgpui-term 无渲染钩子，且现代远端普遍自带 256 色 |
+| Professional Customizer / 插件体系 | 无 | 不做：单产品不分发定制版 |
 
 ## 非目标（明确不做）
 

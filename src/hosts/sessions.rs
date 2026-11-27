@@ -26,6 +26,14 @@ pub enum ProtocolKind {
     Ssh,
     /// Telnet：明文 TCP + 最小 IAC 协商，不做认证与加密。
     Telnet,
+    /// 裸 TCP：把本机与 `host:port` 之间的字节双向搬运，上面不叠加任何协议
+    /// （PuTTY 的 "Raw" 会话；连接串口服务器、redis-cli 式探测端口等）。
+    Tcp,
+    /// WebSocket：把终端字节跑在 ws://（或 wss://）帧里，对接 websockify /
+    /// Web 串口网关这类"浏览器才能开终端"的服务（issue #3）。
+    Ws,
+    /// 串口：本地设备（COM3 / /dev/ttyUSB0），参数见 [`SerialParams`]。
+    Serial,
     /// 远程桌面（RDP）：点开走桌面标签，不进终端。
     Rdp,
     /// 远程桌面（VNC）。
@@ -84,11 +92,116 @@ pub struct HostConfig {
     /// 表的 `jumps` 键持久化，启动后回填到这里。
     #[serde(default)]
     pub proxy_jump: Option<i64>,
+    /// 协议附加参数（串口波特率 / WebSocket 路径与 TLS）。
+    ///
+    /// 连接时直接读本字段：降级模式随 sessions.json 落盘（旧数据反序列化出
+    /// 全默认值）；加密库模式 hosts 表没有该列，随 `settings` 表的
+    /// `host_extras` 键持久化，启动后回填到这里（同 protocol / jump 的待遇）。
+    #[serde(default)]
+    pub extras: HostExtras,
+}
+
+/// 串口连接参数（MobaXterm 串口会话同款字段；随加密库 `host_extras` 键持久化）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SerialParams {
+    /// 波特率（u16 装不下 230400 / 921600，所以独立用 u32 存）。
+    pub baud: u32,
+    /// 数据位（5–8）。
+    pub data_bits: u8,
+    /// 校验位。
+    pub parity: SerialParity,
+    /// 停止位（1 或 2）。
+    pub stop_bits: u8,
+    /// 流控。
+    pub flow: SerialFlow,
+}
+
+impl Default for SerialParams {
+    /// 现代开发板控制台的默认 115200 8-N-1，无流控。
+    fn default() -> Self {
+        Self {
+            baud: 115_200,
+            data_bits: 8,
+            parity: SerialParity::None,
+            stop_bits: 1,
+            flow: SerialFlow::None,
+        }
+    }
+}
+
+/// 串口校验位。Mark / Space 仅 Windows 驱动支持，列进模型但不进表单选项。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SerialParity {
+    #[default]
+    None,
+    Odd,
+    Even,
+    Mark,
+    Space,
+}
+
+/// 串口流控：None、软件（XON/XOFF）、硬件（RTS/CTS）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SerialFlow {
+    #[default]
+    None,
+    Software,
+    Hardware,
+}
+
+/// WebSocket 会话参数（普通 TCP 字段表达不了路径与 TLS）。
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WsParams {
+    /// URL 路径，空串或不含前导 `/` 时按 `/` 处理。
+    pub path: String,
+    /// true 走 wss://（TLS）。
+    pub tls: bool,
+}
+
+/// 每主机的协议附加参数。加密库 hosts 表结构固定，与 protocol / jump 一样
+/// 不进列，随 `settings.host_extras` 键（JSON：主机 id → 参数）持久化，
+/// 启动 / 开库后回填（`app::prefs::HostExtrasPrefs`）；降级模式存 settings.json。
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostExtras {
+    /// 串口参数（仅 Serial 协议有意义）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serial: Option<SerialParams>,
+    /// WebSocket 参数（仅 Ws 协议有意义）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ws: Option<WsParams>,
+}
+
+impl HostExtras {
+    /// 只保留对该协议有意义的参数：协议改掉后残留的另一类参数不算数，
+    /// 迁移 / 合并时据此过滤，避免改协议后旧参数被当成有效值持久化。
+    pub fn relevant_to(&self, protocol: ProtocolKind) -> Self {
+        Self {
+            serial: if protocol == ProtocolKind::Serial {
+                self.serial
+            } else {
+                None
+            },
+            ws: if protocol == ProtocolKind::Ws {
+                self.ws.clone()
+            } else {
+                None
+            },
+        }
+    }
+
+    /// 是否没有任何参数（没有就不写键，settings 里不留空记录）。
+    pub fn is_empty(&self) -> bool {
+        self.serial.is_none() && self.ws.is_none()
+    }
 }
 
 impl HostConfig {
-    /// 列表副标题（user@host:port；Telnet 没有登录用户时只写 host:port）。
+    /// 列表副标题（user@host:port；Telnet 没有登录用户时只写 host:port；
+    /// 串口没有端口概念，只写设备路径）。
     pub fn addr(&self) -> String {
+        if self.protocol == ProtocolKind::Serial {
+            return self.host.clone();
+        }
         if self.user.trim().is_empty() {
             format!("{}:{}", self.host, self.port)
         } else {
@@ -99,10 +212,18 @@ impl HostConfig {
     /// 表单字段基本校验，返回首个错误描述。
     pub fn validate(&self) -> Option<String> {
         if self.host.trim().is_empty() {
+            if self.protocol == ProtocolKind::Serial {
+                return Some("设备路径不能为空".to_string());
+            }
             return Some("主机地址不能为空".to_string());
         }
-        if self.port == 0 {
-            return Some("端口无效".to_string());
+        // 串口没有端口概念（host 字段装的是设备路径，port 恒为 0）。
+        if self.protocol != ProtocolKind::Serial && self.port == 0 {
+            return Some(if self.protocol == ProtocolKind::Tcp {
+                "裸 TCP 必须填写端口".to_string()
+            } else {
+                "端口无效".to_string()
+            });
         }
         // Telnet 的登录名由服务端提示交互输入，表单里可以留空。
         if self.protocol == ProtocolKind::Ssh {
@@ -154,6 +275,9 @@ pub struct Settings {
     /// 主机 → 协议映射（序列化成 JSON 字符串，键是主机 id；只记录非 SSH 的项）。
     #[serde(default)]
     pub protocols: String,
+    /// 主机 → 协议附加参数（串口波特率等 / WebSocket 路径与 TLS；键是主机 id）。
+    #[serde(default)]
+    pub host_extras: String,
     /// 键宏（名称 / 触发键 / 步骤序列，序列化成 JSON 数组）。
     #[serde(default)]
     pub macros: String,
@@ -365,6 +489,12 @@ impl SessionStore {
         self.update_settings(|settings| settings.protocols = json);
     }
 
+    /// 降级模式（无加密库）下保存主机协议附加参数。
+    pub fn save_host_extras(&self, json: &str) {
+        let json = json.to_string();
+        self.update_settings(|settings| settings.host_extras = json);
+    }
+
     /// 降级模式（无加密库）下保存键宏列表。
     pub fn save_macros(&self, json: &str) {
         let json = json.to_string();
@@ -526,6 +656,7 @@ mod tests {
             key_inline: false,
             favorite: false,
             proxy_jump: None,
+            extras: Default::default(),
         }
     }
 
@@ -579,5 +710,75 @@ mod tests {
         assert!(store.load_theme());
         store.save_language("en");
         assert_eq!(store.load_language(), "en");
+    }
+
+    #[test]
+    fn serial_addr_shows_device_only() {
+        let mut device = host("控制台");
+        device.protocol = ProtocolKind::Serial;
+        device.host = "COM3".to_string();
+        device.port = 0;
+        assert_eq!(device.addr(), "COM3");
+        assert_eq!(
+            crate::protocols::protocol_spec(ProtocolKind::Serial).default_port,
+            0
+        );
+    }
+
+    #[test]
+    fn serial_validate_needs_device_but_not_port() {
+        let mut device = host("控制台");
+        device.protocol = ProtocolKind::Serial;
+        device.host = "/dev/ttyUSB0".to_string();
+        device.port = 0;
+        assert_eq!(device.validate(), None);
+        // 设备路径缺失要报错，且文案与主机地址的措辞区分开。
+        device.host = " ".to_string();
+        assert_eq!(device.validate().as_deref(), Some("设备路径不能为空"));
+    }
+
+    #[test]
+    fn tcp_validate_requires_a_port() {
+        let mut target = host("网关");
+        target.protocol = ProtocolKind::Tcp;
+        target.port = 0;
+        assert_eq!(target.validate().as_deref(), Some("裸 TCP 必须填写端口"));
+        target.port = 7681;
+        assert_eq!(target.validate(), None);
+    }
+
+    #[test]
+    fn extras_roundtrip_and_relevance_filter() {
+        let mut device = host("控制台");
+        device.protocol = ProtocolKind::Serial;
+        device.extras = HostExtras {
+            serial: Some(SerialParams::default()),
+            ws: Some(WsParams {
+                path: "/ws".into(),
+                tls: true,
+            }),
+        };
+        // 改成 SSH 后串口参数不再有意义：relevant_to 只保留对应协议那份。
+        assert_eq!(
+            device.extras.relevant_to(ProtocolKind::Ssh),
+            HostExtras::default()
+        );
+        assert_eq!(
+            device
+                .extras
+                .relevant_to(ProtocolKind::Serial)
+                .serial,
+            Some(SerialParams::default())
+        );
+        // 落盘再读回：旧版本 JSON 没有 extras 字段时按全默认处理。
+        let store = store("extras-roundtrip");
+        store.save(&[device]);
+        let loaded = store.load();
+        assert_eq!(loaded[0].extras.serial, Some(SerialParams::default()));
+        let legacy: Vec<HostConfig> = serde_json::from_str(
+            r#"[{"name":"旧数据","host":"h","port":22,"user":"u","auth":"Agent"}]"#,
+        )
+        .unwrap();
+        assert_eq!(legacy[0].extras, HostExtras::default());
     }
 }

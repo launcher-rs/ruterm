@@ -61,10 +61,25 @@ impl RuTermApp {
             self.open_desktop_for_saved(&host, window, cx);
             return;
         }
-        // Telnet 是明文 TCP，没有认证材料可问，直接建连。
-        if host.protocol == ProtocolKind::Telnet {
-            self.connect_telnet(&host, window, cx);
-            return;
+        // Telnet / 裸 TCP / WebSocket / 串口都没有认证材料可问，直接建连。
+        match host.protocol {
+            ProtocolKind::Telnet => {
+                self.connect_telnet(&host, window, cx);
+                return;
+            }
+            ProtocolKind::Tcp => {
+                self.connect_tcp(&host, window, cx);
+                return;
+            }
+            ProtocolKind::Ws => {
+                self.connect_ws(&host, window, cx);
+                return;
+            }
+            ProtocolKind::Serial => {
+                self.connect_serial(&host, window, cx);
+                return;
+            }
+            ProtocolKind::Ssh | ProtocolKind::Rdp | ProtocolKind::Vnc => {}
         }
         if !self.require_ssh_ready(cx) {
             return;
@@ -799,22 +814,293 @@ impl RuTermApp {
             port,
             source: source.clone(),
         };
-        let crate::protocols::SessionHandle {
-            join,
-            started,
-            ready,
-            disconnect,
-        } = crate::protocols::telnet::start(
+        let handle = crate::protocols::telnet::start(
             host,
             port,
             handles,
             Duration::from_secs(self.session_prefs.connect_timeout),
             cx,
         );
+        self.install_stream_session(
+            id,
+            title,
+            addr,
+            "Telnet",
+            source,
+            resume,
+            handle,
+            terminal,
+            terminal_view,
+            retry_attempt,
+            reconnect,
+            window,
+            cx,
+        );
+    }
+
+    /// 建立外接终端并启动裸 TCP 会话，追加为新标签。
+    pub(super) fn connect_tcp(
+        &mut self,
+        host: &HostConfig,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.view_split = None;
+        self.active_tab = Some(id);
+        let title = if host.name.trim().is_empty() {
+            format!("{}:{}", host.host, host.port)
+        } else {
+            host.name.clone()
+        };
+        self.start_tcp(
+            id,
+            title,
+            host.host.clone(),
+            host.port,
+            Some(host.clone()),
+            0,
+            false,
+            window,
+            cx,
+        );
+    }
+
+    /// 在指定标签槽位启动裸 TCP 会话（与 [`Self::start_telnet`] 同形）。
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn start_tcp(
+        &mut self,
+        id: usize,
+        title: String,
+        host: String,
+        port: u16,
+        source: Option<HostConfig>,
+        retry_attempt: u32,
+        reconnect: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((terminal, terminal_view, handles)) = self.open_external_terminal(id, window, cx)
+        else {
+            return;
+        };
+        let addr = format!("{host}:{port}");
+        let resume = Resume::Tcp {
+            host: host.clone(),
+            port,
+            source: source.clone(),
+        };
+        let handle = crate::protocols::tcp::start(
+            host,
+            port,
+            handles,
+            Duration::from_secs(self.session_prefs.connect_timeout),
+            cx,
+        );
+        self.install_stream_session(
+            id,
+            title,
+            addr,
+            "TCP",
+            source,
+            resume,
+            handle,
+            terminal,
+            terminal_view,
+            retry_attempt,
+            reconnect,
+            window,
+            cx,
+        );
+    }
+
+    /// 建立外接终端并启动 WebSocket 会话，追加为新标签。
+    pub(super) fn connect_ws(
+        &mut self,
+        host: &HostConfig,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.view_split = None;
+        self.active_tab = Some(id);
+        let title = if host.name.trim().is_empty() {
+            format!("{}:{}", host.host, host.port)
+        } else {
+            host.name.clone()
+        };
+        let params = host.extras.ws.clone().unwrap_or_default();
+        self.start_ws(
+            id,
+            title,
+            host.host.clone(),
+            host.port,
+            params,
+            Some(host.clone()),
+            0,
+            false,
+            window,
+            cx,
+        );
+    }
+
+    /// 在指定标签槽位启动 WebSocket 会话（与 [`Self::start_telnet`] 同形）。
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn start_ws(
+        &mut self,
+        id: usize,
+        title: String,
+        host: String,
+        port: u16,
+        params: crate::sessions::WsParams,
+        source: Option<HostConfig>,
+        retry_attempt: u32,
+        reconnect: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((terminal, terminal_view, handles)) = self.open_external_terminal(id, window, cx)
+        else {
+            return;
+        };
+        let url = crate::protocols::ws::build_url(&host, port, &params.path, params.tls);
+        let resume = Resume::Ws {
+            host: host.clone(),
+            port,
+            path: params.path.clone(),
+            tls: params.tls,
+            source: source.clone(),
+        };
+        let handle = crate::protocols::ws::start(
+            host,
+            port,
+            params.path,
+            params.tls,
+            handles,
+            Duration::from_secs(self.session_prefs.connect_timeout),
+            cx,
+        );
+        self.install_stream_session(
+            id,
+            title,
+            url,
+            "WS",
+            source,
+            resume,
+            handle,
+            terminal,
+            terminal_view,
+            retry_attempt,
+            reconnect,
+            window,
+            cx,
+        );
+    }
+
+    /// 建立外接终端并打开串口，追加为新标签。
+    pub(super) fn connect_serial(
+        &mut self,
+        host: &HostConfig,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.view_split = None;
+        self.active_tab = Some(id);
+        let title = if host.name.trim().is_empty() {
+            host.host.clone()
+        } else {
+            host.name.clone()
+        };
+        let params = host.extras.serial.unwrap_or_default();
+        self.start_serial(
+            id,
+            title,
+            host.host.clone(),
+            params,
+            Some(host.clone()),
+            0,
+            false,
+            window,
+            cx,
+        );
+    }
+
+    /// 在指定标签槽位打开串口会话（与 [`Self::start_telnet`] 同形）。
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn start_serial(
+        &mut self,
+        id: usize,
+        title: String,
+        device: String,
+        params: crate::sessions::SerialParams,
+        source: Option<HostConfig>,
+        retry_attempt: u32,
+        reconnect: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((terminal, terminal_view, handles)) = self.open_external_terminal(id, window, cx)
+        else {
+            return;
+        };
+        let addr = device.clone();
+        let resume = Resume::Serial {
+            device: device.clone(),
+            params,
+            source: source.clone(),
+        };
+        let handle = crate::protocols::serial::start(device, params, handles, cx);
+        self.install_stream_session(
+            id,
+            title,
+            addr,
+            "Serial",
+            source,
+            resume,
+            handle,
+            terminal,
+            terminal_view,
+            retry_attempt,
+            reconnect,
+            window,
+            cx,
+        );
+    }
+
+    /// 终端型无认证协议（Telnet / 裸 TCP / WebSocket / 串口）共用的落标签流程：
+    /// 状态栏文案、标签字段、就绪与失败回调完全同形，差异只在协议名与地址。
+    /// 协议层各自完成建连（[`SessionHandle`]），这里只负责把结果装进标签。
+    #[allow(clippy::too_many_arguments)]
+    fn install_stream_session(
+        &mut self,
+        id: usize,
+        title: String,
+        addr: String,
+        label: &'static str,
+        source: Option<HostConfig>,
+        resume: Resume,
+        handle: crate::protocols::SessionHandle,
+        terminal: Entity<Terminal>,
+        terminal_view: Entity<TerminalView>,
+        retry_attempt: u32,
+        reconnect: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let crate::protocols::SessionHandle {
+            join,
+            started,
+            ready,
+            disconnect,
+        } = handle;
         // 远端关闭 / 断线 → 保留标签并展示断开横幅。
         self.subscribe_session_end(id, &terminal, &terminal_view, cx);
         self.watch_terminal(id, &terminal, cx);
-        self.status = SharedString::from(format!("正在连接 Telnet {addr}…"));
+        self.status = SharedString::from(format!("正在连接 {label} {addr}…"));
         let title_ordinal = if reconnect {
             self.tabs
                 .iter()
@@ -873,9 +1159,9 @@ impl RuTermApp {
                     if let Some(host_id) = recent_host_id {
                         this.record_recent_host(host_id, cx);
                     }
-                    let connecting = format!("正在连接 Telnet {ready_addr}…");
+                    let connecting = format!("正在连接 {label} {ready_addr}…");
                     if this.status == connecting {
-                        this.status = SharedString::from(format!("已连接 Telnet {ready_addr}"));
+                        this.status = SharedString::from(format!("已连接 {label} {ready_addr}"));
                     }
                     cx.notify();
                 });
@@ -900,12 +1186,12 @@ impl RuTermApp {
                     };
                     let message = if started {
                         format!(
-                            "连接中断：Telnet {addr}（{}）",
+                            "连接中断：{label} {addr}（{}）",
                             crate::session::error_summary(&error)
                         )
                     } else {
                         format!(
-                            "连接失败：Telnet {addr}（{}）",
+                            "连接失败：{label} {addr}（{}）",
                             crate::session::error_summary(&error)
                         )
                     };

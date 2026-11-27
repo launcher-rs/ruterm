@@ -153,6 +153,48 @@ pub(super) enum Resume {
         /// 来源主机：重连时优先用列表里的最新地址 / 端口。
         source: Option<HostConfig>,
     },
+    /// 裸 TCP 会话（无认证）。
+    Tcp {
+        /// 地址与端口：主机被删或改成别的协议时仍能按原地址重连。
+        host: String,
+        port: u16,
+        /// 来源主机：重连时优先用列表里的最新地址 / 端口。
+        source: Option<HostConfig>,
+    },
+    /// WebSocket 会话（无认证）。
+    Ws {
+        /// 地址与端口：主机被删或改成别的协议时仍能按原地址重连。
+        host: String,
+        port: u16,
+        /// URL 路径与 TLS 快照；重连时优先用主机的最新参数。
+        path: String,
+        tls: bool,
+        /// 来源主机：重连时优先用列表里的最新配置。
+        source: Option<HostConfig>,
+    },
+    /// 串口会话（本地设备，无秘密）。
+    Serial {
+        /// 设备路径：主机被删或改成别的协议时仍能按原设备重连。
+        device: String,
+        /// 连接参数快照；重连时优先用主机的最新参数。
+        params: crate::sessions::SerialParams,
+        /// 来源主机：重连时优先用列表里的最新配置。
+        source: Option<HostConfig>,
+    },
+}
+
+impl Resume {
+    /// 状态栏「认证」位显示的协议名；SSH 不占这一位（由认证方式填充），
+    /// 其余无认证协议用协议名占位。
+    pub(super) fn protocol_label(&self) -> Option<&'static str> {
+        match self {
+            Resume::Ssh { .. } => None,
+            Resume::Telnet { .. } => Some("Telnet"),
+            Resume::Tcp { .. } => Some("TCP"),
+            Resume::Ws { .. } => Some("WS"),
+            Resume::Serial { .. } => Some("Serial"),
+        }
+    }
 }
 
 impl RuTermApp {
@@ -450,6 +492,68 @@ impl RuTermApp {
                     window,
                     cx,
                 );
+            }
+            Resume::Tcp { host, port, source } => {
+                // 主机可能被编辑过：仍为裸 TCP 时按最新地址 / 端口重连；
+                // 已改成别的协议或已删除则沿用原地址。
+                let latest = source
+                    .as_ref()
+                    .and_then(|saved| self.hosts.iter().find(|item| item.id == saved.id).cloned());
+                let (host, port, source) = match latest {
+                    Some(latest) if latest.protocol == ProtocolKind::Tcp => {
+                        (latest.host.clone(), latest.port, Some(latest))
+                    }
+                    _ => (host, port, source),
+                };
+                self.start_tcp(id, title, host, port, source, retry_attempt, true, window, cx);
+            }
+            Resume::Ws {
+                host,
+                port,
+                path,
+                tls,
+                source,
+            } => {
+                // 主机可能被编辑过：仍为 WebSocket 时按最新地址 / 端口 / 参数重连；
+                // 已改成别的协议或已删除则沿用原参数。
+                let latest = source
+                    .as_ref()
+                    .and_then(|saved| self.hosts.iter().find(|item| item.id == saved.id).cloned());
+                let mut params = crate::sessions::WsParams { path, tls };
+                let (host, port, source) = match latest {
+                    Some(latest) if latest.protocol == ProtocolKind::Ws => {
+                        if let Some(saved) = latest.extras.ws.clone() {
+                            params = saved;
+                        }
+                        (latest.host.clone(), latest.port, Some(latest))
+                    }
+                    _ => (host, port, source),
+                };
+                self.start_ws(
+                    id, title, host, port, params, source, retry_attempt, true, window, cx,
+                );
+            }
+            Resume::Serial {
+                device,
+                params,
+                source,
+            } => {
+                // 主机可能被编辑过：仍为串口时按最新设备 / 参数重连；
+                // 已改成别的协议或已删除则沿用原参数。
+                let latest = source
+                    .as_ref()
+                    .and_then(|saved| self.hosts.iter().find(|item| item.id == saved.id).cloned());
+                let mut params = params;
+                let (device, source) = match latest {
+                    Some(latest) if latest.protocol == ProtocolKind::Serial => {
+                        if let Some(saved) = latest.extras.serial {
+                            params = saved;
+                        }
+                        (latest.host.clone(), Some(latest))
+                    }
+                    _ => (device, source),
+                };
+                self.start_serial(id, title, device, params, source, retry_attempt, true, window, cx);
             }
         }
     }

@@ -90,6 +90,8 @@ mod schema {
                 favorite: self.favorite,
                 // 跳板机映射存在 settings 表，加载后由 UI 层回填。
                 proxy_jump: None,
+                // 协议 / 附加参数同理：hosts 表没有这两列，UI 层回填。
+                extras: Default::default(),
             }
         }
     }
@@ -1068,6 +1070,7 @@ async fn read_legacy_vault(
                 key_inline: false,
                 favorite: matches!(row.get_value(7), Ok(Value::Integer(v)) if v != 0),
                 proxy_jump: None,
+                extras: Default::default(),
             },
             password,
         ));
@@ -1322,6 +1325,7 @@ mod tests {
             key_inline: false,
             favorite: true,
             proxy_jump: None,
+            extras: Default::default(),
         };
         vault.upsert(&host).await.unwrap();
         vault.set_password(3, Some("s3cret")).await.unwrap();
@@ -1410,6 +1414,7 @@ mod tests {
             key_inline: false,
             favorite: false,
             proxy_jump: None,
+            extras: Default::default(),
         };
         vault.upsert(&host).await.unwrap();
         vault.set_password(7, Some("pw-7")).await.unwrap();
@@ -1538,6 +1543,7 @@ mod tests {
             key_inline: false,
             favorite: false,
             proxy_jump: None,
+            extras: Default::default(),
         };
         std::thread::scope(|scope| {
             scope.spawn(move || {
@@ -1755,6 +1761,7 @@ mod tests {
             key_inline: false,
             favorite: false,
             proxy_jump: None,
+            extras: Default::default(),
         };
         vault.upsert(&host).await.unwrap();
         vault.set_password(5, Some("明文口令")).await.unwrap();
@@ -1811,6 +1818,7 @@ mod tests {
             key_inline: false,
             favorite: false,
             proxy_jump: None,
+            extras: Default::default(),
         };
         vault.upsert(&host).await.unwrap();
 

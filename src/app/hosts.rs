@@ -138,6 +138,7 @@ impl RuTermApp {
                 key_inline: false,
                 favorite: false,
                 proxy_jump: None,
+                extras: Default::default(),
             };
             if self.vault.is_some() {
                 host.id = self.hosts.iter().map(|item| item.id).max().unwrap_or(0) + 1;
@@ -329,6 +330,10 @@ impl RuTermApp {
             if self.vault.is_some() {
                 self.protocols.set(host.id, host.protocol);
                 self.jumps.set(host.id, host.proxy_jump);
+                let relevant = host.extras.relevant_to(host.protocol);
+                if !relevant.is_empty() {
+                    self.host_extras.set(host.id, relevant);
+                }
             }
             self.hosts.push(host.clone());
             self.persist_host(&host, cx);
@@ -337,6 +342,7 @@ impl RuTermApp {
         if self.vault.is_some() {
             self.persist_protocols(cx);
             self.persist_jumps(cx);
+            self.persist_host_extras(cx);
         }
         if !imported_ids.is_empty() {
             for group in &imported_sidebar.groups {
@@ -790,6 +796,8 @@ impl RuTermApp {
             self.persist_jumps(cx);
             self.protocols.forget(removed.id);
             self.persist_protocols(cx);
+            self.host_extras.forget(removed.id);
+            self.persist_host_extras(cx);
         }
         self.status = tr!(cx, "已删除主机 {label}", label = label);
         cx.notify();
@@ -967,10 +975,13 @@ impl RuTermApp {
         }
     }
 
-    /// 主机行图标：Telnet 用地球标；SSH 按认证方式区分，一眼看出连这台机器要什么凭据。
+    /// 主机行图标：Telnet / WS 用地球标（同为网络文本协议），裸 TCP 用网络标，
+    /// 串口用芯片标（设备控制台）；SSH 按认证方式区分，一眼看出连这台机器要什么凭据。
     pub(super) fn host_icon(host: &HostConfig) -> IconName {
         match host.protocol {
-            ProtocolKind::Telnet => IconName::Globe,
+            ProtocolKind::Telnet | ProtocolKind::Ws => IconName::Globe,
+            ProtocolKind::Tcp => IconName::Network,
+            ProtocolKind::Serial => IconName::Cpu,
             // 桌面协议共用「窗口」图标：当前图标集里没有显示器图标。
             ProtocolKind::Rdp | ProtocolKind::Vnc => IconName::Frame,
             ProtocolKind::Ssh => match host.auth {

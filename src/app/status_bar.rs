@@ -92,9 +92,10 @@ impl RuTermApp {
             if self.status_bar.addr {
                 left.push(StatusBarItem::new(tab.addr.clone()).id("addr"));
             }
-            // Telnet 没有认证方式这一栏，用协议名占住同一位置。
-            if matches!(&tab.resume, Some(Resume::Telnet { .. })) {
-                left.push(StatusBarItem::new("Telnet").id("protocol").muted(true));
+            // 无认证协议（Telnet / 裸 TCP / WebSocket / 串口）没有认证方式这一栏，
+            // 用协议名占住同一位置。
+            if let Some(label) = tab.resume.as_ref().and_then(Resume::protocol_label) {
+                left.push(StatusBarItem::new(label).id("protocol").muted(true));
             }
             if let (true, Some(auth)) = (self.status_bar.auth, tab.auth) {
                 left.push(

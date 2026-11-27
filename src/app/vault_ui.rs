@@ -676,6 +676,18 @@ impl RuTermApp {
             if !protocols.protocols.is_empty() {
                 let _ = vault.set_setting("protocols", &protocols.to_json()).await;
             }
+            // 协议附加参数（串口 / WebSocket）同样不在 hosts 表列里：
+            // 把 JSON 主机记录里的参数写进 settings 的 host_extras 键。
+            let mut extras = HostExtrasPrefs::default();
+            for host in &imported {
+                let relevant = host.extras.relevant_to(host.protocol);
+                if !relevant.is_empty() {
+                    extras.set(host.id, relevant);
+                }
+            }
+            if !extras.extras.is_empty() {
+                let _ = vault.set_setting("host_extras", &extras.to_json()).await;
+            }
             return Ok(imported);
         }
         Ok(existing)

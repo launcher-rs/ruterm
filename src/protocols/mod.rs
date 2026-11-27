@@ -15,8 +15,11 @@ use tokio::sync::oneshot;
 
 use crate::sessions::ProtocolKind;
 
+pub(crate) mod serial;
 pub(crate) mod ssh;
+pub(crate) mod tcp;
 pub(crate) mod telnet;
+pub(crate) mod ws;
 
 /// 一种协议的静态元数据：展示名、默认端口、会话类别、列表副标题前缀。
 ///
@@ -49,6 +52,25 @@ const fn spec(kind: ProtocolKind) -> ProtocolSpec {
             default_port: 23,
             desktop: false,
             subtitle_prefix: "Telnet · ",
+        },
+        ProtocolKind::Tcp => ProtocolSpec {
+            label: "TCP",
+            // 裸 TCP 没有约定俗成的默认端口：留 0 让表单不预填，保存时校验必填。
+            default_port: 0,
+            desktop: false,
+            subtitle_prefix: "TCP · ",
+        },
+        ProtocolKind::Ws => ProtocolSpec {
+            label: "WS",
+            default_port: 80,
+            desktop: false,
+            subtitle_prefix: "WS · ",
+        },
+        ProtocolKind::Serial => ProtocolSpec {
+            label: "Serial",
+            default_port: 0,
+            desktop: false,
+            subtitle_prefix: "Serial · ",
         },
         ProtocolKind::Rdp => ProtocolSpec {
             label: "RDP",

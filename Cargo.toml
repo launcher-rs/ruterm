@@ -54,6 +54,14 @@ ironrdp = { version = "0.17", default-features = false, features = [
 # 间接依赖，只为钉版本：ironrdp-connector 要 `sspi ^0.21`，0.21.0 钉了
 # curve25519-dalek 的预发布版（与 russh 已解析的 5.0.0 冲突）；0.21.3 没有这个问题。
 sspi = "=0.21.3"
+# 串口会话（issue #3）：同步 API，读在专用线程里跑，写走 try_clone 出的独立句柄。
+serialport = "4"
+# WebSocket 会话（issue #3）：connect_async 复用 telnet 同款建连流程；
+# native-tls 与 reqwest / ironrdp 同栈（Windows 上是 schannel），wss 不额外引入 rustls。
+tokio-tungstenite = { version = "0.30.0", features = ["native-tls"] }
+# WebSocket 会话要拆 Sink / Stream 两半（select 里同时读和写），StreamExt / SinkExt 来自它；
+# 本就是 tokio-tungstenite 的传递依赖，只是升为直接依赖。
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
 
 [patch.crates-io]
 # ironrdp-connector 的 CredSSP 唯一用到的是 `picky::key::PrivateKey`。上游

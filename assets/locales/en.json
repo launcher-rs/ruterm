@@ -1097,5 +1097,22 @@
  "API 正常": "API OK",
  "API 失败": "API failed",
  "下载正常": "Download OK",
- "下载失败": "Download failed"
+ "下载失败": "Download failed",
+ "URL 路径": "URL path",
+ "URL 路径（留空为 /）": "URL path (empty for /)",
+ "串口参数": "Serial parameters",
+ "停止位": "Stop bits",
+ "偶校验": "Even",
+ "奇校验": "Odd",
+ "数据位": "Data bits",
+ "无": "None",
+ "校验位": "Parity",
+ "波特率": "Baud rate",
+ "流控": "Flow control",
+ "硬件（RTS/CTS）": "Hardware (RTS/CTS)",
+ "软件（XON/XOFF）": "Software (XON/XOFF)",
+ "设备路径": "Device path",
+ "设备路径（COM3 / /dev/ttyUSB0）": "Device path (COM3 / /dev/ttyUSB0)",
+ "☐ 加密传输（TLS）": "☐ Encrypted (TLS)",
+ "☑ 加密传输（TLS）": "☑ Encrypted (TLS)"
 }

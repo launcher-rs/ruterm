@@ -6,6 +6,17 @@
 - 发布时把「未发布」段改名为对应版本号并补日期（版本号与 `Cargo.toml` 一致），再打 `v<版本>` 标签；
 - 打标签后 release 工作流会自动提取 CHANGELOG 里对应版本段作为 Release 说明，所以条目请写用户能感知的变化，不写内部实现细节。
 
+## [未发布]
+
+### 新增
+
+- 新增三种连接方式（[issue #3](https://github.com/launcher-rs/ruterm/issues/3)，对齐 MobaXterm 的会话能力）：
+  - **串口**：直连本地设备（`COM3` / `/dev/ttyUSB0`）当终端用，波特率 / 数据位 / 校验位 / 停止位 / 流控可选，默认 115200 8-N-1；打开即拉高 DTR / RTS，行为与 PuTTY / MobaXterm 一致。
+  - **裸 TCP**：与任意 `host:port` 之间的原始字节双向搬运（PuTTY 的 "Raw" 会话），用于串口服务器、预留端口服务与手动调试协议。
+  - **WebSocket**：终端字节跑在 `ws://` / `wss://` 帧里，对接 websockify、Web 串口网关等浏览器终端服务；URL 路径与 TLS 按主机保存，Ping 自动应答。
+  - 三种会话与 Telnet 同待遇：无认证直接建连、断线保留内容可原标签重连与自动重连、串口 / WS 主机参数随凭据库（降级模式随 sessions.json）持久化。
+- 主机表单协议分段扩展为 SSH / Telnet / TCP / WS / Serial / RDP / VNC 七档，串口主机的副标题只显示设备路径、状态栏以协议名占位认证栏。
+
 ## [0.2.4] - 2026-11-27
 
 ### 修复

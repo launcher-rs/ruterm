@@ -8,6 +8,7 @@
 | 能力 | 状态 | 说明 |
 |------|------|------|
 | SSH 连接与终端 | `[x]` | russh + rgpui-term（外部 IO 后端），交互式 PTY |
+| 串口 / 裸 TCP / WebSocket（issue #3） | `[x]` | 三种无认证终端协议与 Telnet 同形（`SessionHandle` 公共句柄 + `install_stream_session` 共用落标签流程，断线横幅 / 回车重连 / 自动重连一致）。串口：`serialport` 同步 API，读线程阻塞轮询 + `try_clone` 独立写句柄，打开拉高 DTR / RTS，参数 115200 8-N-1 默认（波特率 / 数据位 / 校验位 / 停止位 / 流控五项下拉，MobaXterm 同款字段）；裸 TCP：Telnet 去掉 IAC 的直通搬运；WebSocket：tokio-tungstenite（native-tls），帧原样进出、Ping 自动回 Pong，路径与 TLS 按主机保存。协议模型在 `src/hosts/sessions.rs`（`ProtocolKind` + `HostExtras`），后端在 `src/protocols/{tcp,ws,serial}.rs`，参数持久化走 `HostConfig.extras`（降级随 sessions.json）+ 加密库 `settings.host_extras` 键（`HostExtrasPrefs`，同 protocols / jumps 先例） |
 | 文件浏览与传输（SFTP） | `[x]` | 边栏「文件」页（「视图」菜单 / `Ctrl+Shift+B`）；工具栏「上传」与拖入即传，行右键「下载到…」；复用当前 SSH 连接开 SFTP 子系统，分块搬运 + 节流进度；SFTP 通道走旁路集合，不污染终端输出（见 §二.7） |
 | 端口转发（-L / -R / -D） | `[x]` | 边栏「转发」页（「终端」菜单 / `Ctrl+Shift+F`）；默认只列已保存规则，点「设置…」才展开添加 / 编辑表单；**先保存规则、再用开关启停**：条目按 `user@host:port` 存进加密库 `forwards` 键，列表行开关即时生效、可设「连接时自动开启」。本地（-L）监听 `127.0.0.1:<端口>` 经当前连接转到服务器视角的目标；远程（-R）向服务器申请 `127.0.0.1:<端口>` 经 SSH 回到本机；动态（-D）在本机提供 SOCKS5 代理、目标由客户端协商；监听都只绑回环地址，生效条数压成「转发」图标角标（见 §二.7） |
 | 跳板机（ProxyJump） | `[x]` | 主机表单「跳板机」下拉选另一台已保存主机；先连跳板机，再经 `direct-tcpip` 通道 `connect_stream` 连目标（限一级，排除自环与链式）。逐跳各自 TOFU 校验；跳板机密码 / 口令 / 内嵌私钥只取自内存缓存或加密库，取不到给提示而不二次弹窗；绑定存加密库 `settings.jumps`（见 §二.7） |

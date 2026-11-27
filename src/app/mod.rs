@@ -161,6 +161,8 @@ pub(crate) struct RuTermApp {
     jumps: JumpPrefs,
     /// 主机 → 协议映射（host id → protocol），双层持久化。
     protocols: ProtocolPrefs,
+    /// 主机 → 协议附加参数（串口参数 / WebSocket 参数），双层持久化。
+    host_extras: HostExtrasPrefs,
     /// 分组新建 / 重命名弹窗（`renaming` 为 None 表示新建）。
     group_prompt: Option<GroupPrompt>,
     /// 删除二次确认（主机 id；浮层遮挡期间 attach_vault 仍可能整表替换列表，
@@ -388,6 +390,7 @@ impl RuTermApp {
         let forward_prefs = ForwardPrefs::from_json(&settings.forwards);
         let jumps = JumpPrefs::from_json(&settings.jumps);
         let protocols = ProtocolPrefs::from_json(&settings.protocols);
+        let host_extras = HostExtrasPrefs::from_json(&settings.host_extras);
         let macros = crate::macros::from_json(&settings.macros);
         let snippets = crate::snippets::from_json(&settings.snippets);
         let history = CommandHistory::from_json(&settings.history);
@@ -514,6 +517,7 @@ impl RuTermApp {
             sidebar,
             jumps,
             protocols,
+            host_extras,
             group_prompt: None,
             confirm_delete: None,
             confirm_trust: None,
@@ -652,6 +656,7 @@ impl RuTermApp {
             key_inline: false,
             favorite: false,
             proxy_jump: None,
+            extras: Default::default(),
         };
         self.hosts.push(host.clone());
         self.persist_host(&host, cx);
@@ -1020,6 +1025,37 @@ impl RuTermApp {
                 if this.protocols != prefs {
                     this.protocols = prefs;
                     this.apply_protocols();
+                    cx.notify();
+                }
+            });
+            // 协议附加参数（串口 / WebSocket）同样以库内为准；开库前保存过参数的
+            // 主机（降级 JSON，id 可能为 0）把主机记录里的参数并进偏好，避免被覆盖。
+            let stored_extras = vault
+                .setting("host_extras")
+                .await
+                .ok()
+                .flatten()
+                .map(|json| HostExtrasPrefs::from_json(&json))
+                .unwrap_or_default();
+            let _ = this.update(cx, |this, cx| {
+                let mut prefs = stored_extras;
+                let mut changed = false;
+                for host in &this.hosts {
+                    // 非串口 / WS 协议的主机即使带着残留参数也不收。
+                    if host.id == 0 {
+                        continue;
+                    }
+                    let current = host.extras.relevant_to(host.protocol);
+                    if !current.is_empty() {
+                        changed |= prefs.set(host.id, current);
+                    }
+                }
+                if changed {
+                    this.persist_host_extras(cx);
+                }
+                if this.host_extras != prefs {
+                    this.host_extras = prefs;
+                    this.apply_host_extras();
                     cx.notify();
                 }
             });

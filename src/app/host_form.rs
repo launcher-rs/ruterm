@@ -10,7 +10,10 @@ use rgpui::{
 };
 
 use crate::NewHost;
-use crate::sessions::{AuthMethod, HostConfig, ProtocolKind};
+use crate::sessions::{
+    AuthMethod, HostConfig, HostExtras, ProtocolKind, SerialFlow, SerialParity, SerialParams,
+    WsParams,
+};
 use crate::tr;
 
 use super::remote_desktop::{desktop_cache_key, store_desktop_secret_after_save};
@@ -42,6 +45,20 @@ pub(super) struct NewHostForm {
     pub(super) group: Option<SharedString>,
     /// 跳板机（另一台已保存主机的 id）；None＝直连。
     pub(super) jump: Option<i64>,
+    /// 串口波特率（仅 Serial 协议有效）。
+    pub(super) baud: u32,
+    /// 串口数据位（5–8）。
+    pub(super) data_bits: u8,
+    /// 串口校验位。
+    pub(super) parity: SerialParity,
+    /// 串口停止位（1 / 2）。
+    pub(super) stop_bits: u8,
+    /// 串口流控。
+    pub(super) flow: SerialFlow,
+    /// WebSocket URL 路径（仅 Ws 协议有效；空串按 "/" 处理）。
+    pub(super) ws_path: Entity<InputState>,
+    /// WebSocket 是否走 TLS（wss://）。
+    pub(super) ws_tls: bool,
     /// Some(id)＝编辑既有主机（保存时按该 id 原位替换）。
     /// 用 id 而非下标：表单开着时列表可能被后台整表替换，下标会指向别的行。
     pub(super) editing: Option<i64>,
@@ -120,6 +137,13 @@ impl RuTermApp {
         } else {
             tr!(cx, "展示名（留空用主机地址）")
         };
+        // 串口 / WebSocket 的附加参数：编辑时回填主机记录，新建按默认 115200 8-N-1 与 ws://。
+        let saved_extras = existing
+            .as_ref()
+            .map(|host| host.extras.clone())
+            .unwrap_or_default();
+        let saved_serial = saved_extras.serial.unwrap_or_default();
+        let saved_ws = saved_extras.ws.unwrap_or_default();
         let form = NewHostForm {
             protocol,
             name: cx.new(|cx| {
@@ -130,7 +154,13 @@ impl RuTermApp {
                 }
             }),
             host: cx.new(|cx| {
-                let input = InputState::new(window, cx).placeholder(tr!(cx, "host 或 IP"));
+                // 串口的 host 字段装的是设备路径，占位文案跟着换。
+                let host_placeholder = if protocol == ProtocolKind::Serial {
+                    tr!(cx, "设备路径（COM3 / /dev/ttyUSB0）")
+                } else {
+                    tr!(cx, "host 或 IP")
+                };
+                let input = InputState::new(window, cx).placeholder(host_placeholder);
                 match &existing {
                     Some(host) => input.default_value(host.host.clone()),
                     None => match &seed {
@@ -140,10 +170,18 @@ impl RuTermApp {
                 }
             }),
             port: cx.new(|cx| {
+                // 没有默认端口的协议（裸 TCP 必填、串口无端口）留空，不预填 0。
                 let default_port = seed
                     .as_ref()
                     .map(|(_, _, port)| port.to_string())
-                    .unwrap_or_else(|| protocol.default_port().to_string());
+                    .unwrap_or_else(|| {
+                        let port = protocol.default_port();
+                        if port == 0 {
+                            String::new()
+                        } else {
+                            port.to_string()
+                        }
+                    });
                 match &existing {
                     Some(host) => InputState::new(window, cx).default_value(host.port.to_string()),
                     None => InputState::new(window, cx).default_value(default_port),
@@ -178,6 +216,20 @@ impl RuTermApp {
             auth,
             group,
             jump: existing.as_ref().and_then(|host| host.proxy_jump),
+            baud: saved_serial.baud,
+            data_bits: saved_serial.data_bits,
+            parity: saved_serial.parity,
+            stop_bits: saved_serial.stop_bits,
+            flow: saved_serial.flow,
+            ws_path: cx.new(|cx| {
+                let input = InputState::new(window, cx).placeholder(tr!(cx, "URL 路径（留空为 /）"));
+                if saved_ws.path.is_empty() {
+                    input
+                } else {
+                    input.default_value(saved_ws.path.clone())
+                }
+            }),
+            ws_tls: saved_ws.tls,
             editing: edit_id,
         };
         self.new_host = Some(form);
@@ -232,9 +284,11 @@ impl RuTermApp {
         let key_path = form.key_path.read(cx).value().trim().to_string();
         // 端口留空沿用协议默认；填了但解析不出（如 22q2、超 u16 的 99999）必须
         // 显式报错——静默改写成默认端口会让「保存的」和「输入的」悄悄不一致，
-        // 之后连接失败极难归因。
+        // 之后连接失败极难归因。串口没有端口概念，恒为 0。
         let port_raw = form.port.read(cx).value().trim().to_string();
-        let port = if port_raw.is_empty() {
+        let port = if protocol == ProtocolKind::Serial {
+            0
+        } else if port_raw.is_empty() {
             protocol.default_port()
         } else {
             match port_raw.parse::<u16>() {
@@ -250,6 +304,21 @@ impl RuTermApp {
                 }
             }
         };
+        // 协议附加参数：只收当前协议有意义的那份（另一类不写，改协议不留残值）。
+        let ws_path_raw = form.ws_path.read(cx).value().trim().to_string();
+        let extras = HostExtras {
+            serial: (protocol == ProtocolKind::Serial).then_some(SerialParams {
+                baud: form.baud,
+                data_bits: form.data_bits,
+                parity: form.parity,
+                stop_bits: form.stop_bits,
+                flow: form.flow,
+            }),
+            ws: (protocol == ProtocolKind::Ws).then_some(WsParams {
+                path: ws_path_raw,
+                tls: form.ws_tls,
+            }),
+        };
         let mut host = HostConfig {
             protocol,
             id: 0,
@@ -262,6 +331,7 @@ impl RuTermApp {
             key_inline: auth == AuthMethod::IdentityFile && key_inline,
             favorite: false,
             proxy_jump: jump,
+            extras,
         };
         if host.protocol == ProtocolKind::Ssh && host.key_inline {
             if self.vault.is_none() {
@@ -335,6 +405,7 @@ impl RuTermApp {
                 self.persist_host(&host, cx);
                 self.note_jump(&host, cx);
                 self.note_protocol(&host, cx);
+                self.note_host_extras(&host, cx);
                 let note = self.store_form_secret(&host, passphrase.clone(), save_secret, cx);
                 let password_note =
                     self.store_desktop_form_secret(&host, password.clone(), save_secret, cx);
@@ -364,6 +435,7 @@ impl RuTermApp {
         self.persist_host(&host, cx);
         self.note_jump(&host, cx);
         self.note_protocol(&host, cx);
+        self.note_host_extras(&host, cx);
         let note = self.store_form_secret(&host, passphrase, save_secret, cx);
         let password_note = self.store_desktop_form_secret(&host, password, save_secret, cx);
         let key_note = self.store_form_key(&host, key_data, false, cx);
@@ -707,19 +779,24 @@ impl RuTermApp {
                             .gap_2()
                             .overflow_y_scrollbar()
                             .child({
-                                // 协议分段：终端（SSH / Telnet）与远程桌面（RDP / VNC）共用同一张卡片。
-                                // 切换时若端口仍是旧协议的默认值，顺带换成新协议默认端口。
+                                // 协议分段：终端（SSH / Telnet / 裸 TCP / WebSocket / 串口）
+                                // 与远程桌面（RDP / VNC）共用同一张卡片，放不下自动换行。
+                                // 切换时若端口仍是旧协议的默认值，顺带换成新协议默认端口
+                                // （没有默认端口的协议不覆盖，让用户自己填）。
                                 let options = [
                                     ProtocolKind::Ssh,
                                     ProtocolKind::Telnet,
+                                    ProtocolKind::Tcp,
+                                    ProtocolKind::Ws,
+                                    ProtocolKind::Serial,
                                     ProtocolKind::Rdp,
                                     ProtocolKind::Vnc,
                                 ];
                                 v_flex()
                                     .gap_1()
                                     .child(div().text_sm().child(tr!(cx, "协议")))
-                                    .child(h_flex().gap_2().children(options.into_iter().map(
-                                        |option| {
+                                    .child(h_flex().flex_wrap().gap_2().children(
+                                        options.into_iter().map(|option| {
                                             let is_selected = form.protocol == option;
                                             div()
                                                 .id(SharedString::from(format!(
@@ -758,8 +835,7 @@ impl RuTermApp {
                                                             .protocol
                                                             .default_port()
                                                             .to_string();
-                                                        let next =
-                                                            option.default_port().to_string();
+                                                        let next_port = option.default_port();
                                                         let port_now = form
                                                             .port
                                                             .read(cx)
@@ -767,9 +843,15 @@ impl RuTermApp {
                                                             .trim()
                                                             .to_string();
                                                         form.protocol = option;
-                                                        if port_now == previous {
+                                                        // 没有默认端口的协议（裸 TCP 必填、
+                                                        // 串口无端口）不覆盖现有输入。
+                                                        if next_port != 0 && port_now == previous {
                                                             form.port.update(cx, |state, cx| {
-                                                                state.set_value(next, window, cx);
+                                                                state.set_value(
+                                                                    next_port.to_string(),
+                                                                    window,
+                                                                    cx,
+                                                                );
                                                             });
                                                         }
                                                         cx.notify();
@@ -779,15 +861,26 @@ impl RuTermApp {
                                     )))
                             })
                             .child(labeled_field(tr!(cx, "展示名"), &form.name, &pal))
-                            .child(labeled_field(tr!(cx, "主机地址"), &form.host, &pal))
+                            .child(labeled_field(
+                                // 串口没有主机地址：host 字段装的是设备路径。
+                                if protocol == ProtocolKind::Serial {
+                                    tr!(cx, "设备路径")
+                                } else {
+                                    tr!(cx, "主机地址")
+                                },
+                                &form.host,
+                                &pal,
+                            ))
                             .child(
                                 h_flex()
                                     .gap_3()
-                                    .child(div().flex_1().child(labeled_field(
-                                        tr!(cx, "端口"),
-                                        &form.port,
-                                        &pal,
-                                    )))
+                                    .when(protocol != ProtocolKind::Serial, |this| {
+                                        this.child(div().flex_1().child(labeled_field(
+                                            tr!(cx, "端口"),
+                                            &form.port,
+                                            &pal,
+                                        )))
+                                    })
                                     // Telnet / VNC 的登录名在会话内交互输入，表单里没有对应字段。
                                     .when(
                                         matches!(protocol, ProtocolKind::Ssh | ProtocolKind::Rdp),
@@ -800,6 +893,23 @@ impl RuTermApp {
                                         },
                                     ),
                             )
+                            // 串口参数（MobaXterm 串口会话同款字段），默认 115200 8-N-1。
+                            .when(protocol == ProtocolKind::Serial, |this| {
+                                this.child(serial_params_block(cx, form))
+                            })
+                            // WebSocket 路径与 TLS：普通 TCP 字段表达不了这两项。
+                            .when(protocol == ProtocolKind::Ws, |this| {
+                                this.child(
+                                    v_flex()
+                                        .gap_2()
+                                        .child(labeled_field(
+                                            tr!(cx, "URL 路径"),
+                                            &form.ws_path,
+                                            &pal,
+                                        ))
+                                        .child(ws_tls_row(cx, form, &pal)),
+                                )
+                            })
                             // 桌面协议密码：已保存的密码一律不回填显示（与「修改参数」一致）。
                             // 这里输入的是「新密码」，留空保存＝沿用已保存的密码。
                             .when(
@@ -1326,4 +1436,238 @@ impl RuTermApp {
         })
         .detach();
     }
+
+    /// 把协议附加参数（串口 / WebSocket）回填到主机列表。
+    ///
+    /// 只对加密库模式生效：降级模式下参数直接序列化在 sessions.json 的主机
+    /// 记录里（主机 id 可能为 0，按 id 回填反而会把它抹掉），理由同
+    /// [`Self::apply_jumps`]。
+    pub(super) fn apply_host_extras(&mut self) {
+        if self.vault.is_none() {
+            return;
+        }
+        for host in &mut self.hosts {
+            host.extras = self
+                .host_extras
+                .of(host.id)
+                .relevant_to(host.protocol);
+        }
+    }
+
+    /// 记录某主机的协议附加参数（保存表单时调用；host.extras 已带上新值）。
+    ///
+    /// 只保存对该协议有意义的部分：协议改掉后残留的旧参数一并清掉，
+    /// 全默认值删键。加密库模式写 `settings` 的 `host_extras` 键；降级模式下
+    /// 参数已随 sessions.json 落盘，这里不动（否则会按 id=0 覆盖成空）。
+    pub(super) fn note_host_extras(&mut self, host: &HostConfig, cx: &mut Context<Self>) {
+        if self.vault.is_none() {
+            return;
+        }
+        let relevant = host.extras.relevant_to(host.protocol);
+        if self.host_extras.of(host.id) == relevant {
+            return;
+        }
+        if self.host_extras.set(host.id, relevant) {
+            self.persist_host_extras(cx);
+        }
+    }
+
+    /// 协议附加参数落库；加密库不可用时退回旧 settings.json。
+    pub(super) fn persist_host_extras(&self, cx: &mut Context<Self>) {
+        let json = self.host_extras.to_json();
+        let Some(vault) = self.vault.clone() else {
+            self.store.save_host_extras(&json);
+            return;
+        };
+        cx.spawn(async move |_, _| {
+            if let Err(error) = vault.set_setting("host_extras", &json).await {
+                log::warn!("写入库内协议附加参数失败: {error}");
+            }
+        })
+        .detach();
+    }
+}
+
+/// 带标签的下拉选择，选中值经 `pick` 写回表单（表单实体内按 id 重新取用，
+/// 与跳板机下拉同一套借用法）。
+fn labeled_select(
+    cx: &Context<RuTermApp>,
+    id: &'static str,
+    label: SharedString,
+    options: Vec<SharedString>,
+    selected: usize,
+    pick: impl Fn(usize, &mut NewHostForm) + Send + Sync + 'static,
+) -> AnyElement {
+    let entity = cx.entity();
+    v_flex()
+        .gap_1()
+        .child(div().text_sm().child(label))
+        .child(
+            Select::new(options)
+                .id(id)
+                .selected(Some(selected))
+                .w_full()
+                .on_change(move |index, _name, _window, cx| {
+                    entity.update(cx, |this, cx| {
+                        if let Some(form) = this.new_host.as_mut() {
+                            pick(index, form);
+                            cx.notify();
+                        }
+                    });
+                }),
+        )
+        .into_any_element()
+}
+
+/// 串口参数块：波特率 / 数据位 / 校验位 / 停止位 / 流控五项下拉
+/// （字段语义与 MobaXterm 串口会话一致），默认 115200 8-N-1 无流控。
+fn serial_params_block(cx: &Context<RuTermApp>, form: &NewHostForm) -> AnyElement {
+    const BAUDS: [u32; 15] = [
+        300, 600, 1200, 2400, 4800, 9600, 14400, 19200, 28800, 38400, 57600, 115200, 230400,
+        460800, 921600,
+    ];
+    let baud_labels: Vec<SharedString> = BAUDS
+        .iter()
+        .map(|baud| SharedString::from(baud.to_string()))
+        .collect();
+    let baud_selected = BAUDS
+        .iter()
+        .position(|baud| *baud == form.baud)
+        .unwrap_or(11);
+    const DATA_BITS: [u8; 4] = [5, 6, 7, 8];
+    let data_labels: Vec<SharedString> = DATA_BITS
+        .iter()
+        .map(|bits| SharedString::from(bits.to_string()))
+        .collect();
+    let data_selected = DATA_BITS
+        .iter()
+        .position(|bits| *bits == form.data_bits)
+        .unwrap_or(3);
+    const PARITIES: [SerialParity; 3] = [SerialParity::None, SerialParity::Odd, SerialParity::Even];
+    let parity_labels: Vec<SharedString> = vec![
+        tr!(cx, "无"),
+        tr!(cx, "奇校验"),
+        tr!(cx, "偶校验"),
+    ];
+    let parity_selected = PARITIES
+        .iter()
+        .position(|parity| *parity == form.parity)
+        .unwrap_or(0);
+    const STOP_BITS: [u8; 2] = [1, 2];
+    let stop_labels: Vec<SharedString> = STOP_BITS
+        .iter()
+        .map(|bits| SharedString::from(bits.to_string()))
+        .collect();
+    let stop_selected = STOP_BITS
+        .iter()
+        .position(|bits| *bits == form.stop_bits)
+        .unwrap_or(0);
+    const FLOWS: [SerialFlow; 3] = [SerialFlow::None, SerialFlow::Software, SerialFlow::Hardware];
+    let flow_labels: Vec<SharedString> = vec![
+        tr!(cx, "无"),
+        tr!(cx, "软件（XON/XOFF）"),
+        tr!(cx, "硬件（RTS/CTS）"),
+    ];
+    let flow_selected = FLOWS
+        .iter()
+        .position(|flow| *flow == form.flow)
+        .unwrap_or(0);
+
+    v_flex()
+        .gap_2()
+        .child(div().text_sm().child(tr!(cx, "串口参数")))
+        .child(
+            h_flex()
+                .gap_2()
+                .child(
+                    div().flex_1().child(labeled_select(
+                        cx,
+                        "serial-baud",
+                        tr!(cx, "波特率"),
+                        baud_labels,
+                        baud_selected,
+                        move |index, form| {
+                            form.baud = BAUDS.get(index).copied().unwrap_or(115_200);
+                        },
+                    )),
+                )
+                .child(
+                    div().flex_1().child(labeled_select(
+                        cx,
+                        "serial-data-bits",
+                        tr!(cx, "数据位"),
+                        data_labels,
+                        data_selected,
+                        move |index, form| {
+                            form.data_bits = DATA_BITS.get(index).copied().unwrap_or(8);
+                        },
+                    )),
+                ),
+        )
+        .child(
+            h_flex()
+                .gap_2()
+                .child(
+                    div().flex_1().child(labeled_select(
+                        cx,
+                        "serial-parity",
+                        tr!(cx, "校验位"),
+                        parity_labels,
+                        parity_selected,
+                        move |index, form| {
+                            form.parity = PARITIES.get(index).copied().unwrap_or_default();
+                        },
+                    )),
+                )
+                .child(
+                    div().flex_1().child(labeled_select(
+                        cx,
+                        "serial-stop-bits",
+                        tr!(cx, "停止位"),
+                        stop_labels,
+                        stop_selected,
+                        move |index, form| {
+                            form.stop_bits = STOP_BITS.get(index).copied().unwrap_or(1);
+                        },
+                    )),
+                ),
+        )
+        .child(labeled_select(
+            cx,
+            "serial-flow",
+            tr!(cx, "流控"),
+            flow_labels,
+            flow_selected,
+            move |index, form| {
+                form.flow = FLOWS.get(index).copied().unwrap_or_default();
+            },
+        ))
+        .into_any_element()
+}
+
+/// WebSocket「加密（wss://）」开关行（勾选态直接用字符前缀，与桌面密码开关一致）。
+fn ws_tls_row(cx: &Context<RuTermApp>, form: &NewHostForm, pal: &Palette) -> AnyElement {
+    let checked = form.ws_tls;
+    h_flex()
+        .id("ws-tls")
+        .gap_2()
+        .items_center()
+        .cursor_pointer()
+        .on_click(cx.listener(|this, _, _, cx| {
+            if let Some(form) = this.new_host.as_mut() {
+                form.ws_tls = !form.ws_tls;
+                cx.notify();
+            }
+        }))
+        .child(
+            div()
+                .text_xs()
+                .text_color(if checked { pal.text } else { pal.muted })
+                .child(if checked {
+                    tr!(cx, "☑ 加密传输（TLS）")
+                } else {
+                    tr!(cx, "☐ 加密传输（TLS）")
+                }),
+        )
+        .into_any_element()
 }

@@ -856,6 +856,7 @@ impl RuTermApp {
                 key_inline: false,
                 favorite: false,
                 proxy_jump: None,
+                extras: Default::default(),
             },
         };
         if let Some(error) = host.validate() {

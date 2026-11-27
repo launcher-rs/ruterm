@@ -8,7 +8,7 @@ use rgpui_term::TerminalThemeConfig;
 use serde::{Deserialize, Serialize};
 
 use crate::remote::Metric;
-use crate::sessions::{HostConfig, ProtocolKind};
+use crate::sessions::{HostConfig, HostExtras, ProtocolKind};
 
 use super::*;
 
@@ -774,6 +774,54 @@ impl ProtocolPrefs {
     }
 }
 
+/// 主机 → 协议附加参数映射（host id → 串口参数 / WebSocket 参数）。
+///
+/// 为什么不进 hosts 表：同 [`ProtocolPrefs`]，加密库的表由 toasty 建模，加列要手工
+/// ALTER 旧库；这些参数只有对应协议的主机才有，随 `settings` 表的 `host_extras`
+/// 键持久化。降级模式直接随 settings.json 落盘。串口参数里没有秘密，明文 JSON 即可。
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostExtrasPrefs {
+    /// 键是字符串形式的 host id（JSON 对象的键只能是字符串）。
+    #[serde(default)]
+    pub(super) extras: BTreeMap<String, HostExtras>,
+}
+
+impl HostExtrasPrefs {
+    /// 读出某台主机的附加参数；没有记录时按各自协议的默认值。
+    pub(super) fn of(&self, host_id: i64) -> HostExtras {
+        self.extras
+            .get(&host_id.to_string())
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// 覆盖一台主机的附加参数；返回是否发生了变化（据此决定是否回写）。
+    /// 全默认值视为「没有参数」，直接删键，不给 settings 留垃圾。
+    pub(super) fn set(&mut self, host_id: i64, extras: HostExtras) -> bool {
+        let key = host_id.to_string();
+        if extras == HostExtras::default() {
+            return self.extras.remove(&key).is_some();
+        }
+        let previous = self.extras.insert(key, extras.clone());
+        previous != Some(extras)
+    }
+
+    pub(super) fn forget(&mut self, host_id: i64) {
+        self.extras.remove(&host_id.to_string());
+    }
+
+    pub(super) fn to_json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
+    }
+
+    pub(super) fn from_json(text: &str) -> Self {
+        if text.is_empty() {
+            return Self::default();
+        }
+        serde_json::from_str(text).unwrap_or_default()
+    }
+}
+
 /// 本机 shell 的偏好：自定义展示名 + 起始工作目录 + 启动参数 + 环境变量
 /// （按 profile id = 路径 + 参数记账）。
 ///
@@ -1140,14 +1188,14 @@ mod tests {
     use super::{
         AUTO_RECONNECT_MAX, CONNECT_TIMEOUT_DEFAULT, CONNECT_TIMEOUT_MAX, CONNECT_TIMEOUT_MIN,
         CUSTOM_ANSI_BASE, CUSTOM_BRIGHT_BASE, CUSTOM_DEFAULT_ANSI, CUSTOM_DEFAULT_BRIGHT,
-        FONT_SIZE_MAX, FONT_SIZE_MIN, ForwardPrefs, JumpPrefs, LINE_HEIGHT_MAX, LINE_HEIGHT_MIN,
-        LocalShellPrefs, ProtocolPrefs, SavedForward, SessionPrefs, SidebarPrefs, SidebarSort,
-        SortableHost, StatusBarPrefs, TERMINAL_THEME_DEFAULT, TerminalColors, TerminalPrefs,
-        UpdatePrefs, auto_reconnect_delay, hex_to_hsla, normalize_hex,
+        FONT_SIZE_MAX, FONT_SIZE_MIN, ForwardPrefs, HostExtrasPrefs, JumpPrefs, LINE_HEIGHT_MAX,
+        LINE_HEIGHT_MIN, LocalShellPrefs, ProtocolPrefs, SavedForward, SessionPrefs, SidebarPrefs,
+        SidebarSort, SortableHost, StatusBarPrefs, TERMINAL_THEME_DEFAULT, TerminalColors,
+        TerminalPrefs, UpdatePrefs, auto_reconnect_delay, hex_to_hsla, normalize_hex,
     };
     use crate::remote::Metric;
     use crate::session::ForwardKind;
-    use crate::sessions::ProtocolKind;
+    use crate::sessions::{HostExtras, ProtocolKind};
 
     fn saved(name: &str, kind: ForwardKind, listen: u16) -> SavedForward {
         SavedForward {
@@ -1260,6 +1308,36 @@ mod tests {
         assert_eq!(
             ProtocolPrefs::from_json("{ not json"),
             ProtocolPrefs::default()
+        );
+    }
+
+    #[test]
+    fn host_extras_prefs_set_forget_and_roundtrip() {
+        let mut prefs = HostExtrasPrefs::default();
+        let serial = HostExtras {
+            serial: Some(crate::sessions::SerialParams {
+                baud: 9600,
+                ..Default::default()
+            }),
+            ws: None,
+        };
+        assert!(prefs.set(6, serial.clone()));
+        assert!(!prefs.set(6, serial.clone()));
+        assert_eq!(prefs.of(6), serial);
+        // 没有记录的主机按全默认读出。
+        assert_eq!(prefs.of(7), HostExtras::default());
+        assert_eq!(HostExtrasPrefs::from_json(&prefs.to_json()), prefs);
+
+        // 全默认值 = 删键，不留空壳记录。
+        assert!(prefs.set(6, HostExtras::default()));
+        assert_eq!(prefs.of(6), HostExtras::default());
+        prefs.set(8, serial);
+        prefs.forget(8);
+        assert_eq!(prefs.of(8), HostExtras::default());
+        assert_eq!(HostExtrasPrefs::from_json(""), HostExtrasPrefs::default());
+        assert_eq!(
+            HostExtrasPrefs::from_json("{ not json"),
+            HostExtrasPrefs::default()
         );
     }
 

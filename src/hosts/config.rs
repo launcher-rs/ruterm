@@ -229,6 +229,7 @@ mod tests {
             key_inline,
             favorite: false,
             proxy_jump: None,
+            extras: Default::default(),
         }
     }
 
