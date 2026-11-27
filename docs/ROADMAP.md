@@ -90,6 +90,8 @@
   落地：`src/protocols/{tcp,ws,serial}.rs`（各自返回公共 `SessionHandle`，文档注释里
   预留的"串口 / WebSocket"位置补齐）；建连层把 Telnet 的落标签流程抽成
   `install_stream_session`，四种无认证协议共用；`Resume::Tcp / Ws / Serial` 快照重连。
+  tcp / ws 的字节泵有真实回显服务集成测试（建连 / 上行 / 断开 / 服务端关闭 / 超时
+  五条路径），串口无硬件只能手测。
   持久化沿用「不加列、用 settings 键」：串口 / WS 参数存 `HostConfig.extras`
   （降级模式随 sessions.json 落盘）+ 加密库 `settings.host_extras` 键
   （`HostExtrasPrefs`，同 protocols / jumps 先例，降级模式 id=0 不回填）。
@@ -406,7 +408,7 @@
 | Multi-execution（多会话同发命令） | 已有（同步输入 / 命令广播） | — |
 | Macros（录制终端操作后回放） | 有键宏（触发键 → 多步文本），无**录制** | 观望：录制回放价值有限且误录风险高，键宏已覆盖主要场景 |
 | Text editor（远程文件就地编辑） | 基本覆盖：「打开远端文件」落本机副本、改动后回传确认 | 观望：就地铁辑需要远端进程配合，收益低 |
-| 会话日志（终端输出落文件） | 无 | 候选（`S`）：审计 / 留痕刚需，低成本可做 |
+| 会话日志（终端输出落文件） | 已完成（设置 → 会话，默认关；下行字节原样落 `logs/`，上行按键不落盘） | — |
 | Rlogin（明文 513） | 无 | 不做：明文协议已近绝迹，Telnet 场景重合 |
 | FTP（明文 21） | 无（SFTP 覆盖） | 不做：明文传输，与安全定位冲突 |
 | Mosh（UDP 漫游） | 无 | 观望：需 mosh-server + SSP 协议栈，收益集中在弱网漫游，暂无场景 |

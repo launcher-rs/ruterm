@@ -41,6 +41,23 @@ impl RuTermApp {
         self.auth_gate.ready() && self.vault.is_some() && !self.vault_maintenance
     }
 
+    /// 会话日志开关打开时，为本次会话新建落盘文件；关闭或打开失败返回 None
+    /// （协议层拿到 None 就是纯转发，不影响建连）。重连是新会话，另起新文件。
+    /// 只服务远程终端会话（SSH / Telnet / TCP / WS / 串口）；本地终端不落日志。
+    fn open_session_log(
+        &self,
+        label: &str,
+        addr: &str,
+    ) -> Option<crate::session::session_log::SessionLog> {
+        if !self.session_prefs.session_log {
+            return None;
+        }
+        crate::session::session_log::SessionLog::open(
+            &crate::session::session_log::logs_dir(&self.mode),
+            &format!("{label}-{addr}"),
+        )
+    }
+
     pub(super) fn require_ssh_ready(&mut self, cx: &mut Context<Self>) -> bool {
         if self.ssh_ready() {
             return true;
@@ -545,6 +562,7 @@ impl RuTermApp {
             self.vault.clone(),
             Duration::from_secs(self.session_prefs.connect_timeout),
             self.terminal.shell_integration,
+            self.open_session_log("SSH", &addr),
             cx,
         );
         // 会话结束（远端 exit / 断线 / 连接失败）→ 保留标签并展示断开横幅。
@@ -819,6 +837,7 @@ impl RuTermApp {
             port,
             handles,
             Duration::from_secs(self.session_prefs.connect_timeout),
+            self.open_session_log("Telnet", &addr),
             cx,
         );
         self.install_stream_session(
@@ -896,6 +915,7 @@ impl RuTermApp {
             port,
             handles,
             Duration::from_secs(self.session_prefs.connect_timeout),
+            self.open_session_log("TCP", &addr),
             cx,
         );
         self.install_stream_session(
@@ -980,6 +1000,7 @@ impl RuTermApp {
             params.tls,
             handles,
             Duration::from_secs(self.session_prefs.connect_timeout),
+            self.open_session_log("WS", &url),
             cx,
         );
         self.install_stream_session(
@@ -1053,7 +1074,13 @@ impl RuTermApp {
             params,
             source: source.clone(),
         };
-        let handle = crate::protocols::serial::start(device, params, handles, cx);
+        let handle = crate::protocols::serial::start(
+            device,
+            params,
+            handles,
+            self.open_session_log("Serial", &addr),
+            cx,
+        );
         self.install_stream_session(
             id,
             title,

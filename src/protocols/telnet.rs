@@ -7,7 +7,7 @@
 //! - 上行字节里的 0xFF 按 Telnet 规则双写转义。
 //!
 //! 网络 IO 全在 rgpui 的 tokio 运行时上异步进行，UI 线程零阻塞；
-//! 下行字节灌入 [`FeedHandle`]，会话结束由 `end_session` 收尾，与 SSH 一致。
+//! 下行字节灌入 [`LoggingFeed`]（可带会话日志），会话结束由 `end_session` 收尾，与 SSH 一致。
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use rgpui::AppContext;
-use rgpui_term::{ExternalHandles, FeedHandle, PtyBoundMessage};
+use rgpui_term::{ExternalHandles, PtyBoundMessage};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 
@@ -40,14 +40,18 @@ const TELOPT_NAWS: u8 = 31;
 pub type TelnetSession = crate::protocols::SessionHandle;
 
 /// 在 rgpui 的 tokio 运行时上启动 Telnet 会话。
+///
+/// `log` 是会话日志（None = 设置里未开启，`feed` 纯转发）。
 pub fn start<C: AppContext>(
     host: String,
     port: u16,
     handles: ExternalHandles,
     connect_timeout: Duration,
+    log: Option<crate::session::SessionLog>,
     cx: &C,
 ) -> TelnetSession {
     let ExternalHandles { feed, rx } = handles;
+    let feed = crate::session::session_log::LoggingFeed::new(feed, log);
     let (ui_tx, ui_rx) = mpsc::unbounded_channel::<PtyBoundMessage>();
     let (ready_tx, ready_rx) = oneshot::channel();
     let (disconnect_tx, disconnect_rx) = oneshot::channel();
@@ -106,7 +110,7 @@ pub fn start<C: AppContext>(
 async fn run(
     host: String,
     port: u16,
-    feed: FeedHandle,
+    feed: crate::session::session_log::LoggingFeed,
     mut up_rx: mpsc::UnboundedReceiver<PtyBoundMessage>,
     started: Arc<AtomicBool>,
     connect_timeout: Duration,

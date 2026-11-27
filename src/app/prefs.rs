@@ -495,7 +495,7 @@ pub(super) fn auto_reconnect_delay(attempt: u32) -> Duration {
     })
 }
 
-/// 会话行为偏好：断线自动重连与建连超时。
+/// 会话行为偏好：断线自动重连、建连超时与会话日志。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionPrefs {
     /// 连接意外中断（网络断开、服务端掉线）后自动重连；远端主动 `exit` 不触发。
@@ -504,6 +504,10 @@ pub struct SessionPrefs {
     /// 建连 + 认证 + 开 shell 的总超时（秒）。
     #[serde(default = "connect_timeout_default")]
     pub connect_timeout: u64,
+    /// 会话日志：把远程会话的终端下行字节原样记到数据目录 logs/ 下。
+    /// 只记下行输出；上行按键（含密码输入）绝不落盘。默认关。
+    #[serde(default)]
+    pub session_log: bool,
 }
 
 pub(super) fn auto_reconnect_default() -> bool {
@@ -519,6 +523,7 @@ impl Default for SessionPrefs {
         Self {
             auto_reconnect: true,
             connect_timeout: CONNECT_TIMEOUT_DEFAULT,
+            session_log: false,
         }
     }
 }

@@ -8,7 +8,7 @@
 //! - 两个句柄都 drop 后操作系统才真正关闭设备。
 //!
 //! 打开设备即拉高 DTR / RTS（与 PuTTY / MobaXterm 一致）；
-//! 下行字节灌入 [`FeedHandle`]，会话结束由 `end_session` 收尾。
+//! 下行字节灌入 [`LoggingFeed`]（可带会话日志），会话结束由 `end_session` 收尾。
 
 use std::io::{Read as _, Write as _};
 use std::sync::Arc;
@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use rgpui::AppContext;
-use rgpui_term::{FeedHandle, PtyBoundMessage};
+use rgpui_term::PtyBoundMessage;
 use serialport::{DataBits, FlowControl, Parity, StopBits};
 use tokio::sync::{mpsc, oneshot};
 
@@ -30,13 +30,17 @@ const PORT_TIMEOUT: Duration = Duration::from_millis(100);
 pub type SerialSession = crate::protocols::SessionHandle;
 
 /// 在 rgpui 的 tokio 运行时上启动串口会话。
+///
+/// `log` 是会话日志（None = 设置里未开启，`feed` 纯转发）。
 pub fn start<C: AppContext>(
     device: String,
     params: SerialParams,
     handles: rgpui_term::ExternalHandles,
+    log: Option<crate::session::SessionLog>,
     cx: &C,
 ) -> SerialSession {
     let rgpui_term::ExternalHandles { feed, rx } = handles;
+    let feed = crate::session::session_log::LoggingFeed::new(feed, log);
     let (ui_tx, ui_rx) = mpsc::unbounded_channel::<PtyBoundMessage>();
     let (ready_tx, ready_rx) = oneshot::channel();
     let (disconnect_tx, disconnect_rx) = oneshot::channel();
@@ -98,7 +102,7 @@ pub fn start<C: AppContext>(
 async fn run(
     device: String,
     params: SerialParams,
-    feed: FeedHandle,
+    feed: crate::session::session_log::LoggingFeed,
     mut up_rx: mpsc::UnboundedReceiver<PtyBoundMessage>,
     started: Arc<AtomicBool>,
     mut disconnect: oneshot::Receiver<()>,

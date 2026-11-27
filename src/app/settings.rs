@@ -812,6 +812,34 @@ impl RuTermApp {
                     .child(tr!(cx, "超时覆盖 DNS、TCP、握手、认证与开启 shell 的全过程；超时即结束本次尝试并报「连接超时」。")),
             )
             .child(div().mt_2().h(px(1.0)).w_full().bg(pal.border))
+            .child({
+                let logging = cx.entity();
+                Checkbox::new("session-log")
+                    .label(tr!(cx, "会话日志"))
+                    .checked(self.session_prefs.session_log)
+                    .on_change(move |value, _window, cx| {
+                        logging.update(cx, |this, cx| {
+                            let mut prefs = this.session_prefs.clone();
+                            prefs.session_log = value;
+                            this.set_session_prefs(prefs, cx);
+                        });
+                    })
+            })
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(pal.muted)
+                    .child(tr!(cx, "把远程会话里远端返回的字节原样记到数据目录 logs/ 下（一个会话一个文件，文件名时间为 UTC）。只记下行输出，上行按键（含密码输入）绝不落盘。改动只对之后建立的会话生效。")),
+            )
+            .child({
+                let opening = cx.entity();
+                Button::new("session-log-open-dir")
+                    .label(tr!(cx, "打开日志文件夹"))
+                    .on_click(move |_, _window, cx| {
+                        opening.update(cx, |this, cx| this.open_session_logs_dir(cx));
+                    })
+            })
+            .child(div().mt_2().h(px(1.0)).w_full().bg(pal.border))
             .child(
                 Checkbox::new("session-tray")
                     .label(tr!(cx, "启用系统托盘"))
@@ -852,6 +880,17 @@ impl RuTermApp {
         let mut prefs = self.session_prefs.clone();
         prefs.nudge_connect_timeout(steps);
         self.set_session_prefs(prefs, cx);
+    }
+
+    /// 打开会话日志目录（设置「会话」分页按钮）。目录不存在时先建出来，
+    /// 免得系统打开器报路径无效；日志关闭时目录可能尚未存在。
+    pub(super) fn open_session_logs_dir(&self, cx: &mut Context<Self>) {
+        let dir = crate::session::session_log::logs_dir(&self.mode);
+        if let Err(error) = std::fs::create_dir_all(&dir) {
+            log::warn!("创建会话日志目录失败: {error}");
+        }
+        super::files::open_path_with_default(&dir);
+        cx.notify();
     }
 
     /// 开关系统托盘：立即创建 / 置空图标并写启动设置。

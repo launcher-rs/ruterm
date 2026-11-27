@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result};
 use bytes::Bytes;
 use rgpui::AppContext;
-use rgpui_term::{ExternalHandles, FeedHandle, PtyBoundMessage};
+use rgpui_term::{ExternalHandles, PtyBoundMessage};
 use russh::Channel;
 use russh::ChannelMsg;
 use russh::ChannelWriteHalf;
@@ -35,10 +35,12 @@ use crate::remote::{PROBE_CMD, RemoteInfo};
 use crate::transfer;
 
 mod cwd;
+pub(crate) mod session_log;
 
 // 纯解析函数迁到 cwd 子模块，re-export 保持 crate::session::path_from_osc7 路径不变。
 pub(crate) use cwd::path_from_osc7;
 use cwd::{CwdKeystrokes, lex_join};
+pub(crate) use session_log::SessionLog;
 
 /// 信号：私钥有口令但连接未携带口令。
 ///
@@ -302,12 +304,14 @@ pub fn error_summary(error: &anyhow::Error) -> String {
 /// 返回的任务必须被持有（提前 drop 会取消 SSH）。
 /// `vault` 用于加密库内的 known_hosts 校验；None 时回退旧文件（降级模式）。
 /// `connect_timeout` 覆盖"建连 → 认证 → 开 shell"整个阶段。
+/// `log` 是会话日志（None = 设置里未开启，纯转发）。
 pub fn start<C: AppContext>(
     target: SshTarget,
     handles: ExternalHandles,
     vault: Option<Arc<crate::vault::Vault>>,
     connect_timeout: Duration,
     shell_integration: bool,
+    log: Option<SessionLog>,
     cx: &C,
 ) -> SshSession {
     let ExternalHandles { feed, rx } = handles;
@@ -322,6 +326,7 @@ pub fn start<C: AppContext>(
     let (command_tx, command_rx) = mpsc::unbounded_channel::<SessionCommand>();
     let started = Arc::new(AtomicBool::new(false));
 
+    let feed = session_log::LoggingFeed::new(feed, log);
     feed.feed(format!("\r\n[ruterm] 正在连接 {}…\r\n", target.addr()).into_bytes());
 
     let closing_feed = feed.clone();
@@ -373,7 +378,7 @@ pub fn start<C: AppContext>(
 #[allow(clippy::too_many_arguments)]
 async fn run(
     target: SshTarget,
-    feed: FeedHandle,
+    feed: session_log::LoggingFeed,
     ui_rx: mpsc::UnboundedReceiver<PtyBoundMessage>,
     info_tx: mpsc::UnboundedSender<RemoteInfo>,
     cwd_tx: mpsc::UnboundedSender<String>,

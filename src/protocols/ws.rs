@@ -7,7 +7,7 @@
 //! - TLS 走 `native-tls`（Windows 上是 schannel），与 reqwest / IronRDP 同栈。
 //!
 //! 网络 IO 全在 rgpui 的 tokio 运行时上异步进行，UI 线程零阻塞；
-//! 下行字节灌入 [`FeedHandle`]，会话结束由 `end_session` 收尾，与 Telnet 一致。
+//! 下行字节灌入 [`LoggingFeed`]（可带会话日志），会话结束由 `end_session` 收尾，与 Telnet 一致。
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,7 +16,7 @@ use std::time::Duration;
 use anyhow::{Context as _, Result};
 use futures_util::{SinkExt as _, StreamExt as _};
 use rgpui::AppContext;
-use rgpui_term::{FeedHandle, PtyBoundMessage};
+use rgpui_term::PtyBoundMessage;
 use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
 
@@ -27,6 +27,8 @@ pub type WsSession = crate::protocols::SessionHandle;
 ///
 /// `path` / `tls` 来自主机的 [`WsParams`](crate::sessions::WsParams)；
 /// 没有参数（主机列表缺省）时路径按 `/`、不走 TLS。
+/// `log` 是会话日志（None = 设置里未开启，`feed` 纯转发）。
+#[allow(clippy::too_many_arguments)]
 pub fn start<C: AppContext>(
     host: String,
     port: u16,
@@ -34,9 +36,11 @@ pub fn start<C: AppContext>(
     tls: bool,
     handles: rgpui_term::ExternalHandles,
     connect_timeout: Duration,
+    log: Option<crate::session::SessionLog>,
     cx: &C,
 ) -> WsSession {
     let rgpui_term::ExternalHandles { feed, rx } = handles;
+    let feed = crate::session::session_log::LoggingFeed::new(feed, log);
     let (ui_tx, ui_rx) = mpsc::unbounded_channel::<PtyBoundMessage>();
     let (ready_tx, ready_rx) = oneshot::channel();
     let (disconnect_tx, disconnect_rx) = oneshot::channel();
@@ -108,7 +112,7 @@ pub(crate) fn build_url(host: &str, port: u16, path: &str, tls: bool) -> String 
 #[allow(clippy::too_many_arguments)]
 async fn run(
     url: String,
-    feed: FeedHandle,
+    feed: crate::session::session_log::LoggingFeed,
     mut up_rx: mpsc::UnboundedReceiver<PtyBoundMessage>,
     started: Arc<AtomicBool>,
     connect_timeout: Duration,
@@ -175,6 +179,132 @@ async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::time::Duration;
+
+    /// 与 tcp 测试同形的句柄包装：真实 FeedHandle + 日志 + 测试用上行通道。
+    fn handles(
+        log: Option<crate::session::SessionLog>,
+    ) -> (
+        crate::session::session_log::LoggingFeed,
+        mpsc::UnboundedSender<PtyBoundMessage>,
+        mpsc::UnboundedReceiver<PtyBoundMessage>,
+    ) {
+        let mut builder = rgpui_term::TerminalBuilder::new_external(None).expect("外联后端");
+        let rgpui_term::ExternalHandles { feed, .. } =
+            builder.take_external_handles().expect("外联句柄");
+        let (up_tx, up_rx) = mpsc::unbounded_channel();
+        (crate::session::session_log::LoggingFeed::new(feed, log), up_tx, up_rx)
+    }
+
+    /// 起一个回显 WebSocket 服务：Binary / Text 帧原样回写，收帧上报。
+    async fn echo_server() -> (u16, mpsc::UnboundedReceiver<Vec<u8>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (got_tx, got_rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.expect("接受连接");
+            let mut ws = tokio_tungstenite::accept_async(sock)
+                .await
+                .expect("WS 握手");
+            use futures_util::StreamExt as _;
+            while let Some(frame) = ws.next().await {
+                match frame.expect("WS 读取") {
+                    Message::Binary(data) => {
+                        if got_tx.send(data.to_vec()).is_err() {
+                            break;
+                        }
+                        if ws.send(Message::Binary(data)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Message::Text(text) => {
+                        if ws.send(Message::Text(text)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Message::Ping(payload) => {
+                        let _ = ws.send(Message::Pong(payload)).await;
+                    }
+                    Message::Close(_) => break,
+                    _ => {}
+                }
+            }
+        });
+        (port, got_rx)
+    }
+
+    #[tokio::test]
+    async fn run_roundtrips_binary_frames_against_a_real_ws_server() {
+        let (port, mut got_rx) = echo_server().await;
+        let (feed, up_tx, up_rx) = handles(None);
+        let started = Arc::new(AtomicBool::new(false));
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let (disconnect_tx, disconnect_rx) = oneshot::channel();
+
+        let task = tokio::spawn(run(
+            format!("ws://127.0.0.1:{port}/echo"),
+            feed,
+            up_rx,
+            started.clone(),
+            Duration::from_secs(5),
+            disconnect_rx,
+            ready_tx,
+        ));
+
+        tokio::time::timeout(Duration::from_secs(5), ready_rx)
+            .await
+            .expect("ready 超时")
+            .expect("ready 关闭");
+        assert!(started.load(Ordering::SeqCst));
+
+        // 上行按键 → Binary 帧，服务器必须原样收到。
+        up_tx
+            .send(PtyBoundMessage::Input(b"hi".to_vec()))
+            .unwrap();
+        let received = tokio::time::timeout(Duration::from_secs(5), got_rx.recv())
+            .await
+            .expect("等服务器收帧超时")
+            .expect("服务器通道关闭");
+        assert_eq!(received, b"hi");
+
+        disconnect_tx.send(()).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("run 未在断开后退出")
+            .expect("join 失败");
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn run_fails_fast_on_a_dead_url() {
+        // 端口无人监听：建连报错、started 不置位。
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let (feed, _up_tx, up_rx) = handles(None);
+        let started = Arc::new(AtomicBool::new(false));
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let (disconnect_tx, disconnect_rx) = oneshot::channel();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            run(
+                format!("ws://127.0.0.1:{port}/echo"),
+                feed,
+                up_rx,
+                started.clone(),
+                Duration::from_millis(300),
+                disconnect_rx,
+                ready_tx,
+            ),
+        )
+        .await
+        .expect("失败路径本身卡住");
+        assert!(result.is_err(), "无人监听应报错");
+        assert!(!started.load(Ordering::SeqCst));
+        drop(disconnect_tx);
+        drop(ready_rx);
+    }
 
     #[test]
     fn url_defaults_path_to_slash() {

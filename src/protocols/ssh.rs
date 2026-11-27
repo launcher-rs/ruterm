@@ -12,7 +12,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
-use rgpui_term::FeedHandle;
 use russh::Channel;
 use russh::ChannelId;
 use russh::client::{self, ChannelOpenHandle, Msg, Session};
@@ -253,7 +252,7 @@ pub struct ForwardedTcpip {
 
 /// russh 会话的事件处理器：实现 `client::Handler`。
 pub struct SshTerminalHandler {
-    feed: FeedHandle,
+    feed: crate::session::session_log::LoggingFeed,
     host: String,
     port: u16,
     /// 非终端通道（exec 探测等），其字节与控制消息都不进终端。
@@ -278,7 +277,7 @@ impl SshTerminalHandler {
     /// 以下行注入句柄、主机信息、旁路通道集合与可选凭据库构造处理器。
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        feed: FeedHandle,
+        feed: crate::session::session_log::LoggingFeed,
         host: String,
         port: u16,
         side: SideChannels,

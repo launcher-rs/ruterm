@@ -1114,5 +1114,8 @@
  "设备路径": "Device path",
  "设备路径（COM3 / /dev/ttyUSB0）": "Device path (COM3 / /dev/ttyUSB0)",
  "☐ 加密传输（TLS）": "☐ Encrypted (TLS)",
- "☑ 加密传输（TLS）": "☑ Encrypted (TLS)"
+ "☑ 加密传输（TLS）": "☑ Encrypted (TLS)",
+ "会话日志": "Session log",
+ "打开日志文件夹": "Open log folder",
+ "把远程会话里远端返回的字节原样记到数据目录 logs/ 下（一个会话一个文件，文件名时间为 UTC）。只记下行输出，上行按键（含密码输入）绝不落盘。改动只对之后建立的会话生效。": "Record the bytes a remote session sends back, verbatim, under logs/ in the data directory (one file per session, filenames use UTC time). Only downstream output is recorded; upstream keystrokes (including passwords) are never written to disk. Changes apply to sessions created afterwards."
 }
