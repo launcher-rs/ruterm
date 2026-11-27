@@ -636,7 +636,9 @@ impl RuTermApp {
         // 默认窗口只有 720 高，字段一多表单就会顶出可视区。整卡最大高度跟着窗口走，
         // 字段区自己滚动，标题与底部按钮永远留在窗口内。
         let max_height = (window.viewport_size().height - px(48.0)).max(px(360.0));
-        let fields_max_height = (max_height - px(160.0)).max(px(200.0));
+        // 注意这里必须用确定高度 h 而不是 max_h：rgpui 的滚动区以自身布局高度计算滚动范围，
+        // max_h 下内容会把滚动区撑到固有高度、最后只是被卡片裁掉，根本滚不动。
+        let fields_height = (max_height - px(160.0)).max(px(200.0));
         let methods = [
             AuthMethod::Agent,
             AuthMethod::IdentityFile,
@@ -700,8 +702,9 @@ impl RuTermApp {
                     .child(
                         v_flex()
                             .id("host-form-fields")
+                            .h(fields_height)
+                            .flex_shrink_0()
                             .gap_2()
-                            .max_h(fields_max_height)
                             .overflow_y_scrollbar()
                             .child({
                                 // 协议分段：终端（SSH / Telnet）与远程桌面（RDP / VNC）共用同一张卡片。

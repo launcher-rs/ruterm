@@ -11,6 +11,9 @@ description = "Rust 远程连接工具，集成 SSH、本地终端、SFTP 与远
 rgpui = { version = "1.8.4", features = ["tokio"] }
 rgpui-platform = "1.8.4"
 rgpui-term = "1.8.4"
+# 检查更新组件：版本比较 / 镜像回退 / 分块下载 / 解压落地都在扩展库里，
+# 项目侧只做菜单、对话框、偏好与状态栏编排（用法参考 launcher-rs/rumark）。
+rgpui-extra = { git = "https://github.com/launcher-rs/rgpui-extra.git", features = ["ui"] }
 russh = { version = "0.64.1", default-features = false, features = ["flate2", "ring", "rsa"] }
 russh-sftp = "3.0.1"
 zmodem2 = "0.7.3"
@@ -37,9 +40,7 @@ image = { version = "0.25.10", default-features = false }
 # 剪贴板在 Windows 上由 ironrdp-cliprdr-native 直接挂系统剪贴板，文本双向自动同步。
 # 本机副本还提供拖放上传的进度登记（写剪贴板前登记，剪贴板线程回报已发送字节）。
 ironrdp-cliprdr-native = { path = "vendor/cliprdr-native" }
-# 检查更新组件：版本比较 / 镜像回退 / 分块下载 / 解压落地都在扩展库里，
-# 项目侧只做菜单、对话框、偏好与状态栏编排（用法参考 launcher-rs/rumark）。
-rgpui-extra = { git = "https://github.com/launcher-rs/rgpui-extra.git", features = ["ui"] }
+
 # 「检查镜像」用同一套 reqwest 做轻量探测（Release API + 安装包首字节），不重复引入 HTTP 栈。
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "default-tls"] }
 ironrdp = { version = "0.17", default-features = false, features = [
